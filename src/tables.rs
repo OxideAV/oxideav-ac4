@@ -116,6 +116,14 @@ pub fn n_sect_bits(transf_length_idx: u32) -> u32 {
     }
 }
 
+// TODO: `sfb_offset_48()` — Tables B.4 / B.5 / B.6. These are long
+// column-per-transform-length tables (63, 61, 55, 49, 49, 43, 36, 36,
+// 33 entries etc.) and are only meaningful once asf_section_data()
+// and asf_spectral_data() decoding lands. They are deliberately
+// deferred so that when they're needed they can be transcribed with
+// a proper value-level cross-check against the spec rather than a
+// blind dump.
+
 /// `sect_esc_val` companion to [`n_sect_bits`]: `(1 << n_sect_bits) - 1`.
 #[inline]
 pub fn sect_esc_val(transf_length_idx: u32) -> u32 {
