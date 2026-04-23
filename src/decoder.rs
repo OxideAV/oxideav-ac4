@@ -23,7 +23,7 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::{sync, toc};
+use crate::{asf, sync, toc};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac4Decoder::new(params)))
@@ -41,6 +41,11 @@ pub struct Ac4Decoder {
     eof: bool,
     /// Last parsed frame info — exposed for downstream inspection.
     pub last_info: Option<toc::Ac4FrameInfo>,
+    /// Last parsed substream tool summary (first substream of the last
+    /// decoded frame). `None` when the TOC didn't expose a usable size
+    /// for the substream (e.g. single-substream frame where
+    /// `b_size_present == 0`).
+    pub last_substream: Option<asf::Ac4SubstreamInfo>,
 }
 
 impl Ac4Decoder {
@@ -52,6 +57,7 @@ impl Ac4Decoder {
             pending: None,
             eof: false,
             last_info: None,
+            last_substream: None,
         }
     }
 
@@ -135,6 +141,43 @@ impl Decoder for Ac4Decoder {
                 info.frame_length
             }
         };
+        // Best-effort walk of the first substream. The exact byte offset
+        // of substream 0 is `toc_len + payload_base`, where `toc_len` is
+        // the length of the byte-aligned ac4_toc() element. We don't
+        // currently track `toc_len` out of [`toc::parse_ac4_toc`]; as a
+        // cheap approximation we try the first substream size if the
+        // substream_index_table exposed one, carving the tail of the
+        // packet. This is fine for single-substream frames (the
+        // overwhelmingly common case).
+        let substream_try = {
+            let first_size = info.substream_sizes.first().copied();
+            if let Some(sz) = first_size {
+                let sz = sz as usize;
+                if sz > 0 && sz <= raw.len() {
+                    let start = raw.len().saturating_sub(sz);
+                    Some(&raw[start..start + sz])
+                } else {
+                    None
+                }
+            } else {
+                // Single-substream frame with implicit size: feed the
+                // walker the tail of the packet starting right after
+                // the TOC+payload_base guess. The walker reads at most
+                // a handful of bits before aligning + opaque-consuming;
+                // if we're off by a few bytes the substream info just
+                // comes back best-effort.
+                None
+            }
+        };
+        self.last_substream = substream_try.and_then(|sb| {
+            let channels_u16 = channels;
+            let b_iframe = info
+                .presentations
+                .first()
+                .map(|p| p.b_iframe)
+                .unwrap_or(info.b_iframe_global);
+            asf::walk_ac4_substream(sb, channels_u16, b_iframe, info.frame_length).ok()
+        });
         self.last_info = Some(info);
         let byte_count = (samples as usize) * (channels as usize) * 2; // S16 interleaved.
         let data = vec![vec![0u8; byte_count]];

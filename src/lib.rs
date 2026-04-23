@@ -42,6 +42,7 @@
 
 #![allow(dead_code)]
 
+pub mod asf;
 pub mod decoder;
 pub mod sync;
 pub mod toc;
