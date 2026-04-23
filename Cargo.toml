@@ -1,0 +1,18 @@
+[package]
+name = "oxideav-ac4"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-ac4"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust Dolby AC-4 audio decoder foundation for oxideav — sync, TOC, presentation and substream parsing"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-ac4"
+keywords = ["multimedia", "audio", "ac4", "dolby", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
