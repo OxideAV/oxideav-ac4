@@ -33,6 +33,8 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
+use crate::asf_data;
+use crate::sfb_offset;
 use crate::tables;
 use crate::toc::variable_bits;
 
@@ -297,6 +299,11 @@ pub struct SubstreamTools {
     pub psy_info_secondary: Option<AsfPsyInfo>,
     /// `b_enable_mdct_stereo_proc` — stereo MDCT joint processing flag.
     pub mdct_stereo_proc: bool,
+    /// Dequantised + scaled spectral coefficients for the primary
+    /// channel (length = `sfb_offset[max_sfb]`). `None` when the
+    /// Huffman-driven data path didn't run (non-SIMPLE / non-ASF /
+    /// short-frame grouping cases).
+    pub scaled_spec_primary: Option<Vec<f32>>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -460,11 +467,54 @@ pub fn parse_mono_audio_data_outer(
         // channel — per sf_info(spec_frontend, 0, 0).
         if let Ok(psy) = parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
             tools.psy_info_primary = Some(psy);
+            // For the single-window-group / long-frame case we can now
+            // walk asf_section_data + asf_spectral_data +
+            // asf_scalefac_data + asf_snf_data and produce scaled
+            // spectral coefficients.
+            if ti.b_long_frame && tools.psy_info_primary.as_ref().unwrap().num_window_groups == 1 {
+                let psy_ref = tools.psy_info_primary.as_ref().unwrap().clone();
+                if let Some(scaled) = decode_asf_long_mono_body(br, &ti, &psy_ref) {
+                    tools.scaled_spec_primary = Some(scaled);
+                }
+            }
         }
-        // asf_section_data / asf_spectral_data / asf_scalefac_data /
-        // asf_snf_data bodies pending Huffman tables — not decoded yet.
     }
     Ok(())
+}
+
+/// Decode the `sf_data` body for a mono, long-frame, single-window-
+/// group ASF substream. Returns the dequantised + scaled spectral
+/// coefficients for the frame.
+///
+/// On any Huffman / bitstream error we return `None` — the caller
+/// falls back to silence. Uses the decoder's own max_sfb (from
+/// psy_info) rather than num_sfb_48 since the latter is only a cap.
+fn decode_asf_long_mono_body(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+) -> Option<Vec<f32>> {
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let max_sfb_cap = tables::num_sfb_48(tl)?;
+    let max_sfb = psy.max_sfb_0.min(max_sfb_cap);
+    if max_sfb == 0 {
+        return None;
+    }
+    let sfbo = sfb_offset::sfb_offset_48(tl)?;
+    // asf_section_data.
+    let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
+    // asf_spectral_data.
+    let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
+    // asf_scalefac_data.
+    let sf_gain =
+        asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    // asf_snf_data — consume the bits but ignore the output for now
+    // (noise fill to be added later).
+    let _snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    // Dequantise + scale.
+    let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
+    Some(scaled)
 }
 
 /// Parse the outer layers of a stereo `audio_data()` element

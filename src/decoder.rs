@@ -23,7 +23,7 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::{asf, sync, toc};
+use crate::{asf, mdct, sync, toc};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac4Decoder::new(params)))
@@ -46,6 +46,11 @@ pub struct Ac4Decoder {
     /// for the substream (e.g. single-substream frame where
     /// `b_size_present == 0`).
     pub last_substream: Option<asf::Ac4SubstreamInfo>,
+    /// Per-channel overlap-add state (length = transform_length samples).
+    /// Keyed by channel index; resized on transform-length change.
+    overlap: Vec<Vec<f32>>,
+    /// Transform length of the previous frame (for overlap sizing).
+    prev_transform_length: u32,
 }
 
 impl Ac4Decoder {
@@ -58,6 +63,8 @@ impl Ac4Decoder {
             eof: false,
             last_info: None,
             last_substream: None,
+            overlap: Vec::new(),
+            prev_transform_length: 0,
         }
     }
 
@@ -150,23 +157,24 @@ impl Decoder for Ac4Decoder {
         // packet. This is fine for single-substream frames (the
         // overwhelmingly common case).
         let substream_try = {
+            // Substream 0 starts at toc_size + payload_base.
+            let start = (info.toc_size + info.payload_base) as usize;
             let first_size = info.substream_sizes.first().copied();
-            if let Some(sz) = first_size {
+            if start >= raw.len() {
+                None
+            } else if let Some(sz) = first_size {
                 let sz = sz as usize;
-                if sz > 0 && sz <= raw.len() {
-                    let start = raw.len().saturating_sub(sz);
-                    Some(&raw[start..start + sz])
+                let end = start.saturating_add(sz).min(raw.len());
+                if sz > 0 {
+                    Some(&raw[start..end])
                 } else {
                     None
                 }
             } else {
-                // Single-substream frame with implicit size: feed the
-                // walker the tail of the packet starting right after
-                // the TOC+payload_base guess. The walker reads at most
-                // a handful of bits before aligning + opaque-consuming;
-                // if we're off by a few bytes the substream info just
-                // comes back best-effort.
-                None
+                // Single-substream frame with implicit size: the
+                // substream spans to the end of the packet (possibly
+                // minus CRC bytes, which the syncframe layer stripped).
+                Some(&raw[start..])
             }
         };
         self.last_substream = substream_try.and_then(|sb| {
@@ -178,9 +186,64 @@ impl Decoder for Ac4Decoder {
                 .unwrap_or(info.b_iframe_global);
             asf::walk_ac4_substream(sb, channels_u16, b_iframe, info.frame_length).ok()
         });
+        // If we have scaled spectra for channel 0, run IMDCT + OLA
+        // and produce real PCM. Otherwise fall back to silence.
+        let mut pcm_samples: Option<Vec<i16>> = None;
+        if let Some(sub) = self.last_substream.as_ref() {
+            if let Some(scaled) = sub.tools.scaled_spec_primary.as_ref() {
+                if let Some(ti) = sub.tools.transform_info_primary.as_ref() {
+                    let n = ti.transform_length_0 as usize;
+                    if n > 0 && n == samples as usize {
+                        // Zero-pad the scaled coefficients up to N.
+                        let mut x = vec![0.0_f32; n];
+                        let copy = scaled.len().min(n);
+                        x[..copy].copy_from_slice(&scaled[..copy]);
+                        // Resize overlap buffer if transform length
+                        // changed.
+                        if self.prev_transform_length != n as u32 {
+                            self.overlap.clear();
+                            self.overlap.push(vec![0.0_f32; n]);
+                            self.prev_transform_length = n as u32;
+                        } else if self.overlap.is_empty() {
+                            self.overlap.push(vec![0.0_f32; n]);
+                        }
+                        let y = mdct::imdct(&x);
+                        let window = mdct::kbd_window(n as u32);
+                        let pcm_f = mdct::imdct_olap_symmetric(
+                            &y,
+                            &window,
+                            &mut self.overlap[0],
+                        );
+                        // Convert to S16, clamped.
+                        let mut out = Vec::with_capacity(pcm_f.len());
+                        for s in pcm_f {
+                            let scaled = (s * 32767.0).clamp(-32768.0, 32767.0);
+                            out.push(scaled as i16);
+                        }
+                        pcm_samples = Some(out);
+                    }
+                }
+            }
+        }
         self.last_info = Some(info);
         let byte_count = (samples as usize) * (channels as usize) * 2; // S16 interleaved.
-        let data = vec![vec![0u8; byte_count]];
+        let data = if let Some(pcm) = pcm_samples {
+            // Interleave mono into channels slots (dup for stereo).
+            let mut buf = vec![0u8; byte_count];
+            for (i, &s) in pcm.iter().enumerate() {
+                let le = s.to_le_bytes();
+                for c in 0..channels as usize {
+                    let off = (i * channels as usize + c) * 2;
+                    if off + 1 < buf.len() {
+                        buf[off] = le[0];
+                        buf[off + 1] = le[1];
+                    }
+                }
+            }
+            vec![buf]
+        } else {
+            vec![vec![0u8; byte_count]]
+        };
         Ok(Frame::Audio(AudioFrame {
             format: SampleFormat::S16,
             channels,
@@ -289,6 +352,213 @@ mod tests {
         assert_eq!(info.frame_rate_index, 1);
         assert_eq!(info.frame_length, 1_920);
         assert!(info.b_iframe_global);
+    }
+
+    fn build_mono_toc() -> Vec<u8> {
+        // Single-presentation, single-substream AC-4 TOC claiming
+        // 48 kHz, 24 fps, mono (channel_mode prefix '0'), b_iframe = 1.
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 2); // bitstream_version = 2
+        bw.write_u32(7, 10); // sequence_counter
+        bw.write_u32(0, 1); // b_wait_frames
+        bw.write_u32(1, 1); // fs_index = 1 (48 kHz)
+        bw.write_u32(1, 4); // frame_rate_index = 1 (24 fps)
+        bw.write_u32(1, 1); // b_iframe_global
+        bw.write_u32(1, 1); // b_single_presentation
+        bw.write_u32(0, 1); // b_payload_base
+        // ac4_presentation_info:
+        bw.write_u32(1, 1); // b_single_substream
+        bw.write_u32(0, 1); // presentation_version = 0
+        bw.write_u32(0, 3); // md_compat
+        bw.write_u32(0, 1); // b_belongs_to_presentation_id
+        bw.write_u32(0, 1); // frame_rate_multiply_info
+        // emdf_info:
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 3);
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 1);
+        // ac4_substream_info:
+        bw.write_u32(0b0, 1); // channel_mode = 0 (mono) — prefix '0'
+        bw.write_u32(0, 1); // b_sf_multiplier
+        bw.write_u32(0, 1); // b_bitrate_info
+        bw.write_u32(0, 1); // b_content_type
+        bw.write_u32(1, 1); // b_iframe
+        bw.write_u32(0, 2); // substream_index
+        bw.write_u32(0, 1); // b_pre_virtualized
+        bw.write_u32(0, 1); // b_add_emdf_substreams
+        // substream_index_table:
+        bw.write_u32(1, 2); // n_substreams - 1
+        bw.write_u32(0, 1); // b_size_present
+        bw.align_to_byte();
+        bw.finish()
+    }
+
+    /// Write a sect_len_incr sequence for a given section length.
+    /// For n_sect_bits=3, esc=7: sect_len=1+7k+incr; emit k escapes
+    /// followed by one non-escape.
+    fn write_sect_len_incr(bw: &mut BitWriter, sect_len: u32, n_sect_bits: u32, esc: u32) {
+        // sect_len = 1 + esc*k + incr where 0 <= incr < esc.
+        let base = sect_len.saturating_sub(1);
+        let k = base / esc;
+        let incr = base % esc;
+        for _ in 0..k {
+            bw.write_u32(esc, n_sect_bits);
+        }
+        bw.write_u32(incr, n_sect_bits);
+    }
+
+    /// Build an ac4_substream() body for mono, SIMPLE mode, ASF frontend,
+    /// long frame, num_window_groups=1, with a single spectral band
+    /// containing small quantised values so the decoder can produce
+    /// non-silent audio.
+    fn build_mono_asf_substream_body(tl: u32, max_sfb: u32) -> Vec<u8> {
+        use crate::huffman;
+        let mut bw = BitWriter::new();
+        // audio_size_value (15 bits) — placeholder 200.
+        bw.write_u32(200, 15);
+        bw.write_bit(false); // b_more_bits = 0
+        bw.align_to_byte();
+        // audio_data() for channel_mode=0 (mono), b_iframe=1:
+        //   mono_codec_mode = 0 (SIMPLE)
+        bw.write_u32(0, 1);
+        //   mono_data(0):
+        //     spec_frontend = 0 (ASF)
+        bw.write_u32(0, 1);
+        //     asf_transform_info() — b_long_frame = 1.
+        bw.write_bit(true);
+        //     asf_psy_info(0, 0): max_sfb[0] in n_msfb_bits = 6.
+        bw.write_u32(max_sfb, 6);
+        //     No grouping bits for long frame.
+        // asf_section_data: one section covering 0..max_sfb with cb=5
+        // (dim=2, signed). n_sect_bits = 3 (transf_length_idx=0 for
+        // long frame).
+        bw.write_u32(5, 4); // sect_cb
+        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        // asf_spectral_data.
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let end_line = sfbo[max_sfb as usize] as u32;
+        let hcb = huffman::asf_hcb(5).unwrap();
+        let pairs = end_line / 2;
+        for _ in 0..pairs {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        // asf_scalefac_data: reference_scale_factor = 120.
+        bw.write_u32(120, 8);
+        // No dpcm_sf codewords needed — all-zero spectra means
+        // max_quant_idx == 0 for every band.
+        // asf_snf_data: b_snf_data_exists = 0.
+        bw.write_u32(0, 1);
+        bw.align_to_byte();
+        while bw.byte_len() < 220 {
+            bw.write_u32(0, 8);
+        }
+        bw.finish()
+    }
+
+    #[test]
+    fn decoder_mono_asf_decode_path_runs() {
+        // Build a mono AC-4 frame and push it through the decoder.
+        // We're not asserting specific PCM values — we're asserting the
+        // full pipeline (TOC -> substream -> ASF data -> IMDCT) runs
+        // without error on a well-formed synthetic packet.
+        let mut bytes = build_mono_toc();
+        let body = build_mono_asf_substream_body(1920, 10);
+        bytes.extend(body);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio");
+        };
+        // Mono frame, 48 kHz, 1920 samples at 24 fps.
+        assert_eq!(af.channels, 1);
+        assert_eq!(af.sample_rate, 48_000);
+        assert_eq!(af.samples, 1_920);
+        assert_eq!(af.format, SampleFormat::S16);
+        // substream parse must have succeeded.
+        let sub = dec.last_substream.as_ref().unwrap();
+        assert!(sub.tools.transform_info_primary.is_some());
+        // We wrote a frame with all-zero spectra, so PCM output should
+        // be silent (no MDCT energy injected).
+        assert!(af.data[0].iter().all(|&b| b == 0));
+    }
+
+    /// Build an ac4_substream() body carrying a single non-zero
+    /// quantised spectral line so the IMDCT produces a real waveform.
+    fn build_mono_asf_substream_body_with_tone(tl: u32, max_sfb: u32) -> Vec<u8> {
+        use crate::huffman;
+        let mut bw = BitWriter::new();
+        bw.write_u32(400, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(0, 1); // mono_codec_mode = SIMPLE
+        bw.write_u32(0, 1); // spec_frontend = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(max_sfb, 6); // max_sfb[0]
+        bw.write_u32(5, 4); // sect_cb
+        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let end_line = sfbo[max_sfb as usize] as u32;
+        // Emit one pair where the first line is +1 and rest zero.
+        // HCB5 is signed. cb_mod=9, cb_off=4. For (1, 0): cb_idx = (1+4)*9 + (0+4) = 49.
+        let hcb = huffman::asf_hcb(5).unwrap();
+        bw.write_u32(hcb.cw[49], hcb.len[49] as u32);
+        let pairs = end_line / 2;
+        for _ in 1..pairs {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        // scalefac_data: reference_scale_factor = 120. sfb 0 has mqi=1
+        // so first_scf_found triggers, sf_gain[0] = 2^((120-100)/4) = 32.
+        bw.write_u32(120, 8);
+        // snf: b_snf_data_exists = 0.
+        bw.write_u32(0, 1);
+        bw.align_to_byte();
+        while bw.byte_len() < 420 {
+            bw.write_u32(0, 8);
+        }
+        bw.finish()
+    }
+
+    #[test]
+    fn decoder_mono_asf_single_tone_produces_nonsilent_pcm() {
+        // This exercises the full Huffman-driven ASF data path with a
+        // synthetic frame that encodes a single +1 quantised spectral
+        // line at bin 0 (sfb 0). Dequantisation gives a value of 1.0
+        // * 2^((120-100)/4) = 32.0. After IMDCT + windowing the PCM
+        // output should have nonzero energy (signal injected at the
+        // DC bin produces a bias + ripple).
+        let mut bytes = build_mono_toc();
+        let body = build_mono_asf_substream_body_with_tone(1920, 10);
+        bytes.extend(body);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio");
+        };
+        assert_eq!(af.channels, 1);
+        assert_eq!(af.samples, 1_920);
+        // Substream parse must have succeeded and scaled spectra is
+        // populated.
+        let sub = dec.last_substream.as_ref().unwrap();
+        let scaled = sub.tools.scaled_spec_primary.as_ref().unwrap();
+        // sfb 0 spans bins 0..4 (per SFB_OFFSET_1920[0..=1] = [0, 4]).
+        // First non-zero value should be at bin 0.
+        assert!(scaled[0].abs() > 0.0);
+        // PCM should have non-trivial energy.
+        let samples_i16: Vec<i16> = af.data[0]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let nonzero_count = samples_i16.iter().filter(|&&s| s != 0).count();
+        assert!(
+            nonzero_count > 100,
+            "expected non-silent PCM, got {nonzero_count} non-zero samples",
+        );
+        let energy: i64 = samples_i16.iter().map(|&s| (s as i64) * (s as i64)).sum();
+        assert!(energy > 0, "zero-energy output");
     }
 
     #[test]

@@ -224,6 +224,10 @@ pub struct Ac4FrameInfo {
     pub payload_base: u32,
     /// Descriptors for each presentation (as far as we parse them).
     pub presentations: Vec<PresentationInfo>,
+    /// Size of the byte-aligned `ac4_toc()` element in bytes. The
+    /// first substream starts at `toc_size + payload_base` bytes into
+    /// the `raw_ac4_frame()` payload.
+    pub toc_size: u32,
 }
 
 /// Per-presentation information we extract from `ac4_presentation_info()`.
@@ -319,6 +323,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
 
     // Byte-align at the end of ac4_toc().
     br.align_to_byte();
+    let toc_size = br.byte_position() as u32;
 
     // Derive effective sample rate: pick the first presentation's
     // sf_multiplier if present, otherwise fall back to the base rate.
@@ -352,6 +357,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         substream_sizes,
         payload_base,
         presentations,
+        toc_size,
     })
 }
 
