@@ -59,6 +59,7 @@
 pub mod asf;
 pub mod decoder;
 pub mod huffman;
+pub mod mdct;
 pub mod sfb_offset;
 pub mod sync;
 pub mod tables;
