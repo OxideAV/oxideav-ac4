@@ -38,21 +38,38 @@
 //!   see the frame's tool mix and MDCT window grouping without touching
 //!   Huffman state.
 //!
+//! * **Coefficient pipeline** — [`huffman`] carries the normative
+//!   ASF_HCB_SCALEFAC / ASF_HCB_SNF / ASF_HCB_1..11 tables from Annex
+//!   A (plus CB_DIM / UNSIGNED_CB); [`sfb_offset`] carries the
+//!   Annex B.4-B.7 scale-factor-band offset vectors for the 48 kHz
+//!   family. [`asf_data`] walks `asf_section_data()`,
+//!   `asf_spectral_data()` (with Pseudocode-19 dim=2/dim=4 split and
+//!   Pseudocode-20 codebook-11 extension code),
+//!   `asf_scalefac_data()` (dpcm-over-reference scale factors with
+//!   `sf_gain = 2^((sf-100)/4)`), and `asf_snf_data()`.
+//!   `dequantise_and_scale()` applies `rec_spec = sign(q)|q|^(4/3)`
+//!   then multiplies by the band gain.
+//! * **MDCT** — [`mdct`] implements the reference AC-4 IMDCT (§5.5.2
+//!   pseudocodes 60-64, naive O(N^2) complex DFT) plus the KBD
+//!   window family (§5.5.3, alphas from Table 186) with overlap-add.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
-//! * ASF section/spectral/scalefac/snf data (Huffman-driven) — no
-//!   Huffman tables transcribed yet; the decoder emits silence.
-//! * MDCT synthesis and window overlap-add — no transform yet.
+//! * Short / grouped frames (`num_window_groups > 1`) — coefficient
+//!   path only exercises the long-frame path today.
 //! * A-SPX (`aspx_config`, `aspx_data_*`) and A-CPL tools.
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
+//! * Spectral noise fill synthesis — `asf_snf_data()` parses the
+//!   Huffman-coded indices but doesn't inject shaped noise into
+//!   zero bands yet.
 //! * Per-substream `metadata()` payload parsing (DRC, dialog norm,
 //!   downmix coefficients) — bits are skipped via `substream_size`.
 //! * TS 103 190-2 IFM (immersive / object) decoding.
 //! * Encoder.
 //!
-//! Downstream consumers should therefore treat this crate as a
-//! container / framing aid today and expect the audio to be silent
-//! until the coefficient pipeline lands.
+//! The decoder emits real PCM for long-frame, single-window-group
+//! mono SIMPLE/ASF streams. Everything else falls back to silence
+//! with a correctly-shaped AudioFrame.
 
 #![allow(dead_code)]
 
