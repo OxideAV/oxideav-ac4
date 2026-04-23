@@ -27,10 +27,24 @@
 //!   `AudioFrame` with the correct channel count, sample rate, and
 //!   samples-per-frame for the stream configuration.
 //!
+//! * **ASF substream walker** — [`asf::walk_ac4_substream`] reads
+//!   `ac4_substream()` (audio_size + variable_bits extension), the
+//!   mono/stereo outer `audio_data()` layers (mono_codec_mode /
+//!   stereo_codec_mode, spec_frontend, b_enable_mdct_stereo_proc),
+//!   `asf_transform_info()` (Tables 99 / 100 / 103) and
+//!   `asf_psy_info()` (Table 106 n_msfb_bits + Tables 109/110
+//!   n_grp_bits). Surfaces the result through
+//!   [`decoder::Ac4Decoder::last_substream`] so downstream tooling can
+//!   see the frame's tool mix and MDCT window grouping without touching
+//!   Huffman state.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
-//! * ASF / ASF-A2 / A-SPX substream coefficient decoding — the
-//!   generated PCM is silence.
+//! * ASF section/spectral/scalefac/snf data (Huffman-driven) — no
+//!   Huffman tables transcribed yet; the decoder emits silence.
+//! * MDCT synthesis and window overlap-add — no transform yet.
+//! * A-SPX (`aspx_config`, `aspx_data_*`) and A-CPL tools.
+//! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Per-substream `metadata()` payload parsing (DRC, dialog norm,
 //!   downmix coefficients) — bits are skipped via `substream_size`.
 //! * TS 103 190-2 IFM (immersive / object) decoding.
@@ -45,6 +59,7 @@
 pub mod asf;
 pub mod decoder;
 pub mod sync;
+pub mod tables;
 pub mod toc;
 
 use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
