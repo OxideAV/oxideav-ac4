@@ -103,6 +103,15 @@
 //!   gating (including mirroring left-channel TIC into right when
 //!   `tic_copy` is set).
 //!
+//! * **A-SPX Huffman infrastructure** — [`aspx::AspxHcb`] is a
+//!   `(len[], cw[], cb_off)` codebook helper: the symbol decoder walks
+//!   one bit at a time until a `(len == width, cw == code)` match
+//!   lands, then returns `symbol_index - cb_off` as the delta. The 18
+//!   Annex A.2 codebook headers (Tables A.16..=A.33 — codebook_length
+//!   / cb_off) ship as `AspxHcbMeta` constants today; the normative
+//!   `len[]` / `cw[]` arrays still need to be transcribed from the
+//!   spec's accompaniment `ts_103190_tables.c`.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient

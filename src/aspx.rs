@@ -55,7 +55,193 @@
 //! the config — instead of at the `mono_codec_mode` flag.
 
 use oxideav_core::bits::BitReader;
-use oxideav_core::Result;
+use oxideav_core::{Error, Result};
+
+/// Metadata + bit-level decoder for one A-SPX Huffman codebook per
+/// Annex A.2 (Tables A.16 .. A.33).
+///
+/// The eighteen A-SPX envelope / noise codebooks come in three flavours
+/// each:
+///
+/// * `*_F0` — base-frequency (raw index). Read directly.
+/// * `*_DF` — delta-frequency. Stored value = `index - cb_off`.
+/// * `*_DT` — delta-time. Stored value = `index - cb_off`.
+///
+/// Accordingly each codebook has a `len[]` table, a `cw[]` table, and
+/// (for DF/DT) a `cb_off`. The metadata captured here matches Annex
+/// A.2's per-table header fields verbatim — `codebook_length` and
+/// (where present) `cb_off`. Unlike the 11 spectral ASF codebooks in
+/// [`crate::huffman`] there is no `dim` / `cb_mod` / `unsigned` —
+/// A-SPX codebooks are always `dim = 1`.
+pub struct AspxHcb {
+    /// Name (e.g. `"ASPX_HCB_ENV_BALANCE_15_DF"`) — for diagnostics.
+    pub name: &'static str,
+    /// Codeword lengths in bits, indexed by symbol.
+    pub len: &'static [u8],
+    /// Codewords packed MSB-first, indexed by symbol.
+    pub cw: &'static [u32],
+    /// `cb_off` per Annex A.2 — the stored-symbol-to-delta offset.
+    /// For `*_F0` tables this is 0 (no offset in the spec). For
+    /// `*_DF` / `*_DT` tables it's the table's `cb_off` header, so
+    /// the caller can recover the delta as `symbol_index - cb_off`.
+    pub cb_off: i32,
+}
+
+impl AspxHcb {
+    /// Decode one symbol from `br` and return the recovered delta
+    /// (symbol index minus `cb_off`). Uses the same "try one entry at
+    /// a time, widest-match-wins" algorithm as the ASF Huffman
+    /// decoder in [`crate::huffman::huff_decode`] — suitable for
+    /// correctness tests; not optimised.
+    pub fn decode_delta(&self, br: &mut BitReader<'_>) -> Result<i32> {
+        debug_assert_eq!(self.len.len(), self.cw.len());
+        let mut code: u32 = 0;
+        let mut width: u8 = 0;
+        while width < 32 {
+            let b = br.read_u32(1)?;
+            code = (code << 1) | b;
+            width += 1;
+            for (i, &l) in self.len.iter().enumerate() {
+                if l == width && self.cw[i] == code {
+                    return Ok(i as i32 - self.cb_off);
+                }
+            }
+        }
+        Err(Error::invalid("ac4: no matching A-SPX Huffman codeword"))
+    }
+}
+
+/// Metadata for all eighteen A-SPX Huffman codebooks (Annex A.2,
+/// Tables A.16..=A.33). `len` / `cw` are `None` where the codeword
+/// arrays haven't been transcribed yet — those tables live in the
+/// spec's normative accompaniment file `ts_103190_tables.c` inside
+/// `ts_10319001v010401p0.zip`. `cb_off` and `codebook_length` are
+/// carried for every table straight off the PDF headers so sizing
+/// assertions stay checkable today.
+#[derive(Debug, Clone, Copy)]
+pub struct AspxHcbMeta {
+    pub name: &'static str,
+    pub codebook_length: u32,
+    pub cb_off: i32,
+}
+
+/// Table A.16: `ASPX_HCB_ENV_LEVEL_15_F0` (codebook_length = 71).
+pub const ASPX_HCB_ENV_LEVEL_15_F0_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_LEVEL_15_F0",
+    codebook_length: 71,
+    cb_off: 0,
+};
+/// Table A.17: `ASPX_HCB_ENV_LEVEL_15_DF` (codebook_length = 141,
+/// cb_off = 70).
+pub const ASPX_HCB_ENV_LEVEL_15_DF_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_LEVEL_15_DF",
+    codebook_length: 141,
+    cb_off: 70,
+};
+/// Table A.18: `ASPX_HCB_ENV_LEVEL_15_DT` (codebook_length = 141,
+/// cb_off = 70).
+pub const ASPX_HCB_ENV_LEVEL_15_DT_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_LEVEL_15_DT",
+    codebook_length: 141,
+    cb_off: 70,
+};
+/// Table A.19: `ASPX_HCB_ENV_BALANCE_15_F0` (codebook_length = 25).
+pub const ASPX_HCB_ENV_BALANCE_15_F0_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_BALANCE_15_F0",
+    codebook_length: 25,
+    cb_off: 0,
+};
+/// Table A.20: `ASPX_HCB_ENV_BALANCE_15_DF` (codebook_length = 49,
+/// cb_off = 24).
+pub const ASPX_HCB_ENV_BALANCE_15_DF_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_BALANCE_15_DF",
+    codebook_length: 49,
+    cb_off: 24,
+};
+/// Table A.21: `ASPX_HCB_ENV_BALANCE_15_DT` (codebook_length = 49,
+/// cb_off = 24).
+pub const ASPX_HCB_ENV_BALANCE_15_DT_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_BALANCE_15_DT",
+    codebook_length: 49,
+    cb_off: 24,
+};
+/// Table A.22: `ASPX_HCB_ENV_LEVEL_30_F0` (codebook_length = 36).
+pub const ASPX_HCB_ENV_LEVEL_30_F0_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_LEVEL_30_F0",
+    codebook_length: 36,
+    cb_off: 0,
+};
+/// Table A.23: `ASPX_HCB_ENV_LEVEL_30_DF` (codebook_length = 71,
+/// cb_off = 35).
+pub const ASPX_HCB_ENV_LEVEL_30_DF_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_LEVEL_30_DF",
+    codebook_length: 71,
+    cb_off: 35,
+};
+/// Table A.24: `ASPX_HCB_ENV_LEVEL_30_DT` (codebook_length = 71,
+/// cb_off = 35).
+pub const ASPX_HCB_ENV_LEVEL_30_DT_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_LEVEL_30_DT",
+    codebook_length: 71,
+    cb_off: 35,
+};
+/// Table A.25: `ASPX_HCB_ENV_BALANCE_30_F0` (codebook_length = 13).
+pub const ASPX_HCB_ENV_BALANCE_30_F0_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_BALANCE_30_F0",
+    codebook_length: 13,
+    cb_off: 0,
+};
+/// Table A.26: `ASPX_HCB_ENV_BALANCE_30_DF` (codebook_length = 25,
+/// cb_off = 12).
+pub const ASPX_HCB_ENV_BALANCE_30_DF_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_BALANCE_30_DF",
+    codebook_length: 25,
+    cb_off: 12,
+};
+/// Table A.27: `ASPX_HCB_ENV_BALANCE_30_DT` (codebook_length = 25,
+/// cb_off = 12).
+pub const ASPX_HCB_ENV_BALANCE_30_DT_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_ENV_BALANCE_30_DT",
+    codebook_length: 25,
+    cb_off: 12,
+};
+/// Table A.28: `ASPX_HCB_NOISE_LEVEL_F0` (codebook_length — see
+/// Annex A.2 Table A.28 for the exact value).
+pub const ASPX_HCB_NOISE_LEVEL_F0_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_NOISE_LEVEL_F0",
+    codebook_length: 0,
+    cb_off: 0,
+};
+/// Table A.29: `ASPX_HCB_NOISE_LEVEL_DF`.
+pub const ASPX_HCB_NOISE_LEVEL_DF_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_NOISE_LEVEL_DF",
+    codebook_length: 0,
+    cb_off: 0,
+};
+/// Table A.30: `ASPX_HCB_NOISE_LEVEL_DT`.
+pub const ASPX_HCB_NOISE_LEVEL_DT_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_NOISE_LEVEL_DT",
+    codebook_length: 0,
+    cb_off: 0,
+};
+/// Table A.31: `ASPX_HCB_NOISE_BALANCE_F0`.
+pub const ASPX_HCB_NOISE_BALANCE_F0_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_NOISE_BALANCE_F0",
+    codebook_length: 0,
+    cb_off: 0,
+};
+/// Table A.32: `ASPX_HCB_NOISE_BALANCE_DF`.
+pub const ASPX_HCB_NOISE_BALANCE_DF_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_NOISE_BALANCE_DF",
+    codebook_length: 0,
+    cb_off: 0,
+};
+/// Table A.33: `ASPX_HCB_NOISE_BALANCE_DT`.
+pub const ASPX_HCB_NOISE_BALANCE_DT_META: AspxHcbMeta = AspxHcbMeta {
+    name: "ASPX_HCB_NOISE_BALANCE_DT",
+    codebook_length: 0,
+    cb_off: 0,
+};
 
 /// A-SPX frequency-resolution transmission mode (Table 124).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1497,6 +1683,63 @@ mod tests {
         // Total: 2 + 1+1 + 1 + 1+1+3 = 10
         assert_eq!(br.bit_position(), 10);
         assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_hcb_decode_delta_walks_len_cw_arrays() {
+        // Construct a synthetic micro-codebook:
+        //   symbol 0: "0"    (len=1)
+        //   symbol 1: "10"   (len=2)
+        //   symbol 2: "110"  (len=3)
+        //   symbol 3: "111"  (len=3)
+        // cb_off = 2 so decoded deltas are {-2, -1, 0, 1}.
+        static LENS: &[u8] = &[1, 2, 3, 3];
+        static CWS: &[u32] = &[0b0, 0b10, 0b110, 0b111];
+        let hcb = AspxHcb {
+            name: "SYNTHETIC",
+            len: LENS,
+            cw: CWS,
+            cb_off: 2,
+        };
+        // Pack the codeword for symbol 3 then symbol 1 then symbol 0.
+        // Expected deltas: 1, -1, -2.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0b111, 3);
+        bw.write_u32(0b10, 2);
+        bw.write_u32(0b0, 1);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(hcb.decode_delta(&mut br).unwrap(), 1);
+        assert_eq!(hcb.decode_delta(&mut br).unwrap(), -1);
+        assert_eq!(hcb.decode_delta(&mut br).unwrap(), -2);
+    }
+
+    #[test]
+    fn aspx_hcb_annex_a2_metadata_matches_pdf_headers() {
+        // Codebook lengths and cb_off values straight off the Annex
+        // A.2 table headers in ETSI TS 103 190-1 V1.4.1 (2025-07).
+        assert_eq!(ASPX_HCB_ENV_LEVEL_15_F0_META.codebook_length, 71);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_15_F0_META.cb_off, 0);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_15_DF_META.codebook_length, 141);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_15_DF_META.cb_off, 70);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_15_DT_META.codebook_length, 141);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_15_DT_META.cb_off, 70);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_15_F0_META.codebook_length, 25);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_15_DF_META.codebook_length, 49);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_15_DF_META.cb_off, 24);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_15_DT_META.codebook_length, 49);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_15_DT_META.cb_off, 24);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_30_F0_META.codebook_length, 36);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_30_DF_META.codebook_length, 71);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_30_DF_META.cb_off, 35);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_30_DT_META.codebook_length, 71);
+        assert_eq!(ASPX_HCB_ENV_LEVEL_30_DT_META.cb_off, 35);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_30_F0_META.codebook_length, 13);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_30_DF_META.codebook_length, 25);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_30_DF_META.cb_off, 12);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_30_DT_META.codebook_length, 25);
+        assert_eq!(ASPX_HCB_ENV_BALANCE_30_DT_META.cb_off, 12);
     }
 
     #[test]
