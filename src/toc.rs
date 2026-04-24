@@ -328,10 +328,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     // Derive effective sample rate: pick the first presentation's
     // sf_multiplier if present, otherwise fall back to the base rate.
     let base_sr = base_sample_rate(fs_index);
-    let sf_mul = presentations
-        .first()
-        .map(|p| p.sf_multiplier)
-        .unwrap_or(0);
+    let sf_mul = presentations.first().map(|p| p.sf_multiplier).unwrap_or(0);
     let sample_rate = match (fs_index, sf_mul) {
         (1, 1) => 96_000,
         (1, 2) => 192_000,

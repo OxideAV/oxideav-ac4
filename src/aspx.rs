@@ -438,21 +438,48 @@ pub static ASPX_HCB_ALL: &[(HuffmanCodebookId, &AspxHcb)] = &[
     (HuffmanCodebookId::EnvLevel15F0, &ASPX_HCB_ENV_LEVEL_15_F0),
     (HuffmanCodebookId::EnvLevel15Df, &ASPX_HCB_ENV_LEVEL_15_DF),
     (HuffmanCodebookId::EnvLevel15Dt, &ASPX_HCB_ENV_LEVEL_15_DT),
-    (HuffmanCodebookId::EnvBalance15F0, &ASPX_HCB_ENV_BALANCE_15_F0),
-    (HuffmanCodebookId::EnvBalance15Df, &ASPX_HCB_ENV_BALANCE_15_DF),
-    (HuffmanCodebookId::EnvBalance15Dt, &ASPX_HCB_ENV_BALANCE_15_DT),
+    (
+        HuffmanCodebookId::EnvBalance15F0,
+        &ASPX_HCB_ENV_BALANCE_15_F0,
+    ),
+    (
+        HuffmanCodebookId::EnvBalance15Df,
+        &ASPX_HCB_ENV_BALANCE_15_DF,
+    ),
+    (
+        HuffmanCodebookId::EnvBalance15Dt,
+        &ASPX_HCB_ENV_BALANCE_15_DT,
+    ),
     (HuffmanCodebookId::EnvLevel30F0, &ASPX_HCB_ENV_LEVEL_30_F0),
     (HuffmanCodebookId::EnvLevel30Df, &ASPX_HCB_ENV_LEVEL_30_DF),
     (HuffmanCodebookId::EnvLevel30Dt, &ASPX_HCB_ENV_LEVEL_30_DT),
-    (HuffmanCodebookId::EnvBalance30F0, &ASPX_HCB_ENV_BALANCE_30_F0),
-    (HuffmanCodebookId::EnvBalance30Df, &ASPX_HCB_ENV_BALANCE_30_DF),
-    (HuffmanCodebookId::EnvBalance30Dt, &ASPX_HCB_ENV_BALANCE_30_DT),
+    (
+        HuffmanCodebookId::EnvBalance30F0,
+        &ASPX_HCB_ENV_BALANCE_30_F0,
+    ),
+    (
+        HuffmanCodebookId::EnvBalance30Df,
+        &ASPX_HCB_ENV_BALANCE_30_DF,
+    ),
+    (
+        HuffmanCodebookId::EnvBalance30Dt,
+        &ASPX_HCB_ENV_BALANCE_30_DT,
+    ),
     (HuffmanCodebookId::NoiseLevelF0, &ASPX_HCB_NOISE_LEVEL_F0),
     (HuffmanCodebookId::NoiseLevelDf, &ASPX_HCB_NOISE_LEVEL_DF),
     (HuffmanCodebookId::NoiseLevelDt, &ASPX_HCB_NOISE_LEVEL_DT),
-    (HuffmanCodebookId::NoiseBalanceF0, &ASPX_HCB_NOISE_BALANCE_F0),
-    (HuffmanCodebookId::NoiseBalanceDf, &ASPX_HCB_NOISE_BALANCE_DF),
-    (HuffmanCodebookId::NoiseBalanceDt, &ASPX_HCB_NOISE_BALANCE_DT),
+    (
+        HuffmanCodebookId::NoiseBalanceF0,
+        &ASPX_HCB_NOISE_BALANCE_F0,
+    ),
+    (
+        HuffmanCodebookId::NoiseBalanceDf,
+        &ASPX_HCB_NOISE_BALANCE_DF,
+    ),
+    (
+        HuffmanCodebookId::NoiseBalanceDt,
+        &ASPX_HCB_NOISE_BALANCE_DT,
+    ),
 ];
 
 /// A-SPX frequency-resolution transmission mode (Table 124).
@@ -870,10 +897,7 @@ pub struct AspxDeltaDir {
 /// Parse `aspx_delta_dir(ch)` at the current bit-reader position per
 /// ETSI TS 103 190-1 Table 54 (§4.2.12.5). Reads
 /// `aspx_num_env[ch] + aspx_num_noise[ch]` bits in total.
-pub fn parse_aspx_delta_dir(
-    br: &mut BitReader<'_>,
-    framing: &AspxFraming,
-) -> Result<AspxDeltaDir> {
+pub fn parse_aspx_delta_dir(br: &mut BitReader<'_>, framing: &AspxFraming) -> Result<AspxDeltaDir> {
     let mut sig = Vec::with_capacity(framing.num_env as usize);
     for _ in 0..framing.num_env {
         sig.push(br.read_bit()?);
@@ -1319,7 +1343,7 @@ pub fn parse_aspx_huff_data(
 /// hand-built fixtures this is straightforward; for real AC-4
 /// bitstreams this needs the QMF-subband layout wiring in a later
 /// round.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AspxSbgCounts {
     pub num_sbg_sig_highres: u32,
     pub num_sbg_sig_lowres: u32,
@@ -1384,6 +1408,216 @@ pub fn parse_aspx_ec_data(
         out.push(envdata);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------
+// §5.7.6.3.1 Subband-group derivation
+// ---------------------------------------------------------------------
+
+/// Static high-resolution subband-group template, `sbg_template_highres`
+/// (ETSI TS 103 190-1 §5.7.6.3.1.1). 23 entries.
+pub const ASPX_SBG_TEMPLATE_HIGHRES: [u32; 23] = [
+    18, 19, 20, 21, 22, 23, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 47, 50, 53, 56, 59, 62,
+];
+
+/// Static low-resolution subband-group template, `sbg_template_lowres`
+/// (ETSI TS 103 190-1 §5.7.6.3.1.1). 21 entries.
+pub const ASPX_SBG_TEMPLATE_LOWRES: [u32; 21] = [
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 26, 28, 30, 32, 35, 38, 42, 46,
+];
+
+/// Derived A-SPX frequency tables from §5.7.6.3.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AspxFrequencyTables {
+    /// Master subband-group table (Pseudocode 67). Length is
+    /// `num_sbg_master + 1` (borders).
+    pub sbg_master: Vec<u32>,
+    /// Number of master subband groups.
+    pub num_sbg_master: u32,
+    /// Lower border of the first subband group = `sbg_master[0]`.
+    pub sba: u32,
+    /// Upper border of the last subband group = `sbg_master[num_sbg_master]`.
+    pub sbz: u32,
+    /// High-resolution signal-envelope subband-group table
+    /// (Pseudocode 68).
+    pub sbg_sig_highres: Vec<u32>,
+    /// Cross-over subband = `sbg_sig_highres[0]`.
+    pub sbx: u32,
+    /// Number of subbands spanned by the A-SPX tool (`sbz - sbx`).
+    pub num_sb_aspx: u32,
+    /// Low-resolution signal-envelope subband-group table
+    /// (Pseudocode 69).
+    pub sbg_sig_lowres: Vec<u32>,
+    /// Noise-envelope subband-group table (Pseudocode 70).
+    pub sbg_noise: Vec<u32>,
+    /// Aggregate counts suitable for passing into
+    /// [`parse_aspx_ec_data`] / [`parse_aspx_hfgen_iwc_1ch`] /
+    /// [`parse_aspx_hfgen_iwc_2ch`].
+    pub counts: AspxSbgCounts,
+}
+
+/// Derive the A-SPX master subband-group table (Pseudocode 67) from an
+/// `aspx_config`.
+///
+/// Returns `(sbg_master, num_sbg_master, sba, sbz)`.
+pub fn derive_master_sbg_table(cfg: &AspxConfig) -> (Vec<u32>, u32, u32, u32) {
+    let start = cfg.start_freq as u32;
+    let stop = cfg.stop_freq as u32;
+    let (template, base_count): (&[u32], u32) = match cfg.master_freq_scale {
+        AspxMasterFreqScale::HighRes => (&ASPX_SBG_TEMPLATE_HIGHRES, 22),
+        AspxMasterFreqScale::LowRes => (&ASPX_SBG_TEMPLATE_LOWRES, 20),
+    };
+    let num_sbg_master = base_count - 2 * start - 2 * stop;
+    let mut sbg_master = Vec::with_capacity((num_sbg_master + 1) as usize);
+    for sbg in 0..=num_sbg_master {
+        sbg_master.push(template[(2 * start + sbg) as usize]);
+    }
+    let sba = sbg_master[0];
+    let sbz = sbg_master[num_sbg_master as usize];
+    (sbg_master, num_sbg_master, sba, sbz)
+}
+
+/// Result bundle for [`derive_sig_sbg_tables`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AspxSigSbgTables {
+    pub sbg_sig_highres: Vec<u32>,
+    pub sbg_sig_lowres: Vec<u32>,
+    pub sbx: u32,
+    pub num_sb_aspx: u32,
+    pub num_sbg_sig_highres: u32,
+    pub num_sbg_sig_lowres: u32,
+}
+
+/// Derive the high/low-resolution signal-envelope subband-group tables
+/// (§5.7.6.3.1.2, Pseudocodes 68 and 69) from the master table.
+pub fn derive_sig_sbg_tables(
+    sbg_master: &[u32],
+    num_sbg_master: u32,
+    xover_offset: u32,
+) -> Result<AspxSigSbgTables> {
+    if xover_offset > num_sbg_master {
+        return Err(Error::invalid(
+            "ac4: aspx_xover_subband_offset exceeds num_sbg_master",
+        ));
+    }
+    let num_sbg_sig_highres = num_sbg_master - xover_offset;
+    let mut sbg_sig_highres = Vec::with_capacity((num_sbg_sig_highres + 1) as usize);
+    for sbg in 0..=num_sbg_sig_highres {
+        sbg_sig_highres.push(sbg_master[(sbg + xover_offset) as usize]);
+    }
+    let sbx = sbg_sig_highres[0];
+    let num_sb_aspx = sbg_sig_highres[num_sbg_sig_highres as usize].saturating_sub(sbx);
+
+    // Pseudocode 69: low-res table is a decimation of the high-res table
+    // by 2. Even branch keeps 0, 2, 4, ...; odd branch keeps 0, 1, 3, 5, ...
+    let num_sbg_sig_lowres = num_sbg_sig_highres - num_sbg_sig_highres / 2;
+    let mut sbg_sig_lowres = Vec::with_capacity((num_sbg_sig_lowres + 1) as usize);
+    sbg_sig_lowres.push(sbg_sig_highres[0]);
+    if num_sbg_sig_highres % 2 == 0 {
+        for sbg in 1..=num_sbg_sig_lowres {
+            sbg_sig_lowres.push(sbg_sig_highres[(2 * sbg) as usize]);
+        }
+    } else {
+        for sbg in 1..=num_sbg_sig_lowres {
+            sbg_sig_lowres.push(sbg_sig_highres[(2 * sbg - 1) as usize]);
+        }
+    }
+    Ok(AspxSigSbgTables {
+        sbg_sig_highres,
+        sbg_sig_lowres,
+        sbx,
+        num_sb_aspx,
+        num_sbg_sig_highres,
+        num_sbg_sig_lowres,
+    })
+}
+
+/// Derive the noise-envelope subband-group table (§5.7.6.3.1.3,
+/// Pseudocode 70).
+///
+/// `aspx_noise_sbg` here is the **raw** 2-bit field from
+/// [`AspxConfig`].
+pub fn derive_noise_sbg_table(
+    aspx_noise_sbg: u32,
+    sbz: u32,
+    sbx: u32,
+    sbg_sig_lowres: &[u32],
+    num_sbg_sig_lowres: u32,
+) -> Result<Vec<u32>> {
+    if sbx == 0 {
+        return Err(Error::invalid(
+            "ac4: sbx must be > 0 for noise sbg derivation",
+        ));
+    }
+    if sbz <= sbx {
+        return Err(Error::invalid(
+            "ac4: sbz must exceed sbx for noise sbg derivation",
+        ));
+    }
+    let ratio = (sbz as f64) / (sbx as f64);
+    let log2_ratio = ratio.log2();
+    let raw = (aspx_noise_sbg as f64) * log2_ratio + 0.5;
+    let mut num_sbg_noise = raw.floor().max(1.0) as u32;
+    if num_sbg_noise > 5 {
+        num_sbg_noise = 5;
+    }
+    if num_sbg_noise > num_sbg_sig_lowres {
+        num_sbg_noise = num_sbg_sig_lowres.max(1);
+    }
+    let mut idx = vec![0u32; (num_sbg_noise + 1) as usize];
+    let mut sbg_noise = Vec::with_capacity((num_sbg_noise + 1) as usize);
+    sbg_noise.push(sbg_sig_lowres[0]);
+    for sbg in 1..=num_sbg_noise {
+        idx[sbg as usize] = idx[(sbg - 1) as usize];
+        let remaining = num_sbg_sig_lowres - idx[(sbg - 1) as usize];
+        let divisor = num_sbg_noise + 1 - sbg;
+        idx[sbg as usize] += remaining / divisor;
+        sbg_noise.push(sbg_sig_lowres[idx[sbg as usize] as usize]);
+    }
+    Ok(sbg_noise)
+}
+
+/// Derive the full set of A-SPX frequency tables (master, high-res
+/// signal, low-res signal, noise) per §5.7.6.3.1 from `aspx_config()`
+/// plus the per-frame `aspx_xover_subband_offset`.
+pub fn derive_aspx_frequency_tables(
+    cfg: &AspxConfig,
+    xover_offset: u32,
+) -> Result<AspxFrequencyTables> {
+    let (sbg_master, num_sbg_master, sba, sbz) = derive_master_sbg_table(cfg);
+    let sig = derive_sig_sbg_tables(&sbg_master, num_sbg_master, xover_offset)?;
+    let AspxSigSbgTables {
+        sbg_sig_highres,
+        sbg_sig_lowres,
+        sbx,
+        num_sb_aspx,
+        num_sbg_sig_highres,
+        num_sbg_sig_lowres,
+    } = sig;
+    let sbg_noise = derive_noise_sbg_table(
+        cfg.noise_sbg as u32,
+        sbz,
+        sbx,
+        &sbg_sig_lowres,
+        num_sbg_sig_lowres,
+    )?;
+    let num_sbg_noise = (sbg_noise.len() as u32).saturating_sub(1);
+    Ok(AspxFrequencyTables {
+        sbg_master,
+        num_sbg_master,
+        sba,
+        sbz,
+        sbg_sig_highres,
+        sbx,
+        num_sb_aspx,
+        sbg_sig_lowres,
+        sbg_noise,
+        counts: AspxSbgCounts {
+            num_sbg_sig_highres,
+            num_sbg_sig_lowres,
+            num_sbg_noise,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -2413,7 +2647,12 @@ mod tests {
         // NOISE ignores quant-mode — every step-mode maps the same way.
         for qm in [AspxQuantStep::Fine, AspxQuantStep::Coarse] {
             assert_eq!(
-                get_aspx_hcb(AspxDataType::Noise, qm, AspxStereoMode::Level, AspxHcbType::F0),
+                get_aspx_hcb(
+                    AspxDataType::Noise,
+                    qm,
+                    AspxStereoMode::Level,
+                    AspxHcbType::F0
+                ),
                 HuffmanCodebookId::NoiseLevelF0
             );
             assert_eq!(
@@ -2464,11 +2703,11 @@ mod tests {
         let out = parse_aspx_ec_data(
             &mut br,
             AspxDataType::Signal,
-            1,          // num_env
-            &[true],    // freq_res[0] = high-res
+            1,       // num_env
+            &[true], // freq_res[0] = high-res
             AspxQuantStep::Fine,
             AspxStereoMode::Level,
-            &[false],   // direction[0] = FREQ
+            &[false], // direction[0] = FREQ
             AspxSbgCounts {
                 num_sbg_sig_highres: 3,
                 num_sbg_sig_lowres: 2,
@@ -2510,7 +2749,7 @@ mod tests {
         let out = parse_aspx_ec_data(
             &mut br,
             AspxDataType::Noise,
-            2, // num_env
+            2,   // num_env
             &[], // freq_res ignored for NOISE
             // Flip quant_mode to confirm it's ignored.
             AspxQuantStep::Coarse,
@@ -2528,6 +2767,225 @@ mod tests {
         assert_eq!(out[0].values, vec![0, 1]);
         assert!(out[1].direction_time);
         assert_eq!(out[1].values, vec![-1, 2]);
+        assert_eq!(br.bit_position(), total_bits);
+    }
+
+    // --- §5.7.6.3.1 master-freq-scale derivation ----------------------
+
+    fn cfg_for(scale: AspxMasterFreqScale, start: u8, stop: u8, noise_sbg: u8) -> AspxConfig {
+        AspxConfig {
+            quant_mode_env: AspxQuantStep::Fine,
+            start_freq: start,
+            stop_freq: stop,
+            master_freq_scale: scale,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: AspxFreqResMode::Signalled,
+        }
+    }
+
+    #[test]
+    fn master_sbg_table_highres_full_span() {
+        let cfg = cfg_for(AspxMasterFreqScale::HighRes, 0, 0, 0);
+        let (master, num_master, sba, sbz) = derive_master_sbg_table(&cfg);
+        assert_eq!(num_master, 22);
+        assert_eq!(sba, 18);
+        assert_eq!(sbz, 62);
+        assert_eq!(master.len(), 23);
+        assert_eq!(master[0], 18);
+        assert_eq!(master[22], 62);
+        assert_eq!(master[10], 32);
+    }
+
+    #[test]
+    fn master_sbg_table_lowres_full_span() {
+        let cfg = cfg_for(AspxMasterFreqScale::LowRes, 0, 0, 0);
+        let (master, num_master, sba, sbz) = derive_master_sbg_table(&cfg);
+        assert_eq!(num_master, 20);
+        assert_eq!(sba, 10);
+        assert_eq!(sbz, 46);
+        assert_eq!(master.first(), Some(&10));
+        assert_eq!(master.last(), Some(&46));
+    }
+
+    #[test]
+    fn master_sbg_table_highres_trimmed() {
+        let cfg = cfg_for(AspxMasterFreqScale::HighRes, 3, 3, 0);
+        let (master, num_master, sba, sbz) = derive_master_sbg_table(&cfg);
+        assert_eq!(num_master, 10);
+        assert_eq!(sba, 24);
+        assert_eq!(sbz, 44);
+        assert_eq!(master, vec![24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44]);
+    }
+
+    #[test]
+    fn sig_sbg_tables_xover_zero_on_highres() {
+        let cfg = cfg_for(AspxMasterFreqScale::HighRes, 0, 0, 0);
+        let (master, num_master, _sba, _sbz) = derive_master_sbg_table(&cfg);
+        let sig = derive_sig_sbg_tables(&master, num_master, 0).unwrap();
+        assert_eq!(sig.num_sbg_sig_highres, 22);
+        assert_eq!(sig.sbx, 18);
+        assert_eq!(sig.num_sb_aspx, 62 - 18);
+        assert_eq!(sig.sbg_sig_highres, master);
+        assert_eq!(sig.num_sbg_sig_lowres, 11);
+        assert_eq!(sig.sbg_sig_lowres.len(), 12);
+        assert_eq!(sig.sbg_sig_lowres[0], 18);
+        for k in 1..=sig.num_sbg_sig_lowres as usize {
+            assert_eq!(sig.sbg_sig_lowres[k], sig.sbg_sig_highres[2 * k]);
+        }
+    }
+
+    #[test]
+    fn sig_sbg_tables_xover_odd_branch() {
+        let cfg = cfg_for(AspxMasterFreqScale::HighRes, 3, 3, 0);
+        let (master, num_master, _sba, _sbz) = derive_master_sbg_table(&cfg);
+        assert_eq!(num_master, 10);
+        let sig = derive_sig_sbg_tables(&master, num_master, 2).unwrap();
+        assert_eq!(sig.num_sbg_sig_highres, 8);
+        assert_eq!(sig.sbx, master[2]);
+        assert_eq!(sig.num_sb_aspx, master[num_master as usize] - sig.sbx);
+        assert_eq!(sig.num_sbg_sig_lowres, 4);
+        for k in 1..=sig.num_sbg_sig_lowres as usize {
+            assert_eq!(sig.sbg_sig_lowres[k], sig.sbg_sig_highres[2 * k]);
+        }
+
+        let sig_odd = derive_sig_sbg_tables(&master, num_master, 3).unwrap();
+        assert_eq!(sig_odd.num_sbg_sig_highres, 7);
+        assert_eq!(sig_odd.num_sbg_sig_lowres, 4);
+        assert_eq!(sig_odd.sbg_sig_lowres[0], sig_odd.sbg_sig_highres[0]);
+        for k in 1..=sig_odd.num_sbg_sig_lowres as usize {
+            assert_eq!(
+                sig_odd.sbg_sig_lowres[k],
+                sig_odd.sbg_sig_highres[2 * k - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn sig_sbg_tables_xover_exceeds_master_errors() {
+        let cfg = cfg_for(AspxMasterFreqScale::HighRes, 3, 3, 0);
+        let (master, num_master, _sba, _sbz) = derive_master_sbg_table(&cfg);
+        assert!(derive_sig_sbg_tables(&master, num_master, num_master + 1).is_err());
+    }
+
+    #[test]
+    fn noise_sbg_table_derivation_matches_pseudocode_70() {
+        let cfg = cfg_for(AspxMasterFreqScale::HighRes, 0, 0, 3);
+        let tables = derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        assert_eq!(tables.sbx, 18);
+        assert_eq!(tables.sbz, 62);
+        assert!(tables.counts.num_sbg_noise <= 5);
+        assert_eq!(tables.counts.num_sbg_noise, 5);
+        assert_eq!(tables.sbg_noise.len(), 6);
+        assert_eq!(tables.sbg_noise[0], tables.sbg_sig_lowres[0]);
+    }
+
+    #[test]
+    fn noise_sbg_clamps_to_minimum_of_one() {
+        let cfg = cfg_for(AspxMasterFreqScale::LowRes, 0, 0, 0);
+        let tables = derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        assert_eq!(tables.counts.num_sbg_noise, 1);
+        assert_eq!(tables.sbg_noise.len(), 2);
+        assert_eq!(tables.sbg_noise[0], tables.sbg_sig_lowres[0]);
+    }
+
+    /// Exercise a multi-envelope, mixed-resolution SIGNAL ec_data stream.
+    ///
+    /// Three envelopes with `freq_res = [true, false, true]` force the
+    /// walker to pick high-res counts for envs 0 and 2, low-res for env 1.
+    /// Verifies the bit cursor advances by exactly the sum of emitted
+    /// code lengths.
+    #[test]
+    fn aspx_ec_data_three_env_mixed_freq_res_bit_accounting() {
+        let f0_cb = &ASPX_HCB_ENV_LEVEL_15_F0;
+        let df_cb = &ASPX_HCB_ENV_LEVEL_15_DF;
+        let counts = AspxSbgCounts {
+            num_sbg_sig_highres: 3,
+            num_sbg_sig_lowres: 2,
+            num_sbg_noise: 1,
+        };
+        // env 0 (highres, FREQ): F0(30), DF(70), DF(71)
+        // env 1 (lowres,  FREQ): F0(31), DF(70)
+        // env 2 (highres, FREQ): F0(32), DF(70), DF(70)
+        let seq: &[&[(bool, usize)]] = &[
+            &[(true, 30), (false, 70), (false, 71)],
+            &[(true, 31), (false, 70)],
+            &[(true, 32), (false, 70), (false, 70)],
+        ];
+        let mut bw = BitWriter::new();
+        let mut total_bits: u64 = 0;
+        for sbgs in seq {
+            for &(is_f0, idx) in *sbgs {
+                let cb = if is_f0 { f0_cb } else { df_cb };
+                bw.write_u32(cb.cw[idx], cb.len[idx] as u32);
+                total_bits += cb.len[idx] as u64;
+            }
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let out = parse_aspx_ec_data(
+            &mut br,
+            AspxDataType::Signal,
+            3,
+            &[true, false, true],
+            AspxQuantStep::Fine,
+            AspxStereoMode::Level,
+            &[false, false, false],
+            counts,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].values, vec![30, 0, 1]);
+        assert_eq!(out[1].values, vec![31, 0]);
+        assert_eq!(out[2].values, vec![32, 0, 0]);
+        assert_eq!(br.bit_position(), total_bits);
+    }
+
+    #[test]
+    fn aspx_frequency_tables_produce_counts_compatible_with_ec_data() {
+        let cfg = cfg_for(AspxMasterFreqScale::LowRes, 2, 1, 1);
+        let tables = derive_aspx_frequency_tables(&cfg, 1).unwrap();
+        // num_sbg_master = 20 - 4 - 2 = 14.
+        assert_eq!(tables.num_sbg_master, 14);
+        assert_eq!(tables.counts.num_sbg_sig_highres, 13);
+        let f0_cb = &ASPX_HCB_ENV_LEVEL_15_F0;
+        let df_cb = &ASPX_HCB_ENV_LEVEL_15_DF;
+        let f0_idx = 50usize;
+        let df_zero_idx = 70usize;
+        let mut bw = BitWriter::new();
+        bw.write_u32(f0_cb.cw[f0_idx], f0_cb.len[f0_idx] as u32);
+        let mut total_bits = f0_cb.len[f0_idx] as u64;
+        for _ in 1..tables.counts.num_sbg_sig_highres {
+            bw.write_u32(df_cb.cw[df_zero_idx], df_cb.len[df_zero_idx] as u32);
+            total_bits += df_cb.len[df_zero_idx] as u64;
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let out = parse_aspx_ec_data(
+            &mut br,
+            AspxDataType::Signal,
+            1,
+            &[true],
+            AspxQuantStep::Fine,
+            AspxStereoMode::Level,
+            &[false],
+            tables.counts,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].values.len(),
+            tables.counts.num_sbg_sig_highres as usize
+        );
+        assert_eq!(out[0].values[0], 50);
+        for v in &out[0].values[1..] {
+            assert_eq!(*v, 0);
+        }
         assert_eq!(br.bit_position(), total_bits);
     }
 }

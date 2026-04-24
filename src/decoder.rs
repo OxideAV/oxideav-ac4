@@ -353,7 +353,7 @@ mod tests {
         bw.write_u32(0, 1); // b_content_type
         bw.write_u32(1, 1); // b_iframe
         bw.write_u32(0, 2); // substream_index
-        // b_pre_virtualized = 0, b_add_emdf_substreams = 0.
+                            // b_pre_virtualized = 0, b_add_emdf_substreams = 0.
         bw.write_u32(0, 1);
         bw.write_u32(0, 1);
         // substream_index_table(): n_substreams=1, b_size_present=0.
@@ -406,13 +406,13 @@ mod tests {
         bw.write_u32(1, 1); // b_iframe_global
         bw.write_u32(1, 1); // b_single_presentation
         bw.write_u32(0, 1); // b_payload_base
-        // ac4_presentation_info:
+                            // ac4_presentation_info:
         bw.write_u32(1, 1); // b_single_substream
         bw.write_u32(0, 1); // presentation_version = 0
         bw.write_u32(0, 3); // md_compat
         bw.write_u32(0, 1); // b_belongs_to_presentation_id
         bw.write_u32(0, 1); // frame_rate_multiply_info
-        // emdf_info:
+                            // emdf_info:
         bw.write_u32(0, 2);
         bw.write_u32(0, 3);
         bw.write_u32(0, 1);
@@ -426,7 +426,7 @@ mod tests {
         bw.write_u32(0, 2); // substream_index
         bw.write_u32(0, 1); // b_pre_virtualized
         bw.write_u32(0, 1); // b_add_emdf_substreams
-        // substream_index_table:
+                            // substream_index_table:
         bw.write_u32(1, 2); // n_substreams - 1
         bw.write_u32(0, 1); // b_size_present
         bw.align_to_byte();
@@ -625,11 +625,11 @@ mod tests {
         bw.write_u32(0, 1); // spec_frontend_l = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(max_sfb, 6); // max_sfb[0]
-        // --- Right channel ---
+                                  // --- Right channel ---
         bw.write_u32(0, 1); // spec_frontend_r = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(max_sfb, 6); // max_sfb[0]
-        // sf_data(spec_frontend_l): section_data + spectral + scalefac + snf.
+                                  // sf_data(spec_frontend_l): section_data + spectral + scalefac + snf.
         let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
         let end_line = sfbo[max_sfb as usize] as u32;
         let hcb = huffman::asf_hcb(5).unwrap();
@@ -669,8 +669,8 @@ mod tests {
         // channels must carry real PCM (non-silent), and their sample
         // streams must differ.
         let mut bytes = build_minimal_toc(); // stereo TOC — channel_mode '10'
-        // cb_idx=49 is (q0=1, q1=0); cb_idx=58 is (q0=2, q1=0).
-        // Different tones -> different PCM per channel.
+                                             // cb_idx=49 is (q0=1, q1=0); cb_idx=58 is (q0=2, q1=0).
+                                             // Different tones -> different PCM per channel.
         let body = build_stereo_asf_split_body_with_tones(1920, 10, 49, 58);
         bytes.extend(body);
         let params = CodecParameters::audio(CodecId::new("ac4"));

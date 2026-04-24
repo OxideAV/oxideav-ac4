@@ -16,7 +16,10 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::huffman::{asf_hcb, ext_decode, huff_decode, split_qspec, CB_DIM, UNSIGNED_CB, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN, HCB_SNF_CW, HCB_SNF_LEN};
+use crate::huffman::{
+    asf_hcb, ext_decode, huff_decode, split_qspec, CB_DIM, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN,
+    HCB_SNF_CW, HCB_SNF_LEN, UNSIGNED_CB,
+};
 use crate::tables::num_sfb_48;
 
 /// Decoded section information for one window group.
@@ -55,9 +58,9 @@ pub fn parse_asf_section_data(
     } else {
         (5u32, 31u32)
     };
-    let num_sfb = num_sfb_48(transform_length).ok_or_else(|| {
-        Error::invalid("ac4: asf_section_data: unsupported transform_length")
-    })? as u32;
+    let num_sfb = num_sfb_48(transform_length)
+        .ok_or_else(|| Error::invalid("ac4: asf_section_data: unsupported transform_length"))?
+        as u32;
 
     let mut out = AsfSections {
         sfb_cb: vec![0u8; max_sfb as usize],
@@ -143,8 +146,8 @@ pub fn parse_asf_spectral_data(
         if cb == 0 || cb > 11 {
             continue;
         }
-        let hcb = asf_hcb(cb)
-            .ok_or_else(|| Error::invalid("ac4: asf_spectral_data: bad codebook"))?;
+        let hcb =
+            asf_hcb(cb).ok_or_else(|| Error::invalid("ac4: asf_spectral_data: bad codebook"))?;
         let dim = CB_DIM[cb as usize];
         let unsig = UNSIGNED_CB[cb as usize];
         let sect_start_line = sfb_offset[sections.sect_start[i] as usize] as usize;
@@ -378,14 +381,13 @@ mod tests {
         let mqi = vec![0u32, 3u32, 0u32];
         let mut bw = BitWriter::new();
         bw.write_u32(120, 8); // reference_scale_factor
-        // Only sfb=1 has mqi>0 and cb!=0 -> first_scf_found is set,
-        // no codeword emitted. sfb=0: mqi=0 -> skip. sfb=2: mqi=0 ->
-        // skip. So no huffman data needed.
+                              // Only sfb=1 has mqi>0 and cb!=0 -> first_scf_found is set,
+                              // no codeword emitted. sfb=0: mqi=0 -> skip. sfb=2: mqi=0 ->
+                              // skip. So no huffman data needed.
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
-        let gains =
-            parse_asf_scalefac_data(&mut br, &sections, &mqi, 3, 256).unwrap();
+        let gains = parse_asf_scalefac_data(&mut br, &sections, &mqi, 3, 256).unwrap();
         assert_eq!(gains[0], 0.0);
         assert!((gains[1] - 32.0).abs() < 1e-3);
         assert_eq!(gains[2], 0.0);
@@ -409,8 +411,7 @@ mod tests {
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
-        let gains =
-            parse_asf_scalefac_data(&mut br, &sections, &mqi, 3, 256).unwrap();
+        let gains = parse_asf_scalefac_data(&mut br, &sections, &mqi, 3, 256).unwrap();
         assert!((gains[0] - 32.0).abs() < 1e-2);
         assert!((gains[1] - 32.0).abs() < 1e-2);
         assert!((gains[2] - 2.0_f32.powf((123.0 - 100.0) / 4.0)).abs() < 1e-2);

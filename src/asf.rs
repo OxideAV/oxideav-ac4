@@ -201,9 +201,8 @@ pub fn parse_asf_psy_info(
 
     // Resolve n_msfb_bits / n_side_bits from Table 106 for the primary
     // transform length.
-    let (nm0, ns0, _nml0) = tables::n_msfb_bits_48(transform_info.transform_length_0).ok_or_else(
-        || Error::invalid("ac4: asf_psy_info: unsupported transform_length[0]"),
-    )?;
+    let (nm0, ns0, _nml0) = tables::n_msfb_bits_48(transform_info.transform_length_0)
+        .ok_or_else(|| Error::invalid("ac4: asf_psy_info: unsupported transform_length[0]"))?;
 
     if b_side_limited {
         info.max_sfb_0 = br.read_u32(ns0)?;
@@ -361,6 +360,26 @@ pub struct SubstreamTools {
     pub aspx_qmode_env_primary: Option<aspx::AspxQuantStep>,
     /// `aspx_qmode_env[1]` — same, for the secondary channel.
     pub aspx_qmode_env_secondary: Option<aspx::AspxQuantStep>,
+    /// Derived A-SPX frequency tables (§5.7.6.3.1). Populated on any
+    /// I-frame ASPX substream that parses `aspx_config` plus
+    /// `aspx_xover_subband_offset` without hitting a bailout.
+    pub aspx_frequency_tables: Option<aspx::AspxFrequencyTables>,
+    /// Parsed `aspx_hfgen_iwc_1ch()` for the mono ASPX path (Table 55).
+    pub aspx_hfgen_iwc_1ch: Option<aspx::AspxHfgenIwc1Ch>,
+    /// Parsed `aspx_hfgen_iwc_2ch()` for the stereo ASPX path (Table 56).
+    pub aspx_hfgen_iwc_2ch: Option<aspx::AspxHfgenIwc2Ch>,
+    /// `aspx_data_sig[0]` — per-envelope Huffman-decoded signal
+    /// envelopes for the primary channel.
+    pub aspx_data_sig_primary: Option<Vec<aspx::AspxHuffEnv>>,
+    /// `aspx_data_sig[1]` — per-envelope signal envelopes for the
+    /// secondary channel in a stereo ASPX substream.
+    pub aspx_data_sig_secondary: Option<Vec<aspx::AspxHuffEnv>>,
+    /// `aspx_data_noise[0]` — per-envelope Huffman-decoded noise
+    /// envelopes for the primary channel.
+    pub aspx_data_noise_primary: Option<Vec<aspx::AspxHuffEnv>>,
+    /// `aspx_data_noise[1]` — per-envelope noise envelopes for the
+    /// secondary channel.
+    pub aspx_data_noise_secondary: Option<Vec<aspx::AspxHuffEnv>>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -568,9 +587,52 @@ pub fn parse_mono_audio_data_outer(
                     tools.aspx_qmode_env_primary = Some(qmode);
                     // aspx_delta_dir(0) follows aspx_framing(0) per
                     // Table 51 — fully determined by framing.num_env /
-                    // num_noise so we can consume it here without the
-                    // A-SPX subband-group derivation.
+                    // num_noise.
                     let dd = aspx::parse_aspx_delta_dir(br, &framing)?;
+                    // Derive the §5.7.6.3.1 frequency tables and use
+                    // them to parse aspx_hfgen_iwc_1ch() (Table 55)
+                    // then two aspx_ec_data() calls (SIGNAL + NOISE)
+                    // per the aspx_data_1ch() body. Any derivation
+                    // error silently skips this block without clearing
+                    // the framing / delta_dir already stashed.
+                    if let Ok(tables) = aspx::derive_aspx_frequency_tables(&cfg, xover as u32) {
+                        let hfgen = aspx::parse_aspx_hfgen_iwc_1ch(
+                            br,
+                            cfg.num_noise_sbgroups(),
+                            tables.counts.num_sbg_sig_highres,
+                            nats,
+                        )?;
+                        tools.aspx_hfgen_iwc_1ch = Some(hfgen);
+                        // Signal envelopes — per Table 51, stereo_mode
+                        // is LEVEL (literal `0` in the Table 51 body)
+                        // for the 1-channel path.
+                        let sig = aspx::parse_aspx_ec_data(
+                            br,
+                            aspx::AspxDataType::Signal,
+                            framing.num_env,
+                            &framing.freq_res,
+                            qmode,
+                            aspx::AspxStereoMode::Level,
+                            &dd.sig_delta_dir,
+                            tables.counts,
+                        )?;
+                        tools.aspx_data_sig_primary = Some(sig);
+                        // Noise envelopes — per Table 51 freq_res /
+                        // qmode are `0` (both ignored by the NOISE
+                        // branch of Pseudocode 79).
+                        let noise = aspx::parse_aspx_ec_data(
+                            br,
+                            aspx::AspxDataType::Noise,
+                            framing.num_noise,
+                            &[],
+                            aspx::AspxQuantStep::Fine,
+                            aspx::AspxStereoMode::Level,
+                            &dd.noise_delta_dir,
+                            tables.counts,
+                        )?;
+                        tools.aspx_data_noise_primary = Some(noise);
+                        tools.aspx_frequency_tables = Some(tables);
+                    }
                     tools.aspx_delta_dir_primary = Some(dd);
                     tools.aspx_framing_primary = Some(framing);
                 }
@@ -605,8 +667,7 @@ fn decode_asf_long_mono_body(
     // asf_spectral_data.
     let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
     // asf_scalefac_data.
-    let sf_gain =
-        asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
     // asf_snf_data — consume the bits but ignore the output for now
     // (noise fill to be added later).
     let _snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
@@ -694,20 +755,18 @@ pub fn parse_stereo_audio_data_outer(
                     tools.aspx_balance = Some(balance);
                     let framing_ch1_ref;
                     if !balance {
-                        let framing_ch1 =
-                            aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
+                        let framing_ch1 = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
                         // Per Table 52 the ch1 qmode is recomputed
                         // against the ch1 framing (and re-clamped on
                         // FIXFIX + num_env == 1).
-                        let qmode_ch1 = if matches!(
-                            framing_ch1.int_class,
-                            aspx::AspxIntClass::FixFix
-                        ) && framing_ch1.num_env == 1
-                        {
-                            aspx::AspxQuantStep::Fine
-                        } else {
-                            cfg.quant_mode_env
-                        };
+                        let qmode_ch1 =
+                            if matches!(framing_ch1.int_class, aspx::AspxIntClass::FixFix)
+                                && framing_ch1.num_env == 1
+                            {
+                                aspx::AspxQuantStep::Fine
+                            } else {
+                                cfg.quant_mode_env
+                            };
                         tools.aspx_qmode_env_secondary = Some(qmode_ch1);
                         tools.aspx_framing_secondary = Some(framing_ch1);
                         framing_ch1_ref = tools.aspx_framing_secondary.as_ref();
@@ -719,11 +778,80 @@ pub fn parse_stereo_audio_data_outer(
                     // aspx_delta_dir(0) then aspx_delta_dir(1) per
                     // Table 52.
                     let dd0 = aspx::parse_aspx_delta_dir(br, &framing_ch0)?;
-                    tools.aspx_delta_dir_primary = Some(dd0);
-                    if let Some(f_ch1) = framing_ch1_ref {
-                        let dd1 = aspx::parse_aspx_delta_dir(br, f_ch1)?;
-                        tools.aspx_delta_dir_secondary = Some(dd1);
+                    let f_ch1 = framing_ch1_ref.unwrap_or(&framing_ch0);
+                    let dd1 = aspx::parse_aspx_delta_dir(br, f_ch1)?;
+                    // §5.7.6.3.1 derivation feeds aspx_hfgen_iwc_2ch()
+                    // (Table 56) then four aspx_ec_data() calls
+                    // (ch0/ch1 SIGNAL, ch0/ch1 NOISE) per Table 52.
+                    if let Ok(tables) = aspx::derive_aspx_frequency_tables(&cfg, xover as u32) {
+                        let hfgen = aspx::parse_aspx_hfgen_iwc_2ch(
+                            br,
+                            balance,
+                            cfg.num_noise_sbgroups(),
+                            tables.counts.num_sbg_sig_highres,
+                            nats,
+                        )?;
+                        tools.aspx_hfgen_iwc_2ch = Some(hfgen);
+                        let qmode_ch1_effective =
+                            tools.aspx_qmode_env_secondary.unwrap_or(qmode_ch0);
+                        // ch0 SIGNAL: stereo_mode = LEVEL (Table 52).
+                        let sig0 = aspx::parse_aspx_ec_data(
+                            br,
+                            aspx::AspxDataType::Signal,
+                            framing_ch0.num_env,
+                            &framing_ch0.freq_res,
+                            qmode_ch0,
+                            aspx::AspxStereoMode::Level,
+                            &dd0.sig_delta_dir,
+                            tables.counts,
+                        )?;
+                        tools.aspx_data_sig_primary = Some(sig0);
+                        // ch1 SIGNAL: BALANCE when aspx_balance == 1
+                        // else LEVEL (Table 52).
+                        let sm_ch1 = if balance {
+                            aspx::AspxStereoMode::Balance
+                        } else {
+                            aspx::AspxStereoMode::Level
+                        };
+                        let sig1 = aspx::parse_aspx_ec_data(
+                            br,
+                            aspx::AspxDataType::Signal,
+                            f_ch1.num_env,
+                            &f_ch1.freq_res,
+                            qmode_ch1_effective,
+                            sm_ch1,
+                            &dd1.sig_delta_dir,
+                            tables.counts,
+                        )?;
+                        tools.aspx_data_sig_secondary = Some(sig1);
+                        // ch0 NOISE.
+                        let noise0 = aspx::parse_aspx_ec_data(
+                            br,
+                            aspx::AspxDataType::Noise,
+                            framing_ch0.num_noise,
+                            &[],
+                            aspx::AspxQuantStep::Fine,
+                            aspx::AspxStereoMode::Level,
+                            &dd0.noise_delta_dir,
+                            tables.counts,
+                        )?;
+                        tools.aspx_data_noise_primary = Some(noise0);
+                        // ch1 NOISE mirrors ch1 SIGNAL stereo_mode.
+                        let noise1 = aspx::parse_aspx_ec_data(
+                            br,
+                            aspx::AspxDataType::Noise,
+                            f_ch1.num_noise,
+                            &[],
+                            aspx::AspxQuantStep::Fine,
+                            sm_ch1,
+                            &dd1.noise_delta_dir,
+                            tables.counts,
+                        )?;
+                        tools.aspx_data_noise_secondary = Some(noise1);
+                        tools.aspx_frequency_tables = Some(tables);
                     }
+                    tools.aspx_delta_dir_primary = Some(dd0);
+                    tools.aspx_delta_dir_secondary = Some(dd1);
                     tools.aspx_framing_primary = Some(framing_ch0);
                 }
             }
@@ -916,8 +1044,7 @@ fn decode_asf_long_stereo_joint_body(
         .zip(mqi_r.iter())
         .map(|(a, b)| (*a).max(*b))
         .collect();
-    let sf_gain =
-        asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
     // Per-sfb ms_used flag array. Only active bands (cb != 0 and
     // max_quant_idx > 0) carry a bit per §7.5 Pseudocode 77; other
     // bands default to false.
@@ -1334,7 +1461,7 @@ mod tests {
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(0b01, 2); // ASPX
-        // aspx_config: all-zero fields.
+                               // aspx_config: all-zero fields.
         bw.write_u32(0, 15);
         // companding_control(2): sync_flag=0, compand_on=[1,1].
         bw.write_bit(false);
@@ -1363,7 +1490,7 @@ mod tests {
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(0b01, 2); // ASPX
-        // No aspx_config — go straight to companding_control(2).
+                               // No aspx_config — go straight to companding_control(2).
         bw.write_bit(true); // sync_flag = 1 -> single compand_on
         bw.write_bit(true); // compand_on[0] = 1
         bw.align_to_byte();
@@ -1380,7 +1507,7 @@ mod tests {
     }
 
     /// Write sect_len_incr per §4.2.7.1 Table 80 (section-length
-     /// expansion). Duplicated from `decoder.rs` tests for crate-local use.
+    /// expansion). Duplicated from `decoder.rs` tests for crate-local use.
     fn write_sect_len_incr(bw: &mut BitWriter, sect_len: u32, n_sect_bits: u32, esc: u32) {
         let base = sect_len.saturating_sub(1);
         let k = base / esc;
@@ -1429,7 +1556,7 @@ mod tests {
         bw.write_u32(0, 2); // noise_sbg
         bw.write_u32(0, 1); // num_env_bits_fixfix = 0 -> 1-bit tmp_num_env
         bw.write_u32(3, 2); // freq_res_mode = 3 (High)
-        // companding_control(1): compand_on[0] = 1, no avg.
+                            // companding_control(1): compand_on[0] = 1, no avg.
         bw.write_bit(true);
         // mono_data(0): spec_frontend = 0 (ASF).
         bw.write_u32(0, 1);
@@ -1481,7 +1608,7 @@ mod tests {
         assert_eq!(framing.num_env, 2);
         assert_eq!(framing.num_noise, 2);
         assert!(framing.freq_res.is_empty()); // freq_res_mode = High
-        // Stereo sidecar untouched on mono.
+                                              // Stereo sidecar untouched on mono.
         assert!(info.tools.aspx_framing_secondary.is_none());
         assert!(info.tools.aspx_balance.is_none());
         // aspx_delta_dir(0) followed on the same path: consumed
@@ -1491,7 +1618,10 @@ mod tests {
         assert_eq!(dd.noise_delta_dir, vec![false; 2]);
         // FIXFIX + num_env > 1, so the config's quant_mode_env carries
         // through (and the config had it as Fine).
-        assert_eq!(info.tools.aspx_qmode_env_primary, Some(aspx::AspxQuantStep::Fine));
+        assert_eq!(
+            info.tools.aspx_qmode_env_primary,
+            Some(aspx::AspxQuantStep::Fine)
+        );
     }
 
     #[test]
@@ -1505,7 +1635,7 @@ mod tests {
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(1, 1); // mono_codec_mode = ASPX
-        // No aspx_config (b_iframe = false).
+                            // No aspx_config (b_iframe = false).
         bw.write_bit(true); // companding_control(1): compand_on[0] = 1.
         bw.write_u32(0, 1); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame = 1
@@ -1531,6 +1661,109 @@ mod tests {
         assert!(info.tools.aspx_config.is_none());
         assert!(info.tools.aspx_framing_primary.is_none());
         assert!(info.tools.aspx_xover_subband_offset.is_none());
+    }
+
+    /// End-to-end mono ASPX I-frame substream: hand-build
+    /// aspx_hfgen_iwc_1ch plus two aspx_ec_data() payloads and verify
+    /// the walker captures them. This is the round-6 acceptance test
+    /// for parse_aspx_ec_data's wiring through §5.7.6.3.1 derivation.
+    #[test]
+    fn walk_mono_aspx_iframe_reads_ec_data_end_to_end() {
+        use crate::aspx::{
+            ASPX_HCB_ENV_LEVEL_15_DF, ASPX_HCB_ENV_LEVEL_15_F0, ASPX_HCB_NOISE_LEVEL_F0,
+        };
+        use crate::huffman;
+        let mut bw = BitWriter::new();
+        bw.write_u32(500, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(1, 1); // mono_codec_mode = ASPX
+                            // aspx_config(): quant_mode=0, start=3, stop=3, scale=1
+                            // (highres -> 22 - 6 - 6 = 10 master groups), freq_res_mode=3
+                            // (High -> no per-env freq_res bits), other flags zero.
+        bw.write_u32(0, 1); // quant_mode_env
+        bw.write_u32(3, 3); // start_freq
+        bw.write_u32(3, 2); // stop_freq
+        bw.write_u32(1, 1); // master_freq_scale = HighRes
+        bw.write_bit(false); // interpolation
+        bw.write_bit(false); // preflat
+        bw.write_bit(false); // limiter
+        bw.write_u32(0, 2); // noise_sbg
+        bw.write_u32(0, 1); // num_env_bits_fixfix
+        bw.write_u32(3, 2); // freq_res_mode = High
+                            // companding_control(1): compand_on[0] = 1.
+        bw.write_bit(true);
+        // mono_data(0): ASF frontend, long frame, max_sfb=10, zero
+        // spectra + scalefac 120 + no snf.
+        bw.write_u32(0, 1); // spec_frontend = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(10, 6); // max_sfb
+        bw.write_u32(5, 4);
+        write_sect_len_incr(&mut bw, 10, 3, 7);
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let end_line = sfbo[10] as u32;
+        let hcb = huffman::asf_hcb(5).unwrap();
+        for _ in 0..(end_line / 2) {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        bw.write_u32(120, 8); // reference scalefac
+        bw.write_u32(0, 1); // b_snf_data_exists
+                            // aspx_data_1ch(): xover=7 -> num_sbg_sig_highres = 10 - 7 = 3
+                            // and num_sbg_sig_lowres = 2. num_sbg_noise clamps to 1 since
+                            // aspx_noise_sbg = 0. FIXFIX + tmp_num_env=0 -> num_env = 1.
+        bw.write_u32(7, 3); // aspx_xover_subband_offset
+        bw.write_bit(false); // FIXFIX
+        bw.write_bit(false); // tmp_num_env = 0
+                             // aspx_delta_dir(0): sig[0]=0, noise[0]=0 (FREQ for both).
+        bw.write_bit(false);
+        bw.write_bit(false);
+        // aspx_hfgen_iwc_1ch: tna_mode[0] = 0 (2 bits), ah_present=0,
+        // fic_present=0, tic_present=0 (3 bits).
+        bw.write_u32(0, 2);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        // aspx_data_sig[0]: num_env=1, high-res (3 subband groups).
+        // F0 symbol 30 + two DF zero-deltas (index 70).
+        let f0_cb = &ASPX_HCB_ENV_LEVEL_15_F0;
+        let df_cb = &ASPX_HCB_ENV_LEVEL_15_DF;
+        bw.write_u32(f0_cb.cw[30], f0_cb.len[30] as u32);
+        bw.write_u32(df_cb.cw[70], df_cb.len[70] as u32);
+        bw.write_u32(df_cb.cw[70], df_cb.len[70] as u32);
+        // aspx_data_noise[0]: num_noise=1 (since num_env==1), num_sbg_noise=1.
+        // One F0 codeword from the NOISE_LEVEL_F0 table.
+        let noise_f0 = &ASPX_HCB_NOISE_LEVEL_F0;
+        bw.write_u32(noise_f0.cw[6], noise_f0.len[6] as u32);
+        bw.align_to_byte();
+        while bw.byte_len() < 520 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let info = walk_ac4_substream(&bytes, 1, true, 1920).unwrap();
+        // §5.7.6.3.1 derivation results.
+        let tables = info.tools.aspx_frequency_tables.as_ref().expect("tables");
+        assert_eq!(tables.num_sbg_master, 10);
+        assert_eq!(tables.sba, 24);
+        assert_eq!(tables.sbz, 44);
+        assert_eq!(tables.counts.num_sbg_sig_highres, 3);
+        assert_eq!(tables.counts.num_sbg_sig_lowres, 2);
+        assert_eq!(tables.counts.num_sbg_noise, 1);
+        // hfgen: all gates off.
+        let hfgen = info.tools.aspx_hfgen_iwc_1ch.as_ref().expect("hfgen");
+        assert_eq!(hfgen.tna_mode, vec![0]);
+        assert!(!hfgen.ah_present);
+        assert!(!hfgen.fic_present);
+        assert!(!hfgen.tic_present);
+        // Signal envelope: F0=30, DF=0, DF=0.
+        let sig = info.tools.aspx_data_sig_primary.as_ref().expect("sig");
+        assert_eq!(sig.len(), 1);
+        assert_eq!(sig[0].values, vec![30, 0, 0]);
+        assert!(!sig[0].direction_time);
+        // Noise envelope: single F0 with delta = 6.
+        let noise = info.tools.aspx_data_noise_primary.as_ref().expect("noise");
+        assert_eq!(noise.len(), 1);
+        assert_eq!(noise[0].values, vec![6]);
+        assert!(!noise[0].direction_time);
     }
 
     #[test]

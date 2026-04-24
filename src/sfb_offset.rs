@@ -100,19 +100,13 @@ pub const SFB_OFFSET_192: &[u16] = &[
 ];
 
 /// Table B.7, column "128@44,1 / 128@48". 15 entries (14+1).
-pub const SFB_OFFSET_128: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 128,
-];
+pub const SFB_OFFSET_128: &[u16] = &[0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 128];
 
 /// Table B.7, column "120@48". 15 entries (14+1).
-pub const SFB_OFFSET_120: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 120,
-];
+pub const SFB_OFFSET_120: &[u16] = &[0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 120];
 
 /// Table B.7, column "96@48". 13 entries (12+1).
-pub const SFB_OFFSET_96: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96,
-];
+pub const SFB_OFFSET_96: &[u16] = &[0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96];
 
 /// Look up the `sfb_offset[]` vector for the given transform length at
 /// 48 kHz / 44.1 kHz.

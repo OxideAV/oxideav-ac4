@@ -164,11 +164,7 @@ pub fn imdct(x: &[f32]) -> Vec<f32> {
 /// right window so subsequent overlap is ready).
 ///
 /// Simplified non-block-switching path: assumes N == N_prev.
-pub fn imdct_olap_symmetric(
-    x_unwindowed: &[f32],
-    window: &[f32],
-    overlap: &mut [f32],
-) -> Vec<f32> {
+pub fn imdct_olap_symmetric(x_unwindowed: &[f32], window: &[f32], overlap: &mut [f32]) -> Vec<f32> {
     let two_n = x_unwindowed.len();
     let n = two_n / 2;
     debug_assert_eq!(window.len(), two_n);

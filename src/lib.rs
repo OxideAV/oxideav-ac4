@@ -118,23 +118,41 @@
 //!   implements `aspx_ec_data()` (Table 57, §4.2.12.8) on top of
 //!   [`aspx::parse_aspx_huff_data`] (Table 58) — per-envelope loop
 //!   that picks F0/DF/DT codebook per direction and returns a vector
-//!   of [`aspx::AspxHuffEnv`]s. Caller supplies `num_sbg_*` counts via
-//!   [`aspx::AspxSbgCounts`] pending the §5.7.6.3.1 master-freq-scale
-//!   derivation. Plumbed into the substream walker through the ASPX
-//!   framing + `aspx_delta_dir(ch)` read: `asf::walk_ac4_substream`
-//!   now reads both `aspx_delta_dir(0)` (mono + stereo ASPX I-frames)
-//!   and `aspx_delta_dir(1)` (stereo ASPX I-frames) on top of the
-//!   existing `aspx_framing` consumption, alongside the effective
-//!   per-channel `aspx_qmode_env` post FIXFIX + num_env=1 clamp.
+//!   of [`aspx::AspxHuffEnv`]s.
+//! * **A-SPX master freq-scale derivation** —
+//!   [`aspx::derive_aspx_frequency_tables`] implements §5.7.6.3.1
+//!   Pseudocodes 67, 68, 69 and 70: picks between
+//!   [`aspx::ASPX_SBG_TEMPLATE_HIGHRES`] and
+//!   [`aspx::ASPX_SBG_TEMPLATE_LOWRES`] by `aspx_master_freq_scale`,
+//!   trims with `aspx_start_freq` / `aspx_stop_freq` into the master
+//!   subband-group table, then applies `aspx_xover_subband_offset` to
+//!   produce the high-res / low-res signal tables. The noise
+//!   subband-group table follows Pseudocode 70's `max(1,
+//!   floor(aspx_noise_sbg * log2(sbz/sbx) + 0.5))` count rule and is
+//!   clamped to `num_sbg_noise <= 5`. Returns
+//!   [`aspx::AspxFrequencyTables`] containing master / high-res /
+//!   low-res / noise border tables plus `sba`, `sbz`, `sbx`,
+//!   `num_sb_aspx` and an [`aspx::AspxSbgCounts`] ready to feed
+//!   [`aspx::parse_aspx_ec_data`].
+//! * **Full A-SPX data-path wiring** — `asf::walk_ac4_substream` now
+//!   runs the whole `aspx_data_1ch()` / `aspx_data_2ch()` body on
+//!   I-frame ASPX substreams: `aspx_xover_subband_offset` →
+//!   `aspx_framing` (+ stereo `aspx_balance` / second framing) →
+//!   `aspx_delta_dir` → derived [`aspx::AspxFrequencyTables`] →
+//!   `aspx_hfgen_iwc_1ch()` / `aspx_hfgen_iwc_2ch()` →
+//!   `aspx_ec_data()` SIGNAL and NOISE per channel. All parsed data
+//!   lands on [`asf::SubstreamTools`] alongside the existing framing /
+//!   delta-dir / qmode fields.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * A-SPX subband-group derivation (§5.7.6.3.1 `num_sbg_*`), QMF
-//!   analysis / synthesis, HF regeneration, and envelope application —
-//!   `aspx_ec_data()` is parseable but its outputs don't feed an
-//!   actual bandwidth-extension pipeline yet.
+//! * QMF analysis / synthesis, HF regeneration, envelope application
+//!   and all §5.7.6.4 tools — `aspx_ec_data()` is end-to-end parsed
+//!   and its outputs (signal / noise deltas) now sit on
+//!   [`asf::SubstreamTools`] but don't feed an actual bandwidth-
+//!   extension pipeline yet.
 //! * A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
