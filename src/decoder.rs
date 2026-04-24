@@ -51,6 +51,12 @@ pub struct Ac4Decoder {
     overlap: Vec<Vec<f32>>,
     /// Transform length of the previous frame (for overlap sizing).
     prev_transform_length: u32,
+    /// Per-channel A-SPX persistent state — noise generator
+    /// `noise_idx_prev` (§5.7.6.4.3 Pseudocode 103), tone generator
+    /// `sine_idx_prev` (§5.7.6.4.4 Pseudocode 105), and the
+    /// `sine_idx_sb_prev` / `tsg_ptr_prev` / `num_atsg_sig_prev` bundle
+    /// that Pseudocode 92 consults. Grown on demand as channels decode.
+    aspx_ext_state: Vec<aspx::AspxChannelExtState>,
 }
 
 impl Ac4Decoder {
@@ -65,6 +71,7 @@ impl Ac4Decoder {
             last_substream: None,
             overlap: Vec::new(),
             prev_transform_length: 0,
+            aspx_ext_state: Vec::new(),
         }
     }
 
@@ -82,10 +89,18 @@ impl Ac4Decoder {
     /// the patch subband groups (§5.7.6.3.1.4 + §5.7.6.4.1.4
     /// simplified), per-envelope HF envelope adjustment gains
     /// (§5.7.6.4.2 Pseudocodes 90 / 91 / 95) when the substream
-    /// carried envelope deltas, and otherwise a flat 0.5 gain scaffold,
-    /// then inverse QMF synthesis. Returns the bandwidth-extended PCM
-    /// (f32) aligned to the input PCM after accounting for the
-    /// combined QMF group delay.
+    /// carried envelope deltas, noise + tone injection (§5.7.6.4.3 P102,
+    /// §5.7.6.4.4 P104, §5.7.6.4.5 P107/P108) driven by `add_harmonic`
+    /// flags + `scf_sig_sb` / `scf_noise_sb` (Pseudocode 92/94), and
+    /// otherwise a flat 0.5 gain scaffold. Finally runs inverse QMF
+    /// synthesis. Returns the bandwidth-extended PCM (f32) aligned to
+    /// the input PCM after accounting for the combined QMF group delay.
+    ///
+    /// `state` carries the noise/tone/sine-idx index state across calls
+    /// (one per decoder channel). `add_harmonic` is from the parsed
+    /// `aspx_hfgen_iwc_*` (Table 55/56) — empty/None if the substream
+    /// didn't carry it, in which case the tone generator stays silent
+    /// but noise still injects if envelope deltas are available.
     ///
     /// If any preconditions fail (length not a multiple of 64, tables
     /// missing, sbx >= 64) the original PCM is returned unchanged.
@@ -99,6 +114,8 @@ impl Ac4Decoder {
         noise_deltas: Option<&[aspx::AspxHuffEnv]>,
         qmode_env: Option<aspx::AspxQuantStep>,
         delta_dir: Option<&aspx::AspxDeltaDir>,
+        add_harmonic: Option<&[bool]>,
+        state: &mut aspx::AspxChannelExtState,
         num_ts_in_ats: u32,
     ) -> Vec<f32> {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
@@ -155,8 +172,10 @@ impl Ac4Decoder {
         }
         // Per-envelope HF envelope adjustment (§5.7.6.4.2 Pseudocodes
         // 90 / 91 / 95) when the bitstream surface carried envelope
-        // deltas. Otherwise fall back to the flat-gain scaffold so
-        // output PCM still has audible HF content.
+        // deltas, followed by noise + tone injection (§5.7.6.4.3 / .4 /
+        // .5 Pseudocodes 102 / 104 / 107 / 108) when add_harmonic flags
+        // are available. Otherwise fall back to the flat-gain scaffold
+        // so output PCM still has audible HF content.
         let mut used_envelope = false;
         if let (Some(frm), Some(sig), Some(noise), Some(qm), Some(dd)) =
             (framing, sig_deltas, noise_deltas, qmode_env, delta_dir)
@@ -180,6 +199,29 @@ impl Ac4Decoder {
                             cfg.interpolation,
                         );
                         adjuster.apply(&mut q);
+                        // Noise + tone injection on top of the
+                        // envelope-adjusted HF. `add_harmonic` is sized
+                        // to `num_sbg_sig_highres`; if the caller didn't
+                        // provide one (no aspx_hfgen_iwc in the
+                        // substream), default to an all-false slice so
+                        // only the noise floor contributes.
+                        let num_sbg_sig_highres = tables.sbg_sig_highres.len().saturating_sub(1);
+                        let default_ah = vec![false; num_sbg_sig_highres];
+                        let ah: &[bool] = match add_harmonic {
+                            Some(s) if s.len() == num_sbg_sig_highres => s,
+                            _ => &default_ah,
+                        };
+                        // FIXFIX has no transient pointer (§4.3.10.4.7).
+                        let aspx_tsg_ptr: u32 = 0;
+                        aspx::inject_noise_and_tone(
+                            &mut q,
+                            &adjuster,
+                            tables,
+                            &atsg_noise,
+                            ah,
+                            aspx_tsg_ptr,
+                            state,
+                        );
                         used_envelope = true;
                     }
                 }
@@ -190,6 +232,10 @@ impl Ac4Decoder {
             // non-FIXFIX / missing-envelope paths). Using 0.5 so the
             // regenerated HF doesn't overwhelm the LF.
             aspx::apply_flat_envelope_gain(&mut q, tables.sbx, tables.sbz, 0.5);
+            // Reset per-channel carry-over state — the envelope path
+            // didn't run, so nothing consistent to advance. Next
+            // successful interval starts at master_reset.
+            state.reset();
         }
         // Inverse QMF synthesis.
         let mut syn = qmf::QmfSynthesisBank::new();
@@ -380,6 +426,8 @@ impl Decoder for Ac4Decoder {
             qmode_sec,
             delta_dir_pri,
             delta_dir_sec,
+            ah_pri,
+            ah_sec,
         ) = if let Some(sub) = self.last_substream.as_ref() {
             let pri = sub
                 .tools
@@ -395,6 +443,20 @@ impl Decoder for Ac4Decoder {
                 .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
             let tables = sub.tools.aspx_frequency_tables.clone();
             let cfg = sub.tools.aspx_config;
+            // add_harmonic flags per channel: prefer the 2-channel
+            // hfgen payload when present, else fall back to the 1-ch
+            // one for the primary channel (secondary inherits nothing
+            // in that case — the 1-ch hfgen only covers one channel).
+            let (ah_p, ah_s) = if let Some(h2) = sub.tools.aspx_hfgen_iwc_2ch.as_ref() {
+                (
+                    Some(h2.add_harmonic[0].clone()),
+                    Some(h2.add_harmonic[1].clone()),
+                )
+            } else if let Some(h1) = sub.tools.aspx_hfgen_iwc_1ch.as_ref() {
+                (Some(h1.add_harmonic.clone()), None)
+            } else {
+                (None, None)
+            };
             (
                 pri,
                 sec,
@@ -410,10 +472,13 @@ impl Decoder for Ac4Decoder {
                 sub.tools.aspx_qmode_env_secondary,
                 sub.tools.aspx_delta_dir_primary.clone(),
                 sub.tools.aspx_delta_dir_secondary.clone(),
+                ah_p,
+                ah_s,
             )
         } else {
             (
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None,
             )
         };
         // If the ASPX I-frame pipeline populated derived frequency
@@ -421,10 +486,15 @@ impl Decoder for Ac4Decoder {
         // the IMDCT low-band PCM.
         let use_aspx_ext = aspx_tables.is_some() && aspx_cfg.is_some();
         let num_ts_in_ats = aspx::num_ts_in_ats(info.frame_length.max(1));
+        // Make sure the per-channel A-SPX state vector is large enough.
+        while self.aspx_ext_state.len() < channels as usize {
+            self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
+        }
         if let Some((scaled, n)) = primary_in {
             if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
                 if use_aspx_ext {
                     let pcm_f = self.imdct_channel_f32(0, &scaled, n);
+                    let state = &mut self.aspx_ext_state[0];
                     let extended = Self::aspx_extend_pcm(
                         &pcm_f,
                         aspx_tables.as_ref().unwrap(),
@@ -434,6 +504,8 @@ impl Decoder for Ac4Decoder {
                         noise_pri.as_deref(),
                         qmode_pri,
                         delta_dir_pri.as_ref(),
+                        ah_pri.as_deref(),
+                        state,
                         num_ts_in_ats,
                     );
                     pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
@@ -447,6 +519,7 @@ impl Decoder for Ac4Decoder {
                 if n > 0 && n == samples as usize {
                     if use_aspx_ext {
                         let pcm_f = self.imdct_channel_f32(1, &scaled, n);
+                        let state = &mut self.aspx_ext_state[1];
                         let extended = Self::aspx_extend_pcm(
                             &pcm_f,
                             aspx_tables.as_ref().unwrap(),
@@ -456,6 +529,8 @@ impl Decoder for Ac4Decoder {
                             noise_sec.as_deref(),
                             qmode_sec.or(qmode_pri),
                             delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
+                            ah_sec.as_deref().or(ah_pri.as_deref()),
+                            state,
                             num_ts_in_ats,
                         );
                         pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
@@ -1058,7 +1133,10 @@ mod tests {
             freq_res_mode: aspx::AspxFreqResMode::Signalled,
         };
         let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
-        let out = Ac4Decoder::aspx_extend_pcm(&pcm, &tables, &cfg, None, None, None, None, None, 1);
+        let mut state = aspx::AspxChannelExtState::new();
+        let out = Ac4Decoder::aspx_extend_pcm(
+            &pcm, &tables, &cfg, None, None, None, None, None, None, &mut state, 1,
+        );
         assert_eq!(out.len(), pcm.len());
         // Steady-state energy must be non-zero in the far tail (post
         // QMF settling).
