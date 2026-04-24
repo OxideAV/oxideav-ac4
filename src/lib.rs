@@ -161,28 +161,50 @@
 //!   §5.7.6.4.1.4 Pseudocode 89 high-band tile copy via the patch
 //!   table (no chirp/alpha0/alpha1 tonal adjust yet — that's the TNS
 //!   body of §5.7.6.4.1.2). [`aspx::apply_flat_envelope_gain`] is a
-//!   one-gain scaffold for the §5.7.6.4.2 HF envelope adjustment
-//!   tool. Together with the QMF bank these form an end-to-end
-//!   bandwidth-extension pipeline: PCM → QMF analysis → low-band
-//!   truncate → HF tile-copy → QMF synthesis → non-silent PCM.
+//!   one-gain scaffold kept as a fallback for the §5.7.6.4.2 HF
+//!   envelope adjustment tool. Together with the QMF bank these form
+//!   an end-to-end bandwidth-extension pipeline: PCM → QMF analysis →
+//!   low-band truncate → HF tile-copy → QMF synthesis → non-silent
+//!   PCM.
+//! * **A-SPX HF envelope adjustment (per-envelope gain)** —
+//!   [`aspx::AspxEnvelopeAdjuster`] implements §5.7.6.4.2 Pseudocodes
+//!   90 + 91 + 95 (non-harmonic, non-limited path): delta-decode
+//!   `aspx_data_sig` / `aspx_data_noise` (Pseudocodes 80 / 81) via
+//!   [`aspx::delta_decode_sig`] / [`aspx::delta_decode_noise`],
+//!   dequantize to `scf_sig_sbg` / `scf_noise_sbg` (Pseudocodes 82 / 83)
+//!   via [`aspx::dequantize_sig_scf`] / [`aspx::dequantize_noise_scf`],
+//!   estimate the actual HF envelope energy
+//!   ([`aspx::estimate_envelope_energy`]), map subband-group scale
+//!   factors onto QMF subbands ([`aspx::map_scf_to_qmf_subbands`]),
+//!   then compute per-subband compensatory gains
+//!   ([`aspx::compute_sig_gains`]) = `sqrt(scf_sig / ((1 + est) *
+//!   (1 + scf_noise)))`. The per-envelope gains are applied via
+//!   [`aspx::apply_envelope_gains`] using the FIXFIX Table-194
+//!   `atsg_sig` / `atsg_noise` borders derived by
+//!   [`aspx::derive_fixfix_atsg`]. The decoder auto-selects the
+//!   per-envelope path when the substream parsed FIXFIX framing
+//!   plus matching envelope deltas, and falls back to
+//!   `apply_flat_envelope_gain(0.5)` otherwise.
 //! * **ASPX decoder wiring** — [`decoder::Ac4Decoder`] now routes
 //!   ASPX substreams through the extension pipeline: when an I-frame
 //!   ASPX substream produces derived `aspx_frequency_tables`, the
 //!   decoder takes the IMDCT low-band PCM, runs QMF analysis →
-//!   tile-copy HF regen → QMF synthesis, and emits bandwidth-extended
-//!   PCM instead of silence.
+//!   tile-copy HF regen → per-envelope gain (or flat-gain fallback)
+//!   → QMF synthesis, and emits bandwidth-extended PCM instead of
+//!   silence.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * Full §5.7.6.4 A-SPX HF regeneration — complex-covariance
+//! * Remaining §5.7.6.4 A-SPX HF regeneration — complex-covariance
 //!   tonal-to-noise prediction (Pseudocodes 86 / 87 / 88), the full
-//!   envelope estimation / gain-compensation loop (Pseudocodes 90 /
-//!   91), the noise generator (§5.7.6.4.3), the tone generator
-//!   (§5.7.6.4.4) and the HF-signal assembling (§5.7.6.4.5).
-//!   Today's pipeline delivers audio through tile-copy + flat gain
-//!   only.
+//!   harmonic / limiter branch of the gain loop (Pseudocodes 92–101),
+//!   the noise generator (§5.7.6.4.3 — module exists in
+//!   [`aspx_noise`]) and tone generator (§5.7.6.4.4 — module exists in
+//!   [`aspx_tone`]) aren't yet wired into the HF signal assembler.
+//!   Non-FIXFIX interval classes (FIXVAR / VARFIX / VARVAR) fall back
+//!   to the flat-gain scaffold too.
 //! * A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the

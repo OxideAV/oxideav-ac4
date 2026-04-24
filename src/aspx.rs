@@ -1819,6 +1819,482 @@ pub fn apply_flat_envelope_gain(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32, g
     }
 }
 
+// ---------------------------------------------------------------------
+// §5.7.6.3.3.1 FIXFIX atsg_sig / atsg_noise borders (Table 194)
+// ---------------------------------------------------------------------
+
+/// `tab_border[num_aspx_timeslots][num_atsg]` — ETSI TS 103 190-1
+/// Table 194. Returns the A-SPX time-slot-group border vector for an
+/// `aspx_int_class == FIXFIX` interval. Returned vector has length
+/// `num_atsg + 1` and its last entry equals `num_aspx_timeslots`.
+///
+/// Returns `None` when the `(num_aspx_timeslots, num_atsg)` pair is not
+/// one of the 15 combinations listed in Table 194.
+pub fn tab_border_fixfix(num_aspx_timeslots: u32, num_atsg: u32) -> Option<Vec<u32>> {
+    match (num_aspx_timeslots, num_atsg) {
+        (6, 1) => Some(vec![0, 6]),
+        (6, 2) => Some(vec![0, 3, 6]),
+        (6, 4) => Some(vec![0, 2, 3, 4, 6]),
+        (8, 1) => Some(vec![0, 8]),
+        (8, 2) => Some(vec![0, 4, 8]),
+        (8, 4) => Some(vec![0, 2, 4, 6, 8]),
+        (12, 1) => Some(vec![0, 12]),
+        (12, 2) => Some(vec![0, 6, 12]),
+        (12, 4) => Some(vec![0, 3, 6, 9, 12]),
+        (15, 1) => Some(vec![0, 15]),
+        (15, 2) => Some(vec![0, 8, 15]),
+        (15, 4) => Some(vec![0, 4, 8, 12, 15]),
+        (16, 1) => Some(vec![0, 16]),
+        (16, 2) => Some(vec![0, 8, 16]),
+        (16, 4) => Some(vec![0, 4, 8, 12, 16]),
+        _ => None,
+    }
+}
+
+/// Derive `atsg_sig` / `atsg_noise` per ETSI TS 103 190-1 §5.7.6.3.3.1
+/// (Pseudocode 76) for an `aspx_int_class == FIXFIX` interval. Returns
+/// `None` if the (num_aspx_timeslots, num_env) or (num_aspx_timeslots,
+/// num_noise) pair is not in Table 194.
+pub fn derive_fixfix_atsg(
+    num_aspx_timeslots: u32,
+    num_env: u32,
+    num_noise: u32,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    let sig = tab_border_fixfix(num_aspx_timeslots, num_env)?;
+    let noise = tab_border_fixfix(num_aspx_timeslots, num_noise)?;
+    Some((sig, noise))
+}
+
+// ---------------------------------------------------------------------
+// §5.7.6.3.4 Decoding A-SPX signal / noise envelopes
+// Pseudocodes 80 / 81 delta-decode, Pseudocodes 82 / 83 dequantize.
+// ---------------------------------------------------------------------
+
+/// Delta-decode the signal envelope scale factors per ETSI TS 103 190-1
+/// §5.7.6.3.4 Pseudocode 80.
+pub fn delta_decode_sig(
+    deltas: &[AspxHuffEnv],
+    num_sbg: u32,
+    qscf_prev_last: &[i32],
+    delta: i32,
+) -> Vec<Vec<i32>> {
+    let num_env = deltas.len();
+    let mut qscf: Vec<Vec<i32>> = vec![vec![0_i32; num_env]; num_sbg as usize];
+    for (atsg, env) in deltas.iter().enumerate() {
+        if env.direction_time {
+            for sbg in 0..(num_sbg as usize) {
+                let prev = if atsg == 0 {
+                    qscf_prev_last.get(sbg).copied().unwrap_or(0)
+                } else {
+                    qscf[sbg][atsg - 1]
+                };
+                let d = env.values.get(sbg).copied().unwrap_or(0);
+                qscf[sbg][atsg] = prev + delta * d;
+            }
+        } else {
+            let mut acc: i32 = 0;
+            for sbg in 0..(num_sbg as usize) {
+                let d = env.values.get(sbg).copied().unwrap_or(0);
+                acc += delta * d;
+                qscf[sbg][atsg] = acc;
+            }
+        }
+    }
+    qscf
+}
+
+/// Delta-decode the noise envelope scale factors per ETSI TS 103 190-1
+/// §5.7.6.3.4 Pseudocode 81. Same shape / semantics as
+/// [`delta_decode_sig`].
+pub fn delta_decode_noise(
+    deltas: &[AspxHuffEnv],
+    num_sbg: u32,
+    qscf_prev_last: &[i32],
+    delta: i32,
+) -> Vec<Vec<i32>> {
+    let num_env = deltas.len();
+    let mut qscf: Vec<Vec<i32>> = vec![vec![0_i32; num_env]; num_sbg as usize];
+    for (atsg, env) in deltas.iter().enumerate() {
+        if env.direction_time {
+            for sbg in 0..(num_sbg as usize) {
+                let prev = if atsg == 0 {
+                    qscf_prev_last.get(sbg).copied().unwrap_or(0)
+                } else {
+                    qscf[sbg][atsg - 1]
+                };
+                let d = env.values.get(sbg).copied().unwrap_or(0);
+                qscf[sbg][atsg] = prev + delta * d;
+            }
+        } else {
+            let mut acc: i32 = 0;
+            for sbg in 0..(num_sbg as usize) {
+                let d = env.values.get(sbg).copied().unwrap_or(0);
+                acc += delta * d;
+                qscf[sbg][atsg] = acc;
+            }
+        }
+    }
+    qscf
+}
+
+/// Dequantize signal envelope scale factors per ETSI TS 103 190-1
+/// §5.7.6.3.5 Pseudocode 82 (non-balance path). `a = 2` for Fine /
+/// 1.5 dB, `a = 1` for Coarse / 3 dB. `num_qmf_subbands = 64`.
+pub fn dequantize_sig_scf(
+    qscf: &[Vec<i32>],
+    qmode_env: AspxQuantStep,
+    delta_dir: &[bool],
+    num_qmf_subbands: u32,
+) -> Vec<Vec<f32>> {
+    let a: f32 = match qmode_env {
+        AspxQuantStep::Fine => 2.0,
+        AspxQuantStep::Coarse => 1.0,
+    };
+    let n_subbands = num_qmf_subbands as f32;
+    let num_sbg = qscf.len();
+    if num_sbg == 0 {
+        return Vec::new();
+    }
+    let num_env = qscf[0].len();
+    let mut scf: Vec<Vec<f32>> = vec![vec![0.0_f32; num_env]; num_sbg];
+    for atsg in 0..num_env {
+        for sbg in 0..num_sbg {
+            let q = qscf[sbg][atsg] as f32;
+            scf[sbg][atsg] = n_subbands * 2_f32.powf(q / a);
+        }
+        if num_sbg >= 2
+            && !delta_dir.get(atsg).copied().unwrap_or(false)
+            && qscf[0][atsg] == 0
+            && scf[1][atsg] < 0.0
+        {
+            scf[0][atsg] = scf[1][atsg];
+        }
+    }
+    scf
+}
+
+/// Dequantize noise envelope scale factors per ETSI TS 103 190-1
+/// §5.7.6.3.5 Pseudocode 83: `scf_noise_sbg = 2^(6 - qscf_noise_sbg)`.
+pub fn dequantize_noise_scf(qscf: &[Vec<i32>]) -> Vec<Vec<f32>> {
+    const NOISE_FLOOR_OFFSET: i32 = 6;
+    let num_sbg = qscf.len();
+    if num_sbg == 0 {
+        return Vec::new();
+    }
+    let num_env = qscf[0].len();
+    let mut scf: Vec<Vec<f32>> = vec![vec![0.0_f32; num_env]; num_sbg];
+    for atsg in 0..num_env {
+        for sbg in 0..num_sbg {
+            let q = qscf[sbg][atsg];
+            scf[sbg][atsg] = 2_f32.powi(NOISE_FLOOR_OFFSET - q);
+        }
+    }
+    scf
+}
+
+// ---------------------------------------------------------------------
+// §5.7.6.4.2.1 Pseudocode 90 — envelope-energy estimation.
+// ---------------------------------------------------------------------
+
+/// Estimate per-envelope, per-subband energy of the HF QMF matrix
+/// `q_high` per ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocode 90. Returns
+/// `est_sig_sb` indexed `[sb_relative][atsg_sig]`.
+pub fn estimate_envelope_energy(
+    q_high: &[Vec<(f32, f32)>],
+    sbg_sig: &[u32],
+    atsg_sig: &[u32],
+    num_ts_in_ats: u32,
+    num_sb_aspx: u32,
+    sbx: u32,
+    aspx_interpolation: bool,
+) -> Vec<Vec<f32>> {
+    let num_atsg_sig = atsg_sig.len().saturating_sub(1);
+    let mut est: Vec<Vec<f32>> = vec![vec![0.0_f32; num_atsg_sig]; num_sb_aspx as usize];
+    if num_atsg_sig == 0 || sbg_sig.len() < 2 {
+        return est;
+    }
+    for atsg in 0..num_atsg_sig {
+        let tsa = atsg_sig[atsg] * num_ts_in_ats;
+        let tsz = atsg_sig[atsg + 1] * num_ts_in_ats;
+        let ts_span = tsz.saturating_sub(tsa) as f32;
+        if ts_span <= 0.0 {
+            continue;
+        }
+        let mut sbg = 0_usize;
+        for sb in 0..(num_sb_aspx as usize) {
+            while sbg + 1 < sbg_sig.len().saturating_sub(1) && (sb as u32 + sbx) >= sbg_sig[sbg + 1]
+            {
+                sbg += 1;
+            }
+            let mut est_sig: f64 = 0.0;
+            for ts in tsa..tsz {
+                let ts = ts as usize;
+                if aspx_interpolation {
+                    let sb_abs = sb + sbx as usize;
+                    if sb_abs < q_high.len() && ts < q_high[sb_abs].len() {
+                        let (re, im) = q_high[sb_abs][ts];
+                        est_sig += (re as f64) * (re as f64) + (im as f64) * (im as f64);
+                    }
+                } else {
+                    let j_lo = sbg_sig[sbg] as usize;
+                    let j_hi = sbg_sig[sbg + 1] as usize;
+                    for j in j_lo..j_hi {
+                        if j < q_high.len() && ts < q_high[j].len() {
+                            let (re, im) = q_high[j][ts];
+                            est_sig += (re as f64) * (re as f64) + (im as f64) * (im as f64);
+                        }
+                    }
+                }
+            }
+            if aspx_interpolation {
+                est_sig /= ts_span as f64;
+            } else {
+                let band_span = (sbg_sig[sbg + 1] - sbg_sig[sbg]) as f64;
+                if band_span > 0.0 {
+                    est_sig /= band_span;
+                }
+                est_sig /= ts_span as f64;
+            }
+            est[sb][atsg] = est_sig as f32;
+        }
+    }
+    est
+}
+
+// ---------------------------------------------------------------------
+// §5.7.6.4.2.1 Pseudocode 91 — map scf_sig_sbg / scf_noise_sbg to QMF
+// subbands.
+// ---------------------------------------------------------------------
+
+/// Output of [`map_scf_to_qmf_subbands`].
+#[derive(Debug, Clone, Default)]
+pub struct ScfByQmfSubband {
+    /// `scf_sig_sb[sb][atsg]`, shape `num_sb_aspx × num_atsg_sig`.
+    pub scf_sig_sb: Vec<Vec<f32>>,
+    /// `scf_noise_sb[sb][atsg]`, keyed by signal envelope.
+    pub scf_noise_sb: Vec<Vec<f32>>,
+}
+
+/// Map `scf_sig_sbg` / `scf_noise_sbg` to per-QMF-subband matrices per
+/// ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocode 91.
+#[allow(clippy::too_many_arguments)]
+pub fn map_scf_to_qmf_subbands(
+    scf_sig_sbg: &[Vec<f32>],
+    scf_noise_sbg: &[Vec<f32>],
+    sbg_sig: &[u32],
+    sbg_noise: &[u32],
+    atsg_sig: &[u32],
+    atsg_noise: &[u32],
+    num_sb_aspx: u32,
+    sbx: u32,
+) -> ScfByQmfSubband {
+    let num_atsg_sig = atsg_sig.len().saturating_sub(1);
+    let mut scf_sig_sb: Vec<Vec<f32>> = vec![vec![0.0_f32; num_atsg_sig]; num_sb_aspx as usize];
+    let mut scf_noise_sb: Vec<Vec<f32>> = vec![vec![0.0_f32; num_atsg_sig]; num_sb_aspx as usize];
+    let num_sbg_sig = sbg_sig.len().saturating_sub(1);
+    let num_sbg_noise = sbg_noise.len().saturating_sub(1);
+    let mut atsg_noise_idx: usize = 0;
+    for atsg in 0..num_atsg_sig {
+        for sbg in 0..num_sbg_sig {
+            let lo = sbg_sig[sbg].saturating_sub(sbx) as usize;
+            let hi = sbg_sig[sbg + 1].saturating_sub(sbx) as usize;
+            let val = scf_sig_sbg
+                .get(sbg)
+                .and_then(|row| row.get(atsg))
+                .copied()
+                .unwrap_or(0.0);
+            for sb in lo..hi.min(num_sb_aspx as usize) {
+                scf_sig_sb[sb][atsg] = val;
+            }
+        }
+        if atsg_noise_idx + 1 < atsg_noise.len().saturating_sub(1)
+            && atsg_sig.get(atsg).copied().unwrap_or(0)
+                == atsg_noise
+                    .get(atsg_noise_idx + 1)
+                    .copied()
+                    .unwrap_or(u32::MAX)
+        {
+            atsg_noise_idx += 1;
+        }
+        for sbg in 0..num_sbg_noise {
+            let lo = sbg_noise[sbg].saturating_sub(sbx) as usize;
+            let hi = sbg_noise[sbg + 1].saturating_sub(sbx) as usize;
+            let val = scf_noise_sbg
+                .get(sbg)
+                .and_then(|row| row.get(atsg_noise_idx))
+                .copied()
+                .unwrap_or(0.0);
+            for sb in lo..hi.min(num_sb_aspx as usize) {
+                scf_noise_sb[sb][atsg] = val;
+            }
+        }
+    }
+    ScfByQmfSubband {
+        scf_sig_sb,
+        scf_noise_sb,
+    }
+}
+
+// ---------------------------------------------------------------------
+// §5.7.6.4.2.2 Pseudocode 95 — compensatory gains (non-harmonic path).
+// ---------------------------------------------------------------------
+
+/// Compute the per-subband, per-envelope compensatory signal gain per
+/// ETSI TS 103 190-1 §5.7.6.4.2.2 Pseudocode 95 (non-harmonic branch
+/// `sine_area_sb == 0`).
+pub fn compute_sig_gains(
+    est_sig_sb: &[Vec<f32>],
+    scf_sig_sb: &[Vec<f32>],
+    scf_noise_sb: &[Vec<f32>],
+) -> Vec<Vec<f32>> {
+    const EPSILON: f32 = 1.0;
+    let num_sb = est_sig_sb.len();
+    if num_sb == 0 {
+        return Vec::new();
+    }
+    let num_atsg = est_sig_sb[0].len();
+    let mut out: Vec<Vec<f32>> = vec![vec![0.0_f32; num_atsg]; num_sb];
+    for sb in 0..num_sb {
+        for atsg in 0..num_atsg {
+            let est = est_sig_sb[sb][atsg];
+            let sig = scf_sig_sb
+                .get(sb)
+                .and_then(|row| row.get(atsg))
+                .copied()
+                .unwrap_or(0.0);
+            let noise = scf_noise_sb
+                .get(sb)
+                .and_then(|row| row.get(atsg))
+                .copied()
+                .unwrap_or(0.0);
+            let denom = (EPSILON + est) * (1.0 + noise);
+            let ratio = if denom > 0.0 { sig / denom } else { 0.0 };
+            out[sb][atsg] = ratio.max(0.0).sqrt();
+        }
+    }
+    out
+}
+
+/// Apply `sig_gain_sb[sb][atsg]` per-envelope, per-subband to the QMF
+/// matrix `q` in place (Pseudocode 106 simplified — the non-harmonic,
+/// non-limited, no-`Y_prev` path).
+pub fn apply_envelope_gains(
+    q: &mut [Vec<(f32, f32)>],
+    sig_gain_sb: &[Vec<f32>],
+    atsg_sig: &[u32],
+    num_ts_in_ats: u32,
+    sbx: u32,
+    num_sb_aspx: u32,
+) {
+    let num_atsg = atsg_sig.len().saturating_sub(1);
+    if num_atsg == 0 {
+        return;
+    }
+    for atsg in 0..num_atsg {
+        let tsa = (atsg_sig[atsg] * num_ts_in_ats) as usize;
+        let tsz = (atsg_sig[atsg + 1] * num_ts_in_ats) as usize;
+        for sb in 0..(num_sb_aspx as usize) {
+            let sb_abs = sb + sbx as usize;
+            if sb_abs >= q.len() {
+                break;
+            }
+            let g = sig_gain_sb
+                .get(sb)
+                .and_then(|row| row.get(atsg))
+                .copied()
+                .unwrap_or(0.0);
+            let row = &mut q[sb_abs];
+            let ts_hi = tsz.min(row.len());
+            for slot in row[tsa..ts_hi].iter_mut() {
+                slot.0 *= g;
+                slot.1 *= g;
+            }
+        }
+    }
+}
+
+/// Bundled A-SPX envelope-adjustment payload derived from bitstream
+/// deltas (Pseudocodes 80 / 81 / 82 / 83 / 90 / 91 / 95).
+#[derive(Debug, Clone)]
+pub struct AspxEnvelopeAdjuster {
+    pub atsg_sig: Vec<u32>,
+    pub num_ts_in_ats: u32,
+    pub sbx: u32,
+    pub num_sb_aspx: u32,
+    pub sig_gain_sb: Vec<Vec<f32>>,
+    pub scf_sig_sb: Vec<Vec<f32>>,
+    pub scf_noise_sb: Vec<Vec<f32>>,
+}
+
+impl AspxEnvelopeAdjuster {
+    /// Build the full envelope-adjuster payload: delta decode (P80/P81)
+    /// → dequantize (P82/P83) → estimate (P90) → map (P91) →
+    /// compensate (P95).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_deltas(
+        q_high: &[Vec<(f32, f32)>],
+        tables: &AspxFrequencyTables,
+        sig_deltas: &[AspxHuffEnv],
+        noise_deltas: &[AspxHuffEnv],
+        qmode_env: AspxQuantStep,
+        delta_dir_sig: &[bool],
+        atsg_sig: &[u32],
+        atsg_noise: &[u32],
+        num_ts_in_ats: u32,
+        aspx_interpolation: bool,
+    ) -> Self {
+        let sbg_sig = &tables.sbg_sig_highres;
+        let sbg_noise = &tables.sbg_noise;
+        let num_sbg_sig = (sbg_sig.len() as u32).saturating_sub(1);
+        let num_sbg_noise = (sbg_noise.len() as u32).saturating_sub(1);
+        let qscf_sig = delta_decode_sig(sig_deltas, num_sbg_sig, &[], 1);
+        let qscf_noise = delta_decode_noise(noise_deltas, num_sbg_noise, &[], 1);
+        let scf_sig_sbg = dequantize_sig_scf(&qscf_sig, qmode_env, delta_dir_sig, 64);
+        let scf_noise_sbg = dequantize_noise_scf(&qscf_noise);
+        let est_sig_sb = estimate_envelope_energy(
+            q_high,
+            sbg_sig,
+            atsg_sig,
+            num_ts_in_ats,
+            tables.num_sb_aspx,
+            tables.sbx,
+            aspx_interpolation,
+        );
+        let mapped = map_scf_to_qmf_subbands(
+            &scf_sig_sbg,
+            &scf_noise_sbg,
+            sbg_sig,
+            sbg_noise,
+            atsg_sig,
+            atsg_noise,
+            tables.num_sb_aspx,
+            tables.sbx,
+        );
+        let sig_gain_sb = compute_sig_gains(&est_sig_sb, &mapped.scf_sig_sb, &mapped.scf_noise_sb);
+        Self {
+            atsg_sig: atsg_sig.to_vec(),
+            num_ts_in_ats,
+            sbx: tables.sbx,
+            num_sb_aspx: tables.num_sb_aspx,
+            sig_gain_sb,
+            scf_sig_sb: mapped.scf_sig_sb,
+            scf_noise_sb: mapped.scf_noise_sb,
+        }
+    }
+
+    /// Apply the gains to a QMF matrix in place.
+    pub fn apply(&self, q: &mut [Vec<(f32, f32)>]) {
+        apply_envelope_gains(
+            q,
+            &self.sig_gain_sb,
+            &self.atsg_sig,
+            self.num_ts_in_ats,
+            self.sbx,
+            self.num_sb_aspx,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3422,5 +3898,293 @@ mod tests {
                 assert_eq!(q[sb][ts], (1.0, 2.0));
             }
         }
+    }
+
+    // ---- §5.7.6.4.2 envelope adjustment tests ----
+
+    #[test]
+    fn tab_border_fixfix_matches_table_194() {
+        assert_eq!(tab_border_fixfix(16, 1), Some(vec![0, 16]));
+        assert_eq!(tab_border_fixfix(16, 2), Some(vec![0, 8, 16]));
+        assert_eq!(tab_border_fixfix(16, 4), Some(vec![0, 4, 8, 12, 16]));
+        assert_eq!(tab_border_fixfix(12, 4), Some(vec![0, 3, 6, 9, 12]));
+        // Non-power-of-two-envelope combinations don't exist.
+        assert_eq!(tab_border_fixfix(16, 3), None);
+        // Out-of-range num_aspx_timeslots.
+        assert_eq!(tab_border_fixfix(10, 2), None);
+    }
+
+    #[test]
+    fn delta_decode_sig_freq_then_time() {
+        // Envelope 0: FREQ direction, deltas [4, -1, 2, 0] →
+        // qscf[0..=3] = [4, 3, 5, 5]. Envelope 1: TIME direction,
+        // deltas [1, 1, 1, 1] → qscf += 1 per sbg relative to env 0.
+        let deltas = vec![
+            AspxHuffEnv {
+                values: vec![4, -1, 2, 0],
+                direction_time: false,
+            },
+            AspxHuffEnv {
+                values: vec![1, 1, 1, 1],
+                direction_time: true,
+            },
+        ];
+        let qscf = delta_decode_sig(&deltas, 4, &[], 1);
+        assert_eq!(qscf[0][0], 4);
+        assert_eq!(qscf[1][0], 3);
+        assert_eq!(qscf[2][0], 5);
+        assert_eq!(qscf[3][0], 5);
+        assert_eq!(qscf[0][1], 5);
+        assert_eq!(qscf[1][1], 4);
+        assert_eq!(qscf[2][1], 6);
+        assert_eq!(qscf[3][1], 6);
+    }
+
+    #[test]
+    fn dequantize_sig_scf_fine_3db_matches_formula() {
+        // qscf = [[0,2]], qmode=Fine => a=2, num_qmf_subbands=64
+        // scf = 64 * 2^(q/2) -> q=0: 64, q=2: 128.
+        let qscf = vec![vec![0, 2]];
+        let scf = dequantize_sig_scf(&qscf, AspxQuantStep::Fine, &[false, false], 64);
+        assert!((scf[0][0] - 64.0).abs() < 1e-4);
+        assert!((scf[0][1] - 128.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dequantize_noise_scf_offset_matches_formula() {
+        // qscf=[[0,6,12]] -> scf = 2^(6-q) = [64, 1, 1/64]
+        let qscf = vec![vec![0, 6, 12]];
+        let scf = dequantize_noise_scf(&qscf);
+        assert!((scf[0][0] - 64.0).abs() < 1e-4);
+        assert!((scf[0][1] - 1.0).abs() < 1e-4);
+        assert!((scf[0][2] - (1.0 / 64.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn estimate_envelope_energy_matches_direct_average() {
+        // Build a 2-envelope, 1-subband-group test case. q_high is a
+        // 4-subband × 4-timeslot matrix (sbx=2, num_sb_aspx=2). Env 0
+        // spans ts [0,2), env 1 spans ts [2,4). Subband-group table
+        // covers sbx..sbz in a single group.
+        let num_sb_aspx = 2u32;
+        let sbx = 2u32;
+        let sbg_sig = vec![sbx, sbx + num_sb_aspx];
+        let atsg_sig = vec![0u32, 1, 2];
+        let num_ts_in_ats = 2u32; // -> ts ranges [0,2) and [2,4).
+        let mut q_high: Vec<Vec<(f32, f32)>> = (0..4).map(|_| vec![(0.0, 0.0); 4]).collect();
+        // Env 0: each of sb 2..4 and ts 0..2 = (1,0) -> |^2 = 1.
+        for sb in 2..4 {
+            for ts in 0..2 {
+                q_high[sb][ts] = (1.0, 0.0);
+            }
+        }
+        // Env 1: each of sb 2..4 and ts 2..4 = (2,0) -> |^2 = 4.
+        for sb in 2..4 {
+            for ts in 2..4 {
+                q_high[sb][ts] = (2.0, 0.0);
+            }
+        }
+        // aspx_interpolation = false -> average over group & time.
+        let est = estimate_envelope_energy(
+            &q_high,
+            &sbg_sig,
+            &atsg_sig,
+            num_ts_in_ats,
+            num_sb_aspx,
+            sbx,
+            false,
+        );
+        // Each sb, env 0: sum of 4 contributions / (2 band × 2 ts) = 1
+        // Each sb, env 1: sum of 16 / 4 = 4
+        for sb in 0..2 {
+            assert!((est[sb][0] - 1.0).abs() < 1e-5, "env0 sb{sb} mismatch");
+            assert!((est[sb][1] - 4.0).abs() < 1e-5, "env1 sb{sb} mismatch");
+        }
+    }
+
+    #[test]
+    fn compute_sig_gains_equals_sqrt_ratio() {
+        // est = 3, scf_sig = 16, scf_noise = 0 -> gain = sqrt(16/(1+3))
+        //       = sqrt(4) = 2.
+        let est = vec![vec![3.0]];
+        let sig = vec![vec![16.0]];
+        let noise = vec![vec![0.0]];
+        let g = compute_sig_gains(&est, &sig, &noise);
+        assert!((g[0][0] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn envelope_adjustment_follows_per_envelope_gain_profile() {
+        // Two-envelope FIXFIX test: build a q_high with a known
+        // constant amplitude in the A-SPX range. Provide signal
+        // deltas that produce monotone-increasing scf across
+        // envelopes. Assert that the per-envelope output energy after
+        // AspxEnvelopeAdjuster::apply is higher for the second
+        // envelope than the first, matching the expected curve.
+        let cfg = AspxConfig {
+            quant_mode_env: AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: AspxFreqResMode::High,
+        };
+        let tables = derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        // Layout: num_aspx_timeslots = 16 (matches FIXFIX num_atsg_sig=2),
+        // num_ts_in_ats = 1 -> QMF ts=0..16. Build q_high with flat amp.
+        let num_aspx_ts = 16u32;
+        let num_ts_in_ats = 1u32;
+        let n_qmf_ts = (num_aspx_ts * num_ts_in_ats) as usize;
+        let mut q: Vec<Vec<(f32, f32)>> = (0..64).map(|_| vec![(0.0, 0.0); n_qmf_ts]).collect();
+        // Fill the A-SPX range with a flat unit-amplitude signal.
+        for sb in (tables.sbx as usize)..(tables.sbz as usize) {
+            for ts in 0..n_qmf_ts {
+                q[sb][ts] = (1.0, 0.0);
+            }
+        }
+        // Simulate aspx_data_sig deltas: envelope 0 FREQ with a small
+        // base value (q=2), envelope 1 TIME delta +4 on every sbg
+        // (q=6). Because dequant is 64 * 2^(q/2), env 1 scf should be
+        // 8x env 0 -> gain(env1)^2 ≈ 8x gain(env0)^2. With flat
+        // estimates the dominant factor is the sqrt of the scf ratio,
+        // i.e. env1 gain ≈ sqrt(8) * env0 gain.
+        let num_sbg_sig = tables.counts.num_sbg_sig_highres;
+        let sig_deltas = vec![
+            AspxHuffEnv {
+                values: vec![2; num_sbg_sig as usize],
+                direction_time: false,
+            },
+            AspxHuffEnv {
+                values: vec![4; num_sbg_sig as usize],
+                direction_time: true,
+            },
+        ];
+        // Noise floor zero (q=6 gives noise scf=1, i.e. unit).
+        let num_sbg_noise = (tables.sbg_noise.len() as u32).saturating_sub(1);
+        let noise_deltas = vec![
+            AspxHuffEnv {
+                values: vec![0; num_sbg_noise as usize],
+                direction_time: false,
+            },
+            AspxHuffEnv {
+                values: vec![0; num_sbg_noise as usize],
+                direction_time: true,
+            },
+        ];
+        // Envelope borders from Table 194 (num_aspx_timeslots=16, num_env=2).
+        let (atsg_sig, atsg_noise) = derive_fixfix_atsg(num_aspx_ts, 2, 2).unwrap();
+        let adjuster = AspxEnvelopeAdjuster::from_deltas(
+            &q,
+            &tables,
+            &sig_deltas,
+            &noise_deltas,
+            AspxQuantStep::Fine,
+            &[false, true],
+            &atsg_sig,
+            &atsg_noise,
+            num_ts_in_ats,
+            false,
+        );
+        adjuster.apply(&mut q);
+        // Per-envelope energy in the A-SPX range.
+        let (t0_a, t0_b) = (atsg_sig[0] as usize, atsg_sig[1] as usize);
+        let (t1_a, t1_b) = (atsg_sig[1] as usize, atsg_sig[2] as usize);
+        let mut e0 = 0.0_f64;
+        let mut e1 = 0.0_f64;
+        for sb in (tables.sbx as usize)..(tables.sbz as usize) {
+            for ts in t0_a..t0_b {
+                let (re, im) = q[sb][ts];
+                e0 += (re as f64) * (re as f64) + (im as f64) * (im as f64);
+            }
+            for ts in t1_a..t1_b {
+                let (re, im) = q[sb][ts];
+                e1 += (re as f64) * (re as f64) + (im as f64) * (im as f64);
+            }
+        }
+        // Env 1 should carry *more* energy than env 0 (scf grew 64 ->
+        // 64*2^4 across envs). The ratio is approximately 2^(Δq/a)
+        // times the same baseline — here Δq = 4, a = 2, so the linear
+        // scf ratio is 2^2 = 4; with the sqrt taken by compute_sig_gains
+        // the *amplitude* ratio is 2, and the energy ratio is 4.
+        assert!(e0 > 0.0, "env 0 energy must be non-zero");
+        assert!(e1 > 0.0, "env 1 energy must be non-zero");
+        assert!(
+            e1 > 3.0 * e0,
+            "env 1 energy ({e1}) should be ~4x env 0 energy ({e0})"
+        );
+    }
+
+    #[test]
+    fn apply_envelope_gains_respects_per_envelope_boundaries() {
+        // Two envelopes, two subbands (sbx=2, num_sb_aspx=2), flat
+        // input (1,0). Gains: env 0 -> [1, 2], env 1 -> [3, 4].
+        // Expect per-ts amplitudes mirror those factors.
+        let sbx = 2u32;
+        let num_sb_aspx = 2u32;
+        let atsg_sig = vec![0u32, 2, 4]; // 2 envelopes, 2 A-SPX ts each.
+        let num_ts_in_ats = 1u32;
+        let mut q: Vec<Vec<(f32, f32)>> = (0..4).map(|_| vec![(1.0, 0.0); 4]).collect();
+        let sig_gain_sb = vec![vec![1.0_f32, 3.0], vec![2.0_f32, 4.0]];
+        apply_envelope_gains(
+            &mut q,
+            &sig_gain_sb,
+            &atsg_sig,
+            num_ts_in_ats,
+            sbx,
+            num_sb_aspx,
+        );
+        // sb 2 (= sb 0 relative), env 0 (ts 0..2): gain 1
+        for ts in 0..2 {
+            assert!((q[2][ts].0 - 1.0).abs() < 1e-6);
+        }
+        // sb 2, env 1 (ts 2..4): gain 3
+        for ts in 2..4 {
+            assert!((q[2][ts].0 - 3.0).abs() < 1e-6);
+        }
+        // sb 3 (= sb 1 relative), env 0: gain 2; env 1: gain 4
+        for ts in 0..2 {
+            assert!((q[3][ts].0 - 2.0).abs() < 1e-6);
+        }
+        for ts in 2..4 {
+            assert!((q[3][ts].0 - 4.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn map_scf_to_qmf_subbands_broadcasts_within_group() {
+        // Two subband groups: [sbx..sbx+2, sbx+2..sbx+4].
+        // scf_sig_sbg = [[a_e0, a_e1], [b_e0, b_e1]].
+        // Expect scf_sig_sb[0][0]=a_e0, [0][1]=a_e1, [1][0]=a_e0,
+        // [1][1]=a_e1, [2][0]=b_e0, [2][1]=b_e1, [3][0]=b_e0,
+        // [3][1]=b_e1.
+        let sbx = 2u32;
+        let sbg_sig = vec![sbx, sbx + 2, sbx + 4];
+        let sbg_noise = vec![sbx, sbx + 4];
+        let atsg_sig = vec![0u32, 1, 2];
+        let atsg_noise = vec![0u32, 1, 2];
+        let scf_sig_sbg = vec![vec![10.0_f32, 20.0], vec![30.0, 40.0]];
+        let scf_noise_sbg = vec![vec![1.0_f32, 2.0]];
+        let out = map_scf_to_qmf_subbands(
+            &scf_sig_sbg,
+            &scf_noise_sbg,
+            &sbg_sig,
+            &sbg_noise,
+            &atsg_sig,
+            &atsg_noise,
+            4,
+            sbx,
+        );
+        assert_eq!(out.scf_sig_sb[0][0], 10.0);
+        assert_eq!(out.scf_sig_sb[0][1], 20.0);
+        assert_eq!(out.scf_sig_sb[1][0], 10.0);
+        assert_eq!(out.scf_sig_sb[2][0], 30.0);
+        assert_eq!(out.scf_sig_sb[3][0], 30.0);
+        assert_eq!(out.scf_noise_sb[0][0], 1.0);
+        assert_eq!(out.scf_noise_sb[0][1], 2.0);
+        assert_eq!(out.scf_noise_sb[3][1], 2.0);
     }
 }

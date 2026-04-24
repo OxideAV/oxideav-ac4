@@ -80,17 +80,26 @@ impl Ac4Decoder {
     /// low-band PCM (produced by the core ASF/MDCT path) using the
     /// derived A-SPX frequency tables: forward QMF, HF tile-copy via
     /// the patch subband groups (§5.7.6.3.1.4 + §5.7.6.4.1.4
-    /// simplified), flat envelope gain (§5.7.6.4.2 scaffold), then
-    /// inverse QMF synthesis. Returns the bandwidth-extended PCM (f32)
-    /// aligned to the input PCM after accounting for the combined QMF
-    /// group delay.
+    /// simplified), per-envelope HF envelope adjustment gains
+    /// (§5.7.6.4.2 Pseudocodes 90 / 91 / 95) when the substream
+    /// carried envelope deltas, and otherwise a flat 0.5 gain scaffold,
+    /// then inverse QMF synthesis. Returns the bandwidth-extended PCM
+    /// (f32) aligned to the input PCM after accounting for the
+    /// combined QMF group delay.
     ///
     /// If any preconditions fail (length not a multiple of 64, tables
     /// missing, sbx >= 64) the original PCM is returned unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn aspx_extend_pcm(
         pcm_in: &[f32],
         tables: &aspx::AspxFrequencyTables,
         cfg: &aspx::AspxConfig,
+        framing: Option<&aspx::AspxFraming>,
+        sig_deltas: Option<&[aspx::AspxHuffEnv]>,
+        noise_deltas: Option<&[aspx::AspxHuffEnv]>,
+        qmode_env: Option<aspx::AspxQuantStep>,
+        delta_dir: Option<&aspx::AspxDeltaDir>,
+        num_ts_in_ats: u32,
     ) -> Vec<f32> {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         // Need PCM length as a multiple of 64 for whole QMF slots.
@@ -144,9 +153,44 @@ impl Ac4Decoder {
         for sb in sbx..sbz {
             q[sb] = q_high[sb].clone();
         }
-        // Flat envelope gain (scaffold for the full §5.7.6.4.2 tool).
-        // Using 0.5 so the regenerated HF doesn't overwhelm the LF.
-        aspx::apply_flat_envelope_gain(&mut q, tables.sbx, tables.sbz, 0.5);
+        // Per-envelope HF envelope adjustment (§5.7.6.4.2 Pseudocodes
+        // 90 / 91 / 95) when the bitstream surface carried envelope
+        // deltas. Otherwise fall back to the flat-gain scaffold so
+        // output PCM still has audible HF content.
+        let mut used_envelope = false;
+        if let (Some(frm), Some(sig), Some(noise), Some(qm), Some(dd)) =
+            (framing, sig_deltas, noise_deltas, qmode_env, delta_dir)
+        {
+            let num_aspx_ts = (n_slots as u32) / num_ts_in_ats.max(1);
+            if matches!(frm.int_class, aspx::AspxIntClass::FixFix) {
+                if let Some((atsg_sig, atsg_noise)) =
+                    aspx::derive_fixfix_atsg(num_aspx_ts, frm.num_env, frm.num_noise)
+                {
+                    if sig.len() as u32 == frm.num_env {
+                        let adjuster = aspx::AspxEnvelopeAdjuster::from_deltas(
+                            &q,
+                            tables,
+                            sig,
+                            noise,
+                            qm,
+                            &dd.sig_delta_dir,
+                            &atsg_sig,
+                            &atsg_noise,
+                            num_ts_in_ats,
+                            cfg.interpolation,
+                        );
+                        adjuster.apply(&mut q);
+                        used_envelope = true;
+                    }
+                }
+            }
+        }
+        if !used_envelope {
+            // Flat envelope gain fallback (scaffold kept for the
+            // non-FIXFIX / missing-envelope paths). Using 0.5 so the
+            // regenerated HF doesn't overwhelm the LF.
+            aspx::apply_flat_envelope_gain(&mut q, tables.sbx, tables.sbz, 0.5);
+        }
         // Inverse QMF synthesis.
         let mut syn = qmf::QmfSynthesisBank::new();
         let mut out = Vec::with_capacity(pcm_in.len());
@@ -321,30 +365,62 @@ impl Decoder for Ac4Decoder {
         // Detach the inputs + the ASPX tables once so we can run IMDCT
         // (which mutates overlap state) and the ASPX extension without
         // a borrow conflict on self.
-        let (primary_in, secondary_in, aspx_tables, aspx_cfg) =
-            if let Some(sub) = self.last_substream.as_ref() {
-                let pri = sub
-                    .tools
-                    .scaled_spec_primary
-                    .as_ref()
-                    .zip(sub.tools.transform_info_primary.as_ref())
-                    .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
-                let sec = sub
-                    .tools
-                    .scaled_spec_secondary
-                    .as_ref()
-                    .zip(sub.tools.transform_info_secondary.as_ref())
-                    .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
-                let tables = sub.tools.aspx_frequency_tables.clone();
-                let cfg = sub.tools.aspx_config;
-                (pri, sec, tables, cfg)
-            } else {
-                (None, None, None, None)
-            };
+        let (
+            primary_in,
+            secondary_in,
+            aspx_tables,
+            aspx_cfg,
+            framing_pri,
+            framing_sec,
+            sig_pri,
+            sig_sec,
+            noise_pri,
+            noise_sec,
+            qmode_pri,
+            qmode_sec,
+            delta_dir_pri,
+            delta_dir_sec,
+        ) = if let Some(sub) = self.last_substream.as_ref() {
+            let pri = sub
+                .tools
+                .scaled_spec_primary
+                .as_ref()
+                .zip(sub.tools.transform_info_primary.as_ref())
+                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+            let sec = sub
+                .tools
+                .scaled_spec_secondary
+                .as_ref()
+                .zip(sub.tools.transform_info_secondary.as_ref())
+                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+            let tables = sub.tools.aspx_frequency_tables.clone();
+            let cfg = sub.tools.aspx_config;
+            (
+                pri,
+                sec,
+                tables,
+                cfg,
+                sub.tools.aspx_framing_primary.clone(),
+                sub.tools.aspx_framing_secondary.clone(),
+                sub.tools.aspx_data_sig_primary.clone(),
+                sub.tools.aspx_data_sig_secondary.clone(),
+                sub.tools.aspx_data_noise_primary.clone(),
+                sub.tools.aspx_data_noise_secondary.clone(),
+                sub.tools.aspx_qmode_env_primary,
+                sub.tools.aspx_qmode_env_secondary,
+                sub.tools.aspx_delta_dir_primary.clone(),
+                sub.tools.aspx_delta_dir_secondary.clone(),
+            )
+        } else {
+            (
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            )
+        };
         // If the ASPX I-frame pipeline populated derived frequency
         // tables + config, run the A-SPX bandwidth-extension on top of
         // the IMDCT low-band PCM.
         let use_aspx_ext = aspx_tables.is_some() && aspx_cfg.is_some();
+        let num_ts_in_ats = aspx::num_ts_in_ats(info.frame_length.max(1));
         if let Some((scaled, n)) = primary_in {
             if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
                 if use_aspx_ext {
@@ -353,6 +429,12 @@ impl Decoder for Ac4Decoder {
                         &pcm_f,
                         aspx_tables.as_ref().unwrap(),
                         aspx_cfg.as_ref().unwrap(),
+                        framing_pri.as_ref(),
+                        sig_pri.as_deref(),
+                        noise_pri.as_deref(),
+                        qmode_pri,
+                        delta_dir_pri.as_ref(),
+                        num_ts_in_ats,
                     );
                     pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
                 } else {
@@ -369,6 +451,12 @@ impl Decoder for Ac4Decoder {
                             &pcm_f,
                             aspx_tables.as_ref().unwrap(),
                             aspx_cfg.as_ref().unwrap(),
+                            framing_sec.as_ref().or(framing_pri.as_ref()),
+                            sig_sec.as_deref(),
+                            noise_sec.as_deref(),
+                            qmode_sec.or(qmode_pri),
+                            delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
+                            num_ts_in_ats,
                         );
                         pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
                     } else {
@@ -970,7 +1058,7 @@ mod tests {
             freq_res_mode: aspx::AspxFreqResMode::Signalled,
         };
         let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
-        let out = Ac4Decoder::aspx_extend_pcm(&pcm, &tables, &cfg);
+        let out = Ac4Decoder::aspx_extend_pcm(&pcm, &tables, &cfg, None, None, None, None, None, 1);
         assert_eq!(out.len(), pcm.len());
         // Steady-state energy must be non-zero in the far tail (post
         // QMF settling).
