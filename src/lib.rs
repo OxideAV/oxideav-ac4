@@ -220,6 +220,8 @@ pub mod asf;
 pub mod asf_data;
 pub mod aspx;
 pub mod aspx_huffman;
+pub mod aspx_noise;
+pub mod aspx_tone;
 pub mod decoder;
 pub mod huffman;
 pub mod mdct;
