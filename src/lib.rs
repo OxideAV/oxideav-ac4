@@ -144,24 +144,45 @@
 //!   lands on [`asf::SubstreamTools`] alongside the existing framing /
 //!   delta-dir / qmode fields.
 //!
-//! * **QMF analysis scaffold** — [`qmf::QWIN`] carries the 640-coefficient
-//!   QMF prototype window from Annex D.3, and
-//!   [`qmf::qmf_analysis_slot`] implements one iteration of the §5.7.3.2
-//!   Pseudocode 65 forward transform (windowing + 5-fold time-fold to
-//!   vector u + 64-point modulation to complex subband samples).
-//!   The multi-slot filter-state machine and QMF synthesis
-//!   (Pseudocode 66) are not yet wired in.
+//! * **QMF analysis + synthesis filter bank** — [`qmf::QWIN`] carries
+//!   the 640-coefficient QMF prototype window from Annex D.3.
+//!   [`qmf::qmf_analysis_slot`] + [`qmf::QmfAnalysisBank`] implement
+//!   the §5.7.3.2 Pseudocode 65 forward transform (windowing +
+//!   5-fold time-fold to vector u + 64-point complex modulation);
+//!   [`qmf::qmf_synthesis_slot`] + [`qmf::QmfSynthesisBank`] implement
+//!   the matching §5.7.4.2 Pseudocode 66 inverse transform (shifted
+//!   1 280-sample `qsyn_filt` delay line + 128-point modulation +
+//!   folded-tap 64-way tap sum). The analysis/synthesis pair achieves
+//!   ~80 dB PSNR end-to-end roundtrip on sine and noise test signals
+//!   (unit tests in [`qmf`]).
+//! * **A-SPX HF regeneration scaffold** — [`aspx::derive_patch_tables`]
+//!   implements §5.7.6.3.1.4 Pseudocode 71 (patch subband-group table
+//!   derivation). [`aspx::hf_tile_copy`] implements a simplified
+//!   §5.7.6.4.1.4 Pseudocode 89 high-band tile copy via the patch
+//!   table (no chirp/alpha0/alpha1 tonal adjust yet — that's the TNS
+//!   body of §5.7.6.4.1.2). [`aspx::apply_flat_envelope_gain`] is a
+//!   one-gain scaffold for the §5.7.6.4.2 HF envelope adjustment
+//!   tool. Together with the QMF bank these form an end-to-end
+//!   bandwidth-extension pipeline: PCM → QMF analysis → low-band
+//!   truncate → HF tile-copy → QMF synthesis → non-silent PCM.
+//! * **ASPX decoder wiring** — [`decoder::Ac4Decoder`] now routes
+//!   ASPX substreams through the extension pipeline: when an I-frame
+//!   ASPX substream produces derived `aspx_frequency_tables`, the
+//!   decoder takes the IMDCT low-band PCM, runs QMF analysis →
+//!   tile-copy HF regen → QMF synthesis, and emits bandwidth-extended
+//!   PCM instead of silence.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * QMF synthesis filter-bank (§5.7.4 Pseudocode 66), full
-//!   multi-slot analysis state machine, HF regeneration, envelope
-//!   application and the remaining §5.7.6.4 tools — `aspx_ec_data()`
-//!   is end-to-end parsed and its outputs (signal / noise deltas) now
-//!   sit on [`asf::SubstreamTools`] but don't feed an actual
-//!   bandwidth-extension pipeline yet.
+//! * Full §5.7.6.4 A-SPX HF regeneration — complex-covariance
+//!   tonal-to-noise prediction (Pseudocodes 86 / 87 / 88), the full
+//!   envelope estimation / gain-compensation loop (Pseudocodes 90 /
+//!   91), the noise generator (§5.7.6.4.3), the tone generator
+//!   (§5.7.6.4.4) and the HF-signal assembling (§5.7.6.4.5).
+//!   Today's pipeline delivers audio through tile-copy + flat gain
+//!   only.
 //! * A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
@@ -181,6 +202,19 @@
 //! silence with a correctly-shaped AudioFrame.
 
 #![allow(dead_code)]
+#![allow(
+    clippy::needless_range_loop,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::manual_memcpy,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::unusual_byte_groupings,
+    clippy::unreadable_literal,
+    clippy::nonminimal_bool,
+    clippy::manual_range_patterns,
+    clippy::field_reassign_with_default
+)]
 
 pub mod asf;
 pub mod asf_data;

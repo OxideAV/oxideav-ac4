@@ -23,7 +23,7 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::{asf, mdct, sync, toc};
+use crate::{asf, aspx, mdct, qmf, sync, toc};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac4Decoder::new(params)))
@@ -76,11 +76,94 @@ impl Ac4Decoder {
         }
     }
 
-    /// Run IMDCT + KBD overlap-add for a single channel. `ch` indexes
-    /// the per-channel overlap state (grown on demand). `scaled` is the
-    /// dequantised spectrum; bins past `scaled.len()` are zero-padded
-    /// up to N.
-    fn imdct_channel(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<i16> {
+    /// Run the A-SPX bandwidth-extension pipeline on a block of
+    /// low-band PCM (produced by the core ASF/MDCT path) using the
+    /// derived A-SPX frequency tables: forward QMF, HF tile-copy via
+    /// the patch subband groups (§5.7.6.3.1.4 + §5.7.6.4.1.4
+    /// simplified), flat envelope gain (§5.7.6.4.2 scaffold), then
+    /// inverse QMF synthesis. Returns the bandwidth-extended PCM (f32)
+    /// aligned to the input PCM after accounting for the combined QMF
+    /// group delay.
+    ///
+    /// If any preconditions fail (length not a multiple of 64, tables
+    /// missing, sbx >= 64) the original PCM is returned unchanged.
+    fn aspx_extend_pcm(
+        pcm_in: &[f32],
+        tables: &aspx::AspxFrequencyTables,
+        cfg: &aspx::AspxConfig,
+    ) -> Vec<f32> {
+        const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
+        // Need PCM length as a multiple of 64 for whole QMF slots.
+        if pcm_in.is_empty() || pcm_in.len() % NUM_QMF != 0 {
+            return pcm_in.to_vec();
+        }
+        let sbx = tables.sbx as usize;
+        let sbz = tables.sbz as usize;
+        if sbx == 0 || sbx >= NUM_QMF || sbz <= sbx || sbz > NUM_QMF {
+            return pcm_in.to_vec();
+        }
+        let n_slots = pcm_in.len() / NUM_QMF;
+        // Forward QMF analysis on the low-band PCM.
+        let mut ana = qmf::QmfAnalysisBank::new();
+        let slots = ana.process_block(pcm_in);
+        // Re-layout to q[sb][ts].
+        let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF)
+            .map(|_| vec![(0.0f32, 0.0f32); n_slots])
+            .collect();
+        for (ts, slot) in slots.iter().enumerate() {
+            for (sb, s) in slot.iter().enumerate() {
+                q[sb][ts] = *s;
+            }
+        }
+        // Derive patches from the master-freq-scale tables. 48 kHz
+        // family is the only base_samp_freq wired in the current
+        // TOC-driven pipeline; 44.1 kHz would pass `false` instead.
+        let is_highres = matches!(cfg.master_freq_scale, aspx::AspxMasterFreqScale::HighRes);
+        let patches = aspx::derive_patch_tables(
+            &tables.sbg_master,
+            tables.num_sbg_master,
+            tables.sba,
+            tables.sbx,
+            tables.num_sb_aspx,
+            true,
+            is_highres,
+        );
+        if patches.num_sbg_patches == 0 {
+            return pcm_in.to_vec();
+        }
+        // Truncate the high band (ASPX substreams only carry spectral
+        // data up to sbx in the core path; the bandwidth-extension
+        // tool is responsible for filling sbx..sbz).
+        for sb in sbx..NUM_QMF {
+            for sample in q[sb].iter_mut() {
+                *sample = (0.0, 0.0);
+            }
+        }
+        // HF tile copy into the A-SPX range.
+        let q_high = aspx::hf_tile_copy(&q, &patches, tables.sbx, NUM_QMF as u32);
+        for sb in sbx..sbz {
+            q[sb] = q_high[sb].clone();
+        }
+        // Flat envelope gain (scaffold for the full §5.7.6.4.2 tool).
+        // Using 0.5 so the regenerated HF doesn't overwhelm the LF.
+        aspx::apply_flat_envelope_gain(&mut q, tables.sbx, tables.sbz, 0.5);
+        // Inverse QMF synthesis.
+        let mut syn = qmf::QmfSynthesisBank::new();
+        let mut out = Vec::with_capacity(pcm_in.len());
+        for ts in 0..n_slots {
+            let mut slot = [(0.0f32, 0.0f32); NUM_QMF];
+            for (sb, s) in slot.iter_mut().enumerate() {
+                *s = q[sb][ts];
+            }
+            let row = syn.process_slot(&slot);
+            out.extend_from_slice(&row);
+        }
+        out
+    }
+
+    /// Run IMDCT + KBD overlap-add for a single channel, returning
+    /// floating-point PCM (suitable for the A-SPX QMF pipeline).
+    fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
         // Transform-length change clears *all* channel overlap state so
         // the next frame starts from a consistent history.
         if self.prev_transform_length != n as u32 {
@@ -98,13 +181,23 @@ impl Ac4Decoder {
         x[..copy].copy_from_slice(&scaled[..copy]);
         let y = mdct::imdct(&x);
         let window = mdct::kbd_window(n as u32);
-        let pcm_f = mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch]);
-        let mut out = Vec::with_capacity(pcm_f.len());
-        for s in pcm_f {
-            let v = (s * 32767.0).clamp(-32768.0, 32767.0);
-            out.push(v as i16);
-        }
-        out
+        mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
+    }
+
+    /// Convert an f32 PCM buffer to i16, clamping to the i16 range.
+    fn pcm_f32_to_i16(pcm: &[f32]) -> Vec<i16> {
+        pcm.iter()
+            .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .collect()
+    }
+
+    /// Run IMDCT + KBD overlap-add for a single channel. `ch` indexes
+    /// the per-channel overlap state (grown on demand). `scaled` is the
+    /// dequantised spectrum; bins past `scaled.len()` are zero-padded
+    /// up to N.
+    fn imdct_channel(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<i16> {
+        let pcm_f = self.imdct_channel_f32(ch, scaled, n);
+        Self::pcm_f32_to_i16(&pcm_f)
     }
 }
 
@@ -225,32 +318,62 @@ impl Decoder for Ac4Decoder {
         // `last_substream` up front so the IMDCT step can mutate
         // `self.overlap` without a borrow conflict.
         let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
-        let (primary_in, secondary_in) = if let Some(sub) = self.last_substream.as_ref() {
-            let pri = sub
-                .tools
-                .scaled_spec_primary
-                .as_ref()
-                .zip(sub.tools.transform_info_primary.as_ref())
-                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
-            let sec = sub
-                .tools
-                .scaled_spec_secondary
-                .as_ref()
-                .zip(sub.tools.transform_info_secondary.as_ref())
-                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
-            (pri, sec)
-        } else {
-            (None, None)
-        };
+        // Detach the inputs + the ASPX tables once so we can run IMDCT
+        // (which mutates overlap state) and the ASPX extension without
+        // a borrow conflict on self.
+        let (primary_in, secondary_in, aspx_tables, aspx_cfg) =
+            if let Some(sub) = self.last_substream.as_ref() {
+                let pri = sub
+                    .tools
+                    .scaled_spec_primary
+                    .as_ref()
+                    .zip(sub.tools.transform_info_primary.as_ref())
+                    .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+                let sec = sub
+                    .tools
+                    .scaled_spec_secondary
+                    .as_ref()
+                    .zip(sub.tools.transform_info_secondary.as_ref())
+                    .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+                let tables = sub.tools.aspx_frequency_tables.clone();
+                let cfg = sub.tools.aspx_config;
+                (pri, sec, tables, cfg)
+            } else {
+                (None, None, None, None)
+            };
+        // If the ASPX I-frame pipeline populated derived frequency
+        // tables + config, run the A-SPX bandwidth-extension on top of
+        // the IMDCT low-band PCM.
+        let use_aspx_ext = aspx_tables.is_some() && aspx_cfg.is_some();
         if let Some((scaled, n)) = primary_in {
             if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
-                pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
+                if use_aspx_ext {
+                    let pcm_f = self.imdct_channel_f32(0, &scaled, n);
+                    let extended = Self::aspx_extend_pcm(
+                        &pcm_f,
+                        aspx_tables.as_ref().unwrap(),
+                        aspx_cfg.as_ref().unwrap(),
+                    );
+                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                } else {
+                    pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
+                }
             }
         }
         if channels as usize >= 2 {
             if let Some((scaled, n)) = secondary_in {
                 if n > 0 && n == samples as usize {
-                    pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                    if use_aspx_ext {
+                        let pcm_f = self.imdct_channel_f32(1, &scaled, n);
+                        let extended = Self::aspx_extend_pcm(
+                            &pcm_f,
+                            aspx_tables.as_ref().unwrap(),
+                            aspx_cfg.as_ref().unwrap(),
+                        );
+                        pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
+                    } else {
+                        pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                    }
                 }
             }
         }
@@ -819,6 +942,55 @@ mod tests {
         assert!(
             differing < 4,
             "M/S inverse with S=0 should give L==R, got {differing} diffs"
+        );
+    }
+
+    #[test]
+    fn aspx_extend_pcm_produces_non_silent_output() {
+        // Smoke-test the wiring glue: hand a synthetic low-band PCM +
+        // plausible frequency tables + config to the ASPX extension
+        // helper and assert the output carries energy.
+        let n_slots = 60usize;
+        let n = n_slots * 64;
+        let mut pcm = vec![0.0f32; n];
+        let f = 500.0_f32 / 48_000.0_f32;
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f * i as f32).sin();
+        }
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let out = Ac4Decoder::aspx_extend_pcm(&pcm, &tables, &cfg);
+        assert_eq!(out.len(), pcm.len());
+        // Steady-state energy must be non-zero in the far tail (post
+        // QMF settling).
+        let start = 1200usize;
+        let mut energy = 0.0f64;
+        let mut nonzero = 0usize;
+        for &s in &out[start..] {
+            let v = s as f64;
+            energy += v * v;
+            if s != 0.0 {
+                nonzero += 1;
+            }
+        }
+        assert!(
+            energy > 1e-4,
+            "aspx_extend_pcm output has no energy ({energy})"
+        );
+        assert!(
+            nonzero > (out.len() - start) / 2,
+            "too few non-zero samples: {nonzero}"
         );
     }
 

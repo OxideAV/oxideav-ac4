@@ -1620,6 +1620,205 @@ pub fn derive_aspx_frequency_tables(
     })
 }
 
+// ---------------------------------------------------------------------
+// §5.7.6.3.1.4 Patch subband group table (Pseudocode 71)
+// ---------------------------------------------------------------------
+
+/// Result of patch subband-group derivation (§5.7.6.3.1.4,
+/// Pseudocode 71): the `sbg_patches` border table plus the per-patch
+/// metadata arrays used by HF signal creation (§5.7.6.4.1.4,
+/// Pseudocode 89).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AspxPatchTables {
+    /// `sbg_patches[]` — QMF subband border table for the patches.
+    /// Length = `num_sbg_patches + 1`. Starts at `sbx`.
+    pub sbg_patches: Vec<u32>,
+    /// Number of patches (≤ 5 per the spec).
+    pub num_sbg_patches: u32,
+    /// `sbg_patch_num_sb[i]` — number of QMF subbands in patch `i`.
+    pub sbg_patch_num_sb: Vec<u32>,
+    /// `sbg_patch_start_sb[i]` — QMF subband in the low band that is
+    /// the source start for patch `i`'s tile copy.
+    pub sbg_patch_start_sb: Vec<u32>,
+}
+
+/// Derive the patch subband-group tables from the master table plus
+/// the A-SPX crossover/upper borders. Implements ETSI TS 103 190-1
+/// §5.7.6.3.1.4 Pseudocode 71.
+///
+/// `base_samp_freq_is_48` is `true` for the 48 kHz family, `false`
+/// for the 44.1 kHz family. `master_freq_scale_highres` is `true`
+/// when `aspx_master_freq_scale` selected the high-resolution
+/// template.
+pub fn derive_patch_tables(
+    sbg_master: &[u32],
+    num_sbg_master: u32,
+    sba: u32,
+    sbx: u32,
+    num_sb_aspx: u32,
+    base_samp_freq_is_48: bool,
+    master_freq_scale_highres: bool,
+) -> AspxPatchTables {
+    let goal_sb: u32 = if base_samp_freq_is_48 { 43 } else { 46 };
+    let source_band_low: u32 = if master_freq_scale_highres { 4 } else { 2 };
+    let mut sbg = if goal_sb < sbx + num_sb_aspx {
+        // Find the smallest i such that sbg_master[i] >= goal_sb.
+        let mut s = 0u32;
+        for i in 0..sbg_master.len() {
+            if sbg_master[i] < goal_sb {
+                s = (i + 1) as u32;
+            } else {
+                break;
+            }
+        }
+        s
+    } else {
+        num_sbg_master
+    };
+    let mut msb = sba;
+    let mut usb = sbx;
+    let mut sbg_patch_num_sb: Vec<u32> = Vec::new();
+    let mut sbg_patch_start_sb: Vec<u32> = Vec::new();
+    // Target stopping condition: sb == (sbx + num_sb_aspx).
+    let target = sbx + num_sb_aspx;
+    // Safety guard: bound the outer do-while loop to avoid runaway.
+    for _ in 0..32 {
+        // Inner while loop searches j downward.
+        let mut j = sbg as usize;
+        if j >= sbg_master.len() {
+            break;
+        }
+        let mut sb = sbg_master[j];
+        // `odd = (sb - 2 + sba) % 2` — spec uses signed subtraction but
+        // sb >= 2 in practice.
+        // Inner while loop: sb > (sba - source_band_low + msb - odd)
+        // where odd is recomputed each iteration.
+        loop {
+            let odd = ((sb as i64 - 2 + sba as i64).rem_euclid(2)) as i64;
+            let rhs = sba as i64 - source_band_low as i64 + msb as i64 - odd;
+            if !((sb as i64) > rhs) {
+                break;
+            }
+            if j == 0 {
+                break;
+            }
+            j -= 1;
+            sb = sbg_master[j];
+        }
+        let num_sb = sb.saturating_sub(usb);
+        let odd_final = ((sb as i64 - 2 + sba as i64).rem_euclid(2)) as u32;
+        let patch_start = sba.saturating_sub(odd_final).saturating_sub(num_sb);
+        if num_sb > 0 {
+            sbg_patch_num_sb.push(num_sb);
+            sbg_patch_start_sb.push(patch_start);
+            usb = sb;
+            msb = sb;
+        } else {
+            msb = sbx;
+        }
+        if (sbg as usize) < sbg_master.len() && sbg_master[sbg as usize].saturating_sub(sb) < 3 {
+            sbg = num_sbg_master;
+        }
+        if sb == target {
+            break;
+        }
+    }
+    let mut num_sbg_patches = sbg_patch_num_sb.len() as u32;
+    // Tail trim: if last patch has <3 subbands and there are multiple
+    // patches, drop it.
+    if num_sbg_patches > 1 && *sbg_patch_num_sb.last().unwrap_or(&0) < 3 {
+        sbg_patch_num_sb.pop();
+        sbg_patch_start_sb.pop();
+        num_sbg_patches -= 1;
+    }
+    // Build sbg_patches[] borders starting at sbx.
+    let mut sbg_patches = Vec::with_capacity((num_sbg_patches + 1) as usize);
+    sbg_patches.push(sbx);
+    for i in 0..num_sbg_patches {
+        let next = sbg_patches[i as usize] + sbg_patch_num_sb[i as usize];
+        sbg_patches.push(next);
+    }
+    AspxPatchTables {
+        sbg_patches,
+        num_sbg_patches,
+        sbg_patch_num_sb,
+        sbg_patch_start_sb,
+    }
+}
+
+// ---------------------------------------------------------------------
+// §5.7.6.4.1.4 HF signal creation — simplified tile-copy path
+// ---------------------------------------------------------------------
+
+/// Simplified HF signal creation: copy low-band QMF samples into the
+/// A-SPX range via the patch table.
+///
+/// This skips the full Pseudocode 89 chirp / alpha0 / alpha1 tonal
+/// adjustment (which is gated by `aspx_preflat` and complex-valued
+/// linear prediction over a covariance matrix from §5.7.6.4.1.2) and
+/// instead lays down a clean tile copy — enough to produce
+/// high-frequency content in the output PCM when the rest of the A-SPX
+/// pipeline isn't yet producing valid alpha0/alpha1 coefficients.
+///
+/// `q_low[sb]` is a time-series of complex QMF samples for subband
+/// `sb` (0..64). For `sb < sbx`, `q_low[sb]` has the analysis output
+/// of the low band. For `sb >= sbx`, `q_low[sb]` is zero on entry.
+/// On return, `q_high[sb][ts] = q_low[patch_src][ts]` where
+/// `patch_src = sbg_patch_start_sb[i] + (sb_high - sbx - sum_prev)`.
+pub fn hf_tile_copy(
+    q_low: &[Vec<(f32, f32)>],
+    patches: &AspxPatchTables,
+    sbx: u32,
+    num_qmf_subbands: u32,
+) -> Vec<Vec<(f32, f32)>> {
+    // Determine number of timeslots from any populated column of q_low.
+    let n_ts = q_low.iter().map(|row| row.len()).max().unwrap_or(0);
+    let mut q_high: Vec<Vec<(f32, f32)>> = (0..num_qmf_subbands)
+        .map(|_| vec![(0.0f32, 0.0f32); n_ts])
+        .collect();
+    let mut sum_sb_patches: u32 = 0;
+    for i in 0..patches.num_sbg_patches as usize {
+        let n = patches.sbg_patch_num_sb[i];
+        let start = patches.sbg_patch_start_sb[i];
+        for sb_off in 0..n {
+            let sb_high = sbx + sum_sb_patches + sb_off;
+            let sb_src = start + sb_off;
+            if sb_high >= num_qmf_subbands || (sb_src as usize) >= q_low.len() {
+                continue;
+            }
+            // Copy the time series.
+            let src = &q_low[sb_src as usize];
+            let dst = &mut q_high[sb_high as usize];
+            for ts in 0..n_ts.min(src.len()) {
+                dst[ts] = src[ts];
+            }
+        }
+        sum_sb_patches += n;
+    }
+    q_high
+}
+
+/// Apply a flat envelope gain to the A-SPX range of a QMF time-frequency
+/// matrix in place. `q[sb][ts]` is scaled by `gain` for
+/// `sbx <= sb < sbz`.
+///
+/// This is a simplified stand-in for the full §5.7.6.4.2 HF envelope
+/// adjustment tool (per-envelope / per-subband-group gains from
+/// Pseudocode 91). Used today as a scaffold so the HF range of the
+/// QMF matrix carries non-zero, reasonable-amplitude data to drive
+/// the QMF synthesis filter-bank.
+pub fn apply_flat_envelope_gain(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32, gain: f32) {
+    for sb in sbx..sbz {
+        if (sb as usize) >= q.len() {
+            break;
+        }
+        for sample in q[sb as usize].iter_mut() {
+            sample.0 *= gain;
+            sample.1 *= gain;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2987,5 +3186,241 @@ mod tests {
             assert_eq!(*v, 0);
         }
         assert_eq!(br.bit_position(), total_bits);
+    }
+
+    #[test]
+    fn patch_derivation_midrange_highres() {
+        // Use a plausible high-res configuration: master_freq_scale
+        // highres, sba = 18 (first template entry), sbx mid-range,
+        // num_sb_aspx spanning to a reasonable upper band.
+        let sbg_master: Vec<u32> = ASPX_SBG_TEMPLATE_HIGHRES.to_vec();
+        let num_sbg_master = (sbg_master.len() - 1) as u32;
+        let sba = sbg_master[0];
+        let sbx = 24;
+        // sbz is the last master entry (template tail).
+        let sbz = *sbg_master.last().unwrap();
+        let num_sb_aspx = sbz - sbx;
+        let patches = derive_patch_tables(
+            &sbg_master,
+            num_sbg_master,
+            sba,
+            sbx,
+            num_sb_aspx,
+            true, // 48 kHz
+            true, // high-res
+        );
+        assert!(patches.num_sbg_patches <= 5);
+        // sbg_patches must start at sbx and end at sbz.
+        assert_eq!(patches.sbg_patches[0], sbx);
+        // Not every config reaches sbz exactly (algorithm may trim the
+        // tail); but the last border is <= sbz.
+        assert!(*patches.sbg_patches.last().unwrap() <= sbz);
+    }
+
+    #[test]
+    fn hf_tile_copy_copies_patch_source() {
+        // Minimal patch config with 1 patch: copy subbands 4..8 from
+        // source start 2 into high bands 8..12.
+        let patches = AspxPatchTables {
+            sbg_patches: vec![8, 12],
+            num_sbg_patches: 1,
+            sbg_patch_num_sb: vec![4],
+            sbg_patch_start_sb: vec![2],
+        };
+        let n_ts = 4usize;
+        let mut q_low: Vec<Vec<(f32, f32)>> = (0..64).map(|_| vec![(0.0, 0.0); n_ts]).collect();
+        // Populate sources 2..6 with distinctive values.
+        for src_sb in 2..6 {
+            for ts in 0..n_ts {
+                q_low[src_sb][ts] = (src_sb as f32, ts as f32);
+            }
+        }
+        let q_high = hf_tile_copy(&q_low, &patches, 8, 64);
+        // Expect q_high[8..12] to mirror q_low[2..6].
+        for (high_off, &src_sb) in (2..6).collect::<Vec<_>>().iter().enumerate() {
+            let hsb = 8 + high_off;
+            for ts in 0..n_ts {
+                assert_eq!(
+                    q_high[hsb][ts], q_low[src_sb as usize][ts],
+                    "mismatch at high_sb={hsb} ts={ts}"
+                );
+            }
+        }
+        // Below sbx and above patch end should be zeros.
+        for sb in 0..8 {
+            for ts in 0..n_ts {
+                assert_eq!(
+                    q_high[sb][ts],
+                    (0.0, 0.0),
+                    "low-band sb={sb} should be zero"
+                );
+            }
+        }
+        for sb in 12..64 {
+            for ts in 0..n_ts {
+                assert_eq!(
+                    q_high[sb][ts],
+                    (0.0, 0.0),
+                    "high-band sb={sb} should be zero"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hf_regen_produces_non_silent_high_band() {
+        // End-to-end sanity: feed PCM through forward QMF, truncate at
+        // sbx, run HF tile copy into the high band, and check that the
+        // high-band QMF matrix is non-zero. This is the key "ASPX
+        // substream should produce actual audio" building block.
+        use crate::qmf::{QmfAnalysisBank, NUM_QMF_SUBBANDS};
+        let n_slots = 32usize;
+        let n = n_slots * 64;
+        let mut pcm = vec![0.0f32; n];
+        // Narrow-band signal in the LF range (1 kHz sine at 48 kHz).
+        let f = 1000.0_f32 / 48_000.0_f32;
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f * i as f32).sin();
+        }
+        let mut ana = QmfAnalysisBank::new();
+        let slots = ana.process_block(&pcm);
+        // Re-layout: q_low[sb][ts] instead of slot[sb].
+        let mut q_low: Vec<Vec<(f32, f32)>> = (0..NUM_QMF_SUBBANDS as u32)
+            .map(|_| vec![(0.0, 0.0); n_slots])
+            .collect();
+        for (ts, slot) in slots.iter().enumerate() {
+            for (sb, s) in slot.iter().enumerate() {
+                q_low[sb][ts] = *s;
+            }
+        }
+        // Fake patch config: sbx=16, num_sb_aspx=16, one patch of 16.
+        let patches = AspxPatchTables {
+            sbg_patches: vec![16, 32],
+            num_sbg_patches: 1,
+            sbg_patch_num_sb: vec![16],
+            sbg_patch_start_sb: vec![0],
+        };
+        // Truncate the high band first.
+        for sb in 16..NUM_QMF_SUBBANDS {
+            for s in q_low[sb].iter_mut() {
+                *s = (0.0, 0.0);
+            }
+        }
+        let q_high = hf_tile_copy(&q_low, &patches, 16, NUM_QMF_SUBBANDS as u32);
+        // Check that q_high[16..32] is non-zero.
+        let mut energy = 0.0f64;
+        for sb in 16..32 {
+            for &(re, im) in q_high[sb].iter() {
+                energy += (re as f64) * (re as f64) + (im as f64) * (im as f64);
+            }
+        }
+        assert!(energy > 0.0, "HF regen high band has no energy");
+    }
+
+    #[test]
+    fn aspx_end_to_end_pipeline_produces_non_silent_pcm() {
+        // Full forward + HF regen + inverse pipeline: start from a
+        // LOW-band-only signal (1 kHz sine, well below any A-SPX
+        // sbx), run it through the analysis bank, truncate the high
+        // band, apply tile-copy HF regen via a synthetic patch, then
+        // synthesise back to PCM. The output PCM must be non-silent —
+        // this is the end-to-end check that the whole bandwidth
+        // extension pipeline delivers audio rather than zeros.
+        use crate::qmf::{QmfAnalysisBank, QmfSynthesisBank, NUM_QMF_SUBBANDS};
+        let n_slots = 60usize;
+        let n = n_slots * 64;
+        let mut pcm = vec![0.0f32; n];
+        let f = 1000.0_f32 / 48_000.0_f32;
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f * i as f32).sin();
+        }
+        let mut ana = QmfAnalysisBank::new();
+        let slots = ana.process_block(&pcm);
+        // Re-layout: q[sb][ts].
+        let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF_SUBBANDS as u32)
+            .map(|_| vec![(0.0, 0.0); n_slots])
+            .collect();
+        for (ts, slot) in slots.iter().enumerate() {
+            for (sb, s) in slot.iter().enumerate() {
+                q[sb][ts] = *s;
+            }
+        }
+        let sbx = 16u32;
+        let num_sb_aspx = 16u32;
+        let sbz = sbx + num_sb_aspx;
+        // Truncate the high band (simulates the core decoder not
+        // carrying high-band spectral data past sbx).
+        for sb in sbx..NUM_QMF_SUBBANDS as u32 {
+            for s in q[sb as usize].iter_mut() {
+                *s = (0.0, 0.0);
+            }
+        }
+        // HF regen via tile copy: source band 0..16 → high band 16..32.
+        let patches = AspxPatchTables {
+            sbg_patches: vec![sbx, sbz],
+            num_sbg_patches: 1,
+            sbg_patch_num_sb: vec![num_sb_aspx],
+            sbg_patch_start_sb: vec![0],
+        };
+        let q_high = hf_tile_copy(&q, &patches, sbx, NUM_QMF_SUBBANDS as u32);
+        // Merge into q: write the high band back on top of the truncated q.
+        for sb in sbx..sbz {
+            q[sb as usize] = q_high[sb as usize].clone();
+        }
+        // Flat envelope gain on the HF range (scaffold for §5.7.6.4.2).
+        apply_flat_envelope_gain(&mut q, sbx, sbz, 0.5);
+        // Inverse synthesis.
+        let mut syn = QmfSynthesisBank::new();
+        let mut out = Vec::with_capacity(n);
+        for ts in 0..n_slots {
+            let mut slot = [(0.0f32, 0.0f32); 64];
+            for sb in 0..64 {
+                slot[sb] = q[sb][ts];
+            }
+            let pcm_row = syn.process_slot(&slot);
+            out.extend_from_slice(&pcm_row);
+        }
+        // Output must be non-silent. Steady-state region only.
+        let start = 1100usize;
+        let end = n - 10;
+        let mut energy = 0.0f64;
+        let mut nonzero = 0usize;
+        for i in start..end {
+            let s = out[i] as f64;
+            energy += s * s;
+            if s != 0.0 {
+                nonzero += 1;
+            }
+        }
+        assert!(
+            energy > 1e-3,
+            "ASPX pipeline produced silent PCM (energy={energy})"
+        );
+        assert!(
+            nonzero > (end - start) / 2,
+            "too many zero samples: {nonzero}/{}",
+            end - start
+        );
+    }
+
+    #[test]
+    fn flat_envelope_gain_scales_range() {
+        let mut q: Vec<Vec<(f32, f32)>> = (0..16).map(|_| vec![(1.0, 2.0); 4]).collect();
+        apply_flat_envelope_gain(&mut q, 4, 12, 3.0);
+        for sb in 0..4 {
+            for ts in 0..4 {
+                assert_eq!(q[sb][ts], (1.0, 2.0));
+            }
+        }
+        for sb in 4..12 {
+            for ts in 0..4 {
+                assert_eq!(q[sb][ts], (3.0, 6.0));
+            }
+        }
+        for sb in 12..16 {
+            for ts in 0..4 {
+                assert_eq!(q[sb][ts], (1.0, 2.0));
+            }
+        }
     }
 }
