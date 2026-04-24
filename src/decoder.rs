@@ -601,6 +601,126 @@ mod tests {
         assert!(energy > 0, "zero-energy output");
     }
 
+    /// Build a stereo SIMPLE ac4_substream() body with
+    /// `b_enable_mdct_stereo_proc == 0` (split-MDCT path). `cb_idx_l`
+    /// and `cb_idx_r` inject different HCB5 codewords at the first
+    /// spectral pair of each channel so L and R carry different tones.
+    fn build_stereo_asf_split_body_with_tones(
+        tl: u32,
+        max_sfb: u32,
+        cb_idx_l: usize,
+        cb_idx_r: usize,
+    ) -> Vec<u8> {
+        use crate::huffman;
+        let mut bw = BitWriter::new();
+        // audio_size_value = 800 (15 bits); b_more_bits = 0.
+        bw.write_u32(800, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        // stereo_codec_mode = SIMPLE (0b00, 2 bits).
+        bw.write_u32(0, 2);
+        // b_enable_mdct_stereo_proc = 0.
+        bw.write_bit(false);
+        // --- Left channel ---
+        bw.write_u32(0, 1); // spec_frontend_l = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(max_sfb, 6); // max_sfb[0]
+        // --- Right channel ---
+        bw.write_u32(0, 1); // spec_frontend_r = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(max_sfb, 6); // max_sfb[0]
+        // sf_data(spec_frontend_l): section_data + spectral + scalefac + snf.
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let end_line = sfbo[max_sfb as usize] as u32;
+        let hcb = huffman::asf_hcb(5).unwrap();
+        // Section 0 covers [0..max_sfb) with sect_cb = 5.
+        bw.write_u32(5, 4);
+        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        // Spectral: emit cb_idx_l for pair 0, then cb_idx 40 for the rest.
+        bw.write_u32(hcb.cw[cb_idx_l], hcb.len[cb_idx_l] as u32);
+        let pairs = end_line / 2;
+        for _ in 1..pairs {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        // scalefac: reference_scale_factor = 120.
+        bw.write_u32(120, 8);
+        // snf: b_snf_data_exists = 0.
+        bw.write_u32(0, 1);
+        // sf_data(spec_frontend_r): same pattern, different tone.
+        bw.write_u32(5, 4);
+        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        bw.write_u32(hcb.cw[cb_idx_r], hcb.len[cb_idx_r] as u32);
+        for _ in 1..pairs {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        bw.write_u32(120, 8);
+        bw.write_u32(0, 1);
+        bw.align_to_byte();
+        while bw.byte_len() < 820 {
+            bw.write_u32(0, 8);
+        }
+        bw.finish()
+    }
+
+    #[test]
+    fn decoder_stereo_cpe_split_emits_two_channel_nonsilent_pcm() {
+        // Stereo CPE, SIMPLE split-MDCT path: hand-craft a packet with
+        // one HCB5 tone on L and a different HCB5 tone on R. Both
+        // channels must carry real PCM (non-silent), and their sample
+        // streams must differ.
+        let mut bytes = build_minimal_toc(); // stereo TOC — channel_mode '10'
+        // cb_idx=49 is (q0=1, q1=0); cb_idx=58 is (q0=2, q1=0).
+        // Different tones -> different PCM per channel.
+        let body = build_stereo_asf_split_body_with_tones(1920, 10, 49, 58);
+        bytes.extend(body);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio");
+        };
+        assert_eq!(af.channels, 2);
+        assert_eq!(af.sample_rate, 48_000);
+        assert_eq!(af.samples, 1_920);
+        assert_eq!(af.format, SampleFormat::S16);
+        // Both per-channel spectra should be populated.
+        let sub = dec.last_substream.as_ref().unwrap();
+        assert!(
+            sub.tools.scaled_spec_primary.is_some(),
+            "L spectrum missing"
+        );
+        assert!(
+            sub.tools.scaled_spec_secondary.is_some(),
+            "R spectrum missing"
+        );
+        // Decode PCM channel-wise from the interleaved S16 buffer.
+        let buf = &af.data[0];
+        assert_eq!(buf.len(), (1_920 * 2 * 2) as usize);
+        let mut l: Vec<i16> = Vec::with_capacity(1_920);
+        let mut r: Vec<i16> = Vec::with_capacity(1_920);
+        for i in 0..1_920usize {
+            let off_l = i * 4;
+            let off_r = off_l + 2;
+            l.push(i16::from_le_bytes([buf[off_l], buf[off_l + 1]]));
+            r.push(i16::from_le_bytes([buf[off_r], buf[off_r + 1]]));
+        }
+        let e_l: i64 = l.iter().map(|&s| (s as i64) * (s as i64)).sum();
+        let e_r: i64 = r.iter().map(|&s| (s as i64) * (s as i64)).sum();
+        assert!(e_l > 0, "left channel silent");
+        assert!(e_r > 0, "right channel silent");
+        // Different tones -> different waveforms on L vs R.
+        let nonzero_l = l.iter().filter(|&&s| s != 0).count();
+        let nonzero_r = r.iter().filter(|&&s| s != 0).count();
+        assert!(nonzero_l > 100, "L has too few samples: {nonzero_l}");
+        assert!(nonzero_r > 100, "R has too few samples: {nonzero_r}");
+        let differs = l.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            differs > 100,
+            "L and R waveforms should differ (differing samples: {differs})"
+        );
+    }
+
     #[test]
     fn decoder_handles_sync_wrapped_packet() {
         let raw = build_minimal_toc();
