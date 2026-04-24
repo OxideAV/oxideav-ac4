@@ -34,6 +34,7 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::asf_data;
+use crate::aspx;
 use crate::sfb_offset;
 use crate::tables;
 use crate::toc::variable_bits;
@@ -313,6 +314,17 @@ pub struct SubstreamTools {
     /// otherwise. Length equals the decoded `max_sfb` for the shared
     /// window.
     pub ms_used: Option<Vec<bool>>,
+    /// Parsed `aspx_config()` when the substream's codec mode selected
+    /// one of the A-SPX paths (mono ASPX or stereo ASPX / ASPX_ACPL_*)
+    /// **and** the current frame is an I-frame. `aspx_config` is only
+    /// present in I-frames (§4.2.6.1 / §4.2.6.3); predictive frames
+    /// inherit the previous I-frame's config. For non-I-frames or for
+    /// SIMPLE substreams this stays `None`.
+    pub aspx_config: Option<aspx::AspxConfig>,
+    /// Parsed `companding_control()` when the substream's codec mode
+    /// is one of the ASPX paths. Captured from the bitstream in the
+    /// outer `audio_data()` walker.
+    pub companding: Option<aspx::CompandingControl>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -451,12 +463,16 @@ pub fn parse_mono_audio_data_outer(
     let mode_bit = br.read_u32(1)?;
     let mode = MonoCodecMode::from_bit(mode_bit);
     tools.mono_mode = Some(mode);
-    // aspx_config() / companding_control() / aspx_data_1ch() parsing are
-    // not implemented — see module docs. They're gated by mode==ASPX;
-    // for mode==SIMPLE we only have mono_data(0).
+    // ASPX path (§4.2.6.1): if b_iframe, read aspx_config(); then
+    // companding_control(1); then mono_data(0); then aspx_data_1ch().
+    // We stop after companding_control + mono_data(0) — the aspx_data
+    // Huffman body needs Annex A.2 tables we haven't transcribed.
     if mode != MonoCodecMode::Simple {
-        // ASPX path requires Huffman / QMF state we don't have.
-        return Ok(());
+        if b_iframe {
+            tools.aspx_config = Some(aspx::parse_aspx_config(br)?);
+        }
+        tools.companding = Some(aspx::parse_companding_control(br, 1)?);
+        // Fall through into mono_data(0) — same outer shell as SIMPLE.
     }
     // mono_data(b_lfe=0):
     //   spec_frontend;    1 bit
@@ -545,8 +561,31 @@ pub fn parse_stereo_audio_data_outer(
     tools.stereo_mode = Some(mode);
 
     if mode != StereoCodecMode::Simple {
-        // ASPX / ASPX_ACPL paths need aspx/acpl configs — not parsed
-        // yet.
+        // §4.2.6.3: for b_iframe all ASPX stereo modes start with an
+        // aspx_config(); ASPX_ACPL_{1,2} also carry an acpl_config_1ch
+        // (PARTIAL / FULL) right after — acpl_config parsing isn't
+        // implemented yet so we record the aspx_config only. Then each
+        // stereo mode runs companding_control with a mode-specific
+        // channel count (2 for ASPX, 1 for ASPX_ACPL_*), which we also
+        // surface. The per-channel stereo_data / sf_data / aspx_data /
+        // acpl_data bodies remain Huffman-gated and unhandled.
+        if b_iframe {
+            tools.aspx_config = Some(aspx::parse_aspx_config(br)?);
+            // acpl_config_1ch(PARTIAL/FULL) bits are consumed opaquely —
+            // we don't have an A-CPL parser yet, so bail here instead of
+            // misreading subsequent bits.
+            if matches!(
+                mode,
+                StereoCodecMode::AspxAcpl1 | StereoCodecMode::AspxAcpl2
+            ) {
+                return Ok(());
+            }
+        }
+        let nc = match mode {
+            StereoCodecMode::Aspx => 2,
+            _ => 1,
+        };
+        tools.companding = Some(aspx::parse_companding_control(br, nc)?);
         return Ok(());
     }
 
@@ -1038,22 +1077,129 @@ mod tests {
     }
 
     #[test]
-    fn walk_mono_aspx_substream_records_mode_and_bails() {
-        // mono_codec_mode = 1 (ASPX) — we stop before aspx_config, so
-        // mono_mode is set but no frontend/transform_info.
+    fn walk_mono_aspx_substream_parses_config_and_companding() {
+        // mono_codec_mode = 1 (ASPX) on an I-frame: the walker now
+        // consumes aspx_config() (15 bits) and companding_control(1).
         let mut bw = BitWriter::new();
-        bw.write_u32(5, 15);
+        bw.write_u32(5, 15); // audio_size = 5
+        bw.write_bit(false); // b_more_bits = 0
+        bw.align_to_byte();
+        // mono_codec_mode = 1 (ASPX)
+        bw.write_u32(1, 1);
+        // aspx_config: quant_mode=0, start=3, stop=1, scale=1, interp=1,
+        // preflat=0, limiter=1, noise_sbg=2, num_env_bits_fixfix=0,
+        // freq_res_mode=0.
+        bw.write_u32(0, 1);
+        bw.write_u32(3, 3);
+        bw.write_u32(1, 2);
+        bw.write_u32(1, 1);
+        bw.write_bit(true);
         bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(2, 2);
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 2);
+        // companding_control(1): no sync_flag; compand_on[0] = 1.
+        bw.write_bit(true);
         bw.align_to_byte();
-        bw.write_u32(1, 1); // ASPX
-        bw.align_to_byte();
-        while bw.byte_len() < 16 {
+        while bw.byte_len() < 32 {
             bw.write_u32(0, 8);
         }
         let bytes = bw.finish();
         let info = walk_ac4_substream(&bytes, 1, true, 1920).unwrap();
         assert_eq!(info.tools.mono_mode, Some(MonoCodecMode::Aspx));
-        assert!(info.tools.spec_frontend_primary.is_none());
-        assert!(info.tools.transform_info_primary.is_none());
+        // aspx_config captured.
+        let cfg = info.tools.aspx_config.unwrap();
+        assert_eq!(cfg.start_freq, 3);
+        assert_eq!(cfg.stop_freq, 1);
+        assert_eq!(cfg.noise_sbg, 2);
+        assert_eq!(cfg.num_noise_sbgroups(), 3);
+        assert!(cfg.interpolation);
+        assert!(!cfg.preflat);
+        assert!(cfg.limiter);
+        assert!(cfg.signals_freq_res());
+        // companding captured.
+        let cc = info.tools.companding.as_ref().unwrap();
+        assert_eq!(cc.compand_on, vec![true]);
+        assert!(cc.sync_flag.is_none());
+        assert!(cc.compand_avg.is_none());
+    }
+
+    #[test]
+    fn walk_stereo_aspx_substream_parses_config() {
+        // stereo_codec_mode = 01 (ASPX) on an I-frame: read
+        // aspx_config() then companding_control(2).
+        let mut bw = BitWriter::new();
+        bw.write_u32(5, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(0b01, 2); // ASPX
+        // aspx_config: all-zero fields.
+        bw.write_u32(0, 15);
+        // companding_control(2): sync_flag=0, compand_on=[1,1].
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.align_to_byte();
+        while bw.byte_len() < 32 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let info = walk_ac4_substream(&bytes, 2, true, 1920).unwrap();
+        assert_eq!(info.tools.stereo_mode, Some(StereoCodecMode::Aspx));
+        let cfg = info.tools.aspx_config.unwrap();
+        assert_eq!(cfg.start_freq, 0);
+        let cc = info.tools.companding.as_ref().unwrap();
+        assert_eq!(cc.sync_flag, Some(false));
+        assert_eq!(cc.compand_on, vec![true, true]);
+    }
+
+    #[test]
+    fn walk_stereo_aspx_non_iframe_skips_config() {
+        // Predictive (b_iframe = 0) ASPX frame: aspx_config not present;
+        // we go straight to companding_control.
+        let mut bw = BitWriter::new();
+        bw.write_u32(5, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(0b01, 2); // ASPX
+        // No aspx_config — go straight to companding_control(2).
+        bw.write_bit(true); // sync_flag = 1 -> single compand_on
+        bw.write_bit(true); // compand_on[0] = 1
+        bw.align_to_byte();
+        while bw.byte_len() < 32 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let info = walk_ac4_substream(&bytes, 2, false, 1920).unwrap();
+        assert_eq!(info.tools.stereo_mode, Some(StereoCodecMode::Aspx));
+        assert!(info.tools.aspx_config.is_none());
+        let cc = info.tools.companding.as_ref().unwrap();
+        assert_eq!(cc.sync_flag, Some(true));
+        assert_eq!(cc.compand_on, vec![true]);
+    }
+
+    #[test]
+    fn walk_stereo_aspx_acpl1_reads_config_and_stops_before_acpl() {
+        // stereo_codec_mode = 10 (ASPX_ACPL_1): aspx_config present on
+        // I-frames; acpl_config_1ch follows but isn't parsed — we bail
+        // after aspx_config rather than misread bits.
+        let mut bw = BitWriter::new();
+        bw.write_u32(5, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(0b10, 2); // ASPX_ACPL_1
+        bw.write_u32(0, 15); // aspx_config (all zero)
+        bw.align_to_byte();
+        while bw.byte_len() < 32 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let info = walk_ac4_substream(&bytes, 2, true, 1920).unwrap();
+        assert_eq!(info.tools.stereo_mode, Some(StereoCodecMode::AspxAcpl1));
+        assert!(info.tools.aspx_config.is_some());
+        // We explicitly stop before acpl_config_1ch so companding stays
+        // None for the ACPL path.
+        assert!(info.tools.companding.is_none());
     }
 }

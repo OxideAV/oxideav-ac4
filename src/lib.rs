@@ -53,11 +53,23 @@
 //!   pseudocodes 60-64, naive O(N^2) complex DFT) plus the KBD
 //!   window family (§5.5.3, alphas from Table 186) with overlap-add.
 //!
+//! * **A-SPX configuration** — [`aspx::parse_aspx_config`] implements
+//!   the 15-bit `aspx_config()` element (Table 50, §4.2.12.1) and
+//!   [`aspx::parse_companding_control`] the `companding_control()`
+//!   element (Table 49, §4.2.11). The outer `audio_data()` walker in
+//!   [`asf`] now consumes these for the mono ASPX, stereo ASPX, and
+//!   stereo ASPX_ACPL_{1,2} I-frame paths (for ACPL it stops before
+//!   `acpl_config_1ch`, which isn't parsed yet). Exposes the parsed
+//!   `AspxConfig` through
+//!   [`decoder::Ac4Decoder::last_substream`]`.tools.aspx_config`.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * A-SPX (`aspx_config`, `aspx_data_*`) and A-CPL tools.
+//! * A-SPX envelope / noise data (`aspx_framing`, `aspx_delta_dir`,
+//!   `aspx_hfgen_iwc_*`, `aspx_ec_data`) and A-SPX Huffman tables
+//!   (Annex A.2); A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
@@ -79,6 +91,7 @@
 
 pub mod asf;
 pub mod asf_data;
+pub mod aspx;
 pub mod decoder;
 pub mod huffman;
 pub mod mdct;

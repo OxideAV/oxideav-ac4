@@ -56,7 +56,10 @@ oxideav-ac4 = "0.0"
 ## What's not parsed yet
 
 - ASF / ASF-A2 / A-SPX audio coefficient coding (the heart of the
-  codec).
+  codec). The A-SPX `aspx_config()` header and `companding_control()`
+  element **are** parsed (ETSI §4.2.11 / §4.2.12.1); the Huffman-coded
+  envelope / noise payload (`aspx_framing`, `aspx_ec_data`, etc.) is
+  not.
 - Metadata payloads inside substreams (DRC, dialog normalization,
   downmix params) — the spec's `metadata()` tree is skipped by size,
   not parsed.
