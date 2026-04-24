@@ -106,18 +106,36 @@
 //! * **A-SPX Huffman infrastructure** — [`aspx::AspxHcb`] is a
 //!   `(len[], cw[], cb_off)` codebook helper: the symbol decoder walks
 //!   one bit at a time until a `(len == width, cw == code)` match
-//!   lands, then returns `symbol_index - cb_off` as the delta. The 18
-//!   Annex A.2 codebook headers (Tables A.16..=A.33 — codebook_length
-//!   / cb_off) ship as `AspxHcbMeta` constants today; the normative
-//!   `len[]` / `cw[]` arrays still need to be transcribed from the
-//!   spec's accompaniment `ts_103190_tables.c`.
+//!   lands, then returns `symbol_index - cb_off` as the delta. All 18
+//!   Annex A.2 codebooks (Tables A.16..=A.33) are transcribed in
+//!   [`aspx_huffman`] — six `(F0, DF, DT)` triples covering
+//!   envelope-LEVEL / envelope-BALANCE @ 1.5 dB / 3 dB plus
+//!   noise-LEVEL / noise-BALANCE. A [`aspx::HuffmanCodebookId`] enum
+//!   + [`aspx::lookup_aspx_hcb`] resolve the
+//!   `get_aspx_hcb(data_type, quant_mode, stereo_mode, hcb_type)`
+//!   tuple from §5.7.6.3.4 Pseudocode 79.
+//! * **A-SPX entropy coded data** — [`aspx::parse_aspx_ec_data`]
+//!   implements `aspx_ec_data()` (Table 57, §4.2.12.8) on top of
+//!   [`aspx::parse_aspx_huff_data`] (Table 58) — per-envelope loop
+//!   that picks F0/DF/DT codebook per direction and returns a vector
+//!   of [`aspx::AspxHuffEnv`]s. Caller supplies `num_sbg_*` counts via
+//!   [`aspx::AspxSbgCounts`] pending the §5.7.6.3.1 master-freq-scale
+//!   derivation. Plumbed into the substream walker through the ASPX
+//!   framing + `aspx_delta_dir(ch)` read: `asf::walk_ac4_substream`
+//!   now reads both `aspx_delta_dir(0)` (mono + stereo ASPX I-frames)
+//!   and `aspx_delta_dir(1)` (stereo ASPX I-frames) on top of the
+//!   existing `aspx_framing` consumption, alongside the effective
+//!   per-channel `aspx_qmode_env` post FIXFIX + num_env=1 clamp.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * A-SPX envelope entropy data (`aspx_ec_data`); A-SPX Huffman
-//!   tables (Annex A.2); A-CPL (`acpl_config_*`, `acpl_data_*`).
+//! * A-SPX subband-group derivation (§5.7.6.3.1 `num_sbg_*`), QMF
+//!   analysis / synthesis, HF regeneration, and envelope application —
+//!   `aspx_ec_data()` is parseable but its outputs don't feed an
+//!   actual bandwidth-extension pipeline yet.
+//! * A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into

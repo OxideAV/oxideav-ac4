@@ -346,6 +346,21 @@ pub struct SubstreamTools {
     /// populated for I-frames; carries the crossover-subband offset
     /// used to seed `sbx` in §5.7.6.3.1.2.
     pub aspx_xover_subband_offset: Option<u8>,
+    /// `aspx_delta_dir(0)` — per-envelope delta-direction bits for the
+    /// primary channel (Table 54). Populated when the walker reaches
+    /// `aspx_data_1ch() / aspx_data_2ch()` and the framing decoded
+    /// successfully.
+    pub aspx_delta_dir_primary: Option<aspx::AspxDeltaDir>,
+    /// `aspx_delta_dir(1)` — per-envelope delta-direction bits for
+    /// the secondary channel in a stereo ASPX substream. `None` for
+    /// mono.
+    pub aspx_delta_dir_secondary: Option<aspx::AspxDeltaDir>,
+    /// `aspx_qmode_env[0]` — the effective envelope quant step for
+    /// the primary channel after the `FIXFIX && num_env == 1`
+    /// clamp-to-0 override in Tables 51 / 52.
+    pub aspx_qmode_env_primary: Option<aspx::AspxQuantStep>,
+    /// `aspx_qmode_env[1]` — same, for the secondary channel.
+    pub aspx_qmode_env_secondary: Option<aspx::AspxQuantStep>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -540,6 +555,23 @@ pub fn parse_mono_audio_data_outer(
                     tools.aspx_xover_subband_offset = Some(xover);
                     let nats = aspx::num_aspx_timeslots(frame_len_base);
                     let framing = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
+                    // Per Table 51: `aspx_qmode_env[0] = aspx_quant_mode_env`
+                    // by default, but FIXFIX with a single envelope drops
+                    // back to 0 (1.5 dB / Fine) regardless of the config.
+                    let qmode = if matches!(framing.int_class, aspx::AspxIntClass::FixFix)
+                        && framing.num_env == 1
+                    {
+                        aspx::AspxQuantStep::Fine
+                    } else {
+                        cfg.quant_mode_env
+                    };
+                    tools.aspx_qmode_env_primary = Some(qmode);
+                    // aspx_delta_dir(0) follows aspx_framing(0) per
+                    // Table 51 — fully determined by framing.num_env /
+                    // num_noise so we can consume it here without the
+                    // A-SPX subband-group derivation.
+                    let dd = aspx::parse_aspx_delta_dir(br, &framing)?;
+                    tools.aspx_delta_dir_primary = Some(dd);
                     tools.aspx_framing_primary = Some(framing);
                 }
             }
@@ -644,17 +676,55 @@ pub fn parse_stereo_audio_data_outer(
                     tools.aspx_xover_subband_offset = Some(xover);
                     let nats = aspx::num_aspx_timeslots(frame_len_base);
                     let framing_ch0 = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
-                    tools.aspx_framing_primary = Some(framing_ch0);
+                    // Per Table 52: `aspx_qmode_env[0] = aspx_qmode_env[1]
+                    // = aspx_quant_mode_env` then clamp to 0 on FIXFIX +
+                    // num_env == 1.
+                    let qmode_ch0 = if matches!(framing_ch0.int_class, aspx::AspxIntClass::FixFix)
+                        && framing_ch0.num_env == 1
+                    {
+                        aspx::AspxQuantStep::Fine
+                    } else {
+                        cfg.quant_mode_env
+                    };
+                    tools.aspx_qmode_env_primary = Some(qmode_ch0);
                     // Table 52: aspx_balance (1 bit). If 0, aspx_framing(1)
                     // follows for channel 1; otherwise channel 1 reuses
                     // channel 0's framing.
                     let balance = br.read_bit()?;
                     tools.aspx_balance = Some(balance);
+                    let framing_ch1_ref;
                     if !balance {
                         let framing_ch1 =
                             aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
+                        // Per Table 52 the ch1 qmode is recomputed
+                        // against the ch1 framing (and re-clamped on
+                        // FIXFIX + num_env == 1).
+                        let qmode_ch1 = if matches!(
+                            framing_ch1.int_class,
+                            aspx::AspxIntClass::FixFix
+                        ) && framing_ch1.num_env == 1
+                        {
+                            aspx::AspxQuantStep::Fine
+                        } else {
+                            cfg.quant_mode_env
+                        };
+                        tools.aspx_qmode_env_secondary = Some(qmode_ch1);
                         tools.aspx_framing_secondary = Some(framing_ch1);
+                        framing_ch1_ref = tools.aspx_framing_secondary.as_ref();
+                    } else {
+                        // Shared framing; copy the ch0 qmode across.
+                        tools.aspx_qmode_env_secondary = Some(qmode_ch0);
+                        framing_ch1_ref = Some(&framing_ch0);
                     }
+                    // aspx_delta_dir(0) then aspx_delta_dir(1) per
+                    // Table 52.
+                    let dd0 = aspx::parse_aspx_delta_dir(br, &framing_ch0)?;
+                    tools.aspx_delta_dir_primary = Some(dd0);
+                    if let Some(f_ch1) = framing_ch1_ref {
+                        let dd1 = aspx::parse_aspx_delta_dir(br, f_ch1)?;
+                        tools.aspx_delta_dir_secondary = Some(dd1);
+                    }
+                    tools.aspx_framing_primary = Some(framing_ch0);
                 }
             }
         }
@@ -1414,6 +1484,14 @@ mod tests {
         // Stereo sidecar untouched on mono.
         assert!(info.tools.aspx_framing_secondary.is_none());
         assert!(info.tools.aspx_balance.is_none());
+        // aspx_delta_dir(0) followed on the same path: consumed
+        // num_env + num_noise = 4 bits — all zeros from the padding.
+        let dd = info.tools.aspx_delta_dir_primary.expect("delta dir");
+        assert_eq!(dd.sig_delta_dir, vec![false; 2]);
+        assert_eq!(dd.noise_delta_dir, vec![false; 2]);
+        // FIXFIX + num_env > 1, so the config's quant_mode_env carries
+        // through (and the config had it as Fine).
+        assert_eq!(info.tools.aspx_qmode_env_primary, Some(aspx::AspxQuantStep::Fine));
     }
 
     #[test]
