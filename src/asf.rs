@@ -325,6 +325,27 @@ pub struct SubstreamTools {
     /// is one of the ASPX paths. Captured from the bitstream in the
     /// outer `audio_data()` walker.
     pub companding: Option<aspx::CompandingControl>,
+    /// Parsed `aspx_framing(0)` for the primary channel. Populated when
+    /// the substream's codec mode is one of the ASPX paths and an
+    /// `aspx_config` is in scope (either from this frame if it's an
+    /// I-frame or carried over from a prior I-frame — we only wire the
+    /// I-frame path here so non-I-frame ASPX bitstreams stay at
+    /// companding_control until config state plumbing arrives).
+    pub aspx_framing_primary: Option<aspx::AspxFraming>,
+    /// Parsed `aspx_framing(1)` for the secondary channel in a stereo
+    /// ASPX substream. Only present when `aspx_balance == 0` (the
+    /// secondary channel has its own framing per Table 52); when
+    /// `aspx_balance == 1` the secondary envelope data reuses the
+    /// primary's framing.
+    pub aspx_framing_secondary: Option<aspx::AspxFraming>,
+    /// `aspx_balance` — 1-bit flag from `aspx_data_2ch()` (Table 52).
+    /// Present only in stereo ASPX substreams; otherwise `None`.
+    pub aspx_balance: Option<bool>,
+    /// `aspx_xover_subband_offset` — 3-bit I-frame-sticky field that
+    /// leads `aspx_data_1ch` / `aspx_data_2ch` (Tables 51 / 52). Only
+    /// populated for I-frames; carries the crossover-subband offset
+    /// used to seed `sbx` in §5.7.6.3.1.2.
+    pub aspx_xover_subband_offset: Option<u8>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -496,10 +517,30 @@ pub fn parse_mono_audio_data_outer(
             // walk asf_section_data + asf_spectral_data +
             // asf_scalefac_data + asf_snf_data and produce scaled
             // spectral coefficients.
+            let mut body_ok = false;
             if ti.b_long_frame && tools.psy_info_primary.as_ref().unwrap().num_window_groups == 1 {
                 let psy_ref = tools.psy_info_primary.as_ref().unwrap().clone();
                 if let Some(scaled) = decode_asf_long_mono_body(br, &ti, &psy_ref) {
                     tools.scaled_spec_primary = Some(scaled);
+                    body_ok = true;
+                }
+            }
+            // §4.2.6.1: for the ASPX path, aspx_data_1ch() follows
+            // mono_data(0). Parse its leading xover-subband-offset +
+            // aspx_framing(0) here. Only runs when:
+            //   * we're on an I-frame — both xover-subband-offset and
+            //     aspx_config (which drives aspx_framing) are I-frame-
+            //     sticky;
+            //   * mono_data(0) was fully decoded, so the bitreader sits
+            //     at the start of aspx_data_1ch();
+            //   * aspx_config was parsed into tools above.
+            if mode != MonoCodecMode::Simple && b_iframe && body_ok {
+                if let Some(cfg) = tools.aspx_config {
+                    let xover = br.read_u32(3)? as u8;
+                    tools.aspx_xover_subband_offset = Some(xover);
+                    let nats = aspx::num_aspx_timeslots(frame_len_base);
+                    let framing = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
+                    tools.aspx_framing_primary = Some(framing);
                 }
             }
         }
@@ -586,11 +627,57 @@ pub fn parse_stereo_audio_data_outer(
             _ => 1,
         };
         tools.companding = Some(aspx::parse_companding_control(br, nc)?);
+        // For `StereoCodecMode::Aspx` (Table 22) the stereo_data()
+        // body follows companding_control(2), then aspx_data_2ch()
+        // closes the element. We parse stereo_data() with the same
+        // shared decoder as SIMPLE, then attempt to read the leading
+        // xover-offset + aspx_framing(0)[ + aspx_balance + framing(1)]
+        // of aspx_data_2ch(). Only runs when:
+        //   * we're on an I-frame, and
+        //   * the stereo_data() body decoded cleanly (bitreader is at
+        //     the right place).
+        if matches!(mode, StereoCodecMode::Aspx) {
+            let body_ok = parse_stereo_data_body(br, tools, frame_len_base);
+            if b_iframe && body_ok {
+                if let Some(cfg) = tools.aspx_config {
+                    let xover = br.read_u32(3)? as u8;
+                    tools.aspx_xover_subband_offset = Some(xover);
+                    let nats = aspx::num_aspx_timeslots(frame_len_base);
+                    let framing_ch0 = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
+                    tools.aspx_framing_primary = Some(framing_ch0);
+                    // Table 52: aspx_balance (1 bit). If 0, aspx_framing(1)
+                    // follows for channel 1; otherwise channel 1 reuses
+                    // channel 0's framing.
+                    let balance = br.read_bit()?;
+                    tools.aspx_balance = Some(balance);
+                    if !balance {
+                        let framing_ch1 =
+                            aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
+                        tools.aspx_framing_secondary = Some(framing_ch1);
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
     // SIMPLE path: just `stereo_data()`.
-    //
+    let _ = parse_stereo_data_body(br, tools, frame_len_base);
+    let _ = b_iframe; // reserved for later Huffman-state keying.
+    Ok(())
+}
+
+/// Walk `stereo_data()` (§4.2.6.3 / Table 22) into `tools`. Returns
+/// `true` when the body decoded cleanly enough for the bitreader to sit
+/// at the spec's end-of-body position (i.e. the caller is safe to
+/// continue reading downstream elements like `aspx_data_2ch()`). A
+/// return of `false` means some inner Huffman-gated decode bailed; the
+/// bitreader position after the call is indeterminate.
+fn parse_stereo_data_body(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    frame_len_base: u32,
+) -> bool {
     // stereo_data():
     //   if (b_enable_mdct_stereo_proc) {
     //       spec_frontend_l = ASF; spec_frontend_r = ASF;
@@ -604,74 +691,117 @@ pub fn parse_stereo_audio_data_outer(
     //   }
     //   sf_data(spec_frontend_l);
     //   sf_data(spec_frontend_r);
-    let b_mdct_stereo = br.read_bit()?;
+    let b_mdct_stereo = match br.read_bit() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
     tools.mdct_stereo_proc = b_mdct_stereo;
     if b_mdct_stereo {
         tools.spec_frontend_primary = Some(SpecFrontend::Asf);
         tools.spec_frontend_secondary = Some(SpecFrontend::Asf);
-        let ti = parse_asf_transform_info(br, frame_len_base)?;
+        let ti = match parse_asf_transform_info(br, frame_len_base) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
         tools.transform_info_primary = Some(ti);
         tools.transform_info_secondary = Some(ti);
         // stereo_data() with b_enable_mdct_stereo_proc==1 calls
         // sf_info(ASF, 0, 0) which fires asf_psy_info(0, 0) over the
         // shared transform window.
-        if let Ok(psy) = parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
-            tools.psy_info_primary = Some(psy.clone());
-            // Joint-stereo MDCT path: one shared section / psy layout,
-            // two residual channel spectra, followed by a per-sfb
-            // ms_used[] flag array. Only walk the long-frame, single
-            // window-group body; other shapes stay at outer-layer only.
-            if ti.b_long_frame && psy.num_window_groups == 1 {
-                if let Some((l, r, ms)) = decode_asf_long_stereo_joint_body(br, &ti, &psy) {
+        let psy = match parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        tools.psy_info_primary = Some(psy.clone());
+        // Joint-stereo MDCT path: one shared section / psy layout,
+        // two residual channel spectra, followed by a per-sfb
+        // ms_used[] flag array. Only walk the long-frame, single
+        // window-group body; other shapes stay at outer-layer only.
+        if ti.b_long_frame && psy.num_window_groups == 1 {
+            match decode_asf_long_stereo_joint_body(br, &ti, &psy) {
+                Some((l, r, ms)) => {
                     tools.scaled_spec_primary = Some(l);
                     tools.scaled_spec_secondary = Some(r);
                     tools.ms_used = Some(ms);
+                    true
                 }
+                None => false,
             }
+        } else {
+            // Outer layers parsed but Huffman body not walked — the
+            // bitreader isn't at the end of stereo_data(), so downstream
+            // elements aren't safe to parse.
+            false
         }
     } else {
-        let l = SpecFrontend::from_bit(br.read_u32(1)?);
+        let l = match br.read_u32(1) {
+            Ok(v) => SpecFrontend::from_bit(v),
+            Err(_) => return false,
+        };
         tools.spec_frontend_primary = Some(l);
         let mut ti_l: Option<AsfTransformInfo> = None;
         let mut psy_l: Option<AsfPsyInfo> = None;
         if let SpecFrontend::Asf = l {
-            let ti = parse_asf_transform_info(br, frame_len_base)?;
+            let ti = match parse_asf_transform_info(br, frame_len_base) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
             tools.transform_info_primary = Some(ti);
             ti_l = Some(ti);
             if let Ok(psy) = parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
                 tools.psy_info_primary = Some(psy.clone());
                 psy_l = Some(psy);
+            } else {
+                return false;
             }
         }
-        let r = SpecFrontend::from_bit(br.read_u32(1)?);
+        let r = match br.read_u32(1) {
+            Ok(v) => SpecFrontend::from_bit(v),
+            Err(_) => return false,
+        };
         tools.spec_frontend_secondary = Some(r);
         let mut ti_r: Option<AsfTransformInfo> = None;
         let mut psy_r: Option<AsfPsyInfo> = None;
         if let SpecFrontend::Asf = r {
-            let ti = parse_asf_transform_info(br, frame_len_base)?;
+            let ti = match parse_asf_transform_info(br, frame_len_base) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
             tools.transform_info_secondary = Some(ti);
             ti_r = Some(ti);
             if let Ok(psy) = parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
                 tools.psy_info_secondary = Some(psy.clone());
                 psy_r = Some(psy);
+            } else {
+                return false;
             }
         }
         // Split-MDCT stereo: two independent ASF spectra. Decode each if
         // long-frame + single-window-group. Any malformed body is
         // surfaced as a decode miss (None) rather than a hard error.
+        let mut body_ok = true;
         if let (Some(ti), Some(psy)) = (ti_l, psy_l.as_ref()) {
             if ti.b_long_frame && psy.num_window_groups == 1 {
                 tools.scaled_spec_primary = decode_asf_long_mono_body(br, &ti, psy);
+                if tools.scaled_spec_primary.is_none() {
+                    body_ok = false;
+                }
+            } else {
+                body_ok = false;
             }
         }
         if let (Some(ti), Some(psy)) = (ti_r, psy_r.as_ref()) {
             if ti.b_long_frame && psy.num_window_groups == 1 {
                 tools.scaled_spec_secondary = decode_asf_long_mono_body(br, &ti, psy);
+                if tools.scaled_spec_secondary.is_none() {
+                    body_ok = false;
+                }
+            } else {
+                body_ok = false;
             }
         }
+        body_ok
     }
-    let _ = b_iframe; // reserved for later Huffman-state keying.
-    Ok(())
 }
 
 /// Decode the `sf_data` body for a stereo, long-frame, single-window-
@@ -1177,6 +1307,152 @@ mod tests {
         let cc = info.tools.companding.as_ref().unwrap();
         assert_eq!(cc.sync_flag, Some(true));
         assert_eq!(cc.compand_on, vec![true]);
+    }
+
+    /// Write sect_len_incr per §4.2.7.1 Table 80 (section-length
+     /// expansion). Duplicated from `decoder.rs` tests for crate-local use.
+    fn write_sect_len_incr(bw: &mut BitWriter, sect_len: u32, n_sect_bits: u32, esc: u32) {
+        let base = sect_len.saturating_sub(1);
+        let k = base / esc;
+        let incr = base % esc;
+        for _ in 0..k {
+            bw.write_u32(esc, n_sect_bits);
+        }
+        bw.write_u32(incr, n_sect_bits);
+    }
+
+    #[test]
+    fn walk_mono_aspx_iframe_reads_framing_after_mono_data() {
+        // Full-path mono ASPX I-frame substream:
+        //   audio_size_value (15), b_more_bits (1), byte_align.
+        //   mono_codec_mode = 1 (ASPX)
+        //   aspx_config() — 15 bits.
+        //   companding_control(1) — 1 bit.
+        //   mono_data(0):
+        //     spec_frontend = 0 (ASF)
+        //     asf_transform_info(): b_long_frame = 1
+        //     asf_psy_info(): max_sfb[0] = 10 (6 bits)
+        //     sf_data body (section + spectral zeros + scalefac 120 + snf off)
+        //   aspx_data_1ch():
+        //     aspx_xover_subband_offset = 3 (3 bits)
+        //     aspx_framing(0): FIXFIX (1 bit) + tmp_num_env=1 (1 bit since
+        //     aspx_num_env_bits_fixfix=0) -> num_env = 2.
+        // We set aspx_freq_res_mode to High (not Signalled) so no
+        // freq_res bits follow, keeping the fixture small.
+        use crate::huffman;
+        let mut bw = BitWriter::new();
+        bw.write_u32(200, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        // mono_codec_mode = ASPX
+        bw.write_u32(1, 1);
+        // aspx_config(): quant_mode=0, start=0, stop=0, scale=0,
+        // interp=0, preflat=0, limiter=0, noise_sbg=0,
+        // num_env_bits_fixfix=0, freq_res_mode=3 (High -> not signalled).
+        bw.write_u32(0, 1); // quant_mode_env
+        bw.write_u32(0, 3); // start_freq
+        bw.write_u32(0, 2); // stop_freq
+        bw.write_u32(0, 1); // master_freq_scale
+        bw.write_bit(false); // interpolation
+        bw.write_bit(false); // preflat
+        bw.write_bit(false); // limiter
+        bw.write_u32(0, 2); // noise_sbg
+        bw.write_u32(0, 1); // num_env_bits_fixfix = 0 -> 1-bit tmp_num_env
+        bw.write_u32(3, 2); // freq_res_mode = 3 (High)
+        // companding_control(1): compand_on[0] = 1, no avg.
+        bw.write_bit(true);
+        // mono_data(0): spec_frontend = 0 (ASF).
+        bw.write_u32(0, 1);
+        // asf_transform_info: b_long_frame = 1.
+        bw.write_bit(true);
+        // asf_psy_info: max_sfb[0] = 10 in 6 bits.
+        bw.write_u32(10, 6);
+        // sf_data body (all-zero spectra):
+        //   section: cb_idx = 5 (4 bits) + sect_len for max_sfb=10 via
+        //   n_sect_bits=3 (long frame at 1920), esc=7.
+        bw.write_u32(5, 4);
+        write_sect_len_incr(&mut bw, 10, 3, 7);
+        // spectral pairs — cb 5 is dim=2, so pairs = end_line / 2.
+        // sfb_offset_48 @ 1920 index 10 = ?
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let end_line = sfbo[10] as u32;
+        let hcb = huffman::asf_hcb(5).unwrap();
+        let pairs = end_line / 2;
+        for _ in 0..pairs {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32); // zero pair
+        }
+        // scalefac: reference = 120 (8 bits). All bands are empty, so
+        // no dpcm follows.
+        bw.write_u32(120, 8);
+        // snf: b_snf_data_exists = 0.
+        bw.write_u32(0, 1);
+        // aspx_data_1ch():
+        //   aspx_xover_subband_offset = 3 (3 bits).
+        bw.write_u32(3, 3);
+        //   aspx_framing(0): FIXFIX = '0' (1 bit); tmp_num_env = 1
+        //   (1 bit) -> num_env = 1 << 1 = 2.
+        bw.write_bit(false); // FIXFIX
+        bw.write_bit(true); // tmp_num_env = 1
+        bw.align_to_byte();
+        while bw.byte_len() < 220 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let info = walk_ac4_substream(&bytes, 1, true, 1920).unwrap();
+        // Sanity: we got through the outer layers.
+        assert_eq!(info.tools.mono_mode, Some(MonoCodecMode::Aspx));
+        assert!(info.tools.aspx_config.is_some());
+        assert!(info.tools.companding.is_some());
+        assert!(info.tools.transform_info_primary.is_some());
+        // aspx_data_1ch path fired:
+        assert_eq!(info.tools.aspx_xover_subband_offset, Some(3));
+        let framing = info.tools.aspx_framing_primary.expect("framing");
+        assert_eq!(framing.int_class, aspx::AspxIntClass::FixFix);
+        assert_eq!(framing.num_env, 2);
+        assert_eq!(framing.num_noise, 2);
+        assert!(framing.freq_res.is_empty()); // freq_res_mode = High
+        // Stereo sidecar untouched on mono.
+        assert!(info.tools.aspx_framing_secondary.is_none());
+        assert!(info.tools.aspx_balance.is_none());
+    }
+
+    #[test]
+    fn walk_mono_aspx_non_iframe_does_not_emit_framing() {
+        // Non-I-frame ASPX substream: no aspx_config in the bitstream,
+        // so the walker cannot safely consume aspx_data_1ch (xover
+        // offset is also I-frame-sticky). Framing stays None.
+        use crate::huffman;
+        let mut bw = BitWriter::new();
+        bw.write_u32(200, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(1, 1); // mono_codec_mode = ASPX
+        // No aspx_config (b_iframe = false).
+        bw.write_bit(true); // companding_control(1): compand_on[0] = 1.
+        bw.write_u32(0, 1); // spec_frontend = ASF
+        bw.write_bit(true); // b_long_frame = 1
+        bw.write_u32(10, 6); // max_sfb
+        bw.write_u32(5, 4); // cb
+        write_sect_len_incr(&mut bw, 10, 3, 7);
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let end_line = sfbo[10] as u32;
+        let hcb = huffman::asf_hcb(5).unwrap();
+        for _ in 0..(end_line / 2) {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        bw.write_u32(120, 8);
+        bw.write_u32(0, 1);
+        bw.align_to_byte();
+        while bw.byte_len() < 220 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let info = walk_ac4_substream(&bytes, 1, false, 1920).unwrap();
+        assert_eq!(info.tools.mono_mode, Some(MonoCodecMode::Aspx));
+        // No aspx_config (non-I-frame), so no framing either.
+        assert!(info.tools.aspx_config.is_none());
+        assert!(info.tools.aspx_framing_primary.is_none());
+        assert!(info.tools.aspx_xover_subband_offset.is_none());
     }
 
     #[test]

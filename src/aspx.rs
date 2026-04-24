@@ -446,6 +446,35 @@ fn ceil_log2(n: u32) -> u32 {
     }
 }
 
+/// Return `num_qmf_timeslots = frame_length / num_qmf_subbands` per
+/// ETSI TS 103 190-1 §5.7.3.2 (Table 189). `num_qmf_subbands` is fixed
+/// at 64 for AC-4. Valid inputs are the eight base-rate
+/// `frame_length` values: 2048 / 1920 / 1536 / 1024 / 960 / 768 / 512
+/// / 384 — for which Table 189 gives 32 / 30 / 24 / 16 / 15 / 12 / 8 /
+/// 6. We compute the quotient directly (which matches Table 189 for
+/// any of those inputs) rather than hard-coding the table.
+pub fn num_qmf_timeslots(frame_len_base: u32) -> u32 {
+    frame_len_base / 64
+}
+
+/// Return `num_ts_in_ats` — how many QMF time slots make up one A-SPX
+/// time slot — per ETSI TS 103 190-1 §5.7.6.3.3.0 (Table 192). Two for
+/// `frame_length >= 1536`, one for shorter frames.
+pub fn num_ts_in_ats(frame_len_base: u32) -> u32 {
+    if frame_len_base >= 1536 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Return `num_aspx_timeslots = num_qmf_timeslots / num_ts_in_ats` per
+/// ETSI TS 103 190-1 §5.7.6.3.3.0 Pseudocode 75a. Valid only for the
+/// eight base-rate `frame_length` values in Table 189.
+pub fn num_aspx_timeslots(frame_len_base: u32) -> u32 {
+    num_qmf_timeslots(frame_len_base) / num_ts_in_ats(frame_len_base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,5 +940,43 @@ mod tests {
         assert_eq!(ceil_log2(3 + 2), 3);
         assert_eq!(ceil_log2(4 + 2), 3);
         assert_eq!(ceil_log2(5 + 2), 3);
+    }
+
+    #[test]
+    fn num_qmf_timeslots_matches_table_189() {
+        assert_eq!(num_qmf_timeslots(2048), 32);
+        assert_eq!(num_qmf_timeslots(1920), 30);
+        assert_eq!(num_qmf_timeslots(1536), 24);
+        assert_eq!(num_qmf_timeslots(1024), 16);
+        assert_eq!(num_qmf_timeslots(960), 15);
+        assert_eq!(num_qmf_timeslots(768), 12);
+        assert_eq!(num_qmf_timeslots(512), 8);
+        assert_eq!(num_qmf_timeslots(384), 6);
+    }
+
+    #[test]
+    fn num_ts_in_ats_matches_table_192() {
+        // >= 1536 -> 2, else 1.
+        assert_eq!(num_ts_in_ats(2048), 2);
+        assert_eq!(num_ts_in_ats(1920), 2);
+        assert_eq!(num_ts_in_ats(1536), 2);
+        assert_eq!(num_ts_in_ats(1024), 1);
+        assert_eq!(num_ts_in_ats(960), 1);
+        assert_eq!(num_ts_in_ats(768), 1);
+        assert_eq!(num_ts_in_ats(512), 1);
+        assert_eq!(num_ts_in_ats(384), 1);
+    }
+
+    #[test]
+    fn num_aspx_timeslots_matches_pseudocode_75a() {
+        // num_aspx_timeslots = num_qmf_timeslots / num_ts_in_ats
+        assert_eq!(num_aspx_timeslots(2048), 16); // 32 / 2
+        assert_eq!(num_aspx_timeslots(1920), 15); // 30 / 2
+        assert_eq!(num_aspx_timeslots(1536), 12); // 24 / 2
+        assert_eq!(num_aspx_timeslots(1024), 16); // 16 / 1
+        assert_eq!(num_aspx_timeslots(960), 15); // 15 / 1
+        assert_eq!(num_aspx_timeslots(768), 12); // 12 / 1
+        assert_eq!(num_aspx_timeslots(512), 8); // 8 / 1
+        assert_eq!(num_aspx_timeslots(384), 6); // 6 / 1
     }
 }

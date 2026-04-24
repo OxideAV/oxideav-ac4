@@ -72,11 +72,15 @@
 //!   `aspx_tsg_ptr` sizing via `ceil(log2(num_env + 2))`, and the
 //!   I-frame gate on `aspx_var_bord_left` for VARFIX / VARVAR.
 //!   Returns the full [`aspx::AspxFraming`] (int_class, num_env,
-//!   num_noise, freq_res vector, border fields, tsg_ptr). Not yet
-//!   wired into the `asf::walk_ac4_substream` walker — that still
-//!   stops after `aspx_config()` / `companding_control()` because
-//!   `num_aspx_timeslots` plumbing is not in the frame-level tool
-//!   state yet.
+//!   num_noise, freq_res vector, border fields, tsg_ptr). Wired into
+//!   `asf::walk_ac4_substream` for both the mono ASPX and stereo
+//!   ASPX I-frame paths: after `companding_control()` and the
+//!   `mono_data()` / `stereo_data()` body the walker reads
+//!   `aspx_xover_subband_offset` (3 bits) and then `aspx_framing(0)`
+//!   (and, for stereo, `aspx_balance` + conditional
+//!   `aspx_framing(1)`). `num_aspx_timeslots` for the Note-1 field
+//!   width comes from the TOC's `frame_length` via
+//!   [`aspx::num_aspx_timeslots`] (Table 189 × Table 192).
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
@@ -84,9 +88,7 @@
 //!   path only exercises the long-frame path today.
 //! * A-SPX envelope / noise data (`aspx_delta_dir`, `aspx_hfgen_iwc_*`,
 //!   `aspx_ec_data`) and A-SPX Huffman tables (Annex A.2); A-CPL
-//!   (`acpl_config_*`, `acpl_data_*`). `aspx_framing()` itself parses
-//!   end-to-end but isn't yet invoked from the substream walker pending
-//!   `num_aspx_timeslots` plumbing.
+//!   (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
