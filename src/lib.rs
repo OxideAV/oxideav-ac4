@@ -93,6 +93,15 @@
 //!   `fic_used_in_sfb[]`, and `tic_present` + conditional
 //!   `tic_used_in_slot[]`. Takes `num_sbg_noise`,
 //!   `num_sbg_sig_highres`, `num_aspx_timeslots` from the caller.
+//! * **A-SPX HF generation / interleaved-waveform coding (stereo)** —
+//!   [`aspx::parse_aspx_hfgen_iwc_2ch`] implements Table 56
+//!   (§4.2.12.7). Adds per-channel `tna_mode[ch][]` (with
+//!   `aspx_balance == 1` mirroring channel 0 into channel 1),
+//!   per-channel `aspx_ah_left` / `_right` gates, `aspx_fic_present`
+//!   + per-channel `fic_left` / `fic_right` gates, and the
+//!   `aspx_tic_copy` / `aspx_tic_left` / `aspx_tic_right` TIC
+//!   gating (including mirroring left-channel TIC into right when
+//!   `tic_copy` is set).
 //!
 //! Known gaps (Unsupported or stubbed):
 //!

@@ -577,6 +577,146 @@ pub fn parse_aspx_hfgen_iwc_1ch(
     })
 }
 
+/// Parsed `aspx_hfgen_iwc_2ch()` (ETSI TS 103 190-1 §4.2.12.7,
+/// Table 56). Stereo variant of [`AspxHfgenIwc1Ch`] with the
+/// additional per-channel gating introduced by the 2-channel tool
+/// (Table 56):
+///
+/// * `tna_mode` is 2-dim `[ch][sbg]`. When `aspx_balance == 1` the
+///   encoder signals only channel 0 and the decoder mirrors channel 0
+///   into channel 1.
+/// * `ah_left` / `ah_right` gate the per-channel `add_harmonic[ch][]`
+///   independently.
+/// * `fic_present` gates both channels; when present, `fic_left` and
+///   `fic_right` gate each channel's `fic_used_in_sfb[ch][]` vector
+///   independently.
+/// * `tic_present` gates both channels; when present, `tic_copy`
+///   first decides whether the right channel's pattern is copied
+///   from the left. When `tic_copy == 0`, `tic_left` / `tic_right`
+///   gate each channel's `tic_used_in_slot[ch][]` vector.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AspxHfgenIwc2Ch {
+    pub tna_mode: [Vec<u8>; 2],
+    pub ah_left: bool,
+    pub ah_right: bool,
+    pub add_harmonic: [Vec<bool>; 2],
+    pub fic_present: bool,
+    pub fic_left: bool,
+    pub fic_right: bool,
+    pub fic_used_in_sfb: [Vec<bool>; 2],
+    pub tic_present: bool,
+    pub tic_copy: bool,
+    pub tic_left: bool,
+    pub tic_right: bool,
+    pub tic_used_in_slot: [Vec<bool>; 2],
+}
+
+/// Parse `aspx_hfgen_iwc_2ch(aspx_balance)` at the current bit-reader
+/// position per ETSI TS 103 190-1 Table 56 (§4.2.12.7).
+pub fn parse_aspx_hfgen_iwc_2ch(
+    br: &mut BitReader<'_>,
+    aspx_balance: bool,
+    num_sbg_noise: u32,
+    num_sbg_sig_highres: u32,
+    num_aspx_timeslots: u32,
+) -> Result<AspxHfgenIwc2Ch> {
+    // tna_mode[0][..] always present.
+    let mut tna0 = Vec::with_capacity(num_sbg_noise as usize);
+    for _ in 0..num_sbg_noise {
+        tna0.push(br.read_u32(2)? as u8);
+    }
+    // tna_mode[1][..] present only when aspx_balance == 0; otherwise
+    // mirrors channel 0.
+    let tna1 = if !aspx_balance {
+        let mut v = Vec::with_capacity(num_sbg_noise as usize);
+        for _ in 0..num_sbg_noise {
+            v.push(br.read_u32(2)? as u8);
+        }
+        v
+    } else {
+        tna0.clone()
+    };
+    // Per-channel add-harmonic gates and vectors.
+    let ah_left = br.read_bit()?;
+    let mut ah0 = vec![false; num_sbg_sig_highres as usize];
+    if ah_left {
+        for a in ah0.iter_mut() {
+            *a = br.read_bit()?;
+        }
+    }
+    let ah_right = br.read_bit()?;
+    let mut ah1 = vec![false; num_sbg_sig_highres as usize];
+    if ah_right {
+        for a in ah1.iter_mut() {
+            *a = br.read_bit()?;
+        }
+    }
+    // Frequency-interleaved-coding — outer `fic_present` gate, then
+    // per-channel `fic_left` / `fic_right` gates.
+    let mut fic0 = vec![false; num_sbg_sig_highres as usize];
+    let mut fic1 = vec![false; num_sbg_sig_highres as usize];
+    let fic_present = br.read_bit()?;
+    let mut fic_left = false;
+    let mut fic_right = false;
+    if fic_present {
+        fic_left = br.read_bit()?;
+        if fic_left {
+            for f in fic0.iter_mut() {
+                *f = br.read_bit()?;
+            }
+        }
+        fic_right = br.read_bit()?;
+        if fic_right {
+            for f in fic1.iter_mut() {
+                *f = br.read_bit()?;
+            }
+        }
+    }
+    // Time-interleaved-coding — outer `tic_present` gate, then
+    // `tic_copy` (mirror L into R) or per-channel gates.
+    let mut tic0 = vec![false; num_aspx_timeslots as usize];
+    let mut tic1 = vec![false; num_aspx_timeslots as usize];
+    let mut tic_copy = false;
+    let mut tic_left = false;
+    let mut tic_right = false;
+    let tic_present = br.read_bit()?;
+    if tic_present {
+        tic_copy = br.read_bit()?;
+        if !tic_copy {
+            tic_left = br.read_bit()?;
+            tic_right = br.read_bit()?;
+        }
+        if tic_copy || tic_left {
+            for t in tic0.iter_mut() {
+                *t = br.read_bit()?;
+            }
+        }
+        if tic_right {
+            for t in tic1.iter_mut() {
+                *t = br.read_bit()?;
+            }
+        }
+        if tic_copy {
+            tic1 = tic0.clone();
+        }
+    }
+    Ok(AspxHfgenIwc2Ch {
+        tna_mode: [tna0, tna1],
+        ah_left,
+        ah_right,
+        add_harmonic: [ah0, ah1],
+        fic_present,
+        fic_left,
+        fic_right,
+        fic_used_in_sfb: [fic0, fic1],
+        tic_present,
+        tic_copy,
+        tic_left,
+        tic_right,
+        tic_used_in_slot: [tic0, tic1],
+    })
+}
+
 /// Returns `ceil(log2(n))` for `n >= 1`. For `n == 1` returns 0, i.e.
 /// "zero bits needed". Used to size `aspx_tsg_ptr` (`ptr_bits`).
 fn ceil_log2(n: u32) -> u32 {
@@ -1231,6 +1371,131 @@ mod tests {
         assert!(h.tic_present);
         assert_eq!(h.tic_used_in_slot, vec![true, false, true]);
         assert_eq!(br.bit_position(), 12);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_hfgen_iwc_2ch_balance_on_mirrors_tna_and_all_gates_off() {
+        // aspx_balance = 1 -> tna_mode[1] mirrors tna_mode[0].
+        // num_sbg_noise=2 -> 4 bits for tna0 (no tna1 in bitstream).
+        // ah_left=0, ah_right=0, fic_present=0, tic_present=0 -> 4 bits.
+        // Total = 4 + 4 = 8 bits.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0b01, 2); // tna0[0] = 1
+        bw.write_u32(0b10, 2); // tna0[1] = 2
+        bw.write_bit(false); // ah_left
+        bw.write_bit(false); // ah_right
+        bw.write_bit(false); // fic_present
+        bw.write_bit(false); // tic_present
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let h = parse_aspx_hfgen_iwc_2ch(&mut br, true, 2, 3, 16).unwrap();
+        assert_eq!(h.tna_mode[0], vec![1, 2]);
+        // Channel 1 mirrors channel 0 verbatim.
+        assert_eq!(h.tna_mode[1], vec![1, 2]);
+        assert!(!h.ah_left && !h.ah_right);
+        assert!(!h.fic_present && !h.tic_present);
+        assert_eq!(h.add_harmonic[0], vec![false; 3]);
+        assert_eq!(h.add_harmonic[1], vec![false; 3]);
+        assert_eq!(h.fic_used_in_sfb[0], vec![false; 3]);
+        assert_eq!(h.fic_used_in_sfb[1], vec![false; 3]);
+        assert_eq!(h.tic_used_in_slot[0], vec![false; 16]);
+        assert_eq!(h.tic_used_in_slot[1], vec![false; 16]);
+        assert_eq!(br.bit_position(), 8);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_hfgen_iwc_2ch_balance_off_reads_both_tnas() {
+        // aspx_balance = 0 -> tna1 is read from the bitstream.
+        // num_sbg_noise=1: tna0 (2b) + tna1 (2b).
+        // ah_left=1 + ah_left_vector (sbg_highres=2 -> 2 bits); ah_right=0.
+        // fic_present=1, fic_left=0, fic_right=1 + right vector (2 bits).
+        // tic_present=1, tic_copy=0, tic_left=1, tic_right=0, + left vec (ats=2 -> 2 bits).
+        // Bits:
+        // tna0=3, tna1=2 -> 11, 10
+        // ah_left=1, ah0=[1,0]
+        // ah_right=0
+        // fic_present=1, fic_left=0, fic_right=1, fic1=[1,1]
+        // tic_present=1, tic_copy=0, tic_left=1, tic_right=0, tic0=[0,1]
+        let mut bw = BitWriter::new();
+        bw.write_u32(0b11, 2); // tna0[0]
+        bw.write_u32(0b10, 2); // tna1[0]
+        bw.write_bit(true); // ah_left
+        bw.write_bit(true);
+        bw.write_bit(false); // ah0 = [1,0]
+        bw.write_bit(false); // ah_right
+        bw.write_bit(true); // fic_present
+        bw.write_bit(false); // fic_left
+        bw.write_bit(true); // fic_right
+        bw.write_bit(true);
+        bw.write_bit(true); // fic1 = [1,1]
+        bw.write_bit(true); // tic_present
+        bw.write_bit(false); // tic_copy
+        bw.write_bit(true); // tic_left
+        bw.write_bit(false); // tic_right
+        bw.write_bit(false);
+        bw.write_bit(true); // tic0 = [0,1]
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let h = parse_aspx_hfgen_iwc_2ch(&mut br, false, 1, 2, 2).unwrap();
+        assert_eq!(h.tna_mode[0], vec![3]);
+        assert_eq!(h.tna_mode[1], vec![2]);
+        assert!(h.ah_left);
+        assert!(!h.ah_right);
+        assert_eq!(h.add_harmonic[0], vec![true, false]);
+        assert_eq!(h.add_harmonic[1], vec![false, false]);
+        assert!(h.fic_present);
+        assert!(!h.fic_left);
+        assert!(h.fic_right);
+        assert_eq!(h.fic_used_in_sfb[0], vec![false, false]);
+        assert_eq!(h.fic_used_in_sfb[1], vec![true, true]);
+        assert!(h.tic_present);
+        assert!(!h.tic_copy);
+        assert!(h.tic_left);
+        assert!(!h.tic_right);
+        assert_eq!(h.tic_used_in_slot[0], vec![false, true]);
+        assert_eq!(h.tic_used_in_slot[1], vec![false, false]);
+        // Total bits: 2+2+1+2+1+1+1+1+2+1+1+1+1+2 = 19
+        assert_eq!(br.bit_position(), 19);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_hfgen_iwc_2ch_tic_copy_mirrors_left_into_right() {
+        // num_sbg_noise=1 (tna0 only, balance=1).
+        // ah_left=0, ah_right=0.
+        // fic_present=0.
+        // tic_present=1, tic_copy=1, tic0=[1,0,1] (ats=3 -> 3 bits).
+        // Because tic_copy == 1, tic1 should equal tic0 without extra
+        // bits being read (and no tic_left/tic_right signalled).
+        let mut bw = BitWriter::new();
+        bw.write_u32(0b00, 2); // tna0[0] = 0
+        bw.write_bit(false); // ah_left
+        bw.write_bit(false); // ah_right
+        bw.write_bit(false); // fic_present
+        bw.write_bit(true); // tic_present
+        bw.write_bit(true); // tic_copy
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(true); // tic0 = [1,0,1]
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let h = parse_aspx_hfgen_iwc_2ch(&mut br, true, 1, 2, 3).unwrap();
+        assert_eq!(h.tna_mode[0], vec![0]);
+        assert_eq!(h.tna_mode[1], vec![0]); // balance mirror
+        assert!(h.tic_present);
+        assert!(h.tic_copy);
+        assert_eq!(h.tic_used_in_slot[0], vec![true, false, true]);
+        assert_eq!(h.tic_used_in_slot[1], vec![true, false, true]);
+        // Total: 2 + 1+1 + 1 + 1+1+3 = 10
+        assert_eq!(br.bit_position(), 10);
         assert!(br.read_bit().unwrap());
     }
 
