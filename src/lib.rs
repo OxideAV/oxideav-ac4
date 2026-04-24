@@ -144,15 +144,24 @@
 //!   lands on [`asf::SubstreamTools`] alongside the existing framing /
 //!   delta-dir / qmode fields.
 //!
+//! * **QMF analysis scaffold** — [`qmf::QWIN`] carries the 640-coefficient
+//!   QMF prototype window from Annex D.3, and
+//!   [`qmf::qmf_analysis_slot`] implements one iteration of the §5.7.3.2
+//!   Pseudocode 65 forward transform (windowing + 5-fold time-fold to
+//!   vector u + 64-point modulation to complex subband samples).
+//!   The multi-slot filter-state machine and QMF synthesis
+//!   (Pseudocode 66) are not yet wired in.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * QMF analysis / synthesis, HF regeneration, envelope application
-//!   and all §5.7.6.4 tools — `aspx_ec_data()` is end-to-end parsed
-//!   and its outputs (signal / noise deltas) now sit on
-//!   [`asf::SubstreamTools`] but don't feed an actual bandwidth-
-//!   extension pipeline yet.
+//! * QMF synthesis filter-bank (§5.7.4 Pseudocode 66), full
+//!   multi-slot analysis state machine, HF regeneration, envelope
+//!   application and the remaining §5.7.6.4 tools — `aspx_ec_data()`
+//!   is end-to-end parsed and its outputs (signal / noise deltas) now
+//!   sit on [`asf::SubstreamTools`] but don't feed an actual
+//!   bandwidth-extension pipeline yet.
 //! * A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
@@ -180,6 +189,7 @@ pub mod aspx_huffman;
 pub mod decoder;
 pub mod huffman;
 pub mod mdct;
+pub mod qmf;
 pub mod sfb_offset;
 pub mod sync;
 pub mod tables;
