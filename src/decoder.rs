@@ -721,6 +721,107 @@ mod tests {
         );
     }
 
+    /// Build a stereo SIMPLE ac4_substream() body with
+    /// `b_enable_mdct_stereo_proc == 1` (joint M/S). Shared section
+    /// data + scalefactors, two spectral residuals (M and S), a per
+    /// active sfb `ms_used` flag, and an snf_data block.
+    fn build_stereo_asf_joint_body(
+        tl: u32,
+        max_sfb: u32,
+        cb_idx_m: usize,
+        cb_idx_s: usize,
+    ) -> Vec<u8> {
+        use crate::huffman;
+        let mut bw = BitWriter::new();
+        bw.write_u32(800, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        // stereo_codec_mode = SIMPLE.
+        bw.write_u32(0, 2);
+        // b_enable_mdct_stereo_proc = 1.
+        bw.write_bit(true);
+        // asf_transform_info() — b_long_frame = 1.
+        bw.write_bit(true);
+        // asf_psy_info(0, 0): max_sfb[0].
+        bw.write_u32(max_sfb, 6);
+        // Shared asf_section_data — one section cb=5 over [0..max_sfb).
+        bw.write_u32(5, 4);
+        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let end_line = sfbo[max_sfb as usize] as u32;
+        let pairs = end_line / 2;
+        let hcb = huffman::asf_hcb(5).unwrap();
+        // Channel M spectrum.
+        bw.write_u32(hcb.cw[cb_idx_m], hcb.len[cb_idx_m] as u32);
+        for _ in 1..pairs {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        // Channel S spectrum.
+        bw.write_u32(hcb.cw[cb_idx_s], hcb.len[cb_idx_s] as u32);
+        for _ in 1..pairs {
+            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        }
+        // Shared scalefac_data: reference_scale_factor = 120.
+        bw.write_u32(120, 8);
+        // ms_used[sfb] — one bit per active sfb. Only sfb 0 has energy
+        // (cb != 0 and shared mqi > 0) so just one bit. Set to 1 so the
+        // decoder runs the M/S -> L/R transform.
+        bw.write_u32(1, 1);
+        // snf_data: b_snf_data_exists = 0.
+        bw.write_u32(0, 1);
+        bw.align_to_byte();
+        while bw.byte_len() < 820 {
+            bw.write_u32(0, 8);
+        }
+        bw.finish()
+    }
+
+    #[test]
+    fn decoder_stereo_cpe_joint_ms_emits_two_channels() {
+        // Joint-stereo M/S CPE with shared scalefactors. M has cb_idx=49
+        // (q0=1,q1=0), S has cb_idx=40 (q0=0,q1=0 -> all zero). With
+        // ms_used[0]=1, the inverse is L = M + S = M, R = M - S = M,
+        // so both channels should be equal and non-silent.
+        let mut bytes = build_minimal_toc(); // stereo TOC (channel_mode '10')
+        let body = build_stereo_asf_joint_body(1920, 10, 49, 40);
+        bytes.extend(body);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio");
+        };
+        assert_eq!(af.channels, 2);
+        assert_eq!(af.samples, 1_920);
+        let sub = dec.last_substream.as_ref().unwrap();
+        assert!(sub.tools.mdct_stereo_proc, "joint-stereo flag missing");
+        assert!(sub.tools.scaled_spec_primary.is_some());
+        assert!(sub.tools.scaled_spec_secondary.is_some());
+        // ms_used must have been read and the DC band flagged.
+        let ms_used = sub.tools.ms_used.as_ref().unwrap();
+        assert!(ms_used[0], "ms_used[0] should be true");
+        // Both channels non-silent.
+        let buf = &af.data[0];
+        let mut l: Vec<i16> = Vec::with_capacity(1_920);
+        let mut r: Vec<i16> = Vec::with_capacity(1_920);
+        for i in 0..1_920usize {
+            let off_l = i * 4;
+            let off_r = off_l + 2;
+            l.push(i16::from_le_bytes([buf[off_l], buf[off_l + 1]]));
+            r.push(i16::from_le_bytes([buf[off_r], buf[off_r + 1]]));
+        }
+        let e_l: i64 = l.iter().map(|&s| (s as i64) * (s as i64)).sum();
+        let e_r: i64 = r.iter().map(|&s| (s as i64) * (s as i64)).sum();
+        assert!(e_l > 0 && e_r > 0, "expected non-silent L and R");
+        // With S=0 and ms_used=1: L = M, R = M -> waveforms identical.
+        let differing = l.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            differing < 4,
+            "M/S inverse with S=0 should give L==R, got {differing} diffs"
+        );
+    }
+
     #[test]
     fn decoder_handles_sync_wrapped_packet() {
         let raw = build_minimal_toc();

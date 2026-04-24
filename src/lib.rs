@@ -68,8 +68,12 @@
 //! * Encoder.
 //!
 //! The decoder emits real PCM for long-frame, single-window-group
-//! mono SIMPLE/ASF streams. Everything else falls back to silence
-//! with a correctly-shaped AudioFrame.
+//! mono and stereo SIMPLE/ASF streams. The stereo path covers both
+//! the split-MDCT layout (two independent ASF spectra) and the joint
+//! `b_enable_mdct_stereo_proc == 1` mode (shared sections +
+//! scalefactors, two residuals, per-sfb `ms_used[]` inverse
+//! L = M + S / R = M - S per §7.5). Everything else falls back to
+//! silence with a correctly-shaped AudioFrame.
 
 #![allow(dead_code)]
 
