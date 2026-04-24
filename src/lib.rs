@@ -86,14 +86,20 @@
 //!   per signal envelope plus one bit per noise envelope. The per-
 //!   channel `AspxDeltaDir` drives which `ASPX_HCB_*_{F0,DF,DT}`
 //!   codebook the matching `aspx_ec_data()` path will pull from.
+//! * **A-SPX HF generation / interleaved-waveform coding (mono)** —
+//!   [`aspx::parse_aspx_hfgen_iwc_1ch`] implements Table 55
+//!   (§4.2.12.6): per-subband-group `tna_mode`, `ah_present` +
+//!   conditional `add_harmonic[]`, `fic_present` + conditional
+//!   `fic_used_in_sfb[]`, and `tic_present` + conditional
+//!   `tic_used_in_slot[]`. Takes `num_sbg_noise`,
+//!   `num_sbg_sig_highres`, `num_aspx_timeslots` from the caller.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * A-SPX HF-generation parameters (`aspx_hfgen_iwc_*`) and envelope
-//!   entropy data (`aspx_ec_data`); A-SPX Huffman tables (Annex A.2);
-//!   A-CPL (`acpl_config_*`, `acpl_data_*`).
+//! * A-SPX envelope entropy data (`aspx_ec_data`); A-SPX Huffman
+//!   tables (Annex A.2); A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into

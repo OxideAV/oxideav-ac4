@@ -26,15 +26,27 @@
 //!
 //! * **`aspx_delta_dir()`** (Table 54, §4.2.12.5) — one bit per signal
 //!   envelope plus one per noise envelope.
+//! * **`aspx_hfgen_iwc_1ch()`** (Table 55, §4.2.12.6) — 1-channel
+//!   HF-generation control: `tna_mode[0..num_sbg_noise]`,
+//!   `aspx_ah_present` + optional `add_harmonic[0..num_sbg_sig_highres]`,
+//!   `aspx_fic_present` + optional `fic_used_in_sfb[0..]`, and
+//!   `aspx_tic_present` + optional
+//!   `tic_used_in_slot[0..num_aspx_timeslots]`. The three sbg / ats
+//!   counts come from the A-SPX freq-scale derivation and are passed
+//!   in from the caller.
+//! * **`aspx_hfgen_iwc_2ch()`** (Table 56, §4.2.12.7) — 2-channel
+//!   analogue with explicit per-channel `aspx_ah_left` / `_right` and
+//!   `aspx_fic_left` / `_right` gates, plus `aspx_tic_copy` which
+//!   lets the encoder mirror the left-channel TIC pattern into the
+//!   right. Mirrors the pseudocode in Table 56 byte-for-byte.
 //!
 //! We deliberately stop short of:
 //!
-//! * `aspx_hfgen_iwc_*()`, `aspx_ec_data()` and the A-SPX Huffman
-//!   tables in Annex A.2 — envelope and noise scale factors are
-//!   Huffman-coded with dedicated codebooks (different ones per delta
-//!   direction, quantization step, signal vs noise etc.) and would
-//!   double the crate's line count. See the module-level roadmap in
-//!   `lib.rs`.
+//! * `aspx_ec_data()` and the A-SPX Huffman tables in Annex A.2 —
+//!   envelope and noise scale factors are Huffman-coded with dedicated
+//!   codebooks (different ones per delta direction, quantization step,
+//!   signal vs noise etc.) and would double the crate's line count.
+//!   See the module-level roadmap in `lib.rs`.
 //!
 //! Even so, `parse_aspx_config()` is useful on its own: it unblocks the
 //! `mono_codec_mode == ASPX` I-frame path in the outer `audio_data()`
@@ -475,6 +487,93 @@ pub fn parse_aspx_delta_dir(
     Ok(AspxDeltaDir {
         sig_delta_dir: sig,
         noise_delta_dir: noise,
+    })
+}
+
+/// Parsed `aspx_hfgen_iwc_1ch()` (ETSI TS 103 190-1 §4.2.12.6,
+/// Table 55) — the 1-channel HF-generation + interleaved-waveform
+/// coding element carried after `aspx_delta_dir(0)` on the
+/// `aspx_data_1ch()` path.
+///
+/// Field semantics (§4.3.10.6):
+///
+/// * `tna_mode[n]` (2 bits) — subband-wise tonal-to-noise adjustment
+///   selector for each of `num_sbg_noise` noise subband groups.
+/// * `add_harmonic[n]` (1 bit, optional) — per-highres-subband add-
+///   harmonics flag; gated by `aspx_ah_present`.
+/// * `fic_used_in_sfb[n]` (1 bit, optional) — per-highres-subband
+///   frequency-interleaved-coding flag; gated by `aspx_fic_present`.
+/// * `tic_used_in_slot[n]` (1 bit, optional) — per-A-SPX-timeslot
+///   time-interleaved-coding flag; gated by `aspx_tic_present`.
+///
+/// When a gate bit is 0 the corresponding vector stays all-zero per
+/// the pseudocode's explicit initialisation loops.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AspxHfgenIwc1Ch {
+    pub tna_mode: Vec<u8>,
+    pub ah_present: bool,
+    pub add_harmonic: Vec<bool>,
+    pub fic_present: bool,
+    pub fic_used_in_sfb: Vec<bool>,
+    pub tic_present: bool,
+    pub tic_used_in_slot: Vec<bool>,
+}
+
+/// Parse `aspx_hfgen_iwc_1ch()` at the current bit-reader position per
+/// ETSI TS 103 190-1 Table 55 (§4.2.12.6).
+///
+/// * `num_sbg_noise` — number of noise subband groups (§5.7.6.3.1.3).
+/// * `num_sbg_sig_highres` — number of high-resolution signal subband
+///   groups (§5.7.6.3.1.2).
+/// * `num_aspx_timeslots` — A-SPX time slots per frame (§5.7.6.3.3.0,
+///   Pseudocode 75a).
+///
+/// All three come from the A-SPX freq-scale derivation which is
+/// driven by `aspx_config` + the frame's sample-rate family; this
+/// parser takes them as ready-to-go counts so it stays decoupled from
+/// that future derivation.
+pub fn parse_aspx_hfgen_iwc_1ch(
+    br: &mut BitReader<'_>,
+    num_sbg_noise: u32,
+    num_sbg_sig_highres: u32,
+    num_aspx_timeslots: u32,
+) -> Result<AspxHfgenIwc1Ch> {
+    let mut tna_mode = Vec::with_capacity(num_sbg_noise as usize);
+    for _ in 0..num_sbg_noise {
+        tna_mode.push(br.read_u32(2)? as u8);
+    }
+    // aspx_ah_present + optional per-sbg add_harmonic flags.
+    let ah_present = br.read_bit()?;
+    let mut add_harmonic = vec![false; num_sbg_sig_highres as usize];
+    if ah_present {
+        for ah in add_harmonic.iter_mut() {
+            *ah = br.read_bit()?;
+        }
+    }
+    // aspx_fic_present + optional per-sbg fic_used_in_sfb flags.
+    let fic_present = br.read_bit()?;
+    let mut fic_used_in_sfb = vec![false; num_sbg_sig_highres as usize];
+    if fic_present {
+        for f in fic_used_in_sfb.iter_mut() {
+            *f = br.read_bit()?;
+        }
+    }
+    // aspx_tic_present + optional per-timeslot tic_used_in_slot flags.
+    let tic_present = br.read_bit()?;
+    let mut tic_used_in_slot = vec![false; num_aspx_timeslots as usize];
+    if tic_present {
+        for t in tic_used_in_slot.iter_mut() {
+            *t = br.read_bit()?;
+        }
+    }
+    Ok(AspxHfgenIwc1Ch {
+        tna_mode,
+        ah_present,
+        add_harmonic,
+        fic_present,
+        fic_used_in_sfb,
+        tic_present,
+        tic_used_in_slot,
     })
 }
 
@@ -1069,6 +1168,70 @@ mod tests {
         let dd = parse_aspx_delta_dir(&mut br, &framing).unwrap();
         assert_eq!(dd.sig_delta_dir, vec![false]);
         assert_eq!(dd.noise_delta_dir, vec![true]);
+    }
+
+    #[test]
+    fn aspx_hfgen_iwc_1ch_all_gates_off() {
+        // num_sbg_noise=2 -> 4 bits (tna_mode[0..=1], 2 bits each).
+        // ah_present=0, fic_present=0, tic_present=0 — 3 more bits.
+        // Total = 7 bits.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0b01, 2); // tna_mode[0] = 1
+        bw.write_u32(0b10, 2); // tna_mode[1] = 2
+        bw.write_bit(false); // ah_present
+        bw.write_bit(false); // fic_present
+        bw.write_bit(false); // tic_present
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let h = parse_aspx_hfgen_iwc_1ch(&mut br, 2, 3, 16).unwrap();
+        assert_eq!(h.tna_mode, vec![1, 2]);
+        assert!(!h.ah_present);
+        assert!(!h.fic_present);
+        assert!(!h.tic_present);
+        // Gated-off vectors stay all-zero at their declared length.
+        assert_eq!(h.add_harmonic, vec![false; 3]);
+        assert_eq!(h.fic_used_in_sfb, vec![false; 3]);
+        assert_eq!(h.tic_used_in_slot, vec![false; 16]);
+        assert_eq!(br.bit_position(), 7);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_hfgen_iwc_1ch_all_gates_on() {
+        // num_sbg_noise=1, num_sbg_sig_highres=2, num_aspx_timeslots=3.
+        // tna_mode[0] = 3 (2b)
+        // ah_present=1 + add_harmonic=[1,0] (3b)
+        // fic_present=1 + fic_used_in_sfb=[0,1] (3b)
+        // tic_present=1 + tic_used_in_slot=[1,0,1] (4b)
+        // Total = 2 + 3 + 3 + 4 = 12 bits.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0b11, 2);
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let h = parse_aspx_hfgen_iwc_1ch(&mut br, 1, 2, 3).unwrap();
+        assert_eq!(h.tna_mode, vec![3]);
+        assert!(h.ah_present);
+        assert_eq!(h.add_harmonic, vec![true, false]);
+        assert!(h.fic_present);
+        assert_eq!(h.fic_used_in_sfb, vec![false, true]);
+        assert!(h.tic_present);
+        assert_eq!(h.tic_used_in_slot, vec![true, false, true]);
+        assert_eq!(br.bit_position(), 12);
+        assert!(br.read_bit().unwrap());
     }
 
     #[test]
