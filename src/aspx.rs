@@ -57,6 +57,8 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
+use crate::aspx_huffman;
+
 /// Metadata + bit-level decoder for one A-SPX Huffman codebook per
 /// Annex A.2 (Tables A.16 .. A.33).
 ///
@@ -205,43 +207,253 @@ pub const ASPX_HCB_ENV_BALANCE_30_DT_META: AspxHcbMeta = AspxHcbMeta {
     codebook_length: 25,
     cb_off: 12,
 };
-/// Table A.28: `ASPX_HCB_NOISE_LEVEL_F0` (codebook_length — see
-/// Annex A.2 Table A.28 for the exact value).
+/// Table A.28: `ASPX_HCB_NOISE_LEVEL_F0` (codebook_length = 30).
 pub const ASPX_HCB_NOISE_LEVEL_F0_META: AspxHcbMeta = AspxHcbMeta {
     name: "ASPX_HCB_NOISE_LEVEL_F0",
-    codebook_length: 0,
+    codebook_length: 30,
     cb_off: 0,
 };
-/// Table A.29: `ASPX_HCB_NOISE_LEVEL_DF`.
+/// Table A.29: `ASPX_HCB_NOISE_LEVEL_DF` (codebook_length = 59,
+/// cb_off = 29).
 pub const ASPX_HCB_NOISE_LEVEL_DF_META: AspxHcbMeta = AspxHcbMeta {
     name: "ASPX_HCB_NOISE_LEVEL_DF",
-    codebook_length: 0,
-    cb_off: 0,
+    codebook_length: 59,
+    cb_off: 29,
 };
-/// Table A.30: `ASPX_HCB_NOISE_LEVEL_DT`.
+/// Table A.30: `ASPX_HCB_NOISE_LEVEL_DT` (codebook_length = 59,
+/// cb_off = 29).
 pub const ASPX_HCB_NOISE_LEVEL_DT_META: AspxHcbMeta = AspxHcbMeta {
     name: "ASPX_HCB_NOISE_LEVEL_DT",
-    codebook_length: 0,
-    cb_off: 0,
+    codebook_length: 59,
+    cb_off: 29,
 };
-/// Table A.31: `ASPX_HCB_NOISE_BALANCE_F0`.
+/// Table A.31: `ASPX_HCB_NOISE_BALANCE_F0` (codebook_length = 13).
 pub const ASPX_HCB_NOISE_BALANCE_F0_META: AspxHcbMeta = AspxHcbMeta {
     name: "ASPX_HCB_NOISE_BALANCE_F0",
-    codebook_length: 0,
+    codebook_length: 13,
     cb_off: 0,
 };
-/// Table A.32: `ASPX_HCB_NOISE_BALANCE_DF`.
+/// Table A.32: `ASPX_HCB_NOISE_BALANCE_DF` (codebook_length = 25,
+/// cb_off = 12).
 pub const ASPX_HCB_NOISE_BALANCE_DF_META: AspxHcbMeta = AspxHcbMeta {
     name: "ASPX_HCB_NOISE_BALANCE_DF",
-    codebook_length: 0,
-    cb_off: 0,
+    codebook_length: 25,
+    cb_off: 12,
 };
-/// Table A.33: `ASPX_HCB_NOISE_BALANCE_DT`.
+/// Table A.33: `ASPX_HCB_NOISE_BALANCE_DT` (codebook_length = 25,
+/// cb_off = 12).
 pub const ASPX_HCB_NOISE_BALANCE_DT_META: AspxHcbMeta = AspxHcbMeta {
     name: "ASPX_HCB_NOISE_BALANCE_DT",
-    codebook_length: 0,
+    codebook_length: 25,
+    cb_off: 12,
+};
+
+/// Identifier for one of the eighteen A-SPX Huffman codebooks in
+/// Annex A.2 (Tables A.16..=A.33).
+///
+/// The encoding choice in `aspx_ec_data()` is driven by the triple
+/// `(signal/noise, quant-step, delta direction)` — here split across
+/// the `EnvLevel15` / `EnvLevel30` / `EnvBalance15` / `EnvBalance30` /
+/// `Noise*` prefixes (signal-vs-noise + level-vs-balance + 15 dB vs
+/// 30 dB step) and the `F0` / `DF` / `DT` suffixes (raw value,
+/// delta-frequency, delta-time). See §4.3.10.5 / Tables 130.. for the
+/// selection rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HuffmanCodebookId {
+    EnvLevel15F0,
+    EnvLevel15Df,
+    EnvLevel15Dt,
+    EnvBalance15F0,
+    EnvBalance15Df,
+    EnvBalance15Dt,
+    EnvLevel30F0,
+    EnvLevel30Df,
+    EnvLevel30Dt,
+    EnvBalance30F0,
+    EnvBalance30Df,
+    EnvBalance30Dt,
+    NoiseLevelF0,
+    NoiseLevelDf,
+    NoiseLevelDt,
+    NoiseBalanceF0,
+    NoiseBalanceDf,
+    NoiseBalanceDt,
+}
+
+/// Table A.16 — `ASPX_HCB_ENV_LEVEL_15_F0` decoder.
+pub static ASPX_HCB_ENV_LEVEL_15_F0: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_LEVEL_15_F0",
+    len: aspx_huffman::ASPX_HCB_ENV_LEVEL_15_F0_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_LEVEL_15_F0_CW,
     cb_off: 0,
 };
+/// Table A.17 — `ASPX_HCB_ENV_LEVEL_15_DF` decoder.
+pub static ASPX_HCB_ENV_LEVEL_15_DF: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_LEVEL_15_DF",
+    len: aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DF_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DF_CW,
+    cb_off: 70,
+};
+/// Table A.18 — `ASPX_HCB_ENV_LEVEL_15_DT` decoder.
+pub static ASPX_HCB_ENV_LEVEL_15_DT: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_LEVEL_15_DT",
+    len: aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DT_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DT_CW,
+    cb_off: 70,
+};
+/// Table A.19 — `ASPX_HCB_ENV_BALANCE_15_F0` decoder.
+pub static ASPX_HCB_ENV_BALANCE_15_F0: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_BALANCE_15_F0",
+    len: aspx_huffman::ASPX_HCB_ENV_BALANCE_15_F0_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_BALANCE_15_F0_CW,
+    cb_off: 0,
+};
+/// Table A.20 — `ASPX_HCB_ENV_BALANCE_15_DF` decoder.
+pub static ASPX_HCB_ENV_BALANCE_15_DF: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_BALANCE_15_DF",
+    len: aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DF_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DF_CW,
+    cb_off: 24,
+};
+/// Table A.21 — `ASPX_HCB_ENV_BALANCE_15_DT` decoder.
+pub static ASPX_HCB_ENV_BALANCE_15_DT: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_BALANCE_15_DT",
+    len: aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DT_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DT_CW,
+    cb_off: 24,
+};
+/// Table A.22 — `ASPX_HCB_ENV_LEVEL_30_F0` decoder.
+pub static ASPX_HCB_ENV_LEVEL_30_F0: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_LEVEL_30_F0",
+    len: aspx_huffman::ASPX_HCB_ENV_LEVEL_30_F0_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_LEVEL_30_F0_CW,
+    cb_off: 0,
+};
+/// Table A.23 — `ASPX_HCB_ENV_LEVEL_30_DF` decoder.
+pub static ASPX_HCB_ENV_LEVEL_30_DF: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_LEVEL_30_DF",
+    len: aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DF_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DF_CW,
+    cb_off: 35,
+};
+/// Table A.24 — `ASPX_HCB_ENV_LEVEL_30_DT` decoder.
+pub static ASPX_HCB_ENV_LEVEL_30_DT: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_LEVEL_30_DT",
+    len: aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DT_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DT_CW,
+    cb_off: 35,
+};
+/// Table A.25 — `ASPX_HCB_ENV_BALANCE_30_F0` decoder.
+pub static ASPX_HCB_ENV_BALANCE_30_F0: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_BALANCE_30_F0",
+    len: aspx_huffman::ASPX_HCB_ENV_BALANCE_30_F0_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_BALANCE_30_F0_CW,
+    cb_off: 0,
+};
+/// Table A.26 — `ASPX_HCB_ENV_BALANCE_30_DF` decoder.
+pub static ASPX_HCB_ENV_BALANCE_30_DF: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_BALANCE_30_DF",
+    len: aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DF_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DF_CW,
+    cb_off: 12,
+};
+/// Table A.27 — `ASPX_HCB_ENV_BALANCE_30_DT` decoder.
+pub static ASPX_HCB_ENV_BALANCE_30_DT: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_ENV_BALANCE_30_DT",
+    len: aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DT_LEN,
+    cw: aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DT_CW,
+    cb_off: 12,
+};
+/// Table A.28 — `ASPX_HCB_NOISE_LEVEL_F0` decoder.
+pub static ASPX_HCB_NOISE_LEVEL_F0: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_NOISE_LEVEL_F0",
+    len: aspx_huffman::ASPX_HCB_NOISE_LEVEL_F0_LEN,
+    cw: aspx_huffman::ASPX_HCB_NOISE_LEVEL_F0_CW,
+    cb_off: 0,
+};
+/// Table A.29 — `ASPX_HCB_NOISE_LEVEL_DF` decoder.
+pub static ASPX_HCB_NOISE_LEVEL_DF: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_NOISE_LEVEL_DF",
+    len: aspx_huffman::ASPX_HCB_NOISE_LEVEL_DF_LEN,
+    cw: aspx_huffman::ASPX_HCB_NOISE_LEVEL_DF_CW,
+    cb_off: 29,
+};
+/// Table A.30 — `ASPX_HCB_NOISE_LEVEL_DT` decoder.
+pub static ASPX_HCB_NOISE_LEVEL_DT: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_NOISE_LEVEL_DT",
+    len: aspx_huffman::ASPX_HCB_NOISE_LEVEL_DT_LEN,
+    cw: aspx_huffman::ASPX_HCB_NOISE_LEVEL_DT_CW,
+    cb_off: 29,
+};
+/// Table A.31 — `ASPX_HCB_NOISE_BALANCE_F0` decoder.
+pub static ASPX_HCB_NOISE_BALANCE_F0: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_NOISE_BALANCE_F0",
+    len: aspx_huffman::ASPX_HCB_NOISE_BALANCE_F0_LEN,
+    cw: aspx_huffman::ASPX_HCB_NOISE_BALANCE_F0_CW,
+    cb_off: 0,
+};
+/// Table A.32 — `ASPX_HCB_NOISE_BALANCE_DF` decoder.
+pub static ASPX_HCB_NOISE_BALANCE_DF: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_NOISE_BALANCE_DF",
+    len: aspx_huffman::ASPX_HCB_NOISE_BALANCE_DF_LEN,
+    cw: aspx_huffman::ASPX_HCB_NOISE_BALANCE_DF_CW,
+    cb_off: 12,
+};
+/// Table A.33 — `ASPX_HCB_NOISE_BALANCE_DT` decoder.
+pub static ASPX_HCB_NOISE_BALANCE_DT: AspxHcb = AspxHcb {
+    name: "ASPX_HCB_NOISE_BALANCE_DT",
+    len: aspx_huffman::ASPX_HCB_NOISE_BALANCE_DT_LEN,
+    cw: aspx_huffman::ASPX_HCB_NOISE_BALANCE_DT_CW,
+    cb_off: 12,
+};
+
+/// Resolve an [`HuffmanCodebookId`] into the matching [`AspxHcb`]
+/// decoder instance. All 18 Annex A.2 codebooks are covered.
+pub fn lookup_aspx_hcb(id: HuffmanCodebookId) -> &'static AspxHcb {
+    match id {
+        HuffmanCodebookId::EnvLevel15F0 => &ASPX_HCB_ENV_LEVEL_15_F0,
+        HuffmanCodebookId::EnvLevel15Df => &ASPX_HCB_ENV_LEVEL_15_DF,
+        HuffmanCodebookId::EnvLevel15Dt => &ASPX_HCB_ENV_LEVEL_15_DT,
+        HuffmanCodebookId::EnvBalance15F0 => &ASPX_HCB_ENV_BALANCE_15_F0,
+        HuffmanCodebookId::EnvBalance15Df => &ASPX_HCB_ENV_BALANCE_15_DF,
+        HuffmanCodebookId::EnvBalance15Dt => &ASPX_HCB_ENV_BALANCE_15_DT,
+        HuffmanCodebookId::EnvLevel30F0 => &ASPX_HCB_ENV_LEVEL_30_F0,
+        HuffmanCodebookId::EnvLevel30Df => &ASPX_HCB_ENV_LEVEL_30_DF,
+        HuffmanCodebookId::EnvLevel30Dt => &ASPX_HCB_ENV_LEVEL_30_DT,
+        HuffmanCodebookId::EnvBalance30F0 => &ASPX_HCB_ENV_BALANCE_30_F0,
+        HuffmanCodebookId::EnvBalance30Df => &ASPX_HCB_ENV_BALANCE_30_DF,
+        HuffmanCodebookId::EnvBalance30Dt => &ASPX_HCB_ENV_BALANCE_30_DT,
+        HuffmanCodebookId::NoiseLevelF0 => &ASPX_HCB_NOISE_LEVEL_F0,
+        HuffmanCodebookId::NoiseLevelDf => &ASPX_HCB_NOISE_LEVEL_DF,
+        HuffmanCodebookId::NoiseLevelDt => &ASPX_HCB_NOISE_LEVEL_DT,
+        HuffmanCodebookId::NoiseBalanceF0 => &ASPX_HCB_NOISE_BALANCE_F0,
+        HuffmanCodebookId::NoiseBalanceDf => &ASPX_HCB_NOISE_BALANCE_DF,
+        HuffmanCodebookId::NoiseBalanceDt => &ASPX_HCB_NOISE_BALANCE_DT,
+    }
+}
+
+/// Every codebook shipped in this module — used for table-wide
+/// correctness tests + diagnostics.
+pub static ASPX_HCB_ALL: &[(HuffmanCodebookId, &AspxHcb)] = &[
+    (HuffmanCodebookId::EnvLevel15F0, &ASPX_HCB_ENV_LEVEL_15_F0),
+    (HuffmanCodebookId::EnvLevel15Df, &ASPX_HCB_ENV_LEVEL_15_DF),
+    (HuffmanCodebookId::EnvLevel15Dt, &ASPX_HCB_ENV_LEVEL_15_DT),
+    (HuffmanCodebookId::EnvBalance15F0, &ASPX_HCB_ENV_BALANCE_15_F0),
+    (HuffmanCodebookId::EnvBalance15Df, &ASPX_HCB_ENV_BALANCE_15_DF),
+    (HuffmanCodebookId::EnvBalance15Dt, &ASPX_HCB_ENV_BALANCE_15_DT),
+    (HuffmanCodebookId::EnvLevel30F0, &ASPX_HCB_ENV_LEVEL_30_F0),
+    (HuffmanCodebookId::EnvLevel30Df, &ASPX_HCB_ENV_LEVEL_30_DF),
+    (HuffmanCodebookId::EnvLevel30Dt, &ASPX_HCB_ENV_LEVEL_30_DT),
+    (HuffmanCodebookId::EnvBalance30F0, &ASPX_HCB_ENV_BALANCE_30_F0),
+    (HuffmanCodebookId::EnvBalance30Df, &ASPX_HCB_ENV_BALANCE_30_DF),
+    (HuffmanCodebookId::EnvBalance30Dt, &ASPX_HCB_ENV_BALANCE_30_DT),
+    (HuffmanCodebookId::NoiseLevelF0, &ASPX_HCB_NOISE_LEVEL_F0),
+    (HuffmanCodebookId::NoiseLevelDf, &ASPX_HCB_NOISE_LEVEL_DF),
+    (HuffmanCodebookId::NoiseLevelDt, &ASPX_HCB_NOISE_LEVEL_DT),
+    (HuffmanCodebookId::NoiseBalanceF0, &ASPX_HCB_NOISE_BALANCE_F0),
+    (HuffmanCodebookId::NoiseBalanceDf, &ASPX_HCB_NOISE_BALANCE_DF),
+    (HuffmanCodebookId::NoiseBalanceDt, &ASPX_HCB_NOISE_BALANCE_DT),
+];
 
 /// A-SPX frequency-resolution transmission mode (Table 124).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -941,6 +1153,237 @@ pub fn num_ts_in_ats(frame_len_base: u32) -> u32 {
 /// eight base-rate `frame_length` values in Table 189.
 pub fn num_aspx_timeslots(frame_len_base: u32) -> u32 {
     num_qmf_timeslots(frame_len_base) / num_ts_in_ats(frame_len_base)
+}
+
+/// Data-type selector for `aspx_ec_data()` (ETSI TS 103 190-1 Table 57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AspxDataType {
+    Signal,
+    Noise,
+}
+
+/// Stereo-mode selector for `aspx_ec_data()` (ETSI TS 103 190-1 Table 57).
+/// Maps to `LEVEL` / `BALANCE` in `get_aspx_hcb()` (Pseudocode 79).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AspxStereoMode {
+    Level,
+    Balance,
+}
+
+/// `get_aspx_hcb()` per ETSI TS 103 190-1 §5.7.6.3.4 (Pseudocode 79) —
+/// pick the correct Annex A.2 Huffman codebook from the four-tuple
+/// `(data_type, quant_mode, stereo_mode, hcb_type)`.
+///
+/// * `data_type` — SIGNAL or NOISE.
+/// * `quant_mode` — [`AspxQuantStep::Fine`] (15, 1.5 dB) or
+///   [`AspxQuantStep::Coarse`] (30, 3 dB). Note: NOISE tables don't
+///   carry a quant-mode dimension in Annex A.2; the caller passes `qm = 0`
+///   per Tables 51 / 52, so for NOISE we ignore the quant step.
+/// * `stereo_mode` — LEVEL or BALANCE.
+/// * `hcb_type` — `F0`, `DF`, or `DT` (selected by the encoder's
+///   choice of base-frequency / delta-frequency / delta-time coding).
+pub fn get_aspx_hcb(
+    data_type: AspxDataType,
+    quant_mode: AspxQuantStep,
+    stereo_mode: AspxStereoMode,
+    hcb_type: AspxHcbType,
+) -> HuffmanCodebookId {
+    use AspxDataType::*;
+    use AspxHcbType::*;
+    use AspxQuantStep::*;
+    use AspxStereoMode::*;
+    match (data_type, quant_mode, stereo_mode, hcb_type) {
+        (Signal, Fine, Level, F0) => HuffmanCodebookId::EnvLevel15F0,
+        (Signal, Fine, Level, Df) => HuffmanCodebookId::EnvLevel15Df,
+        (Signal, Fine, Level, Dt) => HuffmanCodebookId::EnvLevel15Dt,
+        (Signal, Fine, Balance, F0) => HuffmanCodebookId::EnvBalance15F0,
+        (Signal, Fine, Balance, Df) => HuffmanCodebookId::EnvBalance15Df,
+        (Signal, Fine, Balance, Dt) => HuffmanCodebookId::EnvBalance15Dt,
+        (Signal, Coarse, Level, F0) => HuffmanCodebookId::EnvLevel30F0,
+        (Signal, Coarse, Level, Df) => HuffmanCodebookId::EnvLevel30Df,
+        (Signal, Coarse, Level, Dt) => HuffmanCodebookId::EnvLevel30Dt,
+        (Signal, Coarse, Balance, F0) => HuffmanCodebookId::EnvBalance30F0,
+        (Signal, Coarse, Balance, Df) => HuffmanCodebookId::EnvBalance30Df,
+        (Signal, Coarse, Balance, Dt) => HuffmanCodebookId::EnvBalance30Dt,
+        (Noise, _, Level, F0) => HuffmanCodebookId::NoiseLevelF0,
+        (Noise, _, Level, Df) => HuffmanCodebookId::NoiseLevelDf,
+        (Noise, _, Level, Dt) => HuffmanCodebookId::NoiseLevelDt,
+        (Noise, _, Balance, F0) => HuffmanCodebookId::NoiseBalanceF0,
+        (Noise, _, Balance, Df) => HuffmanCodebookId::NoiseBalanceDf,
+        (Noise, _, Balance, Dt) => HuffmanCodebookId::NoiseBalanceDt,
+    }
+}
+
+/// Codebook flavour per Annex A.2 — the last suffix in the codebook
+/// name (`F0` / `DF` / `DT`). Driven by whether the symbol is an
+/// envelope's base-frequency value, a delta along frequency, or a
+/// delta along time (§4.2.12.9 Table 58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AspxHcbType {
+    F0,
+    Df,
+    Dt,
+}
+
+/// One envelope's worth of Huffman-decoded A-SPX data — the output
+/// of `aspx_huff_data()` (ETSI TS 103 190-1 Table 58). Holds the
+/// per-subband-group quantised delta values in the order they were
+/// read from the stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AspxHuffEnv {
+    /// Per-subband-group decoded delta values. For `FREQ` direction
+    /// the first entry is an F0 value and the rest are DF deltas;
+    /// for `TIME` direction every entry is a DT delta.
+    pub values: Vec<i32>,
+    /// Transmission direction this envelope used (false = FREQ,
+    /// true = TIME) — tracks `aspx_sig_delta_dir[env]` /
+    /// `aspx_noise_delta_dir[env]`.
+    pub direction_time: bool,
+}
+
+/// `aspx_huff_data()` per ETSI TS 103 190-1 §4.2.12.9 (Table 58) —
+/// decode one envelope's `num_sbg` Huffman codewords.
+///
+/// The `direction` flag selects between the two branches of the
+/// syntax:
+///
+/// * `direction == false` (FREQ): the first value is read with the
+///   matching `*_F0` codebook, the remaining `num_sbg - 1` with the
+///   `*_DF` codebook.
+/// * `direction == true` (TIME): every value is read with the `*_DT`
+///   codebook.
+///
+/// `data_type`, `quant_mode`, `stereo_mode` drive `get_aspx_hcb()`
+/// selection.
+pub fn parse_aspx_huff_data(
+    br: &mut BitReader<'_>,
+    data_type: AspxDataType,
+    num_sbg: u32,
+    quant_mode: AspxQuantStep,
+    stereo_mode: AspxStereoMode,
+    direction: bool,
+) -> Result<AspxHuffEnv> {
+    let mut out = Vec::with_capacity(num_sbg as usize);
+    if !direction {
+        // FREQ — F0 for index 0, DF for the rest.
+        let hcb_f0 = lookup_aspx_hcb(get_aspx_hcb(
+            data_type,
+            quant_mode,
+            stereo_mode,
+            AspxHcbType::F0,
+        ));
+        if num_sbg >= 1 {
+            out.push(hcb_f0.decode_delta(br)?);
+        }
+        if num_sbg >= 2 {
+            let hcb_df = lookup_aspx_hcb(get_aspx_hcb(
+                data_type,
+                quant_mode,
+                stereo_mode,
+                AspxHcbType::Df,
+            ));
+            for _ in 1..num_sbg {
+                out.push(hcb_df.decode_delta(br)?);
+            }
+        }
+    } else {
+        // TIME — all-DT.
+        let hcb_dt = lookup_aspx_hcb(get_aspx_hcb(
+            data_type,
+            quant_mode,
+            stereo_mode,
+            AspxHcbType::Dt,
+        ));
+        for _ in 0..num_sbg {
+            out.push(hcb_dt.decode_delta(br)?);
+        }
+    }
+    Ok(AspxHuffEnv {
+        values: out,
+        direction_time: direction,
+    })
+}
+
+/// A-SPX subband-group count context for `aspx_ec_data()` — the three
+/// `num_sbg_sig_highres` / `num_sbg_sig_lowres` / `num_sbg_noise`
+/// counts derived in §5.7.6.3 from the master frequency scale.
+///
+/// The spec's Note on Table 57 reads:
+///
+/// > Variables num_sbg_sig_highres and num_sbg_sig_lowres are derived
+/// > in clause 5.7.6.3.1.2 and num_sbg_noise is derived according to
+/// > clause 5.7.6.3.1.3.
+///
+/// Since we don't evaluate the full master-freq-scale derivation yet,
+/// the caller passes the derived counts in explicitly. For testing /
+/// hand-built fixtures this is straightforward; for real AC-4
+/// bitstreams this needs the QMF-subband layout wiring in a later
+/// round.
+#[derive(Debug, Clone, Copy)]
+pub struct AspxSbgCounts {
+    pub num_sbg_sig_highres: u32,
+    pub num_sbg_sig_lowres: u32,
+    pub num_sbg_noise: u32,
+}
+
+/// `aspx_ec_data()` per ETSI TS 103 190-1 §4.2.12.8 (Table 57) —
+/// decode `num_env` envelopes' worth of Huffman codewords for either
+/// SIGNAL or NOISE data.
+///
+/// Per envelope:
+///
+/// * SIGNAL: `num_sbg = num_sbg_sig_highres` when `freq_res[env] == 1`,
+///   else `num_sbg_sig_lowres`.
+/// * NOISE: `num_sbg = num_sbg_noise` regardless of `freq_res` (the
+///   caller passes `freq_res = &[]` for NOISE paths — see the
+///   `aspx_data_1ch()` / `aspx_data_2ch()` call sites in Tables 51
+///   and 52 where `freq_res` is literally `0`).
+///
+/// Each envelope's direction is taken from `direction[env]`
+/// (`aspx_sig_delta_dir` / `aspx_noise_delta_dir` from Table 54).
+/// Returns a per-envelope vector of Huffman-decoded symbol streams.
+pub fn parse_aspx_ec_data(
+    br: &mut BitReader<'_>,
+    data_type: AspxDataType,
+    num_env: u32,
+    freq_res: &[bool],
+    quant_mode: AspxQuantStep,
+    stereo_mode: AspxStereoMode,
+    direction: &[bool],
+    sbg: AspxSbgCounts,
+) -> Result<Vec<AspxHuffEnv>> {
+    if direction.len() < num_env as usize {
+        return Err(Error::invalid(
+            "ac4: aspx_ec_data direction vector shorter than num_env",
+        ));
+    }
+    let mut out = Vec::with_capacity(num_env as usize);
+    for env in 0..num_env as usize {
+        let num_sbg = match data_type {
+            AspxDataType::Signal => {
+                // freq_res may be empty when the caller doesn't have
+                // per-envelope resolution data — fall back to the
+                // high-res count (Table 57 Note / §4.3.10.4.9).
+                let use_highres = freq_res.get(env).copied().unwrap_or(true);
+                if use_highres {
+                    sbg.num_sbg_sig_highres
+                } else {
+                    sbg.num_sbg_sig_lowres
+                }
+            }
+            AspxDataType::Noise => sbg.num_sbg_noise,
+        };
+        let envdata = parse_aspx_huff_data(
+            br,
+            data_type,
+            num_sbg,
+            quant_mode,
+            stereo_mode,
+            direction[env],
+        )?;
+        out.push(envdata);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1753,5 +2196,338 @@ mod tests {
         assert_eq!(num_aspx_timeslots(768), 12); // 12 / 1
         assert_eq!(num_aspx_timeslots(512), 8); // 8 / 1
         assert_eq!(num_aspx_timeslots(384), 6); // 6 / 1
+    }
+
+    // --- A-SPX Huffman codebook transcription tests -------------------
+
+    /// Pack `value` as an `len`-bit MSB-first code into `bw`.
+    fn push_hcb_code(bw: &mut BitWriter, len: u8, value: u32) {
+        bw.write_u32(value, len as u32);
+    }
+
+    /// Round-trip every entry of one codebook: for each symbol
+    /// `i`, feed `cw[i]` (packed as `len[i]` MSB-first bits) through
+    /// `AspxHcb::decode_delta()` and check the recovered delta equals
+    /// `i - cb_off`. This is the canonical Huffman contract — if any
+    /// transcription slipped this test catches it.
+    fn round_trip_codebook(hcb: &AspxHcb) {
+        assert_eq!(
+            hcb.len.len(),
+            hcb.cw.len(),
+            "{}: len[] and cw[] length mismatch",
+            hcb.name
+        );
+        for (i, (&l, &cw)) in hcb.len.iter().zip(hcb.cw.iter()).enumerate() {
+            assert!(l > 0, "{}: len[{}] = 0", hcb.name, i);
+            assert!(l <= 32, "{}: len[{}] = {} (> 32)", hcb.name, i, l);
+            let mut bw = BitWriter::new();
+            push_hcb_code(&mut bw, l, cw);
+            // Pad to byte boundary with zeros (safe: any residual
+            // bits after the codeword are irrelevant for this
+            // decode since decode_delta stops at the first match).
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let delta = hcb.decode_delta(&mut br).unwrap_or_else(|e| {
+                panic!(
+                    "{}: decode_delta failed on symbol {} (cw={:#x}, len={}): {:?}",
+                    hcb.name, i, cw, l, e
+                );
+            });
+            let expected = i as i32 - hcb.cb_off;
+            assert_eq!(
+                delta, expected,
+                "{}: symbol {} decoded to delta {} (expected {})",
+                hcb.name, i, delta, expected
+            );
+            assert_eq!(
+                br.bit_position(),
+                l as u64,
+                "{}: consumed {} bits, expected {}",
+                hcb.name,
+                br.bit_position(),
+                l
+            );
+        }
+    }
+
+    #[test]
+    fn aspx_hcb_env_level_15_f0_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_LEVEL_15_F0);
+    }
+
+    #[test]
+    fn aspx_hcb_env_level_15_df_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_LEVEL_15_DF);
+    }
+
+    #[test]
+    fn aspx_hcb_env_level_15_dt_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_LEVEL_15_DT);
+    }
+
+    #[test]
+    fn aspx_hcb_env_balance_15_f0_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_BALANCE_15_F0);
+    }
+
+    #[test]
+    fn aspx_hcb_env_balance_15_df_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_BALANCE_15_DF);
+    }
+
+    #[test]
+    fn aspx_hcb_env_balance_15_dt_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_BALANCE_15_DT);
+    }
+
+    #[test]
+    fn aspx_hcb_env_level_30_f0_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_LEVEL_30_F0);
+    }
+
+    #[test]
+    fn aspx_hcb_env_level_30_df_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_LEVEL_30_DF);
+    }
+
+    #[test]
+    fn aspx_hcb_env_level_30_dt_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_LEVEL_30_DT);
+    }
+
+    #[test]
+    fn aspx_hcb_env_balance_30_f0_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_BALANCE_30_F0);
+    }
+
+    #[test]
+    fn aspx_hcb_env_balance_30_df_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_BALANCE_30_DF);
+    }
+
+    #[test]
+    fn aspx_hcb_env_balance_30_dt_round_trip() {
+        round_trip_codebook(&ASPX_HCB_ENV_BALANCE_30_DT);
+    }
+
+    #[test]
+    fn aspx_hcb_noise_level_f0_round_trip() {
+        round_trip_codebook(&ASPX_HCB_NOISE_LEVEL_F0);
+    }
+
+    #[test]
+    fn aspx_hcb_noise_level_df_round_trip() {
+        round_trip_codebook(&ASPX_HCB_NOISE_LEVEL_DF);
+    }
+
+    #[test]
+    fn aspx_hcb_noise_level_dt_round_trip() {
+        round_trip_codebook(&ASPX_HCB_NOISE_LEVEL_DT);
+    }
+
+    #[test]
+    fn aspx_hcb_noise_balance_f0_round_trip() {
+        round_trip_codebook(&ASPX_HCB_NOISE_BALANCE_F0);
+    }
+
+    #[test]
+    fn aspx_hcb_noise_balance_df_round_trip() {
+        round_trip_codebook(&ASPX_HCB_NOISE_BALANCE_DF);
+    }
+
+    #[test]
+    fn aspx_hcb_noise_balance_dt_round_trip() {
+        round_trip_codebook(&ASPX_HCB_NOISE_BALANCE_DT);
+    }
+
+    /// Sanity: ASPX_HCB_ALL lines up with the lookup + meta consts —
+    /// guards against the table list and `lookup_aspx_hcb()` drifting
+    /// apart, and checks every `(codebook_length, cb_off)` matches the
+    /// corresponding `AspxHcbMeta` header.
+    #[test]
+    fn aspx_hcb_all_matches_lookup_and_meta() {
+        let metas: &[AspxHcbMeta] = &[
+            ASPX_HCB_ENV_LEVEL_15_F0_META,
+            ASPX_HCB_ENV_LEVEL_15_DF_META,
+            ASPX_HCB_ENV_LEVEL_15_DT_META,
+            ASPX_HCB_ENV_BALANCE_15_F0_META,
+            ASPX_HCB_ENV_BALANCE_15_DF_META,
+            ASPX_HCB_ENV_BALANCE_15_DT_META,
+            ASPX_HCB_ENV_LEVEL_30_F0_META,
+            ASPX_HCB_ENV_LEVEL_30_DF_META,
+            ASPX_HCB_ENV_LEVEL_30_DT_META,
+            ASPX_HCB_ENV_BALANCE_30_F0_META,
+            ASPX_HCB_ENV_BALANCE_30_DF_META,
+            ASPX_HCB_ENV_BALANCE_30_DT_META,
+            ASPX_HCB_NOISE_LEVEL_F0_META,
+            ASPX_HCB_NOISE_LEVEL_DF_META,
+            ASPX_HCB_NOISE_LEVEL_DT_META,
+            ASPX_HCB_NOISE_BALANCE_F0_META,
+            ASPX_HCB_NOISE_BALANCE_DF_META,
+            ASPX_HCB_NOISE_BALANCE_DT_META,
+        ];
+        assert_eq!(ASPX_HCB_ALL.len(), 18);
+        assert_eq!(ASPX_HCB_ALL.len(), metas.len());
+        for ((id, hcb), meta) in ASPX_HCB_ALL.iter().zip(metas.iter()) {
+            assert_eq!(hcb.name, meta.name);
+            assert_eq!(hcb.len.len(), meta.codebook_length as usize);
+            assert_eq!(hcb.cw.len(), meta.codebook_length as usize);
+            assert_eq!(hcb.cb_off, meta.cb_off);
+            let via_lookup = lookup_aspx_hcb(*id);
+            assert_eq!(via_lookup.name, hcb.name);
+        }
+    }
+
+    #[test]
+    fn get_aspx_hcb_matches_pseudocode_79() {
+        // Sample the full 3x2x2x3 = 36 SIGNAL+NOISE permutations.
+        // SIGNAL:
+        assert_eq!(
+            get_aspx_hcb(
+                AspxDataType::Signal,
+                AspxQuantStep::Fine,
+                AspxStereoMode::Level,
+                AspxHcbType::Df
+            ),
+            HuffmanCodebookId::EnvLevel15Df
+        );
+        assert_eq!(
+            get_aspx_hcb(
+                AspxDataType::Signal,
+                AspxQuantStep::Coarse,
+                AspxStereoMode::Balance,
+                AspxHcbType::F0
+            ),
+            HuffmanCodebookId::EnvBalance30F0
+        );
+        assert_eq!(
+            get_aspx_hcb(
+                AspxDataType::Signal,
+                AspxQuantStep::Coarse,
+                AspxStereoMode::Level,
+                AspxHcbType::Dt
+            ),
+            HuffmanCodebookId::EnvLevel30Dt
+        );
+        // NOISE ignores quant-mode — every step-mode maps the same way.
+        for qm in [AspxQuantStep::Fine, AspxQuantStep::Coarse] {
+            assert_eq!(
+                get_aspx_hcb(AspxDataType::Noise, qm, AspxStereoMode::Level, AspxHcbType::F0),
+                HuffmanCodebookId::NoiseLevelF0
+            );
+            assert_eq!(
+                get_aspx_hcb(
+                    AspxDataType::Noise,
+                    qm,
+                    AspxStereoMode::Balance,
+                    AspxHcbType::Dt
+                ),
+                HuffmanCodebookId::NoiseBalanceDt
+            );
+        }
+    }
+
+    // --- aspx_ec_data end-to-end -------------------------------------
+
+    /// Hand-build a minimal `aspx_ec_data()` payload for one SIGNAL
+    /// envelope with FREQ direction and 3 subband groups, then confirm
+    /// the walker extracts the three expected deltas and sits at the
+    /// right bit position. Uses `ASPX_HCB_ENV_LEVEL_15_{F0,DF}` so the
+    /// test exercises the Table 57 / 58 branch covering AC-4's most
+    /// common config (1.5 dB step, SIGNAL, LEVEL stereo, FREQ dir).
+    #[test]
+    fn aspx_ec_data_one_env_freq_dir_signal() {
+        // Target deltas:
+        //   sbg 0 (F0):      symbol index 40 — from ASPX_HCB_ENV_LEVEL_15_F0
+        //                    (cb_off = 0, so decoded delta = 40).
+        //   sbg 1 (DF):      symbol index 70 — the zero-delta — from
+        //                    ASPX_HCB_ENV_LEVEL_15_DF (cb_off = 70, so
+        //                    decoded delta = 0).
+        //   sbg 2 (DF):      symbol index 71 — delta +1.
+        let f0_cb = &ASPX_HCB_ENV_LEVEL_15_F0;
+        let df_cb = &ASPX_HCB_ENV_LEVEL_15_DF;
+        let f0_idx = 40usize;
+        let df_zero_idx = 70usize;
+        let df_plus1_idx = 71usize;
+        let mut bw = BitWriter::new();
+        bw.write_u32(f0_cb.cw[f0_idx], f0_cb.len[f0_idx] as u32);
+        bw.write_u32(df_cb.cw[df_zero_idx], df_cb.len[df_zero_idx] as u32);
+        bw.write_u32(df_cb.cw[df_plus1_idx], df_cb.len[df_plus1_idx] as u32);
+        let total_bits = f0_cb.len[f0_idx] as u64
+            + df_cb.len[df_zero_idx] as u64
+            + df_cb.len[df_plus1_idx] as u64;
+        bw.align_to_byte();
+        let bytes = bw.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let out = parse_aspx_ec_data(
+            &mut br,
+            AspxDataType::Signal,
+            1,          // num_env
+            &[true],    // freq_res[0] = high-res
+            AspxQuantStep::Fine,
+            AspxStereoMode::Level,
+            &[false],   // direction[0] = FREQ
+            AspxSbgCounts {
+                num_sbg_sig_highres: 3,
+                num_sbg_sig_lowres: 2,
+                num_sbg_noise: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        let env = &out[0];
+        assert!(!env.direction_time);
+        assert_eq!(env.values, vec![40, 0, 1]);
+        assert_eq!(br.bit_position(), total_bits);
+    }
+
+    /// Same as above but for the NOISE path with TIME direction —
+    /// exercises the `*_DT` codebook and confirms that NOISE ignores
+    /// the caller-passed quant_mode (per Pseudocode 79's NOISE
+    /// branch).
+    #[test]
+    fn aspx_ec_data_two_env_time_dir_noise() {
+        let dt_cb = &ASPX_HCB_NOISE_LEVEL_DT;
+        // Pick a couple of readily-identifiable symbols.
+        //   env 0 sbg 0 -> symbol 29 (DT zero — cb_off = 29, so
+        //                   decoded delta = 0).
+        //   env 0 sbg 1 -> symbol 30 -> delta +1.
+        //   env 1 sbg 0 -> symbol 28 -> delta -1.
+        //   env 1 sbg 1 -> symbol 31 -> delta +2.
+        let symbols = [29usize, 30usize, 28usize, 31usize];
+        let mut bw = BitWriter::new();
+        let mut total_bits: u64 = 0;
+        for &s in &symbols {
+            bw.write_u32(dt_cb.cw[s], dt_cb.len[s] as u32);
+            total_bits += dt_cb.len[s] as u64;
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let out = parse_aspx_ec_data(
+            &mut br,
+            AspxDataType::Noise,
+            2, // num_env
+            &[], // freq_res ignored for NOISE
+            // Flip quant_mode to confirm it's ignored.
+            AspxQuantStep::Coarse,
+            AspxStereoMode::Level,
+            &[true, true], // TIME for both envelopes
+            AspxSbgCounts {
+                num_sbg_sig_highres: 3,
+                num_sbg_sig_lowres: 2,
+                num_sbg_noise: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out[0].direction_time);
+        assert_eq!(out[0].values, vec![0, 1]);
+        assert!(out[1].direction_time);
+        assert_eq!(out[1].values, vec![-1, 2]);
+        assert_eq!(br.bit_position(), total_bits);
     }
 }
