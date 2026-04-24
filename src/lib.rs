@@ -62,14 +62,31 @@
 //!   `acpl_config_1ch`, which isn't parsed yet). Exposes the parsed
 //!   `AspxConfig` through
 //!   [`decoder::Ac4Decoder::last_substream`]`.tools.aspx_config`.
+//! * **A-SPX framing** — [`aspx::parse_aspx_framing`] implements
+//!   `aspx_framing()` (Table 53, §4.2.12.4) end-to-end for all four
+//!   interval classes (FIXFIX / FIXVAR / VARFIX / VARVAR) including
+//!   the 1/2/3-bit `aspx_int_class` prefix code, the envelope-count
+//!   derivation for FIXFIX (`1 << tmp_num_env` with
+//!   `envbits = aspx_num_env_bits_fixfix + 1`), Note-1 1-vs-2-bit
+//!   field widths driven by `num_aspx_timeslots`, the
+//!   `aspx_tsg_ptr` sizing via `ceil(log2(num_env + 2))`, and the
+//!   I-frame gate on `aspx_var_bord_left` for VARFIX / VARVAR.
+//!   Returns the full [`aspx::AspxFraming`] (int_class, num_env,
+//!   num_noise, freq_res vector, border fields, tsg_ptr). Not yet
+//!   wired into the `asf::walk_ac4_substream` walker — that still
+//!   stops after `aspx_config()` / `companding_control()` because
+//!   `num_aspx_timeslots` plumbing is not in the frame-level tool
+//!   state yet.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * A-SPX envelope / noise data (`aspx_framing`, `aspx_delta_dir`,
-//!   `aspx_hfgen_iwc_*`, `aspx_ec_data`) and A-SPX Huffman tables
-//!   (Annex A.2); A-CPL (`acpl_config_*`, `acpl_data_*`).
+//! * A-SPX envelope / noise data (`aspx_delta_dir`, `aspx_hfgen_iwc_*`,
+//!   `aspx_ec_data`) and A-SPX Huffman tables (Annex A.2); A-CPL
+//!   (`acpl_config_*`, `acpl_data_*`). `aspx_framing()` itself parses
+//!   end-to-end but isn't yet invoked from the substream walker pending
+//!   `num_aspx_timeslots` plumbing.
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into

@@ -5,20 +5,27 @@
 //! A-SPX reconstructs the high band in the QMF domain from a compact
 //! envelope-energy sidecar and a small set of control parameters.
 //!
-//! This module implements the **configuration block** `aspx_config()`
-//! (Table 50, §4.2.12.1) plus `companding_control()` (Table 49,
-//! §4.2.11). Together those are everything the bitstream carries in the
-//! I-frame header for an A-SPX substream **before** the envelope /
-//! noise Huffman payload (`aspx_data_1ch()` / `aspx_data_2ch()`) — i.e.
-//! enough to classify a stream, expose its configuration for downstream
-//! tooling, and determine how many bits the envelope payload will be
-//! parameterised by.
+//! This module implements:
+//!
+//! * **`aspx_config()`** (Table 50, §4.2.12.1) — the 15-bit I-frame
+//!   configuration block.
+//! * **`companding_control()`** (Table 49, §4.2.11) — the per-channel
+//!   companding sidecar.
+//! * **`aspx_framing()`** (Table 53, §4.2.12.4) — the per-channel
+//!   envelope framing. This block is variable-width: its size depends
+//!   on the `aspx_int_class` (a 1/2/3-bit prefix code selecting one of
+//!   FIXFIX / FIXVAR / VARFIX / VARVAR), on the config fields
+//!   `aspx_num_env_bits_fixfix` and `aspx_freq_res_mode`, on whether
+//!   the frame is an I-frame (only I-frames carry the leading
+//!   `aspx_var_bord_left` for VARFIX / VARVAR), and on a tool-level
+//!   `num_aspx_timeslots` flag that selects between 1- and 2-bit fields
+//!   for `aspx_num_rel_*` / `aspx_rel_bord_*` (Note 1 in Table 53).
+//!   Together these fully determine the signal- and noise-envelope
+//!   count (`aspx_num_env`, `aspx_num_noise`) for each channel — the
+//!   inputs the envelope Huffman payload will be parameterised by.
 //!
 //! We deliberately stop short of:
 //!
-//! * `aspx_framing()` (§4.2.12.4) — bit-count is dynamic, driven by
-//!   `aspx_num_env_bits_fixfix`, `aspx_freq_res_mode`, and the interval
-//!   class.
 //! * `aspx_delta_dir()`, `aspx_hfgen_iwc_*()`, `aspx_ec_data()` and the
 //!   A-SPX Huffman tables in Annex A.2 — envelope and noise scale
 //!   factors are Huffman-coded with dedicated codebooks (different ones
@@ -239,6 +246,206 @@ pub fn parse_companding_control(
     })
 }
 
+/// A-SPX interval class (ETSI TS 103 190-1 §4.3.10.4.1, Table 126).
+///
+/// Encoded on the wire as a 1/2/3-bit variable-length prefix code:
+/// `0b0` → FIXFIX, `0b10` → FIXVAR, `0b110` → VARFIX, `0b111` → VARVAR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AspxIntClass {
+    FixFix,
+    FixVar,
+    VarFix,
+    VarVar,
+}
+
+impl AspxIntClass {
+    /// Read `aspx_int_class` from the bit-reader using the prefix code
+    /// in Table 126. Consumes between 1 and 3 bits.
+    pub fn read(br: &mut BitReader<'_>) -> Result<Self> {
+        if !br.read_bit()? {
+            return Ok(Self::FixFix); // 0
+        }
+        if !br.read_bit()? {
+            return Ok(Self::FixVar); // 10
+        }
+        if !br.read_bit()? {
+            Ok(Self::VarFix) // 110
+        } else {
+            Ok(Self::VarVar) // 111
+        }
+    }
+
+    /// Number of bits this class occupies on the wire.
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::FixFix => 1,
+            Self::FixVar => 2,
+            Self::VarFix | Self::VarVar => 3,
+        }
+    }
+}
+
+/// Parsed per-channel `aspx_framing()` output (ETSI TS 103 190-1
+/// §4.2.12.4 Table 53 / §4.3.10.4).
+///
+/// This holds the framing elements for a single A-SPX channel: the
+/// interval class, the signal- and noise-envelope counts, the freq-res
+/// vector (empty when `aspx_freq_res_mode != Signalled`), and the raw
+/// variable-border fields that feed later A-SPX stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AspxFraming {
+    /// `aspx_int_class[ch]`.
+    pub int_class: AspxIntClass,
+    /// `aspx_num_env[ch]` — number of signal envelopes, derived from
+    /// `tmp_num_env` (FIXFIX) or from `num_rel_left + num_rel_right + 1`
+    /// (otherwise). Bounded by Table 128: 4 for FIXFIX, 5 otherwise.
+    pub num_env: u32,
+    /// `aspx_num_noise[ch]` — 1 if `num_env == 1`, else 2
+    /// (§4.3.10.4.11).
+    pub num_noise: u32,
+    /// `aspx_freq_res[ch][env]`. Populated only when
+    /// `aspx_freq_res_mode == Signalled`; empty otherwise.
+    pub freq_res: Vec<bool>,
+    /// `aspx_var_bord_left[ch]` — present for VARFIX / VARVAR and only
+    /// in an I-frame (per Table 53).
+    pub var_bord_left: Option<u8>,
+    /// `aspx_var_bord_right[ch]` — present for FIXVAR / VARVAR.
+    pub var_bord_right: Option<u8>,
+    /// `aspx_num_rel_left[ch]`. Zero for FIXFIX / FIXVAR.
+    pub num_rel_left: u8,
+    /// `aspx_num_rel_right[ch]`. Zero for FIXFIX / VARFIX.
+    pub num_rel_right: u8,
+    /// `aspx_rel_bord_left[ch][rel]`. Empty when `num_rel_left == 0`.
+    pub rel_bord_left: Vec<u8>,
+    /// `aspx_rel_bord_right[ch][rel]`. Empty when `num_rel_right == 0`.
+    pub rel_bord_right: Vec<u8>,
+    /// `aspx_tsg_ptr[ch]` — transient-pointer, present for every class
+    /// except FIXFIX. `ptr_bits = ceil(log2(num_env + 2))`.
+    pub tsg_ptr: Option<u8>,
+}
+
+/// Parse `aspx_framing(ch)` at the current bit-reader position per
+/// ETSI TS 103 190-1 Table 53 (§4.2.12.4).
+///
+/// * `cfg` — the previously parsed `aspx_config()`, which drives the
+///   FIXFIX envelope-count field width and the freq-res signalling.
+/// * `b_iframe` — from `ac4_substream_info()`; gates `aspx_var_bord_left`
+///   for VARFIX / VARVAR.
+/// * `num_aspx_timeslots_over_8` — `true` when `num_aspx_timeslots > 8`;
+///   selects 2-bit vs 1-bit fields for `aspx_num_rel_*` and
+///   `aspx_rel_bord_*` (Note 1 in Table 53).
+pub fn parse_aspx_framing(
+    br: &mut BitReader<'_>,
+    cfg: &AspxConfig,
+    b_iframe: bool,
+    num_aspx_timeslots_over_8: bool,
+) -> Result<AspxFraming> {
+    // Width of the Note-1 fields: aspx_num_rel_*, aspx_rel_bord_*.
+    let note1_bits: u32 = if num_aspx_timeslots_over_8 { 2 } else { 1 };
+
+    let int_class = AspxIntClass::read(br)?;
+    let mut num_rel_left: u8 = 0;
+    let mut num_rel_right: u8 = 0;
+    let mut var_bord_left: Option<u8> = None;
+    let mut var_bord_right: Option<u8> = None;
+    let mut rel_bord_left: Vec<u8> = Vec::new();
+    let mut rel_bord_right: Vec<u8> = Vec::new();
+    // Signal-envelope count. FIXFIX sets this directly from tmp_num_env;
+    // the other classes compute it after the branch.
+    let num_env: u32;
+    // Freq-res vector. Signalled in-band only when the config opted in.
+    let mut freq_res: Vec<bool> = Vec::new();
+
+    match int_class {
+        AspxIntClass::FixFix => {
+            // envbits = aspx_num_env_bits_fixfix + 1
+            let envbits = cfg.fixfix_tmp_num_env_bits();
+            let tmp_num_env = br.read_u32(envbits)?;
+            // aspx_num_env = 1 << tmp_num_env
+            num_env = 1u32 << tmp_num_env;
+            if cfg.signals_freq_res() {
+                freq_res.push(br.read_bit()?);
+            }
+        }
+        AspxIntClass::FixVar => {
+            var_bord_right = Some(br.read_u32(2)? as u8);
+            num_rel_right = br.read_u32(note1_bits)? as u8;
+            for _ in 0..num_rel_right {
+                rel_bord_right.push(br.read_u32(note1_bits)? as u8);
+            }
+            num_env = u32::from(num_rel_left) + u32::from(num_rel_right) + 1;
+        }
+        AspxIntClass::VarVar => {
+            if b_iframe {
+                var_bord_left = Some(br.read_u32(2)? as u8);
+            }
+            num_rel_left = br.read_u32(note1_bits)? as u8;
+            for _ in 0..num_rel_left {
+                rel_bord_left.push(br.read_u32(note1_bits)? as u8);
+            }
+            var_bord_right = Some(br.read_u32(2)? as u8);
+            num_rel_right = br.read_u32(note1_bits)? as u8;
+            for _ in 0..num_rel_right {
+                rel_bord_right.push(br.read_u32(note1_bits)? as u8);
+            }
+            num_env = u32::from(num_rel_left) + u32::from(num_rel_right) + 1;
+        }
+        AspxIntClass::VarFix => {
+            if b_iframe {
+                var_bord_left = Some(br.read_u32(2)? as u8);
+            }
+            num_rel_left = br.read_u32(note1_bits)? as u8;
+            for _ in 0..num_rel_left {
+                rel_bord_left.push(br.read_u32(note1_bits)? as u8);
+            }
+            num_env = u32::from(num_rel_left) + u32::from(num_rel_right) + 1;
+        }
+    }
+
+    let mut tsg_ptr: Option<u8> = None;
+    if !matches!(int_class, AspxIntClass::FixFix) {
+        // ptr_bits = ceil(log2(num_env + 2)). "log" here is a float log
+        // without rounding, so result = bits needed to represent
+        // num_env + 2 - 1 = num_env + 1 (for powers of two). We use
+        // u32::next_power_of_two / leading_zeros to evaluate ceil_log2.
+        let ptr_bits = ceil_log2(num_env + 2);
+        tsg_ptr = Some(br.read_u32(ptr_bits)? as u8);
+        if cfg.signals_freq_res() {
+            freq_res.reserve(num_env as usize);
+            for _ in 0..num_env {
+                freq_res.push(br.read_bit()?);
+            }
+        }
+    }
+
+    let num_noise = if num_env > 1 { 2 } else { 1 };
+
+    Ok(AspxFraming {
+        int_class,
+        num_env,
+        num_noise,
+        freq_res,
+        var_bord_left,
+        var_bord_right,
+        num_rel_left,
+        num_rel_right,
+        rel_bord_left,
+        rel_bord_right,
+        tsg_ptr,
+    })
+}
+
+/// Returns `ceil(log2(n))` for `n >= 1`. For `n == 1` returns 0, i.e.
+/// "zero bits needed". Used to size `aspx_tsg_ptr` (`ptr_bits`).
+fn ceil_log2(n: u32) -> u32 {
+    debug_assert!(n >= 1);
+    if n <= 1 {
+        0
+    } else {
+        32 - (n - 1).leading_zeros()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +619,297 @@ mod tests {
         assert_eq!(cc.sync_flag, Some(false));
         assert_eq!(cc.compand_on, vec![true, true, false, true, true]);
         assert_eq!(cc.compand_avg, Some(false));
+    }
+
+    // --- aspx_framing tests ------------------------------------------
+
+    /// Build a default `AspxConfig` parameterised on the two fields
+    /// `parse_aspx_framing` actually consults.
+    fn test_config(num_env_bits_fixfix: u8, freq_res_mode: AspxFreqResMode) -> AspxConfig {
+        AspxConfig {
+            quant_mode_env: AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix,
+            freq_res_mode,
+        }
+    }
+
+    #[test]
+    fn aspx_int_class_prefix_code_matches_table_126() {
+        // 0b0 -> FIXFIX
+        let bytes = {
+            let mut bw = BitWriter::new();
+            bw.write_bit(false);
+            bw.align_to_byte();
+            bw.finish()
+        };
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(AspxIntClass::read(&mut br).unwrap(), AspxIntClass::FixFix);
+        assert_eq!(br.bit_position(), 1);
+
+        // 0b10 -> FIXVAR
+        let bytes = {
+            let mut bw = BitWriter::new();
+            bw.write_bit(true);
+            bw.write_bit(false);
+            bw.align_to_byte();
+            bw.finish()
+        };
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(AspxIntClass::read(&mut br).unwrap(), AspxIntClass::FixVar);
+        assert_eq!(br.bit_position(), 2);
+
+        // 0b110 -> VARFIX
+        let bytes = {
+            let mut bw = BitWriter::new();
+            bw.write_bit(true);
+            bw.write_bit(true);
+            bw.write_bit(false);
+            bw.align_to_byte();
+            bw.finish()
+        };
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(AspxIntClass::read(&mut br).unwrap(), AspxIntClass::VarFix);
+        assert_eq!(br.bit_position(), 3);
+
+        // 0b111 -> VARVAR
+        let bytes = {
+            let mut bw = BitWriter::new();
+            bw.write_bit(true);
+            bw.write_bit(true);
+            bw.write_bit(true);
+            bw.align_to_byte();
+            bw.finish()
+        };
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(AspxIntClass::read(&mut br).unwrap(), AspxIntClass::VarVar);
+        assert_eq!(br.bit_position(), 3);
+    }
+
+    #[test]
+    fn aspx_framing_fixfix_signalled_freq_res() {
+        // aspx_num_env_bits_fixfix = 1 (envbits = 2), freq_res_mode =
+        // Signalled. Bits: int_class=0 (FIXFIX, 1 bit); tmp_num_env=10
+        // (2 bits, value 2 -> num_env = 1 << 2 = 4); aspx_freq_res[0]=1
+        // (1 bit). Total = 4 bits. Sentinel follows.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // FIXFIX
+        bw.write_u32(2, 2); // tmp_num_env = 2
+        bw.write_bit(true); // freq_res[0]
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cfg = test_config(1, AspxFreqResMode::Signalled);
+        let f = parse_aspx_framing(&mut br, &cfg, true, false).unwrap();
+        assert_eq!(f.int_class, AspxIntClass::FixFix);
+        assert_eq!(f.num_env, 4);
+        assert_eq!(f.num_noise, 2);
+        assert_eq!(f.freq_res, vec![true]);
+        assert_eq!(f.var_bord_left, None);
+        assert_eq!(f.var_bord_right, None);
+        assert_eq!(f.num_rel_left, 0);
+        assert_eq!(f.num_rel_right, 0);
+        assert!(f.rel_bord_left.is_empty());
+        assert!(f.rel_bord_right.is_empty());
+        assert_eq!(f.tsg_ptr, None);
+        // Cursor lands on the sentinel bit.
+        assert_eq!(br.bit_position(), 4);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_framing_fixfix_narrow_envbits_no_freq_res() {
+        // aspx_num_env_bits_fixfix = 0 (envbits = 1), freq_res_mode =
+        // High (NOT signalled). Bits: FIXFIX=0 (1 bit), tmp_num_env=1
+        // (1 bit, num_env = 2). Total = 2 bits.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // FIXFIX
+        bw.write_bit(true); // tmp_num_env = 1 -> num_env = 2
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cfg = test_config(0, AspxFreqResMode::High);
+        let f = parse_aspx_framing(&mut br, &cfg, false, true).unwrap();
+        assert_eq!(f.int_class, AspxIntClass::FixFix);
+        assert_eq!(f.num_env, 2);
+        assert_eq!(f.num_noise, 2);
+        assert!(f.freq_res.is_empty());
+        assert_eq!(br.bit_position(), 2);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_framing_fixvar_ts_over_8_with_two_rel() {
+        // FIXVAR prefix = 0b10 (2 bits). num_aspx_timeslots > 8 so
+        // note-1 fields are 2 bits. var_bord_right = 0b11 (2 bits),
+        // num_rel_right = 2 (2 bits), rel_bord_right = [0b01, 0b10]
+        // (2 bits each). Then branch ends -> num_env = 0 + 2 + 1 = 3,
+        // ptr_bits = ceil(log2(5)) = 3. Then since freq_res_mode is
+        // Signalled, read 3 freq_res bits. tsg_ptr = 0b101, freq_res =
+        // [1,0,1]. Total = 2+2+2+2+2+3+3 = 16 bits.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_bit(false); // FIXVAR
+        bw.write_u32(0b11, 2); // var_bord_right
+        bw.write_u32(2, 2); // num_rel_right
+        bw.write_u32(0b01, 2); // rel_bord_right[0]
+        bw.write_u32(0b10, 2); // rel_bord_right[1]
+        bw.write_u32(0b101, 3); // tsg_ptr
+        bw.write_bit(true); // freq_res[0]
+        bw.write_bit(false); // freq_res[1]
+        bw.write_bit(true); // freq_res[2]
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cfg = test_config(0, AspxFreqResMode::Signalled);
+        let f = parse_aspx_framing(&mut br, &cfg, true, true).unwrap();
+        assert_eq!(f.int_class, AspxIntClass::FixVar);
+        assert_eq!(f.num_env, 3);
+        assert_eq!(f.num_noise, 2);
+        assert_eq!(f.var_bord_right, Some(0b11));
+        assert_eq!(f.num_rel_right, 2);
+        assert_eq!(f.rel_bord_right, vec![0b01, 0b10]);
+        assert_eq!(f.num_rel_left, 0);
+        assert!(f.rel_bord_left.is_empty());
+        assert_eq!(f.var_bord_left, None);
+        assert_eq!(f.tsg_ptr, Some(0b101));
+        assert_eq!(f.freq_res, vec![true, false, true]);
+        assert_eq!(br.bit_position(), 16);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_framing_varfix_iframe_ts_short() {
+        // VARFIX prefix = 0b110 (3 bits). b_iframe = true so
+        // var_bord_left is read (2 bits). num_aspx_timeslots <= 8 so
+        // note-1 fields are 1 bit. num_rel_left = 1 (1 bit),
+        // rel_bord_left = [1] (1 bit). Branch ends -> num_env = 2,
+        // ptr_bits = ceil(log2(4)) = 2. freq_res_mode = Low (not
+        // signalled) so no freq_res read. Total bits = 3+2+1+1+2 = 9.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_bit(false); // VARFIX
+        bw.write_u32(0b10, 2); // var_bord_left
+        bw.write_u32(1, 1); // num_rel_left
+        bw.write_u32(1, 1); // rel_bord_left[0]
+        bw.write_u32(0b11, 2); // tsg_ptr
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cfg = test_config(0, AspxFreqResMode::Low);
+        let f = parse_aspx_framing(&mut br, &cfg, true, false).unwrap();
+        assert_eq!(f.int_class, AspxIntClass::VarFix);
+        assert_eq!(f.num_env, 2);
+        assert_eq!(f.num_noise, 2);
+        assert_eq!(f.var_bord_left, Some(0b10));
+        assert_eq!(f.num_rel_left, 1);
+        assert_eq!(f.rel_bord_left, vec![1]);
+        assert_eq!(f.num_rel_right, 0);
+        assert!(f.rel_bord_right.is_empty());
+        assert_eq!(f.var_bord_right, None);
+        assert_eq!(f.tsg_ptr, Some(0b11));
+        assert!(f.freq_res.is_empty());
+        assert_eq!(br.bit_position(), 9);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_framing_varfix_non_iframe_omits_var_bord_left() {
+        // Same as above but b_iframe = false -> var_bord_left is NOT
+        // present in the bitstream. Bits: VARFIX=0b110 (3),
+        // num_rel_left=0 (1), tsg_ptr on num_env=1 -> ptr_bits =
+        // ceil(log2(3)) = 2. Total = 3+1+2 = 6 bits.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_bit(false); // VARFIX
+        bw.write_u32(0, 1); // num_rel_left = 0
+        bw.write_u32(0b10, 2); // tsg_ptr
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cfg = test_config(0, AspxFreqResMode::Low);
+        let f = parse_aspx_framing(&mut br, &cfg, false, false).unwrap();
+        assert_eq!(f.int_class, AspxIntClass::VarFix);
+        assert_eq!(f.num_env, 1);
+        assert_eq!(f.num_noise, 1);
+        assert_eq!(f.var_bord_left, None);
+        assert_eq!(f.num_rel_left, 0);
+        assert_eq!(f.tsg_ptr, Some(0b10));
+        assert_eq!(br.bit_position(), 6);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_framing_varvar_iframe_symmetric() {
+        // VARVAR prefix = 0b111 (3 bits). b_iframe = true.
+        // num_aspx_timeslots <= 8 (1-bit note-1 fields).
+        //   var_bord_left = 0b01 (2)
+        //   num_rel_left = 1 (1) -> rel_bord_left = [0] (1)
+        //   var_bord_right = 0b11 (2)
+        //   num_rel_right = 1 (1) -> rel_bord_right = [1] (1)
+        // num_env = 1+1+1 = 3, ptr_bits = ceil(log2(5)) = 3, tsg_ptr =
+        // 0b100. freq_res_mode = Signalled -> 3 freq_res bits.
+        // Total = 3 + 2 + 1 + 1 + 2 + 1 + 1 + 3 + 3 = 17 bits.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_bit(true); // VARVAR
+        bw.write_u32(0b01, 2); // var_bord_left
+        bw.write_u32(1, 1); // num_rel_left
+        bw.write_u32(0, 1); // rel_bord_left[0]
+        bw.write_u32(0b11, 2); // var_bord_right
+        bw.write_u32(1, 1); // num_rel_right
+        bw.write_u32(1, 1); // rel_bord_right[0]
+        bw.write_u32(0b100, 3); // tsg_ptr
+        bw.write_bit(false); // freq_res[0]
+        bw.write_bit(true); // freq_res[1]
+        bw.write_bit(false); // freq_res[2]
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cfg = test_config(0, AspxFreqResMode::Signalled);
+        let f = parse_aspx_framing(&mut br, &cfg, true, false).unwrap();
+        assert_eq!(f.int_class, AspxIntClass::VarVar);
+        assert_eq!(f.num_env, 3);
+        assert_eq!(f.num_noise, 2);
+        assert_eq!(f.var_bord_left, Some(0b01));
+        assert_eq!(f.num_rel_left, 1);
+        assert_eq!(f.rel_bord_left, vec![0]);
+        assert_eq!(f.var_bord_right, Some(0b11));
+        assert_eq!(f.num_rel_right, 1);
+        assert_eq!(f.rel_bord_right, vec![1]);
+        assert_eq!(f.tsg_ptr, Some(0b100));
+        assert_eq!(f.freq_res, vec![false, true, false]);
+        assert_eq!(br.bit_position(), 17);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn ceil_log2_matches_spec_ptr_bits_formula() {
+        // Spec: ptr_bits = ceil(log(num_env + 2) / log(2)).
+        // num_env = 1 -> log2(3) = ~1.58 -> 2
+        // num_env = 2 -> log2(4) = 2    -> 2
+        // num_env = 3 -> log2(5) = ~2.32 -> 3
+        // num_env = 4 -> log2(6) = ~2.58 -> 3
+        // num_env = 5 -> log2(7) = ~2.81 -> 3
+        assert_eq!(ceil_log2(1 + 2), 2);
+        assert_eq!(ceil_log2(2 + 2), 2);
+        assert_eq!(ceil_log2(3 + 2), 3);
+        assert_eq!(ceil_log2(4 + 2), 3);
+        assert_eq!(ceil_log2(5 + 2), 3);
     }
 }
