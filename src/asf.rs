@@ -304,6 +304,15 @@ pub struct SubstreamTools {
     /// Huffman-driven data path didn't run (non-SIMPLE / non-ASF /
     /// short-frame grouping cases).
     pub scaled_spec_primary: Option<Vec<f32>>,
+    /// Dequantised + scaled spectral coefficients for the secondary
+    /// (right) channel in a stereo SIMPLE substream. `None` for mono
+    /// or non-decoded stereo cases.
+    pub scaled_spec_secondary: Option<Vec<f32>>,
+    /// Per-scale-factor-band M/S flags (`ms_used[sfb]`). Populated for
+    /// `b_enable_mdct_stereo_proc == 1` joint-stereo frames. `None`
+    /// otherwise. Length equals the decoded `max_sfb` for the shared
+    /// window.
+    pub ms_used: Option<Vec<bool>>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -568,31 +577,141 @@ pub fn parse_stereo_audio_data_outer(
         // sf_info(ASF, 0, 0) which fires asf_psy_info(0, 0) over the
         // shared transform window.
         if let Ok(psy) = parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
-            tools.psy_info_primary = Some(psy);
+            tools.psy_info_primary = Some(psy.clone());
+            // Joint-stereo MDCT path: one shared section / psy layout,
+            // two residual channel spectra, followed by a per-sfb
+            // ms_used[] flag array. Only walk the long-frame, single
+            // window-group body; other shapes stay at outer-layer only.
+            if ti.b_long_frame && psy.num_window_groups == 1 {
+                if let Some((l, r, ms)) = decode_asf_long_stereo_joint_body(br, &ti, &psy) {
+                    tools.scaled_spec_primary = Some(l);
+                    tools.scaled_spec_secondary = Some(r);
+                    tools.ms_used = Some(ms);
+                }
+            }
         }
-        // chparam_info() + sf_data() bodies pending.
     } else {
         let l = SpecFrontend::from_bit(br.read_u32(1)?);
         tools.spec_frontend_primary = Some(l);
+        let mut ti_l: Option<AsfTransformInfo> = None;
+        let mut psy_l: Option<AsfPsyInfo> = None;
         if let SpecFrontend::Asf = l {
             let ti = parse_asf_transform_info(br, frame_len_base)?;
             tools.transform_info_primary = Some(ti);
+            ti_l = Some(ti);
             if let Ok(psy) = parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
-                tools.psy_info_primary = Some(psy);
+                tools.psy_info_primary = Some(psy.clone());
+                psy_l = Some(psy);
             }
         }
         let r = SpecFrontend::from_bit(br.read_u32(1)?);
         tools.spec_frontend_secondary = Some(r);
+        let mut ti_r: Option<AsfTransformInfo> = None;
+        let mut psy_r: Option<AsfPsyInfo> = None;
         if let SpecFrontend::Asf = r {
             let ti = parse_asf_transform_info(br, frame_len_base)?;
             tools.transform_info_secondary = Some(ti);
+            ti_r = Some(ti);
             if let Ok(psy) = parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
-                tools.psy_info_secondary = Some(psy);
+                tools.psy_info_secondary = Some(psy.clone());
+                psy_r = Some(psy);
+            }
+        }
+        // Split-MDCT stereo: two independent ASF spectra. Decode each if
+        // long-frame + single-window-group. Any malformed body is
+        // surfaced as a decode miss (None) rather than a hard error.
+        if let (Some(ti), Some(psy)) = (ti_l, psy_l.as_ref()) {
+            if ti.b_long_frame && psy.num_window_groups == 1 {
+                tools.scaled_spec_primary = decode_asf_long_mono_body(br, &ti, psy);
+            }
+        }
+        if let (Some(ti), Some(psy)) = (ti_r, psy_r.as_ref()) {
+            if ti.b_long_frame && psy.num_window_groups == 1 {
+                tools.scaled_spec_secondary = decode_asf_long_mono_body(br, &ti, psy);
             }
         }
     }
     let _ = b_iframe; // reserved for later Huffman-state keying.
     Ok(())
+}
+
+/// Decode the `sf_data` body for a stereo, long-frame, single-window-
+/// group ASF substream with `b_enable_mdct_stereo_proc == 1` (joint
+/// MDCT processing — §7.4 / §7.5).
+///
+/// Layout inferred from the spec:
+///   - shared asf_section_data (one section partition drives both
+///     channels' codebook assignment).
+///   - two asf_spectral_data bodies (residuals for channel L and R,
+///     which are actually M and S when ms_used is set).
+///   - shared asf_scalefac_data (the scalefactors are shared so the
+///     joint quant step is uniform across both channels).
+///   - per-sfb ms_used[sfb] flag — one bit per active band.
+///   - asf_snf_data consumed but not injected.
+///
+/// Returns `(left_scaled, right_scaled, ms_used)` on success.
+fn decode_asf_long_stereo_joint_body(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+) -> Option<(Vec<f32>, Vec<f32>, Vec<bool>)> {
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let max_sfb_cap = tables::num_sfb_48(tl)?;
+    let max_sfb = psy.max_sfb_0.min(max_sfb_cap);
+    if max_sfb == 0 {
+        return None;
+    }
+    let sfbo = sfb_offset::sfb_offset_48(tl)?;
+    // Shared asf_section_data.
+    let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
+    // L / M channel residuals.
+    let (q_l, mqi_l) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
+    // R / S channel residuals.
+    let (q_r, mqi_r) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
+    // Shared scalefactors — compute max_quant_idx as the band-wise max
+    // over both channels so the scalefactor DPCM state tracks bands
+    // that have any energy at all.
+    let mqi: Vec<u32> = mqi_l
+        .iter()
+        .zip(mqi_r.iter())
+        .map(|(a, b)| (*a).max(*b))
+        .collect();
+    let sf_gain =
+        asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    // Per-sfb ms_used flag array. Only active bands (cb != 0 and
+    // max_quant_idx > 0) carry a bit per §7.5 Pseudocode 77; other
+    // bands default to false.
+    let mut ms_used = vec![false; max_sfb as usize];
+    for sfb in 0..max_sfb as usize {
+        let cb = sections.sfb_cb[sfb];
+        if cb == 0 || mqi[sfb] == 0 {
+            continue;
+        }
+        ms_used[sfb] = br.read_bit().ok()?;
+    }
+    // asf_snf_data consumed but not currently injected.
+    let _ = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    // Dequantise + scale both channels with the shared gain.
+    let mut scaled_l = asf_data::dequantise_and_scale(&q_l, &sf_gain, sfbo, max_sfb);
+    let mut scaled_r = asf_data::dequantise_and_scale(&q_r, &sf_gain, sfbo, max_sfb);
+    // Apply inverse M/S per §7.5: L = M + S, R = M - S for bands with
+    // ms_used == true.
+    for (sfb, &used) in ms_used.iter().enumerate() {
+        if !used {
+            continue;
+        }
+        let a = sfbo[sfb] as usize;
+        let b = sfbo[sfb + 1] as usize;
+        let bmax = b.min(scaled_l.len()).min(scaled_r.len());
+        for k in a..bmax {
+            let m = scaled_l[k];
+            let s = scaled_r[k];
+            scaled_l[k] = m + s;
+            scaled_r[k] = m - s;
+        }
+    }
+    Some((scaled_l, scaled_r, ms_used))
 }
 
 /// Walk an `ac4_substream()` payload. `substream_bytes` is the slice

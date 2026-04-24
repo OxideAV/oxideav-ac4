@@ -75,6 +75,37 @@ impl Ac4Decoder {
             (pkt.data.as_slice(), false)
         }
     }
+
+    /// Run IMDCT + KBD overlap-add for a single channel. `ch` indexes
+    /// the per-channel overlap state (grown on demand). `scaled` is the
+    /// dequantised spectrum; bins past `scaled.len()` are zero-padded
+    /// up to N.
+    fn imdct_channel(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<i16> {
+        // Transform-length change clears *all* channel overlap state so
+        // the next frame starts from a consistent history.
+        if self.prev_transform_length != n as u32 {
+            self.overlap.clear();
+            self.prev_transform_length = n as u32;
+        }
+        while self.overlap.len() <= ch {
+            self.overlap.push(vec![0.0_f32; n]);
+        }
+        if self.overlap[ch].len() != n {
+            self.overlap[ch] = vec![0.0_f32; n];
+        }
+        let mut x = vec![0.0_f32; n];
+        let copy = scaled.len().min(n);
+        x[..copy].copy_from_slice(&scaled[..copy]);
+        let y = mdct::imdct(&x);
+        let window = mdct::kbd_window(n as u32);
+        let pcm_f = mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch]);
+        let mut out = Vec::with_capacity(pcm_f.len());
+        for s in pcm_f {
+            let v = (s * 32767.0).clamp(-32768.0, 32767.0);
+            out.push(v as i16);
+        }
+        out
+    }
 }
 
 impl Decoder for Ac4Decoder {
@@ -186,53 +217,62 @@ impl Decoder for Ac4Decoder {
                 .unwrap_or(info.b_iframe_global);
             asf::walk_ac4_substream(sb, channels_u16, b_iframe, info.frame_length).ok()
         });
-        // If we have scaled spectra for channel 0, run IMDCT + OLA
-        // and produce real PCM. Otherwise fall back to silence.
-        let mut pcm_samples: Option<Vec<i16>> = None;
-        if let Some(sub) = self.last_substream.as_ref() {
-            if let Some(scaled) = sub.tools.scaled_spec_primary.as_ref() {
-                if let Some(ti) = sub.tools.transform_info_primary.as_ref() {
-                    let n = ti.transform_length_0 as usize;
-                    if n > 0 && n == samples as usize {
-                        // Zero-pad the scaled coefficients up to N.
-                        let mut x = vec![0.0_f32; n];
-                        let copy = scaled.len().min(n);
-                        x[..copy].copy_from_slice(&scaled[..copy]);
-                        // Resize overlap buffer if transform length
-                        // changed.
-                        if self.prev_transform_length != n as u32 {
-                            self.overlap.clear();
-                            self.overlap.push(vec![0.0_f32; n]);
-                            self.prev_transform_length = n as u32;
-                        } else if self.overlap.is_empty() {
-                            self.overlap.push(vec![0.0_f32; n]);
-                        }
-                        let y = mdct::imdct(&x);
-                        let window = mdct::kbd_window(n as u32);
-                        let pcm_f = mdct::imdct_olap_symmetric(
-                            &y,
-                            &window,
-                            &mut self.overlap[0],
-                        );
-                        // Convert to S16, clamped.
-                        let mut out = Vec::with_capacity(pcm_f.len());
-                        for s in pcm_f {
-                            let scaled = (s * 32767.0).clamp(-32768.0, 32767.0);
-                            out.push(scaled as i16);
-                        }
-                        pcm_samples = Some(out);
-                    }
+        // If we have scaled spectra for the substream, run IMDCT + OLA
+        // and produce real PCM. Per-channel PCM buffers live in
+        // `pcm_per_channel`; the interleaver below lays them out to the
+        // frame's channel count. Any channel without decoded spectra
+        // stays silent. We detach the per-channel inputs from
+        // `last_substream` up front so the IMDCT step can mutate
+        // `self.overlap` without a borrow conflict.
+        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
+        let (primary_in, secondary_in) = if let Some(sub) = self.last_substream.as_ref() {
+            let pri = sub
+                .tools
+                .scaled_spec_primary
+                .as_ref()
+                .zip(sub.tools.transform_info_primary.as_ref())
+                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+            let sec = sub
+                .tools
+                .scaled_spec_secondary
+                .as_ref()
+                .zip(sub.tools.transform_info_secondary.as_ref())
+                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+            (pri, sec)
+        } else {
+            (None, None)
+        };
+        if let Some((scaled, n)) = primary_in {
+            if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
+                pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
+            }
+        }
+        if channels as usize >= 2 {
+            if let Some((scaled, n)) = secondary_in {
+                if n > 0 && n == samples as usize {
+                    pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
                 }
             }
         }
         self.last_info = Some(info);
         let byte_count = (samples as usize) * (channels as usize) * 2; // S16 interleaved.
-        let data = if let Some(pcm) = pcm_samples {
-            // Interleave mono into channels slots (dup for stereo).
+        let any_decoded = pcm_per_channel.iter().any(|p| p.is_some());
+        let data = if any_decoded {
             let mut buf = vec![0u8; byte_count];
-            for (i, &s) in pcm.iter().enumerate() {
-                let le = s.to_le_bytes();
+            // Channel fallback: if only channel 0 was decoded for a
+            // multi-channel stream (e.g. a stereo frame whose CPE body
+            // didn't parse), duplicate it across the remaining slots so
+            // the output is audible rather than one-sided.
+            let fallback = pcm_per_channel[0].clone();
+            for i in 0..samples as usize {
                 for c in 0..channels as usize {
+                    let sample = pcm_per_channel
+                        .get(c)
+                        .and_then(|p| p.as_ref())
+                        .or(fallback.as_ref())
+                        .and_then(|p| p.get(i).copied())
+                        .unwrap_or(0);
+                    let le = sample.to_le_bytes();
                     let off = (i * channels as usize + c) * 2;
                     if off + 1 < buf.len() {
                         buf[off] = le[0];
