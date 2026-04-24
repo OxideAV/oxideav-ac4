@@ -24,14 +24,17 @@
 //!   count (`aspx_num_env`, `aspx_num_noise`) for each channel — the
 //!   inputs the envelope Huffman payload will be parameterised by.
 //!
+//! * **`aspx_delta_dir()`** (Table 54, §4.2.12.5) — one bit per signal
+//!   envelope plus one per noise envelope.
+//!
 //! We deliberately stop short of:
 //!
-//! * `aspx_delta_dir()`, `aspx_hfgen_iwc_*()`, `aspx_ec_data()` and the
-//!   A-SPX Huffman tables in Annex A.2 — envelope and noise scale
-//!   factors are Huffman-coded with dedicated codebooks (different ones
-//!   per delta direction, quantization step, signal vs noise etc.) and
-//!   would double the crate's line count. See the module-level roadmap
-//!   in `lib.rs`.
+//! * `aspx_hfgen_iwc_*()`, `aspx_ec_data()` and the A-SPX Huffman
+//!   tables in Annex A.2 — envelope and noise scale factors are
+//!   Huffman-coded with dedicated codebooks (different ones per delta
+//!   direction, quantization step, signal vs noise etc.) and would
+//!   double the crate's line count. See the module-level roadmap in
+//!   `lib.rs`.
 //!
 //! Even so, `parse_aspx_config()` is useful on its own: it unblocks the
 //! `mono_codec_mode == ASPX` I-frame path in the outer `audio_data()`
@@ -432,6 +435,46 @@ pub fn parse_aspx_framing(
         rel_bord_left,
         rel_bord_right,
         tsg_ptr,
+    })
+}
+
+/// Parsed `aspx_delta_dir(ch)` (ETSI TS 103 190-1 §4.2.12.5, Table 54).
+///
+/// Two bit-arrays gating how the matching `aspx_ec_data()` Huffman
+/// codebook interprets its deltas:
+///
+/// * `aspx_sig_delta_dir[ch][env]` (length `aspx_num_env[ch]`): per
+///   signal-envelope direction flag.
+/// * `aspx_noise_delta_dir[ch][env]` (length `aspx_num_noise[ch]`):
+///   per noise-envelope direction flag.
+///
+/// Convention (per §4.3.10.5 / Table 130): `false` means DF
+/// (delta-frequency / F0 depending on position), `true` means DT
+/// (delta-time).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AspxDeltaDir {
+    pub sig_delta_dir: Vec<bool>,
+    pub noise_delta_dir: Vec<bool>,
+}
+
+/// Parse `aspx_delta_dir(ch)` at the current bit-reader position per
+/// ETSI TS 103 190-1 Table 54 (§4.2.12.5). Reads
+/// `aspx_num_env[ch] + aspx_num_noise[ch]` bits in total.
+pub fn parse_aspx_delta_dir(
+    br: &mut BitReader<'_>,
+    framing: &AspxFraming,
+) -> Result<AspxDeltaDir> {
+    let mut sig = Vec::with_capacity(framing.num_env as usize);
+    for _ in 0..framing.num_env {
+        sig.push(br.read_bit()?);
+    }
+    let mut noise = Vec::with_capacity(framing.num_noise as usize);
+    for _ in 0..framing.num_noise {
+        noise.push(br.read_bit()?);
+    }
+    Ok(AspxDeltaDir {
+        sig_delta_dir: sig,
+        noise_delta_dir: noise,
     })
 }
 
@@ -965,6 +1008,67 @@ mod tests {
         assert_eq!(num_ts_in_ats(768), 1);
         assert_eq!(num_ts_in_ats(512), 1);
         assert_eq!(num_ts_in_ats(384), 1);
+    }
+
+    #[test]
+    fn aspx_delta_dir_reads_num_env_plus_num_noise_bits() {
+        // Framing with num_env=3, num_noise=2 -> 5 bits total.
+        let framing = AspxFraming {
+            int_class: AspxIntClass::VarVar,
+            num_env: 3,
+            num_noise: 2,
+            freq_res: Vec::new(),
+            var_bord_left: None,
+            var_bord_right: None,
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: Vec::new(),
+            rel_bord_right: Vec::new(),
+            tsg_ptr: None,
+        };
+        // Write: sig = [1,0,1], noise = [0,1], sentinel.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let dd = parse_aspx_delta_dir(&mut br, &framing).unwrap();
+        assert_eq!(dd.sig_delta_dir, vec![true, false, true]);
+        assert_eq!(dd.noise_delta_dir, vec![false, true]);
+        assert_eq!(br.bit_position(), 5);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn aspx_delta_dir_single_env_single_noise() {
+        // Minimal case: num_env=1, num_noise=1 -> 2 bits.
+        let framing = AspxFraming {
+            int_class: AspxIntClass::FixFix,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: Vec::new(),
+            var_bord_left: None,
+            var_bord_right: None,
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: Vec::new(),
+            rel_bord_right: Vec::new(),
+            tsg_ptr: None,
+        };
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // sig[0] = 0
+        bw.write_bit(true); // noise[0] = 1
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let dd = parse_aspx_delta_dir(&mut br, &framing).unwrap();
+        assert_eq!(dd.sig_delta_dir, vec![false]);
+        assert_eq!(dd.noise_delta_dir, vec![true]);
     }
 
     #[test]

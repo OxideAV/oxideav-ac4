@@ -81,14 +81,19 @@
 //!   `aspx_framing(1)`). `num_aspx_timeslots` for the Note-1 field
 //!   width comes from the TOC's `frame_length` via
 //!   [`aspx::num_aspx_timeslots`] (Table 189 × Table 192).
+//! * **A-SPX delta direction** — [`aspx::parse_aspx_delta_dir`]
+//!   implements `aspx_delta_dir(ch)` (Table 54, §4.2.12.5): one bit
+//!   per signal envelope plus one bit per noise envelope. The per-
+//!   channel `AspxDeltaDir` drives which `ASPX_HCB_*_{F0,DF,DT}`
+//!   codebook the matching `aspx_ec_data()` path will pull from.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * A-SPX envelope / noise data (`aspx_delta_dir`, `aspx_hfgen_iwc_*`,
-//!   `aspx_ec_data`) and A-SPX Huffman tables (Annex A.2); A-CPL
-//!   (`acpl_config_*`, `acpl_data_*`).
+//! * A-SPX HF-generation parameters (`aspx_hfgen_iwc_*`) and envelope
+//!   entropy data (`aspx_ec_data`); A-SPX Huffman tables (Annex A.2);
+//!   A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
