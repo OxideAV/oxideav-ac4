@@ -460,4 +460,119 @@ mod tests {
         state.reset();
         assert!(state.prev.is_none());
     }
+
+    /// End-to-end: PCM → QMF analysis → zero the HF band → inject
+    /// noise + tone via the generators → QMF synthesis → verify the
+    /// output has measurable HF energy (RMS + band-power bump).
+    ///
+    /// Exercises §5.7.6.4.3 noise gen, §5.7.6.4.4 tone gen, and the
+    /// Pseudocode 107/108 combined assembler all at once.
+    #[test]
+    fn noise_plus_tone_inject_hf_energy_round_trip() {
+        use crate::aspx_noise::{generate_qmf_noise, NoiseGenState};
+        use crate::qmf::{QmfAnalysisBank, QmfSynthesisBank, NUM_QMF_SUBBANDS};
+        let fs = 48_000.0_f32;
+        let f0 = 1_000.0_f32;
+        let n_samples = NUM_QMF_SUBBANDS * 16;
+        let pcm_in: Vec<f32> = (0..n_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * f0 * i as f32 / fs).sin() * 0.5)
+            .collect();
+        let mut ana = QmfAnalysisBank::new();
+        let slots = ana.process_block(&pcm_in);
+        let n_slots = slots.len();
+        let sbx = 8_u32;
+        let sbz = 32_u32;
+        let num_sb_aspx = sbz - sbx;
+        let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF_SUBBANDS)
+            .map(|_| vec![(0.0f32, 0.0f32); n_slots])
+            .collect();
+        for (ts, slot) in slots.iter().enumerate() {
+            for (sb, s) in slot.iter().enumerate() {
+                q[sb][ts] = *s;
+            }
+        }
+        for sb in (sbx as usize)..NUM_QMF_SUBBANDS {
+            for s in q[sb].iter_mut() {
+                *s = (0.0, 0.0);
+            }
+        }
+        let atsg_sig = vec![0_u32, n_slots as u32];
+        let atsg_noise = vec![0_u32, n_slots as u32];
+        let noise_lev: Vec<Vec<f32>> = (0..num_sb_aspx).map(|_| vec![0.1_f32]).collect();
+        let mut tone_mask = vec![false; num_sb_aspx as usize];
+        tone_mask[16 - sbx as usize] = true;
+        let sine_lev = level_matrix_from_flags(&tone_mask, 1, 0.3);
+        let mut ns = NoiseGenState::new();
+        let mut ts_state = ToneGenState::new();
+        let qnoise = generate_qmf_noise(
+            &noise_lev,
+            &atsg_sig,
+            &atsg_noise,
+            1,
+            NUM_QMF_SUBBANDS as u32,
+            sbx,
+            num_sb_aspx,
+            &mut ns,
+        );
+        let qsine = generate_qmf_sine(
+            &sine_lev,
+            &atsg_sig,
+            1,
+            NUM_QMF_SUBBANDS as u32,
+            sbx,
+            num_sb_aspx,
+            &mut ts_state,
+        );
+        hf_assemble(&mut q, &qnoise, &qsine, &atsg_sig, 1, sbx, sbz);
+        // HF QMF energy must be non-trivial.
+        let mut hf_qmf_energy = 0.0_f64;
+        for sb in (sbx as usize)..(sbz as usize) {
+            for &(re, im) in q[sb].iter() {
+                hf_qmf_energy += (re as f64).powi(2) + (im as f64).powi(2);
+            }
+        }
+        assert!(hf_qmf_energy > 0.1, "HF QMF energy = {hf_qmf_energy}");
+        // Inverse QMF.
+        let mut syn = QmfSynthesisBank::new();
+        let mut pcm_out = Vec::with_capacity(n_samples);
+        for ts in 0..n_slots {
+            let mut slot = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
+            for (sb, s) in slot.iter_mut().enumerate() {
+                *s = q[sb][ts];
+            }
+            let row = syn.process_slot(&slot);
+            pcm_out.extend_from_slice(&row);
+        }
+        // Skip QMF group delay; verify HF-band RMS > a threshold.
+        let skip = 384_usize.min(pcm_out.len().saturating_sub(64));
+        // Naive single-bin DFT at ~6.2 kHz (sb 16 center): compare out
+        // to in.
+        let probe_f = 6_187.5_f32;
+        let dft_at = |pcm: &[f32], skip: usize| -> f64 {
+            let mut re = 0.0_f64;
+            let mut im = 0.0_f64;
+            for (i, &s) in pcm[skip..].iter().enumerate() {
+                let angle =
+                    -2.0 * std::f64::consts::PI * (probe_f as f64) * (i as f64) / (fs as f64);
+                re += (s as f64) * angle.cos();
+                im += (s as f64) * angle.sin();
+            }
+            (re * re + im * im).sqrt() / ((pcm.len() - skip).max(1) as f64)
+        };
+        let mag_out = dft_at(&pcm_out, skip);
+        let mag_in = dft_at(&pcm_in, skip);
+        // HF injection raises the probe magnitude above the input
+        // baseline (pure 1 kHz has only tiny leakage at 6.2 kHz).
+        assert!(
+            mag_out > 2.0 * mag_in.max(1e-6),
+            "mag_out={mag_out} mag_in={mag_in}",
+        );
+        let rms_out = (pcm_out[skip..]
+            .iter()
+            .map(|&s| (s as f64).powi(2))
+            .sum::<f64>()
+            / (pcm_out.len() - skip) as f64)
+            .sqrt();
+        assert!(rms_out > 0.01, "rms_out = {rms_out}");
+    }
 }
