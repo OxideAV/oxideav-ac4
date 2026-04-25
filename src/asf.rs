@@ -382,6 +382,13 @@ pub struct SubstreamTools {
     /// `aspx_data_noise[1]` — per-envelope noise envelopes for the
     /// secondary channel.
     pub aspx_data_noise_secondary: Option<Vec<aspx::AspxHuffEnv>>,
+    /// Parsed `acpl_config_1ch(PARTIAL)` (§4.2.13.1 Table 59) for
+    /// stereo `ASPX_ACPL_1` I-frame substreams. `None` for SIMPLE /
+    /// mono ASPX / stereo ASPX paths.
+    pub acpl_config_1ch_partial: Option<crate::acpl::AcplConfig1ch>,
+    /// Parsed `acpl_config_1ch(FULL)` (§4.2.13.1 Table 59) for
+    /// stereo `ASPX_ACPL_2` I-frame substreams. `None` otherwise.
+    pub acpl_config_1ch_full: Option<crate::acpl::AcplConfig1ch>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -699,22 +706,37 @@ pub fn parse_stereo_audio_data_outer(
     if mode != StereoCodecMode::Simple {
         // §4.2.6.3: for b_iframe all ASPX stereo modes start with an
         // aspx_config(); ASPX_ACPL_{1,2} also carry an acpl_config_1ch
-        // (PARTIAL / FULL) right after — acpl_config parsing isn't
-        // implemented yet so we record the aspx_config only. Then each
-        // stereo mode runs companding_control with a mode-specific
-        // channel count (2 for ASPX, 1 for ASPX_ACPL_*), which we also
-        // surface. The per-channel stereo_data / sf_data / aspx_data /
-        // acpl_data bodies remain Huffman-gated and unhandled.
+        // (PARTIAL / FULL) right after — both are now parsed (the
+        // A-CPL config is only 6 bits in PARTIAL mode, 3 in FULL).
+        // Each stereo mode then runs companding_control with a
+        // mode-specific channel count (2 for ASPX, 1 for ASPX_ACPL_*),
+        // which we also surface. The per-channel stereo_data /
+        // sf_data / aspx_data / acpl_data bodies remain Huffman-gated
+        // and unhandled at the outer-walker level — the dedicated
+        // [`crate::acpl`] parsers can be invoked directly once the
+        // surrounding QMF / aspx_data state machine is wired.
         if b_iframe {
             tools.aspx_config = Some(aspx::parse_aspx_config(br)?);
-            // acpl_config_1ch(PARTIAL/FULL) bits are consumed opaquely —
-            // we don't have an A-CPL parser yet, so bail here instead of
-            // misreading subsequent bits.
-            if matches!(
-                mode,
-                StereoCodecMode::AspxAcpl1 | StereoCodecMode::AspxAcpl2
-            ) {
-                return Ok(());
+            match mode {
+                StereoCodecMode::AspxAcpl1 => {
+                    tools.acpl_config_1ch_partial = Some(crate::acpl::parse_acpl_config_1ch(
+                        br,
+                        crate::acpl::Acpl1chMode::Partial,
+                    )?);
+                    // acpl_data_1ch() body still gated on
+                    // surrounding state machine (QMF subband layout
+                    // + sb_to_pb mapping not wired) — bail here so we
+                    // don't misread companding_control() out of place.
+                    return Ok(());
+                }
+                StereoCodecMode::AspxAcpl2 => {
+                    tools.acpl_config_1ch_full = Some(crate::acpl::parse_acpl_config_1ch(
+                        br,
+                        crate::acpl::Acpl1chMode::Full,
+                    )?);
+                    return Ok(());
+                }
+                _ => {}
             }
         }
         let nc = match mode {
@@ -1769,16 +1791,21 @@ mod tests {
     }
 
     #[test]
-    fn walk_stereo_aspx_acpl1_reads_config_and_stops_before_acpl() {
-        // stereo_codec_mode = 10 (ASPX_ACPL_1): aspx_config present on
-        // I-frames; acpl_config_1ch follows but isn't parsed — we bail
-        // after aspx_config rather than misread bits.
+    fn walk_stereo_aspx_acpl1_parses_acpl_config_partial() {
+        // stereo_codec_mode = 10 (ASPX_ACPL_1): aspx_config + then
+        // acpl_config_1ch(PARTIAL) (= 6 bits: 2 bands_id + 1 quant +
+        // 3 qmf_band_minus1). We bail before companding_control —
+        // companding stays None.
         let mut bw = BitWriter::new();
         bw.write_u32(5, 15);
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(0b10, 2); // ASPX_ACPL_1
         bw.write_u32(0, 15); // aspx_config (all zero)
+                             // acpl_config_1ch(PARTIAL): id=1 (12 bands), coarse, qmf_minus1=3
+        bw.write_u32(0b01, 2);
+        bw.write_u32(1, 1);
+        bw.write_u32(0b011, 3);
         bw.align_to_byte();
         while bw.byte_len() < 32 {
             bw.write_u32(0, 8);
@@ -1787,8 +1814,51 @@ mod tests {
         let info = walk_ac4_substream(&bytes, 2, true, 1920).unwrap();
         assert_eq!(info.tools.stereo_mode, Some(StereoCodecMode::AspxAcpl1));
         assert!(info.tools.aspx_config.is_some());
-        // We explicitly stop before acpl_config_1ch so companding stays
-        // None for the ACPL path.
+        let acpl = info
+            .tools
+            .acpl_config_1ch_partial
+            .expect("acpl_config_1ch_partial should be set");
+        assert_eq!(acpl.num_param_bands_id, 1);
+        assert_eq!(acpl.num_param_bands, 12);
+        assert_eq!(acpl.quant_mode, crate::acpl::AcplQuantMode::Coarse);
+        assert_eq!(acpl.qmf_band, 4);
+        assert!(info.tools.acpl_config_1ch_full.is_none());
+        // We bail before companding_control — companding stays None.
+        assert!(info.tools.companding.is_none());
+    }
+
+    #[test]
+    fn walk_stereo_aspx_acpl2_parses_acpl_config_full() {
+        // stereo_codec_mode = 11 (ASPX_ACPL_2): aspx_config + then
+        // acpl_config_1ch(FULL) (= 3 bits: 2 bands_id + 1 quant). Bails
+        // before companding.
+        let mut bw = BitWriter::new();
+        bw.write_u32(5, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(0b11, 2); // ASPX_ACPL_2
+        bw.write_u32(0, 15); // aspx_config (all zero)
+                             // acpl_config_1ch(FULL): id=2 (9 bands), fine, no qmf_band field
+        bw.write_u32(0b10, 2);
+        bw.write_u32(0, 1);
+        bw.align_to_byte();
+        while bw.byte_len() < 32 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let info = walk_ac4_substream(&bytes, 2, true, 1920).unwrap();
+        assert_eq!(info.tools.stereo_mode, Some(StereoCodecMode::AspxAcpl2));
+        assert!(info.tools.aspx_config.is_some());
+        let acpl = info
+            .tools
+            .acpl_config_1ch_full
+            .expect("acpl_config_1ch_full should be set");
+        assert_eq!(acpl.num_param_bands_id, 2);
+        assert_eq!(acpl.num_param_bands, 9);
+        assert_eq!(acpl.quant_mode, crate::acpl::AcplQuantMode::Fine);
+        // qmf_band stays 0 for FULL mode (not transmitted).
+        assert_eq!(acpl.qmf_band, 0);
+        assert!(info.tools.acpl_config_1ch_partial.is_none());
         assert!(info.tools.companding.is_none());
     }
 }

@@ -58,10 +58,14 @@
 //!   [`aspx::parse_companding_control`] the `companding_control()`
 //!   element (Table 49, §4.2.11). The outer `audio_data()` walker in
 //!   [`asf`] now consumes these for the mono ASPX, stereo ASPX, and
-//!   stereo ASPX_ACPL_{1,2} I-frame paths (for ACPL it stops before
-//!   `acpl_config_1ch`, which isn't parsed yet). Exposes the parsed
+//!   stereo ASPX_ACPL_{1,2} I-frame paths. For ASPX_ACPL_{1,2} it now
+//!   also reads the trailing `acpl_config_1ch(PARTIAL)` /
+//!   `acpl_config_1ch(FULL)` element (§4.2.13.1 Table 59) via
+//!   [`acpl::parse_acpl_config_1ch`]. Exposes the parsed
 //!   `AspxConfig` through
-//!   [`decoder::Ac4Decoder::last_substream`]`.tools.aspx_config`.
+//!   [`decoder::Ac4Decoder::last_substream`]`.tools.aspx_config` and
+//!   the A-CPL configs through `acpl_config_1ch_partial` /
+//!   `acpl_config_1ch_full` on [`asf::SubstreamTools`].
 //! * **A-SPX framing** — [`aspx::parse_aspx_framing`] implements
 //!   `aspx_framing()` (Table 53, §4.2.12.4) end-to-end for all four
 //!   interval classes (FIXFIX / FIXVAR / VARFIX / VARVAR) including
@@ -246,7 +250,16 @@
 //!   `master_reset` semantics (resetting `prev_chirp_array` / the
 //!   `Q_low_prev` history) when a new substream starts mid-stream
 //!   isn't surfaced through the decoder API yet.
-//! * A-CPL (`acpl_config_*`, `acpl_data_*`).
+//! * A-CPL data-path wiring — the [`acpl`] module fully implements
+//!   `acpl_config_1ch` / `acpl_config_2ch` / `acpl_framing_data` /
+//!   `acpl_huff_data` / `acpl_ec_data` / `acpl_data_1ch` /
+//!   `acpl_data_2ch` (§4.2.13 Tables 59..65) over all 24 §A.3
+//!   Huffman codebooks ([`acpl_huffman`], Tables A.34..A.57), and the
+//!   outer `audio_data()` walker now reads `acpl_config_1ch` for the
+//!   stereo ASPX_ACPL_{1,2} paths. Wiring the per-frame
+//!   `acpl_data_1ch()` / `acpl_data_2ch()` payloads into the QMF
+//!   bandwidth-extension pipeline (and the `sb_to_pb` Table 197
+//!   mapping that drives `start_band`) still needs to be done.
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
@@ -271,6 +284,8 @@
 
 #![allow(dead_code)]
 
+pub mod acpl;
+pub mod acpl_huffman;
 pub mod asf;
 pub mod asf_data;
 pub mod aspx;
