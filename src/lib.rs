@@ -217,6 +217,24 @@
 //!   → QMF synthesis, and emits bandwidth-extended PCM instead of
 //!   silence.
 //!
+//! * **Dialogue Enhancement (DE) parser** —
+//!   [`de::parse_dialog_enhancement`] walks the
+//!   `dialog_enhancement(b_iframe)` element (§4.2.14.11 Table 76)
+//!   end-to-end: `b_de_data_present` gate, optional I-frame
+//!   `de_config()` (§4.2.14.12 Table 77, `de_method` /
+//!   `de_max_gain` / `de_channel_config`), and the per-frame
+//!   `de_data()` payload (§4.2.14.13 Table 78) including the
+//!   cross-channel `de_keep_pos_flag` + `de_mix_coef[12]_idx` panning
+//!   parameters, the `de_keep_data_flag` re-use gate, the
+//!   `de_ms_proc_flag` M/S processing flag, and the per-channel
+//!   per-band `de_par[ch][band]` matrix decoded via the Annex A.4
+//!   Huffman codebooks ([`de_huffman::de_abs_huffman`] /
+//!   [`de_huffman::de_diff_huffman`], Tables A.58..A.61). The four
+//!   codebooks (`DE_HCB_ABS_0` / `DE_HCB_DIFF_0` / `DE_HCB_ABS_1` /
+//!   `DE_HCB_DIFF_1`) are transcribed verbatim from the normative ETSI
+//!   accompaniment file `ts_10319001v010401p0-tables.c` and are
+//!   verified by Kraft-sum = 1 and prefix-code unit tests.
+//!
 //! * **DRC metadata parser** — [`drc::parse_drc_frame`] walks the
 //!   `drc_frame()` element (§4.2.14.5 Table 70) end-to-end:
 //!   `b_drc_present` gate, optional I-frame `drc_config()` (§4.2.14.6
@@ -294,6 +312,8 @@ pub mod aspx_limiter;
 pub mod aspx_noise;
 pub mod aspx_tns;
 pub mod aspx_tone;
+pub mod de;
+pub mod de_huffman;
 pub mod decoder;
 pub mod drc;
 pub mod drc_huffman;
