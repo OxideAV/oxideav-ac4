@@ -18,7 +18,7 @@
 //! against real AC-4 fixtures without panics, plus a parsed
 //! [`toc::Ac4FrameInfo`] surface for downstream tooling.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };

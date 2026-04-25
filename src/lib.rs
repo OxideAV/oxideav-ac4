@@ -253,8 +253,8 @@ pub mod sync;
 pub mod tables;
 pub mod toc;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 /// Canonical codec id.
 pub const CODEC_ID_STR: &str = "ac4";
