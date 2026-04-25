@@ -307,6 +307,85 @@ pub fn num_param_bands_from_id(id: u32) -> u32 {
 }
 
 // =====================================================================
+// §5.7.7.2 Table 197 — acpl_param_band ↔ QMF subband mapping
+// =====================================================================
+
+/// `sb_to_pb(sb, num_param_bands)` per §5.7.7.2 Table 197.
+///
+/// Maps a QMF subband `sb` (0..=63) to the parameter-band index for one
+/// of the four `acpl_num_param_bands` configurations (15, 12, 9, 7). The
+/// table is given in row-form per the spec — we encode the row break
+/// points and resolve the right column by `num_param_bands`.
+///
+/// Returns the parameter-band index (always < `num_param_bands`).
+pub fn sb_to_pb(sb: u32, num_param_bands: u32) -> u32 {
+    // Row layout from Table 197:
+    //  rows 0..=8 are 1:1 with sb (each row covers one sb).
+    //  Then merged rows: 9-10, 11-13, 14-17, 18-22, 23-34, 35-63.
+    //
+    // Per-column param-band assignments (sb_groups[i] is the row index):
+    //   row →  (15, 12, 9, 7)
+    //    0 → ( 0,  0, 0, 0)
+    //    1 → ( 1,  1, 1, 1)
+    //    2 → ( 2,  2, 2, 2)
+    //    3 → ( 3,  3, 3, 2)
+    //    4 → ( 4,  4, 3, 3)
+    //    5 → ( 5,  4, 4, 3)
+    //    6 → ( 6,  5, 4, 3)
+    //    7 → ( 7,  5, 5, 3)
+    //    8 → ( 8,  6, 5, 4)
+    //  9-10 → ( 9,  6, 6, 4)
+    // 11-13 → (10,  7, 6, 4)
+    // 14-17 → (11,  8, 7, 5)
+    // 18-22 → (12,  9, 7, 5)
+    // 23-34 → (13, 10, 8, 6)
+    // 35-63 → (14, 11, 8, 6)
+
+    // Determine row index from sb.
+    let row: u32 = match sb {
+        0..=8 => sb,
+        9..=10 => 9,
+        11..=13 => 10,
+        14..=17 => 11,
+        18..=22 => 12,
+        23..=34 => 13,
+        _ => 14, // 35..=63 (and clamp anything beyond)
+    };
+
+    // Resolve column by num_param_bands.
+    let table_row: [u32; 4] = match row {
+        0 => [0, 0, 0, 0],
+        1 => [1, 1, 1, 1],
+        2 => [2, 2, 2, 2],
+        3 => [3, 3, 3, 2],
+        4 => [4, 4, 3, 3],
+        5 => [5, 4, 4, 3],
+        6 => [6, 5, 4, 3],
+        7 => [7, 5, 5, 3],
+        8 => [8, 6, 5, 4],
+        9 => [9, 6, 6, 4],
+        10 => [10, 7, 6, 4],
+        11 => [11, 8, 7, 5],
+        12 => [12, 9, 7, 5],
+        13 => [13, 10, 8, 6],
+        _ => [14, 11, 8, 6],
+    };
+
+    let col: usize = match num_param_bands {
+        15 => 0,
+        12 => 1,
+        9 => 2,
+        7 => 3,
+        // For unknown band counts, default to the closest spec column.
+        n if n >= 13 => 0,
+        n if n >= 10 => 1,
+        n if n >= 8 => 2,
+        _ => 3,
+    };
+    table_row[col]
+}
+
+// =====================================================================
 // §4.2.13.1 / §4.2.13.2 — acpl_config_*
 // =====================================================================
 
@@ -928,5 +1007,96 @@ mod tests {
         assert_eq!(data.alpha1[0].values, vec![0, 1]);
         assert_eq!(data.beta1.len(), 1);
         assert_eq!(data.beta1[0].values, vec![0, -1]);
+    }
+
+    // -------------------------------------------------------------
+    // §5.7.7.2 Table 197 — sb_to_pb mapping
+    // -------------------------------------------------------------
+
+    #[test]
+    fn sb_to_pb_15_bands_first_nine_are_one_to_one() {
+        for sb in 0..=8u32 {
+            assert_eq!(sb_to_pb(sb, 15), sb, "sb={sb} 15-band should be identity");
+        }
+    }
+
+    #[test]
+    fn sb_to_pb_15_bands_grouped_rows() {
+        assert_eq!(sb_to_pb(9, 15), 9);
+        assert_eq!(sb_to_pb(10, 15), 9);
+        assert_eq!(sb_to_pb(11, 15), 10);
+        assert_eq!(sb_to_pb(13, 15), 10);
+        assert_eq!(sb_to_pb(14, 15), 11);
+        assert_eq!(sb_to_pb(17, 15), 11);
+        assert_eq!(sb_to_pb(18, 15), 12);
+        assert_eq!(sb_to_pb(22, 15), 12);
+        assert_eq!(sb_to_pb(23, 15), 13);
+        assert_eq!(sb_to_pb(34, 15), 13);
+        assert_eq!(sb_to_pb(35, 15), 14);
+        assert_eq!(sb_to_pb(63, 15), 14);
+    }
+
+    #[test]
+    fn sb_to_pb_12_bands_table_197() {
+        // Selected anchor cells from Table 197's "12" column.
+        assert_eq!(sb_to_pb(0, 12), 0);
+        assert_eq!(sb_to_pb(3, 12), 3);
+        assert_eq!(sb_to_pb(4, 12), 4);
+        assert_eq!(sb_to_pb(5, 12), 4);
+        assert_eq!(sb_to_pb(6, 12), 5);
+        assert_eq!(sb_to_pb(7, 12), 5);
+        assert_eq!(sb_to_pb(8, 12), 6);
+        assert_eq!(sb_to_pb(10, 12), 6);
+        assert_eq!(sb_to_pb(11, 12), 7);
+        assert_eq!(sb_to_pb(13, 12), 7);
+        assert_eq!(sb_to_pb(17, 12), 8);
+        assert_eq!(sb_to_pb(22, 12), 9);
+        assert_eq!(sb_to_pb(34, 12), 10);
+        assert_eq!(sb_to_pb(63, 12), 11);
+    }
+
+    #[test]
+    fn sb_to_pb_9_bands_table_197() {
+        // Selected anchor cells from the "9" column.
+        assert_eq!(sb_to_pb(0, 9), 0);
+        assert_eq!(sb_to_pb(3, 9), 3);
+        assert_eq!(sb_to_pb(4, 9), 3);
+        assert_eq!(sb_to_pb(5, 9), 4);
+        assert_eq!(sb_to_pb(7, 9), 5);
+        assert_eq!(sb_to_pb(10, 9), 6);
+        assert_eq!(sb_to_pb(13, 9), 6);
+        assert_eq!(sb_to_pb(17, 9), 7);
+        assert_eq!(sb_to_pb(22, 9), 7);
+        assert_eq!(sb_to_pb(34, 9), 8);
+        assert_eq!(sb_to_pb(63, 9), 8);
+    }
+
+    #[test]
+    fn sb_to_pb_7_bands_table_197() {
+        // Selected anchor cells from the "7" column.
+        assert_eq!(sb_to_pb(0, 7), 0);
+        assert_eq!(sb_to_pb(2, 7), 2);
+        assert_eq!(sb_to_pb(3, 7), 2);
+        assert_eq!(sb_to_pb(4, 7), 3);
+        assert_eq!(sb_to_pb(7, 7), 3);
+        assert_eq!(sb_to_pb(8, 7), 4);
+        assert_eq!(sb_to_pb(10, 7), 4);
+        assert_eq!(sb_to_pb(13, 7), 4);
+        assert_eq!(sb_to_pb(17, 7), 5);
+        assert_eq!(sb_to_pb(22, 7), 5);
+        assert_eq!(sb_to_pb(34, 7), 6);
+        assert_eq!(sb_to_pb(63, 7), 6);
+    }
+
+    #[test]
+    fn sb_to_pb_image_below_num_param_bands() {
+        // Property: for any (sb, npb) in the spec set, sb_to_pb returns
+        // a value strictly less than npb.
+        for &npb in &[15u32, 12, 9, 7] {
+            for sb in 0..=63u32 {
+                let pb = sb_to_pb(sb, npb);
+                assert!(pb < npb, "sb_to_pb({sb}, {npb}) = {pb} >= {npb}");
+            }
+        }
     }
 }

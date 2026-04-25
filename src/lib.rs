@@ -256,6 +256,33 @@
 //!   = 1 unit test (complete prefix code) plus an explicit prefix-
 //!   code check.
 //!
+//! * **Metadata walker** — [`metadata::parse_metadata`] implements the
+//!   outer `metadata(b_iframe)` element (§4.2.14.1 Table 66) end-to-end:
+//!   `basic_metadata(channel_mode)` (§4.2.14.2 Table 67) including the
+//!   `b_more_basic_metadata` block with optional `further_loudness_info`
+//!   (§4.2.14.3 Table 68), the stereo / multi-channel downmix info
+//!   tracks, the 5.x-only `pre_dmixtyp_5ch` / `pre_upmixtyp_5ch` and
+//!   7.x-only `pre_upmixtyp_3_4` / `pre_upmixtyp_3_2_2` paths, and the
+//!   `b_dc_blocking` flag; `extended_metadata(channel_mode,
+//!   b_associated, b_dialog)` (§4.2.14.4 Table 69) including the
+//!   per-channel `b_*_active` / `b_*_has_dialog` channels-classifier
+//!   block; the `tools_metadata_size_value` (7-bit + optional
+//!   `variable_bits(3) << 7` extension) hint; dispatch into
+//!   [`drc::parse_drc_frame`] and [`de::parse_dialog_enhancement`]; and
+//!   the trailing `b_emdf_payloads_substream` flag. The walker chains a
+//!   [`metadata::MetadataState`] forward across frames so non-I frames
+//!   re-use the most recent `drc_config()` / `de_config()` per the
+//!   bitstream's gating semantics. After DRC + DE consume their bytes
+//!   the walker reconciles against `tools_metadata_size` and skips any
+//!   trailing reserved bits inside the announced envelope, providing
+//!   forward compatibility against future tools-metadata extensions.
+//!
+//! * **A-CPL parameter↔QMF subband mapping** —
+//!   [`acpl::sb_to_pb`] implements §5.7.7.2 Table 197 for all four
+//!   `acpl_num_param_bands` configurations (15 / 12 / 9 / 7), the last
+//!   piece needed to wire `acpl_data_*ch()` parameters through to QMF
+//!   subbands during synthesis.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
@@ -282,13 +309,13 @@
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
 //!   zero bands yet.
-//! * Per-substream `metadata()` payload parsing — the outer
-//!   `metadata()` walker (§4.2.14.1) plus `basic_metadata()`,
-//!   `extended_metadata()`, `further_loudness_info()`, dialog
-//!   enhancement, and `emdf_payloads_substream()` are still skipped
-//!   en bloc via the substream byte size. The `drc_frame()` parser
-//!   ([`drc`]) is in place and can be invoked directly once the outer
-//!   walker is wired.
+//! * `emdf_payloads_substream()` parsing — the outer
+//!   [`metadata::parse_metadata`] walker errors out when
+//!   `b_emdf_payloads_substream == 1` rather than mis-aligning the
+//!   bitstream. Implementing §4.2.4.4 / §4.2.14.14 EMDF payloads is the
+//!   next step before real-bitstream metadata can fully round-trip.
+//!   `walk_ac4_substream` itself doesn't yet invoke the metadata walker
+//!   — that wiring is the follow-up to this round.
 //! * TS 103 190-2 IFM (immersive / object) decoding.
 //! * Encoder.
 //!
@@ -319,6 +346,7 @@ pub mod drc;
 pub mod drc_huffman;
 pub mod huffman;
 pub mod mdct;
+pub mod metadata;
 pub mod qmf;
 pub mod sfb_offset;
 pub mod sync;
