@@ -2523,6 +2523,15 @@ pub struct AspxChannelExtState {
     /// `num_atsg_sig_prev` — the previous interval's signal-envelope
     /// count. Used in Pseudocode 92's p_sine_at_end test.
     pub num_atsg_sig_prev: u32,
+    /// `aspx_tna_mode_prev[]` + `prev_chirp_array[]` per
+    /// §5.7.6.4.1.3 Pseudocode 88. Drives the chirp-factor smoothing
+    /// across consecutive A-SPX intervals.
+    pub tns: crate::aspx_tns::AspxTnsState,
+    /// Previous interval's `Q_low` (per QMF subband) for the
+    /// §5.7.6.4.1.3 Pseudocode 86 covariance calculation. The first
+    /// `TS_OFFSET_HFADJ` slots of `Q_low_ext` come from the tail of
+    /// this matrix.
+    pub q_low_prev: Vec<Vec<(f32, f32)>>,
 }
 
 impl AspxChannelExtState {
@@ -2538,6 +2547,8 @@ impl AspxChannelExtState {
         self.sine_idx_sb_prev = None;
         self.tsg_ptr_prev = 0;
         self.num_atsg_sig_prev = 0;
+        self.tns.reset();
+        self.q_low_prev.clear();
     }
 }
 

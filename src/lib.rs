@@ -159,13 +159,33 @@
 //!   implements §5.7.6.3.1.4 Pseudocode 71 (patch subband-group table
 //!   derivation). [`aspx::hf_tile_copy`] implements a simplified
 //!   §5.7.6.4.1.4 Pseudocode 89 high-band tile copy via the patch
-//!   table (no chirp/alpha0/alpha1 tonal adjust yet — that's the TNS
-//!   body of §5.7.6.4.1.2). [`aspx::apply_flat_envelope_gain`] is a
-//!   one-gain scaffold kept as a fallback for the §5.7.6.4.2 HF
-//!   envelope adjustment tool. Together with the QMF bank these form
-//!   an end-to-end bandwidth-extension pipeline: PCM → QMF analysis →
-//!   low-band truncate → HF tile-copy → QMF synthesis → non-silent
-//!   PCM.
+//!   table (no chirp/alpha0/alpha1 tonal adjust). The full TNS body
+//!   lives in the dedicated [`aspx_tns`] module — see below.
+//!   [`aspx::apply_flat_envelope_gain`] is a one-gain scaffold kept as
+//!   a fallback for the §5.7.6.4.2 HF envelope adjustment tool.
+//!   Together with the QMF bank these form an end-to-end bandwidth-
+//!   extension pipeline: PCM → QMF analysis → low-band truncate → HF
+//!   tile-copy → QMF synthesis → non-silent PCM.
+//! * **A-SPX TNS (chirp + α0 + α1)** — [`aspx_tns`] implements the
+//!   full §5.7.6.4.1.2 / .1.3 / .1.4 complex-covariance Temporal
+//!   Noise Shaping path: pre-flatten gain vector
+//!   ([`aspx_tns::compute_preflat_gains`], Pseudocode 85), complex
+//!   covariance matrix over `Q_low_ext`
+//!   ([`aspx_tns::compute_covariance`], Pseudocode 86), α0 / α1 LPC
+//!   coefficients with the EPSILON_INV slack and the |α|≥4 fallback
+//!   ([`aspx_tns::compute_alphas`], Pseudocode 87), per-noise-subband-
+//!   group chirp factors via the Table 195 `tabNewChirp` lookup with
+//!   attack / decay smoothing ([`aspx_tns::chirp_factors`],
+//!   Pseudocode 88), and the full HF signal creation that adds
+//!   `chirp * α0 * Q_low[n-2]` + `chirp² * α1 * Q_low[n-4]` plus the
+//!   optional pre-flatten divide ([`aspx_tns::hf_tile_tns`],
+//!   Pseudocode 89). Per-channel state ([`aspx_tns::AspxTnsState`])
+//!   carries `aspx_tna_mode_prev[]` / `prev_chirp_array[]` plus the
+//!   tail of the previous interval's `Q_low` for the
+//!   `ts_offset_hfadj = 4` look-back. The decoder auto-selects the
+//!   TNS path when the parsed `aspx_hfgen_iwc_*` provides
+//!   `aspx_tna_mode[ch][]` and the framing is FIXFIX; otherwise it
+//!   falls back to the bare tile copy.
 //! * **A-SPX HF envelope adjustment (per-envelope gain)** —
 //!   [`aspx::AspxEnvelopeAdjuster`] implements §5.7.6.4.2 Pseudocodes
 //!   90 + 91 + 95 (non-harmonic, non-limited path): delta-decode
@@ -197,14 +217,14 @@
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
 //!   path only exercises the long-frame path today.
-//! * Remaining §5.7.6.4 A-SPX HF regeneration — complex-covariance
-//!   tonal-to-noise prediction (Pseudocodes 86 / 87 / 88), the full
-//!   harmonic / limiter branch of the gain loop (Pseudocodes 92–101),
-//!   the noise generator (§5.7.6.4.3 — module exists in
-//!   [`aspx_noise`]) and tone generator (§5.7.6.4.4 — module exists in
-//!   [`aspx_tone`]) aren't yet wired into the HF signal assembler.
-//!   Non-FIXFIX interval classes (FIXVAR / VARFIX / VARVAR) fall back
-//!   to the flat-gain scaffold too.
+//! * Remaining §5.7.6.4 A-SPX HF regeneration — non-FIXFIX interval
+//!   classes (FIXVAR / VARFIX / VARVAR) still fall back to the
+//!   flat-gain scaffold; the limiter (§5.7.6.4.2.2) and TNS
+//!   (§5.7.6.4.1) paths only run on FIXFIX framing today. The TNS
+//!   pipeline is fully implemented in [`aspx_tns`] but per-channel
+//!   `master_reset` semantics (resetting `prev_chirp_array` / the
+//!   `Q_low_prev` history) when a new substream starts mid-stream
+//!   isn't surfaced through the decoder API yet.
 //! * A-CPL (`acpl_config_*`, `acpl_data_*`).
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
@@ -231,6 +251,7 @@ pub mod aspx;
 pub mod aspx_huffman;
 pub mod aspx_limiter;
 pub mod aspx_noise;
+pub mod aspx_tns;
 pub mod aspx_tone;
 pub mod decoder;
 pub mod huffman;

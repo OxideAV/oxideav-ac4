@@ -101,6 +101,10 @@ impl Ac4Decoder {
     /// `aspx_hfgen_iwc_*` (Table 55/56) — empty/None if the substream
     /// didn't carry it, in which case the tone generator stays silent
     /// but noise still injects if envelope deltas are available.
+    /// `tna_mode` is `aspx_tna_mode[sbg]` from the same hfgen payload;
+    /// when present + FIXFIX framing, the HF generator runs the full
+    /// §5.7.6.4.1.3 chirp + α0 + α1 TNS body (Pseudocodes 86 → 89)
+    /// instead of the bare tile copy.
     ///
     /// If any preconditions fail (length not a multiple of 64, tables
     /// missing, sbx >= 64) the original PCM is returned unchanged.
@@ -115,6 +119,10 @@ impl Ac4Decoder {
         qmode_env: Option<aspx::AspxQuantStep>,
         delta_dir: Option<&aspx::AspxDeltaDir>,
         add_harmonic: Option<&[bool]>,
+        // §5.7.6.4.1.3 Pseudocode 88 — `aspx_tna_mode[sbg]` per noise
+        // subband group, drives chirp + α0 + α1 TNS path. `None` falls
+        // back to the bare HF tile copy.
+        tna_mode: Option<&[u8]>,
         state: &mut aspx::AspxChannelExtState,
         num_ts_in_ats: u32,
     ) -> Vec<f32> {
@@ -165,11 +173,77 @@ impl Ac4Decoder {
                 *sample = (0.0, 0.0);
             }
         }
-        // HF tile copy into the A-SPX range.
-        let q_high = aspx::hf_tile_copy(&q, &patches, tables.sbx, NUM_QMF as u32);
-        for (dst, src) in q.iter_mut().zip(q_high.iter()).take(sbz).skip(sbx) {
-            dst.clone_from(src);
+        // HF generation: when the substream gave us aspx_tna_mode + a
+        // FIXFIX framing pair we can derive atsg_sig and run the full
+        // §5.7.6.4.1.3 / .4 TNS body (Pseudocodes 86 → 89). Otherwise
+        // fall back to the bare tile copy in §5.7.6.4.1.4 minus the
+        // chirp/α0/α1 terms.
+        let mut tns_used = false;
+        if let (Some(tna), Some(frm)) = (tna_mode, framing) {
+            let num_aspx_ts = (n_slots as u32) / num_ts_in_ats.max(1);
+            let atsg_sig_opt = if matches!(frm.int_class, aspx::AspxIntClass::FixFix) {
+                aspx::derive_fixfix_atsg(num_aspx_ts, frm.num_env, frm.num_noise).map(|(s, _)| s)
+            } else {
+                None
+            };
+            if let Some(atsg_sig) = atsg_sig_opt {
+                if !tna.is_empty() {
+                    let q_low_ext =
+                        crate::aspx_tns::build_q_low_ext(&q, &state.q_low_prev, tables.sba);
+                    let cov = crate::aspx_tns::compute_covariance(&q_low_ext, tables.sba);
+                    let (alpha0, alpha1) = crate::aspx_tns::compute_alphas(&cov);
+                    let chirp = crate::aspx_tns::chirp_factors(tna, &state.tns);
+                    let gain_vec = if cfg.preflat {
+                        Some(crate::aspx_tns::compute_preflat_gains(
+                            &q,
+                            tables.sbx,
+                            &atsg_sig,
+                            num_ts_in_ats,
+                        ))
+                    } else {
+                        None
+                    };
+                    let q_high = crate::aspx_tns::hf_tile_tns(
+                        &q_low_ext,
+                        &patches,
+                        &tables.sbg_noise,
+                        &chirp.chirp_arr,
+                        &alpha0,
+                        &alpha1,
+                        gain_vec.as_deref(),
+                        tables.sbx,
+                        NUM_QMF as u32,
+                        &atsg_sig,
+                        num_ts_in_ats,
+                    );
+                    for (dst, src) in q.iter_mut().zip(q_high.iter()).take(sbz).skip(sbx) {
+                        let len = dst.len().min(src.len());
+                        dst[..len].copy_from_slice(&src[..len]);
+                    }
+                    crate::aspx_tns::advance_tns_state(&mut state.tns, &chirp);
+                    tns_used = true;
+                }
+            }
         }
+        if !tns_used {
+            // Bare tile copy (§5.7.6.4.1.4 with chirp/α0/α1 = 0).
+            let q_high = aspx::hf_tile_copy(&q, &patches, tables.sbx, NUM_QMF as u32);
+            for (dst, src) in q.iter_mut().zip(q_high.iter()).take(sbz).skip(sbx) {
+                dst.clone_from(src);
+            }
+        }
+        // Snapshot Q_low for the next interval's Pseudocode 86 prefix.
+        // Only snapshot the actual low-band (sb < sba); the high-band
+        // is what we just synthesised, not part of Q_low.
+        state.q_low_prev = (0..(tables.sba as usize))
+            .map(|sb| {
+                if sb < q.len() {
+                    q[sb].clone()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
         // Per-envelope HF envelope adjustment (§5.7.6.4.2 Pseudocodes
         // 90 / 91 / 95) when the bitstream surface carried envelope
         // deltas, followed by noise + tone injection (§5.7.6.4.3 / .4 /
@@ -249,10 +323,18 @@ impl Ac4Decoder {
             // non-FIXFIX / missing-envelope paths). Using 0.5 so the
             // regenerated HF doesn't overwhelm the LF.
             aspx::apply_flat_envelope_gain(&mut q, tables.sbx, tables.sbz, 0.5);
-            // Reset per-channel carry-over state — the envelope path
-            // didn't run, so nothing consistent to advance. Next
-            // successful interval starts at master_reset.
-            state.reset();
+            // Reset per-channel envelope/tone carry-over state — the
+            // envelope adjustment didn't run, so its index state has
+            // nothing consistent to advance. Next successful interval
+            // starts at master_reset semantics. The TNS chirp / α0 /
+            // α1 history (`state.tns` + `state.q_low_prev`) is
+            // independent and is *kept* — its update has already been
+            // recorded above when the TNS path ran.
+            state.noise.reset();
+            state.tone.reset();
+            state.sine_idx_sb_prev = None;
+            state.tsg_ptr_prev = 0;
+            state.num_atsg_sig_prev = 0;
         }
         // Inverse QMF synthesis. Transpose q[sb][ts] -> slot[ts][sb] per
         // §4.4.7 inverse QMF synthesis bank.
@@ -447,6 +529,8 @@ impl Decoder for Ac4Decoder {
             delta_dir_sec,
             ah_pri,
             ah_sec,
+            tna_pri,
+            tna_sec,
         ) = if let Some(sub) = self.last_substream.as_ref() {
             let pri = sub
                 .tools
@@ -476,6 +560,16 @@ impl Decoder for Ac4Decoder {
             } else {
                 (None, None)
             };
+            // §5.7.6.4.1.3 Pseudocode 88 input — `aspx_tna_mode[ch][sbg]`.
+            // 2-ch hfgen carries per-channel modes; 1-ch hfgen carries
+            // a single channel's modes that we apply to the primary.
+            let (tna_p, tna_s) = if let Some(h2) = sub.tools.aspx_hfgen_iwc_2ch.as_ref() {
+                (Some(h2.tna_mode[0].clone()), Some(h2.tna_mode[1].clone()))
+            } else if let Some(h1) = sub.tools.aspx_hfgen_iwc_1ch.as_ref() {
+                (Some(h1.tna_mode.clone()), None)
+            } else {
+                (None, None)
+            };
             (
                 pri,
                 sec,
@@ -493,11 +587,13 @@ impl Decoder for Ac4Decoder {
                 sub.tools.aspx_delta_dir_secondary.clone(),
                 ah_p,
                 ah_s,
+                tna_p,
+                tna_s,
             )
         } else {
             (
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None,
+                None, None, None, None,
             )
         };
         // If the ASPX I-frame pipeline populated derived frequency
@@ -524,6 +620,7 @@ impl Decoder for Ac4Decoder {
                         qmode_pri,
                         delta_dir_pri.as_ref(),
                         ah_pri.as_deref(),
+                        tna_pri.as_deref(),
                         state,
                         num_ts_in_ats,
                     );
@@ -549,6 +646,7 @@ impl Decoder for Ac4Decoder {
                             qmode_sec.or(qmode_pri),
                             delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
                             ah_sec.as_deref().or(ah_pri.as_deref()),
+                            tna_sec.as_deref().or(tna_pri.as_deref()),
                             state,
                             num_ts_in_ats,
                         );
@@ -1154,7 +1252,7 @@ mod tests {
         let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
         let mut state = aspx::AspxChannelExtState::new();
         let out = Ac4Decoder::aspx_extend_pcm(
-            &pcm, &tables, &cfg, None, None, None, None, None, None, &mut state, 1,
+            &pcm, &tables, &cfg, None, None, None, None, None, None, None, &mut state, 1,
         );
         assert_eq!(out.len(), pcm.len());
         // Steady-state energy must be non-zero in the far tail (post
@@ -1177,6 +1275,108 @@ mod tests {
             nonzero > (out.len() - start) / 2,
             "too few non-zero samples: {nonzero}"
         );
+    }
+
+    #[test]
+    fn aspx_extend_pcm_with_tna_mode_diverges_from_bare_tile_copy() {
+        // Same synthetic input as `aspx_extend_pcm_produces_non_silent_output`
+        // but supply `tna_mode = [Heavy]` and a FIXFIX framing so the
+        // §5.7.6.4.1.3 chirp + α0 + α1 TNS body activates. The output
+        // must differ from the bare tile-copy result (Pseudocode 89
+        // adds two correction terms that are zero only when chirp == 0
+        // or α == 0, and we'd hit neither here).
+        //
+        // Use n_slots = 32 with num_ts_in_ats = 2 → num_aspx_ts = 16,
+        // which is one of the eight values Table 194 / 192 supports.
+        let n_slots = 32usize;
+        let n = n_slots * 64;
+        let mut pcm = vec![0.0f32; n];
+        let f = 1500.0_f32 / 48_000.0_f32; // a tone in the low band
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f * i as f32).sin();
+        }
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        // Build a FIXFIX framing with num_env=1, num_noise=1 so that
+        // derive_fixfix_atsg(num_aspx_ts, 1, 1) returns Some(...).
+        let framing = aspx::AspxFraming {
+            int_class: aspx::AspxIntClass::FixFix,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: vec![false],
+            var_bord_left: None,
+            var_bord_right: None,
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let num_sbg_noise = tables.sbg_noise.len().saturating_sub(1).max(1);
+        let tna_mode_heavy = vec![3_u8; num_sbg_noise]; // all "Heavy"
+        let tna_mode_zero = vec![0_u8; num_sbg_noise]; // all "None"
+
+        // Run twice: once with Heavy TNS, once with bare tile copy.
+        let mut state_a = aspx::AspxChannelExtState::new();
+        let out_tns = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            Some(&framing),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&tna_mode_heavy),
+            &mut state_a,
+            2,
+        );
+        let mut state_b = aspx::AspxChannelExtState::new();
+        let out_bare = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            Some(&framing),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&tna_mode_zero),
+            &mut state_b,
+            2,
+        );
+        assert_eq!(out_tns.len(), pcm.len());
+        assert_eq!(out_bare.len(), pcm.len());
+        // Outputs must differ in the post-settling region.
+        let start = 640usize;
+        let mut diffs = 0usize;
+        for (a, b) in out_tns[start..].iter().zip(out_bare[start..].iter()) {
+            if (a - b).abs() > 1e-6 {
+                diffs += 1;
+            }
+        }
+        assert!(
+            diffs > (out_tns.len() - start) / 100,
+            "TNS path didn't diverge from bare tile copy: {diffs} diffs"
+        );
+        // TNS path must also have advanced state: tns.tna_mode_prev /
+        // chirp_prev / q_low_prev should now be populated.
+        assert_eq!(state_a.tns.tna_mode_prev.len(), num_sbg_noise);
+        assert_eq!(state_a.tns.chirp_prev.len(), num_sbg_noise);
+        assert!(!state_a.q_low_prev.is_empty());
     }
 
     #[test]
