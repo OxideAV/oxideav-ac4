@@ -283,6 +283,30 @@
 //!   piece needed to wire `acpl_data_*ch()` parameters through to QMF
 //!   subbands during synthesis.
 //!
+//! * **A-CPL synthesis math** — [`acpl_synth`] implements the §5.7.7
+//!   QMF-domain synthesis pipeline end-to-end:
+//!   [`acpl_synth::differential_decode`] (§5.7.7.7 Pseudocode 121)
+//!   recovers absolute `acpl_<SET>_q` arrays from the Huffman deltas
+//!   produced by [`acpl::parse_acpl_data_1ch`] /
+//!   [`acpl::parse_acpl_data_2ch`], with state carried across
+//!   parameter sets and AC-4 frames via [`acpl_synth::AcplDiffState`];
+//!   [`acpl_synth::dequantize_alpha_beta`] /
+//!   [`acpl_synth::dequantize_beta3`] / [`acpl_synth::dequantize_gamma`]
+//!   apply Tables 203-208 (with the cross-coupled Tables 203/204 and
+//!   205/206 `ibeta` linkage); [`acpl_synth::interpolate`] (§5.7.7.3
+//!   Pseudocode 109) covers both smooth (linear-between-borders) and
+//!   steep (timeslot-keyed) per-QMF-subsample interpolation;
+//!   [`acpl_synth::InputSignalModifier`] (§5.7.7.4.2 Pseudocode 111)
+//!   implements the three frequency-region all-pass IIR decorrelators
+//!   `D0` / `D1` / `D2` over Tables 198-201;
+//!   [`acpl_synth::TransientDucker`] (§5.7.7.4.3 Pseudocodes 112-114)
+//!   carries the per-pb peak-decay / smooth state and emits
+//!   `duck_gain[pb]`; [`acpl_synth::acpl_module`] (§5.7.7.5
+//!   Pseudocode 116) and [`acpl_synth::run_pseudocode_115_pair`]
+//!   (Pseudocode 115) wire the channel-pair element together
+//!   end-to-end with the `acpl_qmf_band` M/S split below the
+//!   threshold and the alpha/beta-modulated decorrelator mix above.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
@@ -295,16 +319,21 @@
 //!   `master_reset` semantics (resetting `prev_chirp_array` / the
 //!   `Q_low_prev` history) when a new substream starts mid-stream
 //!   isn't surfaced through the decoder API yet.
-//! * A-CPL data-path wiring — the [`acpl`] module fully implements
-//!   `acpl_config_1ch` / `acpl_config_2ch` / `acpl_framing_data` /
-//!   `acpl_huff_data` / `acpl_ec_data` / `acpl_data_1ch` /
-//!   `acpl_data_2ch` (§4.2.13 Tables 59..65) over all 24 §A.3
-//!   Huffman codebooks ([`acpl_huffman`], Tables A.34..A.57), and the
-//!   outer `audio_data()` walker now reads `acpl_config_1ch` for the
-//!   stereo ASPX_ACPL_{1,2} paths. Wiring the per-frame
-//!   `acpl_data_1ch()` / `acpl_data_2ch()` payloads into the QMF
-//!   bandwidth-extension pipeline (and the `sb_to_pb` Table 197
-//!   mapping that drives `start_band`) still needs to be done.
+//! * A-CPL data-path decoder hookup — the [`acpl`] module fully
+//!   implements `acpl_config_1ch` / `acpl_config_2ch` /
+//!   `acpl_framing_data` / `acpl_huff_data` / `acpl_ec_data` /
+//!   `acpl_data_1ch` / `acpl_data_2ch` (§4.2.13 Tables 59..65) over
+//!   all 24 §A.3 Huffman codebooks ([`acpl_huffman`], Tables
+//!   A.34..A.57), and the [`acpl_synth`] module fully implements the
+//!   §5.7.7 QMF synthesis math (differential decode + dequant +
+//!   interpolation + decorrelator + ducker + ACplModule). What's
+//!   still missing is the [`decoder::Ac4Decoder`] wiring that
+//!   actually pumps the per-frame `acpl_data_*ch()` payloads through
+//!   [`acpl_synth::run_pseudocode_115_pair`] when an `ASPX_ACPL_*`
+//!   substream lands. Multichannel `5_X_codec_mode = ASPX_ACPL_3`
+//!   (Pseudocodes 117-120 / `Transform`, `ACplModule2`, `ACplModule3`)
+//!   is also still pending — the four §5.7.7.7 dequant tables
+//!   (Tables 203-208) needed to plug those in are already present.
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
@@ -331,6 +360,7 @@
 
 pub mod acpl;
 pub mod acpl_huffman;
+pub mod acpl_synth;
 pub mod asf;
 pub mod asf_data;
 pub mod aspx;
