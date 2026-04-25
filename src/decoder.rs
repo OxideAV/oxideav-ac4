@@ -198,7 +198,6 @@ impl Ac4Decoder {
                             num_ts_in_ats,
                             cfg.interpolation,
                         );
-                        adjuster.apply(&mut q);
                         // Noise + tone injection on top of the
                         // envelope-adjusted HF. `add_harmonic` is sized
                         // to `num_sbg_sig_highres`; if the caller didn't
@@ -213,15 +212,33 @@ impl Ac4Decoder {
                         };
                         // FIXFIX has no transient pointer (§4.3.10.4.7).
                         let aspx_tsg_ptr: u32 = 0;
-                        aspx::inject_noise_and_tone(
-                            &mut q,
-                            &adjuster,
-                            tables,
-                            &atsg_noise,
-                            ah,
-                            aspx_tsg_ptr,
-                            state,
-                        );
+                        if cfg.limiter {
+                            // §5.7.6.4.2.2 limiter pipeline (Pseudocodes
+                            // 96 → 101) replaces the raw sig_gain with
+                            // the boost-corrected sig_gain_sb_adj, so
+                            // do NOT pre-apply adjuster.apply here.
+                            aspx::inject_noise_and_tone_with_limiter(
+                                &mut q,
+                                &adjuster,
+                                tables,
+                                &patches,
+                                &atsg_noise,
+                                ah,
+                                aspx_tsg_ptr,
+                                state,
+                            );
+                        } else {
+                            adjuster.apply(&mut q);
+                            aspx::inject_noise_and_tone(
+                                &mut q,
+                                &adjuster,
+                                tables,
+                                &atsg_noise,
+                                ah,
+                                aspx_tsg_ptr,
+                                state,
+                            );
+                        }
                         used_envelope = true;
                     }
                 }
