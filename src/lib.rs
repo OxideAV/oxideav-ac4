@@ -213,6 +213,27 @@
 //!   → QMF synthesis, and emits bandwidth-extended PCM instead of
 //!   silence.
 //!
+//! * **DRC metadata parser** — [`drc::parse_drc_frame`] walks the
+//!   `drc_frame()` element (§4.2.14.5 Table 70) end-to-end:
+//!   `b_drc_present` gate, optional I-frame `drc_config()` (§4.2.14.6
+//!   Table 71) including up to eight `drc_decoder_mode_config()` blocks
+//!   with all three branches (`drc_repeat_profile_flag`,
+//!   `drc_default_profile_flag`, explicit `drc_compression_curve()`),
+//!   the full `drc_compression_curve()` with optional boost / cut
+//!   sections and per-mode time-constant block (§4.2.14.8 Table 73),
+//!   and the per-frame `drc_data()` payload (§4.2.14.9 Table 74) that
+//!   pulls one `drc_gains()` entry per gainset mode.
+//!   [`drc::parse_drc_gains`] decodes the seven-bit `drc_gain_val`
+//!   seed plus all `(ch, band, sf)` deltas through the Annex A.5
+//!   `DRC_HCB` Huffman codebook (`huff_decode_diff` per §4.3.10.8.3),
+//!   with the per-band / per-channel `ref_drc_gain` reset semantics
+//!   from Table 75 honoured. The Annex A.5 codebook itself
+//!   ([`drc_huffman::DRC_HCB_LEN`] / [`drc_huffman::DRC_HCB_CW`]) is
+//!   transcribed verbatim from the ETSI accompaniment file
+//!   `ts_10319001v010401p0-tables.c` and is verified by a Kraft-sum
+//!   = 1 unit test (complete prefix code) plus an explicit prefix-
+//!   code check.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
@@ -230,8 +251,13 @@
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
 //!   zero bands yet.
-//! * Per-substream `metadata()` payload parsing (DRC, dialog norm,
-//!   downmix coefficients) — bits are skipped via `substream_size`.
+//! * Per-substream `metadata()` payload parsing — the outer
+//!   `metadata()` walker (§4.2.14.1) plus `basic_metadata()`,
+//!   `extended_metadata()`, `further_loudness_info()`, dialog
+//!   enhancement, and `emdf_payloads_substream()` are still skipped
+//!   en bloc via the substream byte size. The `drc_frame()` parser
+//!   ([`drc`]) is in place and can be invoked directly once the outer
+//!   walker is wired.
 //! * TS 103 190-2 IFM (immersive / object) decoding.
 //! * Encoder.
 //!
@@ -254,6 +280,8 @@ pub mod aspx_noise;
 pub mod aspx_tns;
 pub mod aspx_tone;
 pub mod decoder;
+pub mod drc;
+pub mod drc_huffman;
 pub mod huffman;
 pub mod mdct;
 pub mod qmf;
