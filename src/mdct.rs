@@ -56,10 +56,10 @@ fn kaiser_bessel_kernel(n_kernel: u32, alpha: f32) -> Vec<f64> {
     let mut w = vec![0.0_f64; n + 1];
     let pa = PI as f64 * alpha as f64;
     let denom = bessel_i0(pa);
-    for i in 0..=n {
+    for (i, w_i) in w.iter_mut().enumerate() {
         let t = 2.0 * i as f64 / n as f64 - 1.0;
         let arg = pa * (1.0 - t * t).max(0.0).sqrt();
-        w[i] = bessel_i0(arg) / denom;
+        *w_i = bessel_i0(arg) / denom;
     }
     w
 }
@@ -82,15 +82,15 @@ pub fn kbd_window(n: u32) -> Vec<f32> {
     }
     let denom = cum[ns];
     let mut w = vec![0.0_f32; 2 * ns];
-    for i in 0..ns {
+    for (i, w_i) in w.iter_mut().enumerate().take(ns) {
         let num = cum[i];
-        w[i] = (num / denom).sqrt() as f32;
+        *w_i = (num / denom).sqrt() as f32;
     }
-    for i in ns..(2 * ns) {
+    for (i, w_i) in w.iter_mut().enumerate().skip(ns) {
         // 2N - n - 1 per the spec formula.
         let p = 2 * ns - i - 1;
         let num = cum[p];
-        w[i] = (num / denom).sqrt() as f32;
+        *w_i = (num / denom).sqrt() as f32;
     }
     w
 }
@@ -170,19 +170,19 @@ pub fn imdct_olap_symmetric(x_unwindowed: &[f32], window: &[f32], overlap: &mut 
     debug_assert_eq!(window.len(), two_n);
     debug_assert_eq!(overlap.len(), n);
     // Apply window to current 2N block.
-    let mut x = vec![0.0_f32; two_n];
-    for i in 0..two_n {
-        x[i] = x_unwindowed[i] * window[i];
-    }
+    let x: Vec<f32> = x_unwindowed
+        .iter()
+        .zip(window.iter())
+        .map(|(s, w)| s * w)
+        .collect();
     // PCM = overlap + first-N of x.
-    let mut pcm = vec![0.0_f32; n];
-    for i in 0..n {
-        pcm[i] = overlap[i] + x[i];
-    }
+    let pcm: Vec<f32> = overlap
+        .iter()
+        .zip(x.iter().take(n))
+        .map(|(o, xi)| o + xi)
+        .collect();
     // New overlap = second-N of x.
-    for i in 0..n {
-        overlap[i] = x[n + i];
-    }
+    overlap.copy_from_slice(&x[n..]);
     pcm
 }
 

@@ -15,7 +15,7 @@
 //!   bitstream_version, sequence_counter, fs_index, frame_rate_index,
 //!   b_iframe_global, payload_base, per-presentation
 //!   `ac4_presentation_info()` (single / multi-substream, configs 0..=5
-//!   + extension escape, HSF extension, pre-virtualised flag, extra
+//!   plus extension escape, HSF extension, pre-virtualised flag, extra
 //!   EMDF substreams), per-substream `ac4_substream_info()`
 //!   (channel_mode prefix decoder, sf_multiplier, bitrate_indicator,
 //!   content_type w/ language tag, b_iframe),
@@ -98,7 +98,7 @@
 //!   (§4.2.12.7). Adds per-channel `tna_mode[ch][]` (with
 //!   `aspx_balance == 1` mirroring channel 0 into channel 1),
 //!   per-channel `aspx_ah_left` / `_right` gates, `aspx_fic_present`
-//!   + per-channel `fic_left` / `fic_right` gates, and the
+//!   plus per-channel `fic_left` / `fic_right` gates, and the
 //!   `aspx_tic_copy` / `aspx_tic_left` / `aspx_tic_right` TIC
 //!   gating (including mirroring left-channel TIC into right when
 //!   `tic_copy` is set).
@@ -111,7 +111,7 @@
 //!   [`aspx_huffman`] — six `(F0, DF, DT)` triples covering
 //!   envelope-LEVEL / envelope-BALANCE @ 1.5 dB / 3 dB plus
 //!   noise-LEVEL / noise-BALANCE. A [`aspx::HuffmanCodebookId`] enum
-//!   + [`aspx::lookup_aspx_hcb`] resolve the
+//!   plus [`aspx::lookup_aspx_hcb`] resolve the
 //!   `get_aspx_hcb(data_type, quant_mode, stereo_mode, hcb_type)`
 //!   tuple from §5.7.6.3.4 Pseudocode 79.
 //! * **A-SPX entropy coded data** — [`aspx::parse_aspx_ec_data`]
@@ -224,19 +224,6 @@
 //! silence with a correctly-shaped AudioFrame.
 
 #![allow(dead_code)]
-#![allow(
-    clippy::needless_range_loop,
-    clippy::doc_lazy_continuation,
-    clippy::doc_overindented_list_items,
-    clippy::manual_memcpy,
-    clippy::too_many_arguments,
-    clippy::unnecessary_cast,
-    clippy::unusual_byte_groupings,
-    clippy::unreadable_literal,
-    clippy::nonminimal_bool,
-    clippy::manual_range_patterns,
-    clippy::field_reassign_with_default
-)]
 
 pub mod asf;
 pub mod asf_data;

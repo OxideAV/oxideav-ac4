@@ -59,8 +59,7 @@ pub fn parse_asf_section_data(
         (5u32, 31u32)
     };
     let num_sfb = num_sfb_48(transform_length)
-        .ok_or_else(|| Error::invalid("ac4: asf_section_data: unsupported transform_length"))?
-        as u32;
+        .ok_or_else(|| Error::invalid("ac4: asf_section_data: unsupported transform_length"))?;
 
     let mut out = AsfSections {
         sfb_cb: vec![0u8; max_sfb as usize],
@@ -189,7 +188,7 @@ pub fn parse_asf_spectral_data(
         let b = sfb_offset[sfb + 1] as usize;
         let mut m: u32 = 0;
         for &q in &quant_spec[a..b.min(quant_spec.len())] {
-            m = m.max(q.unsigned_abs() as u32);
+            m = m.max(q.unsigned_abs());
         }
         max_quant_idx[sfb] = m;
     }
@@ -351,13 +350,14 @@ mod tests {
     fn spectral_parser_all_zero_section() {
         // max_sfb = 2 at transform_length = 256 (num_sfb=20). Section
         // cb = 0 covers both. No Huffman bits needed in spectral data.
-        let mut sections = AsfSections::default();
-        sections.sect_cb = vec![0u8];
-        sections.sect_start = vec![0u16];
-        sections.sect_end = vec![2u16];
-        sections.sfb_cb = vec![0u8; 2];
-        sections.num_sec = 1;
-        sections.num_sec_lsf = 1;
+        let sections = AsfSections {
+            sect_cb: vec![0u8],
+            sect_start: vec![0u16],
+            sect_end: vec![2u16],
+            sfb_cb: vec![0u8; 2],
+            num_sec: 1,
+            num_sec_lsf: 1,
+        };
         let mut bw = BitWriter::new();
         bw.write_u32(0, 8); // ensure byte exists
         let bytes = bw.finish();
@@ -376,8 +376,10 @@ mod tests {
         // with cb=5 (non-zero). max_quant_idx[1] = 3.
         // reference_scale_factor = 120 -> first sfb with cb!=0 and
         // mqi>0 pins scale_factor at 120, gain = 2^((120-100)/4) = 32.0.
-        let mut sections = AsfSections::default();
-        sections.sfb_cb = vec![5u8, 5u8, 5u8];
+        let sections = AsfSections {
+            sfb_cb: vec![5u8, 5u8, 5u8],
+            ..AsfSections::default()
+        };
         let mqi = vec![0u32, 3u32, 0u32];
         let mut bw = BitWriter::new();
         bw.write_u32(120, 8); // reference_scale_factor
@@ -401,8 +403,10 @@ mod tests {
         // factor moves by cw_idx - 60 = 0, stays at 120. Third band
         // reads another codeword idx=63 (len=4, cw=0x4): delta = 3,
         // scale = 123.
-        let mut sections = AsfSections::default();
-        sections.sfb_cb = vec![5u8, 5u8, 5u8];
+        let sections = AsfSections {
+            sfb_cb: vec![5u8, 5u8, 5u8],
+            ..AsfSections::default()
+        };
         let mqi = vec![3u32, 3u32, 3u32];
         let mut bw = BitWriter::new();
         bw.write_u32(120, 8);

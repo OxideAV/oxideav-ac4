@@ -1366,6 +1366,7 @@ pub struct AspxSbgCounts {
 /// Each envelope's direction is taken from `direction[env]`
 /// (`aspx_sig_delta_dir` / `aspx_noise_delta_dir` from Table 54).
 /// Returns a per-envelope vector of Huffman-decoded symbol streams.
+#[allow(clippy::too_many_arguments)] // ETSI TS 103 190-2 §4.3.10.4.9 aspx_ec_data() signature
 pub fn parse_aspx_ec_data(
     br: &mut BitReader<'_>,
     data_type: AspxDataType,
@@ -1382,7 +1383,7 @@ pub fn parse_aspx_ec_data(
         ));
     }
     let mut out = Vec::with_capacity(num_env as usize);
-    for env in 0..num_env as usize {
+    for (env, &dir) in direction.iter().take(num_env as usize).enumerate() {
         let num_sbg = match data_type {
             AspxDataType::Signal => {
                 // freq_res may be empty when the caller doesn't have
@@ -1397,14 +1398,7 @@ pub fn parse_aspx_ec_data(
             }
             AspxDataType::Noise => sbg.num_sbg_noise,
         };
-        let envdata = parse_aspx_huff_data(
-            br,
-            data_type,
-            num_sbg,
-            quant_mode,
-            stereo_mode,
-            direction[env],
-        )?;
+        let envdata = parse_aspx_huff_data(br, data_type, num_sbg, quant_mode, stereo_mode, dir)?;
         out.push(envdata);
     }
     Ok(out)
@@ -1664,8 +1658,8 @@ pub fn derive_patch_tables(
     let mut sbg = if goal_sb < sbx + num_sb_aspx {
         // Find the smallest i such that sbg_master[i] >= goal_sb.
         let mut s = 0u32;
-        for i in 0..sbg_master.len() {
-            if sbg_master[i] < goal_sb {
+        for (i, &val) in sbg_master.iter().enumerate() {
+            if val < goal_sb {
                 s = (i + 1) as u32;
             } else {
                 break;
@@ -1694,9 +1688,9 @@ pub fn derive_patch_tables(
         // Inner while loop: sb > (sba - source_band_low + msb - odd)
         // where odd is recomputed each iteration.
         loop {
-            let odd = ((sb as i64 - 2 + sba as i64).rem_euclid(2)) as i64;
+            let odd = (sb as i64 - 2 + sba as i64).rem_euclid(2);
             let rhs = sba as i64 - source_band_low as i64 + msb as i64 - odd;
-            if !((sb as i64) > rhs) {
+            if (sb as i64) <= rhs {
                 break;
             }
             if j == 0 {
@@ -1789,9 +1783,8 @@ pub fn hf_tile_copy(
             // Copy the time series.
             let src = &q_low[sb_src as usize];
             let dst = &mut q_high[sb_high as usize];
-            for ts in 0..n_ts.min(src.len()) {
-                dst[ts] = src[ts];
-            }
+            let copy_len = n_ts.min(src.len()).min(dst.len());
+            dst[..copy_len].copy_from_slice(&src[..copy_len]);
         }
         sum_sb_patches += n;
     }
@@ -1882,6 +1875,8 @@ pub fn delta_decode_sig(
     let mut qscf: Vec<Vec<i32>> = vec![vec![0_i32; num_env]; num_sbg as usize];
     for (atsg, env) in deltas.iter().enumerate() {
         if env.direction_time {
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80 qscf[sbg][atsg]
             for sbg in 0..(num_sbg as usize) {
                 let prev = if atsg == 0 {
                     qscf_prev_last.get(sbg).copied().unwrap_or(0)
@@ -1893,6 +1888,8 @@ pub fn delta_decode_sig(
             }
         } else {
             let mut acc: i32 = 0;
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80 qscf[sbg][atsg]
             for sbg in 0..(num_sbg as usize) {
                 let d = env.values.get(sbg).copied().unwrap_or(0);
                 acc += delta * d;
@@ -1916,6 +1913,8 @@ pub fn delta_decode_noise(
     let mut qscf: Vec<Vec<i32>> = vec![vec![0_i32; num_env]; num_sbg as usize];
     for (atsg, env) in deltas.iter().enumerate() {
         if env.direction_time {
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 81 qscf[sbg][atsg]
             for sbg in 0..(num_sbg as usize) {
                 let prev = if atsg == 0 {
                     qscf_prev_last.get(sbg).copied().unwrap_or(0)
@@ -1927,6 +1926,8 @@ pub fn delta_decode_noise(
             }
         } else {
             let mut acc: i32 = 0;
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 81 qscf[sbg][atsg]
             for sbg in 0..(num_sbg as usize) {
                 let d = env.values.get(sbg).copied().unwrap_or(0);
                 acc += delta * d;
@@ -2013,6 +2014,9 @@ pub fn estimate_envelope_energy(
     if num_atsg_sig == 0 || sbg_sig.len() < 2 {
         return est;
     }
+    // ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocode 90: nested atsg / sbg / sb loops
+    // walk est[sb][atsg] in lock-step with atsg_sig[] borders.
+    #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-1 §5.7.6.4.2.1 atsg_sig[atsg]
     for atsg in 0..num_atsg_sig {
         let tsa = atsg_sig[atsg] * num_ts_in_ats;
         let tsz = atsg_sig[atsg + 1] * num_ts_in_ats;
@@ -2021,6 +2025,7 @@ pub fn estimate_envelope_energy(
             continue;
         }
         let mut sbg = 0_usize;
+        #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-1 §5.7.6.4.2.1 est[sb][atsg]
         for sb in 0..(num_sb_aspx as usize) {
             while sbg + 1 < sbg_sig.len().saturating_sub(1) && (sb as u32 + sbx) >= sbg_sig[sbg + 1]
             {
@@ -2094,6 +2099,9 @@ pub fn map_scf_to_qmf_subbands(
     let num_sbg_sig = sbg_sig.len().saturating_sub(1);
     let num_sbg_noise = sbg_noise.len().saturating_sub(1);
     let mut atsg_noise_idx: usize = 0;
+    // ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocode 91: scatter scf_sig_sbg /
+    // scf_noise_sbg into per-QMF-subband matrices via sbg_sig / sbg_noise borders.
+    #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-1 §5.7.6.4.2.1 scf_sig_sb[sb][atsg]
     for atsg in 0..num_atsg_sig {
         for sbg in 0..num_sbg_sig {
             let lo = sbg_sig[sbg].saturating_sub(sbx) as usize;
@@ -2103,6 +2111,8 @@ pub fn map_scf_to_qmf_subbands(
                 .and_then(|row| row.get(atsg))
                 .copied()
                 .unwrap_or(0.0);
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.4.2.1 scf_sig_sb[sb][atsg]
             for sb in lo..hi.min(num_sb_aspx as usize) {
                 scf_sig_sb[sb][atsg] = val;
             }
@@ -2124,6 +2134,8 @@ pub fn map_scf_to_qmf_subbands(
                 .and_then(|row| row.get(atsg_noise_idx))
                 .copied()
                 .unwrap_or(0.0);
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.4.2.1 scf_noise_sb[sb][atsg]
             for sb in lo..hi.min(num_sb_aspx as usize) {
                 scf_noise_sb[sb][atsg] = val;
             }
@@ -2182,6 +2194,9 @@ pub fn derive_sine_idx_sb(
         None => false, // first frame — spec uses the -1 branch
     };
     let mut sine_idx_sb: Vec<Vec<u8>> = vec![vec![0_u8; num_atsg]; num_sb_aspx as usize];
+    // ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocode 92: build sine_idx_sb[sb][atsg]
+    // from per-sbg add_harmonic gates, indexing the matrix by both axes.
+    #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-1 §5.7.6.4.2.1 sine_idx_sb[sb][atsg]
     for atsg in 0..num_atsg {
         for sbg in 0..num_sbg {
             let sba = sbg_sig_highres[sbg].saturating_sub(sbx) as usize;
@@ -2192,6 +2207,8 @@ pub fn derive_sine_idx_sb(
             let hi = sbz_local.min(num_sb_aspx as usize);
             // "sb_mid = (int) 0.5 * (sbz + sba)" — integer truncation toward zero.
             let sb_mid = (sba + sbz_local) / 2;
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.4.2.1 sine_idx_sb[sb][atsg]
             for sb in sba..hi {
                 let ah = add_harmonic.get(sbg).copied().unwrap_or(false);
                 let prev_idx_at_last_env = prev.and_then(|(_, prev_num, prev_mat)| {
@@ -2256,6 +2273,8 @@ pub fn derive_sine_area_sb(
                     break;
                 }
             }
+            #[allow(clippy::needless_range_loop)]
+            // ETSI TS 103 190-1 §5.7.6.4.2.1 sine_area_sb[sb][atsg]
             for sb in sba..hi {
                 sine_area_sb[sb][atsg] = b_sine_present;
             }
@@ -4015,9 +4034,9 @@ mod tests {
         let n_ts = 4usize;
         let mut q_low: Vec<Vec<(f32, f32)>> = (0..64).map(|_| vec![(0.0, 0.0); n_ts]).collect();
         // Populate sources 2..6 with distinctive values.
-        for src_sb in 2..6 {
-            for ts in 0..n_ts {
-                q_low[src_sb][ts] = (src_sb as f32, ts as f32);
+        for (src_sb, row) in q_low.iter_mut().enumerate().take(6).skip(2) {
+            for (ts, cell) in row.iter_mut().enumerate().take(n_ts) {
+                *cell = (src_sb as f32, ts as f32);
             }
         }
         let q_high = hf_tile_copy(&q_low, &patches, 8, 64);
@@ -4032,22 +4051,14 @@ mod tests {
             }
         }
         // Below sbx and above patch end should be zeros.
-        for sb in 0..8 {
-            for ts in 0..n_ts {
-                assert_eq!(
-                    q_high[sb][ts],
-                    (0.0, 0.0),
-                    "low-band sb={sb} should be zero"
-                );
+        for (sb, row) in q_high.iter().enumerate().take(8) {
+            for &cell in row.iter().take(n_ts) {
+                assert_eq!(cell, (0.0, 0.0), "low-band sb={sb} should be zero");
             }
         }
-        for sb in 12..64 {
-            for ts in 0..n_ts {
-                assert_eq!(
-                    q_high[sb][ts],
-                    (0.0, 0.0),
-                    "high-band sb={sb} should be zero"
-                );
+        for (sb, row) in q_high.iter().enumerate().take(64).skip(12) {
+            for &cell in row.iter().take(n_ts) {
+                assert_eq!(cell, (0.0, 0.0), "high-band sb={sb} should be zero");
             }
         }
     }
@@ -4086,16 +4097,16 @@ mod tests {
             sbg_patch_start_sb: vec![0],
         };
         // Truncate the high band first.
-        for sb in 16..NUM_QMF_SUBBANDS {
-            for s in q_low[sb].iter_mut() {
+        for row in q_low.iter_mut().skip(16) {
+            for s in row.iter_mut() {
                 *s = (0.0, 0.0);
             }
         }
         let q_high = hf_tile_copy(&q_low, &patches, 16, NUM_QMF_SUBBANDS as u32);
         // Check that q_high[16..32] is non-zero.
         let mut energy = 0.0f64;
-        for sb in 16..32 {
-            for &(re, im) in q_high[sb].iter() {
+        for row in q_high.iter().take(32).skip(16) {
+            for &(re, im) in row.iter() {
                 energy += (re as f64) * (re as f64) + (im as f64) * (im as f64);
             }
         }
@@ -4157,10 +4168,11 @@ mod tests {
         // Inverse synthesis.
         let mut syn = QmfSynthesisBank::new();
         let mut out = Vec::with_capacity(n);
+        #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-2 §4.4.7 q[sb][ts] indexing
         for ts in 0..n_slots {
             let mut slot = [(0.0f32, 0.0f32); 64];
-            for sb in 0..64 {
-                slot[sb] = q[sb][ts];
+            for (sb, dst) in slot.iter_mut().enumerate() {
+                *dst = q[sb][ts];
             }
             let pcm_row = syn.process_slot(&slot);
             out.extend_from_slice(&pcm_row);
@@ -4170,8 +4182,8 @@ mod tests {
         let end = n - 10;
         let mut energy = 0.0f64;
         let mut nonzero = 0usize;
-        for i in start..end {
-            let s = out[i] as f64;
+        for &sample in &out[start..end] {
+            let s = sample as f64;
             energy += s * s;
             if s != 0.0 {
                 nonzero += 1;
@@ -4192,19 +4204,19 @@ mod tests {
     fn flat_envelope_gain_scales_range() {
         let mut q: Vec<Vec<(f32, f32)>> = (0..16).map(|_| vec![(1.0, 2.0); 4]).collect();
         apply_flat_envelope_gain(&mut q, 4, 12, 3.0);
-        for sb in 0..4 {
-            for ts in 0..4 {
-                assert_eq!(q[sb][ts], (1.0, 2.0));
+        for row in q.iter().take(4) {
+            for &cell in row.iter().take(4) {
+                assert_eq!(cell, (1.0, 2.0));
             }
         }
-        for sb in 4..12 {
-            for ts in 0..4 {
-                assert_eq!(q[sb][ts], (3.0, 6.0));
+        for row in q.iter().take(12).skip(4) {
+            for &cell in row.iter().take(4) {
+                assert_eq!(cell, (3.0, 6.0));
             }
         }
-        for sb in 12..16 {
-            for ts in 0..4 {
-                assert_eq!(q[sb][ts], (1.0, 2.0));
+        for row in q.iter().take(16).skip(12) {
+            for &cell in row.iter().take(4) {
+                assert_eq!(cell, (1.0, 2.0));
             }
         }
     }
@@ -4282,15 +4294,15 @@ mod tests {
         let num_ts_in_ats = 2u32; // -> ts ranges [0,2) and [2,4).
         let mut q_high: Vec<Vec<(f32, f32)>> = (0..4).map(|_| vec![(0.0, 0.0); 4]).collect();
         // Env 0: each of sb 2..4 and ts 0..2 = (1,0) -> |^2 = 1.
-        for sb in 2..4 {
-            for ts in 0..2 {
-                q_high[sb][ts] = (1.0, 0.0);
+        for row in q_high.iter_mut().take(4).skip(2) {
+            for cell in row.iter_mut().take(2) {
+                *cell = (1.0, 0.0);
             }
         }
         // Env 1: each of sb 2..4 and ts 2..4 = (2,0) -> |^2 = 4.
-        for sb in 2..4 {
-            for ts in 2..4 {
-                q_high[sb][ts] = (2.0, 0.0);
+        for row in q_high.iter_mut().take(4).skip(2) {
+            for cell in row.iter_mut().take(4).skip(2) {
+                *cell = (2.0, 0.0);
             }
         }
         // aspx_interpolation = false -> average over group & time.
@@ -4305,9 +4317,9 @@ mod tests {
         );
         // Each sb, env 0: sum of 4 contributions / (2 band × 2 ts) = 1
         // Each sb, env 1: sum of 16 / 4 = 4
-        for sb in 0..2 {
-            assert!((est[sb][0] - 1.0).abs() < 1e-5, "env0 sb{sb} mismatch");
-            assert!((est[sb][1] - 4.0).abs() < 1e-5, "env1 sb{sb} mismatch");
+        for (sb, est_row) in est.iter().enumerate().take(2) {
+            assert!((est_row[0] - 1.0).abs() < 1e-5, "env0 sb{sb} mismatch");
+            assert!((est_row[1] - 4.0).abs() < 1e-5, "env1 sb{sb} mismatch");
         }
     }
 
@@ -4350,9 +4362,13 @@ mod tests {
         let n_qmf_ts = (num_aspx_ts * num_ts_in_ats) as usize;
         let mut q: Vec<Vec<(f32, f32)>> = (0..64).map(|_| vec![(0.0, 0.0); n_qmf_ts]).collect();
         // Fill the A-SPX range with a flat unit-amplitude signal.
-        for sb in (tables.sbx as usize)..(tables.sbz as usize) {
-            for ts in 0..n_qmf_ts {
-                q[sb][ts] = (1.0, 0.0);
+        for row in q
+            .iter_mut()
+            .take(tables.sbz as usize)
+            .skip(tables.sbx as usize)
+        {
+            for cell in row.iter_mut().take(n_qmf_ts) {
+                *cell = (1.0, 0.0);
             }
         }
         // Simulate aspx_data_sig deltas: envelope 0 FREQ with a small
@@ -4404,13 +4420,11 @@ mod tests {
         let (t1_a, t1_b) = (atsg_sig[1] as usize, atsg_sig[2] as usize);
         let mut e0 = 0.0_f64;
         let mut e1 = 0.0_f64;
-        for sb in (tables.sbx as usize)..(tables.sbz as usize) {
-            for ts in t0_a..t0_b {
-                let (re, im) = q[sb][ts];
+        for row in q.iter().take(tables.sbz as usize).skip(tables.sbx as usize) {
+            for &(re, im) in row.iter().take(t0_b).skip(t0_a) {
                 e0 += (re as f64) * (re as f64) + (im as f64) * (im as f64);
             }
-            for ts in t1_a..t1_b {
-                let (re, im) = q[sb][ts];
+            for &(re, im) in row.iter().take(t1_b).skip(t1_a) {
                 e1 += (re as f64) * (re as f64) + (im as f64) * (im as f64);
             }
         }
@@ -4447,19 +4461,19 @@ mod tests {
             num_sb_aspx,
         );
         // sb 2 (= sb 0 relative), env 0 (ts 0..2): gain 1
-        for ts in 0..2 {
-            assert!((q[2][ts].0 - 1.0).abs() < 1e-6);
+        for &cell in q[2].iter().take(2) {
+            assert!((cell.0 - 1.0).abs() < 1e-6);
         }
         // sb 2, env 1 (ts 2..4): gain 3
-        for ts in 2..4 {
-            assert!((q[2][ts].0 - 3.0).abs() < 1e-6);
+        for &cell in q[2].iter().take(4).skip(2) {
+            assert!((cell.0 - 3.0).abs() < 1e-6);
         }
         // sb 3 (= sb 1 relative), env 0: gain 2; env 1: gain 4
-        for ts in 0..2 {
-            assert!((q[3][ts].0 - 2.0).abs() < 1e-6);
+        for &cell in q[3].iter().take(2) {
+            assert!((cell.0 - 2.0).abs() < 1e-6);
         }
-        for ts in 2..4 {
-            assert!((q[3][ts].0 - 4.0).abs() < 1e-6);
+        for &cell in q[3].iter().take(4).skip(2) {
+            assert!((cell.0 - 4.0).abs() < 1e-6);
         }
     }
 
@@ -4556,8 +4570,8 @@ mod tests {
         let sbx = tables.sbx as usize;
         let sbz = tables.sbz as usize;
         // Truncate the HF band (core carries only LF past sbx).
-        for sb in sbx..NUM_QMF_SUBBANDS {
-            for s in q[sb].iter_mut() {
+        for row in q.iter_mut().skip(sbx) {
+            for s in row.iter_mut() {
                 *s = (0.0, 0.0);
             }
         }
@@ -4572,9 +4586,7 @@ mod tests {
             true,
         );
         let q_high = hf_tile_copy(&q, &patches, tables.sbx, NUM_QMF_SUBBANDS as u32);
-        for sb in sbx..sbz {
-            q[sb] = q_high[sb].clone();
-        }
+        q[sbx..sbz].clone_from_slice(&q_high[sbx..sbz]);
         // Build envelope deltas: two signal envelopes, two noise
         // envelopes. Signal scf -> constant, noise scf -> q=6 gives
         // unit scf (2^(6-6) = 1) -> moderate noise floor. Delta_dir
@@ -4633,8 +4645,8 @@ mod tests {
         );
         // HF QMF energy must be substantial.
         let mut hf_qmf_energy = 0.0_f64;
-        for sb in sbx..sbz {
-            for &(re, im) in q[sb].iter() {
+        for row in q.iter().take(sbz).skip(sbx) {
+            for &(re, im) in row.iter() {
                 hf_qmf_energy += (re as f64).powi(2) + (im as f64).powi(2);
             }
         }
@@ -4647,9 +4659,10 @@ mod tests {
         assert_eq!(state.num_atsg_sig_prev, 2);
         assert!(state.noise.prev.is_some());
         assert!(state.tone.prev.is_some());
-        // Inverse QMF + FFT probe.
+        // Inverse QMF + FFT probe — transpose q[sb][ts] -> slot[ts][sb].
         let mut syn = QmfSynthesisBank::new();
         let mut out = Vec::with_capacity(n);
+        #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-2 §4.4.7 q[sb][ts] indexing
         for ts in 0..n_slots {
             let mut slot = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
             for (sb, s) in slot.iter_mut().enumerate() {

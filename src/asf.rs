@@ -192,12 +192,14 @@ pub fn parse_asf_psy_info(
     b_dual_maxsfb: bool,
     b_side_limited: bool,
 ) -> Result<AsfPsyInfo> {
-    let mut info = AsfPsyInfo::default();
-
     // b_different_framing is derived, not coded.
-    info.b_different_framing = frame_len_base >= 1536
+    let b_different_framing = frame_len_base >= 1536
         && !transform_info.b_long_frame
         && transform_info.transf_length[0] != transform_info.transf_length[1];
+    let mut info = AsfPsyInfo {
+        b_different_framing,
+        ..AsfPsyInfo::default()
+    };
 
     // Resolve n_msfb_bits / n_side_bits from Table 106 for the primary
     // transform length.

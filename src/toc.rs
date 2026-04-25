@@ -363,25 +363,15 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
 fn frame_rate_factor(frame_rate_index: u32, b_multiplier: bool, multiplier_bit: u32) -> u32 {
     match frame_rate_index {
         // Indices 2/3/4 — 25 / 29.97 / 30 fps: factor is 1 or (b_multiplier ? 1+multiplier_bit : 1).
-        2 | 3 | 4 => {
-            if b_multiplier {
-                if multiplier_bit == 0 {
-                    2
-                } else {
-                    4
-                }
+        2..=4 if b_multiplier => {
+            if multiplier_bit == 0 {
+                2
             } else {
-                1
+                4
             }
         }
         // Indices 0/1/7/8/9 — high-FPS forms: factor is 1 or 2.
-        0 | 1 | 7 | 8 | 9 => {
-            if b_multiplier {
-                2
-            } else {
-                1
-            }
-        }
+        0 | 1 | 7 | 8 | 9 if b_multiplier => 2,
         _ => 1,
     }
 }
@@ -394,7 +384,7 @@ fn parse_frame_rate_multiply_info(
     let mut b_multiplier = false;
     let mut multiplier_bit = 0u32;
     match frame_rate_index {
-        2 | 3 | 4 => {
+        2..=4 => {
             b_multiplier = br.read_bit()?;
             if b_multiplier {
                 multiplier_bit = br.read_u32(1)?;
@@ -614,7 +604,7 @@ fn parse_presentation_info(
             let _b_hsf_ext = br.read_bit()?;
             let b_hsf_ext = _b_hsf_ext;
             match presentation_config {
-                0 | 1 | 2 => {
+                0..=2 => {
                     // Three variants that share the same layout: main/ME +
                     // optional HSF + secondary stream.
                     let first = parse_substream_info(br, fs_index, frame_rate_index)?;
@@ -707,6 +697,8 @@ mod tests {
     #[test]
     fn variable_bits_single_chunk() {
         // value = 0b10 (2), terminator bit clear.
+        // Grouping mirrors variable_bits(n=2) layout: 2 value bits, 1 terminator, 5 pad.
+        #[allow(clippy::unusual_byte_groupings)] // ETSI TS 103 190-1 §4.2.2 variable_bits()
         let bytes = [0b10_0_00000];
         let mut br = BitReader::new(&bytes);
         let v = variable_bits(&mut br, 2).unwrap();

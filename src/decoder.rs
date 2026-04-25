@@ -160,15 +160,15 @@ impl Ac4Decoder {
         // Truncate the high band (ASPX substreams only carry spectral
         // data up to sbx in the core path; the bandwidth-extension
         // tool is responsible for filling sbx..sbz).
-        for sb in sbx..NUM_QMF {
-            for sample in q[sb].iter_mut() {
+        for row in q.iter_mut().skip(sbx) {
+            for sample in row.iter_mut() {
                 *sample = (0.0, 0.0);
             }
         }
         // HF tile copy into the A-SPX range.
         let q_high = aspx::hf_tile_copy(&q, &patches, tables.sbx, NUM_QMF as u32);
-        for sb in sbx..sbz {
-            q[sb] = q_high[sb].clone();
+        for (dst, src) in q.iter_mut().zip(q_high.iter()).take(sbz).skip(sbx) {
+            dst.clone_from(src);
         }
         // Per-envelope HF envelope adjustment (§5.7.6.4.2 Pseudocodes
         // 90 / 91 / 95) when the bitstream surface carried envelope
@@ -237,9 +237,11 @@ impl Ac4Decoder {
             // successful interval starts at master_reset.
             state.reset();
         }
-        // Inverse QMF synthesis.
+        // Inverse QMF synthesis. Transpose q[sb][ts] -> slot[ts][sb] per
+        // §4.4.7 inverse QMF synthesis bank.
         let mut syn = qmf::QmfSynthesisBank::new();
         let mut out = Vec::with_capacity(pcm_in.len());
+        #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-2 §4.4.7 q[sb][ts] indexing
         for ts in 0..n_slots {
             let mut slot = [(0.0f32, 0.0f32); NUM_QMF];
             for (sb, s) in slot.iter_mut().enumerate() {

@@ -954,23 +954,23 @@ mod tests {
         let mut y: Vec<Vec<(f32, f32)>> = (0..64).map(|_| vec![(0.5_f32, -0.5_f32); 2]).collect();
         add_qmf_noise(&mut y, &out, &atsg_sig, 1, 4, 6);
         // Subbands 0..4 and 6..64 unchanged (still 0.5, -0.5).
-        for sb in 0..4 {
-            for ts in 0..2 {
-                assert_eq!(y[sb][ts], (0.5, -0.5));
+        for row in y.iter().take(4) {
+            for &cell in row.iter().take(2) {
+                assert_eq!(cell, (0.5, -0.5));
             }
         }
-        for sb in 6..64 {
-            for ts in 0..2 {
-                assert_eq!(y[sb][ts], (0.5, -0.5));
+        for row in y.iter().take(64).skip(6) {
+            for &cell in row.iter().take(2) {
+                assert_eq!(cell, (0.5, -0.5));
             }
         }
         // Subbands 4..6 have noise added on top of (0.5, -0.5).
-        for sb in 4..6 {
-            for ts in 0..2 {
+        for (sb, row) in y.iter().enumerate().take(6).skip(4) {
+            for (ts, &cell) in row.iter().enumerate().take(2) {
                 let idx = noise_idx(sb as u32, ts as u32, 0, 1, 2, None);
                 let (exp_re, exp_im) = ASPX_NOISE_TABLE[idx as usize];
-                assert!((y[sb][ts].0 - (0.5 + exp_re)).abs() < 1e-5);
-                assert!((y[sb][ts].1 - (-0.5 + exp_im)).abs() < 1e-5);
+                assert!((cell.0 - (0.5 + exp_re)).abs() < 1e-5);
+                assert!((cell.1 - (-0.5 + exp_im)).abs() < 1e-5);
             }
         }
     }

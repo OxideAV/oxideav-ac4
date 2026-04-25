@@ -392,11 +392,11 @@ mod tests {
         let mut y: Vec<Vec<(f32, f32)>> = (0..64).map(|_| vec![(0.1_f32, 0.2_f32); 2]).collect();
         add_qmf_sine(&mut y, &out, &atsg_sig, 1, 4, 6);
         // Unchanged outside 4..6.
-        for sb in 0..4 {
-            assert_eq!(y[sb][0], (0.1, 0.2));
+        for row in y.iter().take(4) {
+            assert_eq!(row[0], (0.1, 0.2));
         }
-        for sb in 6..64 {
-            assert_eq!(y[sb][0], (0.1, 0.2));
+        for row in y.iter().take(64).skip(6) {
+            assert_eq!(row[0], (0.1, 0.2));
         }
         // Inside 4..6: tone added on top.
         // sb=4 even (+1 sign), idx(0)=1 -> (0,1) * 1 = (0,1).
@@ -438,14 +438,14 @@ mod tests {
         assert!((y[4][0].0 - (nre + 0.0)).abs() < 1e-5);
         assert!((y[4][0].1 - (nim + 1.0)).abs() < 1e-5);
         // Outside A-SPX range — still zero.
-        for sb in 0..4 {
-            for t in 0..2 {
-                assert_eq!(y[sb][t], (0.0, 0.0));
+        for row in y.iter().take(4) {
+            for &cell in row.iter().take(2) {
+                assert_eq!(cell, (0.0, 0.0));
             }
         }
-        for sb in 6..64 {
-            for t in 0..2 {
-                assert_eq!(y[sb][t], (0.0, 0.0));
+        for row in y.iter().take(64).skip(6) {
+            for &cell in row.iter().take(2) {
+                assert_eq!(cell, (0.0, 0.0));
             }
         }
     }
@@ -491,8 +491,8 @@ mod tests {
                 q[sb][ts] = *s;
             }
         }
-        for sb in (sbx as usize)..NUM_QMF_SUBBANDS {
-            for s in q[sb].iter_mut() {
+        for row in q.iter_mut().skip(sbx as usize) {
+            for s in row.iter_mut() {
                 *s = (0.0, 0.0);
             }
         }
@@ -526,15 +526,16 @@ mod tests {
         hf_assemble(&mut q, &qnoise, &qsine, &atsg_sig, 1, sbx, sbz);
         // HF QMF energy must be non-trivial.
         let mut hf_qmf_energy = 0.0_f64;
-        for sb in (sbx as usize)..(sbz as usize) {
-            for &(re, im) in q[sb].iter() {
+        for row in q.iter().take(sbz as usize).skip(sbx as usize) {
+            for &(re, im) in row.iter() {
                 hf_qmf_energy += (re as f64).powi(2) + (im as f64).powi(2);
             }
         }
         assert!(hf_qmf_energy > 0.1, "HF QMF energy = {hf_qmf_energy}");
-        // Inverse QMF.
+        // Inverse QMF — transpose q[sb][ts] -> slot[ts][sb] per §4.4.7.
         let mut syn = QmfSynthesisBank::new();
         let mut pcm_out = Vec::with_capacity(n_samples);
+        #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-2 §4.4.7 q[sb][ts] indexing
         for ts in 0..n_slots {
             let mut slot = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
             for (sb, s) in slot.iter_mut().enumerate() {
