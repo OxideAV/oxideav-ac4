@@ -399,6 +399,7 @@ pub mod decoder;
 pub mod drc;
 pub mod drc_huffman;
 pub mod huffman;
+pub mod mch;
 pub mod mdct;
 pub mod metadata;
 pub mod qmf;

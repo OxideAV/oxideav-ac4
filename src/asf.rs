@@ -562,6 +562,31 @@ pub struct SubstreamTools {
     /// `ASPX_ACPL_1` joint-MDCT residual layer. `None` for all other
     /// paths (split-MDCT, mono, ASPX_ACPL_2).
     pub chparam_info: Option<ChparamInfo>,
+    /// `5_X_codec_mode` (§4.3.5.6 Table 97) for 5.X channel-element
+    /// substreams. Populated by [`crate::mch::parse_5x_audio_data_outer`].
+    pub five_x_mode: Option<crate::mch::FiveXCodecMode>,
+    /// Whether the enclosing `5_X_channel_element(b_has_lfe, ...)` was
+    /// invoked with `b_has_lfe == 1`. Mirrors the parameter so callers
+    /// can correlate `lfe_mono_data` against the framing.
+    pub five_x_b_has_lfe: bool,
+    /// `coding_config` value the 5.X walker resolved (Table 25). `None`
+    /// for ASPX_ACPL_3 (which has no `coding_config`) and for
+    /// non-5.X substreams.
+    pub five_x_coding_config: Option<crate::mch::FiveXCodingConfig>,
+    /// Parsed LFE `mono_data(1)` payload from the 5.X / 7.X walkers.
+    pub lfe_mono_data: Option<crate::mch::MonoLfeData>,
+    /// Parsed `three_channel_data()` outer shell when the 5.X /
+    /// 3.0 walker selected `coding_config == 1`.
+    pub three_channel_data: Option<crate::mch::ThreeChannelData>,
+    /// Parsed `four_channel_data()` outer shell when the 5.X / 7.X
+    /// walker selected `coding_config == 2`.
+    pub four_channel_data: Option<crate::mch::FourChannelData>,
+    /// Parsed `five_channel_data()` outer shell when the 5.X / 7.X
+    /// walker selected `coding_config == 3`.
+    pub five_channel_data: Option<crate::mch::FiveChannelData>,
+    /// Parsed `acpl_config_2ch()` (§4.2.13.2 Table 60) for `ASPX_ACPL_3`
+    /// I-frame substreams. `None` for the other A-CPL paths.
+    pub acpl_config_2ch: Option<crate::acpl::AcplConfig2ch>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -1612,7 +1637,30 @@ pub fn walk_ac4_substream(
     match channels {
         1 => parse_mono_audio_data_outer(&mut br, &mut tools, b_iframe, frame_len_base)?,
         2 => parse_stereo_audio_data_outer(&mut br, &mut tools, b_iframe, frame_len_base)?,
-        // 3.0 / 5.0 / 5.1 / 7.x paths are coding-config-dependent; their
+        // 5.0 / 5.1 — drive the `5_X_channel_element` walker
+        // (§4.2.6.6 Table 25). r19 lands the outer-shell parse;
+        // inner sf_data bodies + ASPX/A-CPL trailers wait for r20.
+        5 => {
+            // 5.0 — no LFE.
+            let _ = crate::mch::parse_5x_audio_data_outer(
+                &mut br,
+                &mut tools,
+                false,
+                b_iframe,
+                frame_len_base,
+            );
+        }
+        6 => {
+            // 5.1 — LFE present.
+            let _ = crate::mch::parse_5x_audio_data_outer(
+                &mut br,
+                &mut tools,
+                true,
+                b_iframe,
+                frame_len_base,
+            );
+        }
+        // 3.0 / 7.x paths are coding-config-dependent; their
         // outer walkers live behind the same Huffman gate as ASF's
         // spectral data. For the baseline we record the channel count
         // and bail.
