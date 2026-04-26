@@ -526,6 +526,21 @@ impl Decoder for Ac4Decoder {
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.acpl_data_1ch.clone());
+        // ASPX_ACPL_1 (joint-MDCT residual layer): M spectrum lives on
+        // `scaled_spec_primary`, S on `scaled_spec_secondary`; both
+        // share the same transform_info. Detect it via the parsed
+        // stereo_codec_mode + acpl_config_1ch_partial (`partial` is the
+        // ACPL_1 flavour).
+        let acpl1_active = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                matches!(sub.tools.stereo_mode, Some(asf::StereoCodecMode::AspxAcpl1))
+                    && sub.tools.acpl_config_1ch_partial.is_some()
+                    && sub.tools.scaled_spec_primary.is_some()
+                    && sub.tools.scaled_spec_secondary.is_some()
+            })
+            .unwrap_or(false);
         let (
             primary_in,
             secondary_in,
@@ -650,12 +665,37 @@ impl Decoder for Ac4Decoder {
                         if let (Some(cfg), Some(data)) =
                             (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
                         {
-                            if let Some((left, right)) = acpl_synth::run_acpl_1ch_pcm(
-                                &extended,
-                                cfg,
-                                data,
-                                &mut self.acpl_state,
-                            ) {
+                            // ASPX_ACPL_1: feed both M (extended) and S
+                            // PCM into the stereo A-CPL. The S spectrum
+                            // is already in `secondary_in`; we IMDCT it
+                            // here without ASPX (the `aspx_data_1ch` in
+                            // ACPL_1 covers the M channel only).
+                            let acpl1_result = if acpl1_active {
+                                if let Some((s_scaled, s_n)) = secondary_in.as_ref() {
+                                    if *s_n == n {
+                                        let s_pcm = self.imdct_channel_f32(1, s_scaled, *s_n);
+                                        acpl_synth::run_acpl_1ch_pcm_stereo(
+                                            &extended,
+                                            &s_pcm,
+                                            cfg,
+                                            data,
+                                            &mut self.acpl_state,
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                acpl_synth::run_acpl_1ch_pcm(
+                                    &extended,
+                                    cfg,
+                                    data,
+                                    &mut self.acpl_state,
+                                )
+                            };
+                            if let Some((left, right)) = acpl1_result {
                                 pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
                                 pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
                             } else {

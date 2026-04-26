@@ -35,6 +35,7 @@ use oxideav_core::{Error, Result};
 
 use crate::asf_data;
 use crate::aspx;
+use crate::huffman::{huff_decode, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN};
 use crate::sfb_offset;
 use crate::tables;
 use crate::toc::variable_bits;
@@ -274,6 +275,166 @@ pub fn parse_asf_psy_info(
     Ok(info)
 }
 
+/// `sap_mode` enum for `chparam_info()` (ETSI TS 103 190-1 §4.2.10.1
+/// Table 47 / §4.3.8.1).
+///
+/// * `0` — no MDCT-stereo data follows; both channels are independent.
+/// * `1` — per-sfb `ms_used[g][sfb]` flag array follows.
+/// * `2` — *reserved*.
+/// * `3` — full `sap_data()` body follows (Table 48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SapMode {
+    None,
+    MsUsed,
+    Reserved,
+    SapData,
+}
+
+impl SapMode {
+    pub fn from_u32(v: u32) -> Self {
+        match v & 0b11 {
+            0 => Self::None,
+            1 => Self::MsUsed,
+            2 => Self::Reserved,
+            _ => Self::SapData,
+        }
+    }
+}
+
+/// `sap_data()` payload (ETSI TS 103 190-1 §4.2.10.2 Table 48).
+///
+/// Carries the stereo audio processing coefficients used in joint-MDCT
+/// stereo coding. `sap_coeff_used[g][sfb]` is a per-pair (sfb, sfb+1)
+/// flag — both halves of the pair share the same flag value. When a
+/// pair's flag is set the bitstream carries a Huffman-coded `dpcm_alpha_q`
+/// delta against the previous coded pair (initial reference is 60 — the
+/// HCB_SCALEFAC DC).
+#[derive(Debug, Clone, Default)]
+pub struct SapData {
+    /// 1 = all `sap_coeff_used` flags are set (no flag array transmitted).
+    pub sap_coeff_all: bool,
+    /// Per-group, per-sfb `sap_coeff_used[g][sfb]` flags (length =
+    /// max_sfb_g).
+    pub sap_coeff_used: Vec<Vec<bool>>,
+    /// `delta_code_time` — only present when `num_window_groups != 1`.
+    pub delta_code_time: bool,
+    /// `dpcm_alpha_q[g][sfb]` — Huffman-decoded DPCM-coded raw indices,
+    /// expressed as deltas. Length = max_sfb_g, entries are 0 when the
+    /// pair flag was not set.
+    pub dpcm_alpha_q: Vec<Vec<i32>>,
+}
+
+/// Parsed `chparam_info()` (ETSI TS 103 190-1 §4.2.10.1 Table 47).
+#[derive(Debug, Clone, Default)]
+pub struct ChparamInfo {
+    /// `sap_mode` — 2-bit selector. Drives whether ms_used / sap_data
+    /// follow.
+    pub sap_mode: u32,
+    /// `ms_used[g][sfb]` — only populated for `sap_mode == 1`. Length =
+    /// num_window_groups; inner length = `get_max_sfb(g)`.
+    pub ms_used: Vec<Vec<bool>>,
+    /// `sap_data()` payload — only populated for `sap_mode == 3`.
+    pub sap_data: Option<SapData>,
+}
+
+impl ChparamInfo {
+    pub fn mode(&self) -> SapMode {
+        SapMode::from_u32(self.sap_mode)
+    }
+}
+
+/// Parse `chparam_info()` per Table 47.
+///
+/// `max_sfb_per_group[g]` provides the per-group max_sfb to walk the
+/// `ms_used` and `sap_coeff_used` loops. Spec note: `get_max_sfb(g)`
+/// (Pseudocode 5) returns either `max_sfb[idx]` or `max_sfb_side[idx]`
+/// depending on `b_side_channel`; the caller is expected to pass the
+/// effective per-group bound here.
+pub fn parse_chparam_info(
+    br: &mut BitReader<'_>,
+    max_sfb_per_group: &[u32],
+) -> Result<ChparamInfo> {
+    let sap_mode = br.read_u32(2)?;
+    let mut info = ChparamInfo {
+        sap_mode,
+        ..ChparamInfo::default()
+    };
+    match SapMode::from_u32(sap_mode) {
+        SapMode::None | SapMode::Reserved => {}
+        SapMode::MsUsed => {
+            let mut groups = Vec::with_capacity(max_sfb_per_group.len());
+            for &m in max_sfb_per_group {
+                let mut row = Vec::with_capacity(m as usize);
+                for _ in 0..m {
+                    row.push(br.read_bit()?);
+                }
+                groups.push(row);
+            }
+            info.ms_used = groups;
+        }
+        SapMode::SapData => {
+            info.sap_data = Some(parse_sap_data(br, max_sfb_per_group)?);
+        }
+    }
+    Ok(info)
+}
+
+/// Parse `sap_data()` per Table 48.
+pub fn parse_sap_data(br: &mut BitReader<'_>, max_sfb_per_group: &[u32]) -> Result<SapData> {
+    let num_groups = max_sfb_per_group.len();
+    let sap_coeff_all = br.read_bit()?;
+    let mut sap_coeff_used = Vec::with_capacity(num_groups);
+    if !sap_coeff_all {
+        // For each group, walk pairs of sfb (sfb, sfb+1) — read one bit
+        // per pair, copy the flag into both halves.
+        for &m in max_sfb_per_group {
+            let mut row = vec![false; m as usize];
+            let mut sfb = 0usize;
+            while sfb < m as usize {
+                let f = br.read_bit()?;
+                row[sfb] = f;
+                if sfb + 1 < m as usize {
+                    row[sfb + 1] = f;
+                }
+                sfb += 2;
+            }
+            sap_coeff_used.push(row);
+        }
+    } else {
+        for &m in max_sfb_per_group {
+            sap_coeff_used.push(vec![true; m as usize]);
+        }
+    }
+    let delta_code_time = if num_groups != 1 {
+        br.read_bit()?
+    } else {
+        false
+    };
+    let mut dpcm_alpha_q = Vec::with_capacity(num_groups);
+    for g in 0..num_groups {
+        let m = max_sfb_per_group[g] as usize;
+        let mut row = vec![0i32; m];
+        let mut sfb = 0usize;
+        while sfb < m {
+            if sap_coeff_used[g][sfb] {
+                let raw = huff_decode(br, HCB_SCALEFAC_LEN, HCB_SCALEFAC_CW)?;
+                // HCB_SCALEFAC's DC element is at index 60; Table 48
+                // codes raw indices 0..120 that map to deltas
+                // (raw - 60).
+                row[sfb] = raw as i32 - 60;
+            }
+            sfb += 2;
+        }
+        dpcm_alpha_q.push(row);
+    }
+    Ok(SapData {
+        sap_coeff_all,
+        sap_coeff_used,
+        delta_code_time,
+        dpcm_alpha_q,
+    })
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -395,6 +556,12 @@ pub struct SubstreamTools {
     /// (SIMPLE / mono ASPX / stereo ASPX) or could not be parsed because
     /// the upstream MDCT body bailed first.
     pub acpl_data_1ch: Option<crate::acpl::AcplData1ch>,
+    /// Parsed `chparam_info()` (§4.2.10.1 Table 47) for joint-MDCT
+    /// stereo bodies. Populated for the `stereo_data()` joint path
+    /// (`b_enable_mdct_stereo_proc == 1`) and for the
+    /// `ASPX_ACPL_1` joint-MDCT residual layer. `None` for all other
+    /// paths (split-MDCT, mono, ASPX_ACPL_2).
+    pub chparam_info: Option<ChparamInfo>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -745,6 +912,207 @@ fn parse_aspx_acpl2_mdct_body(
     }
 }
 
+/// Walk the `ASPX_ACPL_1` joint-MDCT residual layer (§4.2.6.3 case
+/// `ASPX_ACPL_1`):
+///
+/// ```text
+/// if (b_enable_mdct_stereo_proc) {                  1 bit
+///     spec_frontend_m = ASF;
+///     spec_frontend_s = ASF;
+///     sf_info(ASF, 1, 0);
+///     chparam_info();
+/// } else {
+///     spec_frontend_m;                              1 bit
+///     sf_info(spec_frontend_m, 0, 0);
+///     spec_frontend_s;                              1 bit
+///     sf_info(spec_frontend_s, 0, 1);
+/// }
+/// sf_data(spec_frontend_m);
+/// sf_data(spec_frontend_s);
+/// ```
+///
+/// Returns `true` when the body parses cleanly enough that the bitreader
+/// is sitting at the start of the trailing `aspx_data_1ch()`. The decoded
+/// spectral coefficients land on `tools.scaled_spec_primary` (M / left)
+/// and `tools.scaled_spec_secondary` (S / right). Joint-MDCT processing
+/// state lands on `tools.chparam_info` (and `tools.mdct_stereo_proc` /
+/// `tools.ms_used` mirrors for the simple `sap_mode == 1` case).
+///
+/// Only the long-frame, single-window-group case walks the residual
+/// MDCT body; other shapes parse the outer layers and bail.
+fn parse_aspx_acpl1_mdct_body(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    frame_len_base: u32,
+) -> bool {
+    let b_mdct_stereo = match br.read_u32(1) {
+        Ok(v) => v != 0,
+        Err(_) => return false,
+    };
+    tools.mdct_stereo_proc = b_mdct_stereo;
+    if b_mdct_stereo {
+        // Joint MDCT: shared transform shell, sf_info(ASF, 1, 0), then
+        // chparam_info().
+        tools.spec_frontend_primary = Some(SpecFrontend::Asf);
+        tools.spec_frontend_secondary = Some(SpecFrontend::Asf);
+        let ti = match parse_asf_transform_info(br, frame_len_base) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        tools.transform_info_primary = Some(ti);
+        tools.transform_info_secondary = Some(ti);
+        // sf_info(ASF, 1, 0): b_dual_maxsfb = 1, b_side_limited = 0 —
+        // the M channel uses max_sfb[0] (and any per-window max_sfb[1]
+        // for non-long frames), the S channel uses max_sfb_side[0].
+        let psy = match parse_asf_psy_info(br, &ti, frame_len_base, true, false) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        tools.psy_info_primary = Some(psy.clone());
+        tools.psy_info_secondary = Some(psy.clone());
+        // chparam_info(): drive ms_used / sap_data over the per-group
+        // bound. The spec's `get_max_sfb(g)` (Pseudocode 5) returns
+        // `max_sfb_side` for the side-channel decode and `max_sfb` for
+        // the main; chparam_info itself runs at the joint shell, so we
+        // use the side bound (the safer / smaller of the two — the M
+        // channel's extra bands beyond max_sfb_side carry only the M
+        // residual and don't have a meaningful M/S flag).
+        let max_sfb_g = psy.max_sfb_side_0.min(psy.max_sfb_0);
+        let cp = match parse_chparam_info(br, &[max_sfb_g]) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        // Mirror simple-mode `ms_used` into `tools.ms_used` (group 0)
+        // for callers that only care about the per-sfb flag array.
+        if cp.mode() == SapMode::MsUsed && !cp.ms_used.is_empty() {
+            tools.ms_used = Some(cp.ms_used[0].clone());
+        }
+        tools.chparam_info = Some(cp);
+        if !ti.b_long_frame || psy.num_window_groups != 1 {
+            return false;
+        }
+        // sf_data(M); sf_data(S). Each channel has its own max_sfb (M
+        // uses max_sfb_0, S uses max_sfb_side_0). We reuse the
+        // long-frame mono-body decoder for each since the section /
+        // spectral / scalefac / snf streams are independent here (the
+        // joint-MDCT M/S coupling is parametrised by chparam_info — the
+        // residual MDCT is per-channel).
+        let m_body = decode_asf_long_mono_body_with_max_sfb(br, &ti, psy.max_sfb_0);
+        let m_ok = m_body.is_some();
+        if let Some(s) = m_body {
+            tools.scaled_spec_primary = Some(s);
+        }
+        if !m_ok {
+            return false;
+        }
+        let s_body = decode_asf_long_mono_body_with_max_sfb(br, &ti, psy.max_sfb_side_0);
+        let s_ok = s_body.is_some();
+        if let Some(s) = s_body {
+            tools.scaled_spec_secondary = Some(s);
+        }
+        s_ok
+    } else {
+        // Independent stereo MDCT: spec_frontend_m + sf_info(?, 0, 0),
+        // spec_frontend_s + sf_info(?, 0, 1).
+        let m_bit = match br.read_u32(1) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let m_fe = SpecFrontend::from_bit(m_bit);
+        tools.spec_frontend_primary = Some(m_fe);
+        let mut ti_m: Option<AsfTransformInfo> = None;
+        if let SpecFrontend::Asf = m_fe {
+            let ti = match parse_asf_transform_info(br, frame_len_base) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            tools.transform_info_primary = Some(ti);
+            ti_m = Some(ti);
+            // sf_info(spec_frontend_m, 0, 0): b_dual_maxsfb = 0,
+            // b_side_limited = 0 — main channel uses max_sfb[0].
+            let psy = match parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            tools.psy_info_primary = Some(psy);
+        }
+        let s_bit = match br.read_u32(1) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let s_fe = SpecFrontend::from_bit(s_bit);
+        tools.spec_frontend_secondary = Some(s_fe);
+        let mut ti_s: Option<AsfTransformInfo> = None;
+        if let SpecFrontend::Asf = s_fe {
+            let ti = match parse_asf_transform_info(br, frame_len_base) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            tools.transform_info_secondary = Some(ti);
+            ti_s = Some(ti);
+            // sf_info(spec_frontend_s, 0, 1): b_dual_maxsfb = 0,
+            // b_side_limited = 1 — side channel uses max_sfb_side[0]
+            // (deposited into psy.max_sfb_0 by parse_asf_psy_info).
+            let psy = match parse_asf_psy_info(br, &ti, frame_len_base, false, true) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            tools.psy_info_secondary = Some(psy);
+        }
+        // sf_data(M); sf_data(S). Both channels are independent.
+        let psy_m_clone = tools.psy_info_primary.clone();
+        if let (Some(ti), Some(psy)) = (ti_m, psy_m_clone.as_ref()) {
+            if !ti.b_long_frame || psy.num_window_groups != 1 {
+                return false;
+            }
+            match decode_asf_long_mono_body(br, &ti, psy) {
+                Some(s) => tools.scaled_spec_primary = Some(s),
+                None => return false,
+            }
+        } else if matches!(m_fe, SpecFrontend::Ssf) {
+            return false;
+        }
+        let psy_s_clone = tools.psy_info_secondary.clone();
+        if let (Some(ti), Some(psy)) = (ti_s, psy_s_clone.as_ref()) {
+            if !ti.b_long_frame || psy.num_window_groups != 1 {
+                return false;
+            }
+            match decode_asf_long_mono_body(br, &ti, psy) {
+                Some(s) => tools.scaled_spec_secondary = Some(s),
+                None => return false,
+            }
+        } else if matches!(s_fe, SpecFrontend::Ssf) {
+            return false;
+        }
+        true
+    }
+}
+
+/// Like [`decode_asf_long_mono_body`] but uses an explicit `max_sfb`
+/// (caller-provided) instead of pulling it from the psy_info — useful
+/// for joint-MDCT bodies where M and S channels carry distinct
+/// `max_sfb_0` / `max_sfb_side_0` bounds.
+fn decode_asf_long_mono_body_with_max_sfb(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    max_sfb_in: u32,
+) -> Option<Vec<f32>> {
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let max_sfb_cap = tables::num_sfb_48(tl)?;
+    let max_sfb = max_sfb_in.min(max_sfb_cap);
+    if max_sfb == 0 {
+        return None;
+    }
+    let sfbo = sfb_offset::sfb_offset_48(tl)?;
+    let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
+    let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
+    let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    let _snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
+    Some(scaled)
+}
+
 /// Parse the outer layers of a stereo `audio_data()` element
 /// (channel_pair_element / stereo_data).
 ///
@@ -804,12 +1172,11 @@ pub fn parse_stereo_audio_data_outer(
             mode,
             StereoCodecMode::AspxAcpl1 | StereoCodecMode::AspxAcpl2
         ) {
-            // Only the ASPX_ACPL_2 mono-frontend body is wired today —
-            // ASPX_ACPL_1's joint-MDCT residual layer (b_dual_maxsfb=1
-            // with chparam_info()) is more involved and would need a
-            // dedicated walker. For ACPL_1 we still surface the parsed
-            // config so callers can see the substream's tool mix.
+            // ASPX_ACPL_1 walks the joint-MDCT residual layer
+            // (b_dual_maxsfb=1 with chparam_info() — Table 47);
+            // ASPX_ACPL_2 walks a single mono MDCT residual.
             let body_ok = match mode {
+                StereoCodecMode::AspxAcpl1 => parse_aspx_acpl1_mdct_body(br, tools, frame_len_base),
                 StereoCodecMode::AspxAcpl2 => parse_aspx_acpl2_mdct_body(br, tools, frame_len_base),
                 _ => false,
             };
@@ -1967,5 +2334,117 @@ mod tests {
         // acpl_data_1ch stays None.
         assert!(info.tools.companding.is_some());
         assert!(info.tools.acpl_data_1ch.is_none());
+    }
+
+    // ---------------- chparam_info() (Table 47) ----------------
+
+    #[test]
+    fn chparam_info_sap_mode_zero_no_payload() {
+        // sap_mode = 0 -> no further bits.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cp = parse_chparam_info(&mut br, &[8]).unwrap();
+        assert_eq!(cp.sap_mode, 0);
+        assert_eq!(cp.mode(), SapMode::None);
+        assert!(cp.ms_used.is_empty());
+        assert!(cp.sap_data.is_none());
+    }
+
+    #[test]
+    fn chparam_info_sap_mode_one_walks_ms_used_per_group() {
+        // sap_mode = 1; one group with max_sfb = 5 -> 5 bits, MSB-first
+        // 0b10110 -> [true, false, true, true, false].
+        let mut bw = BitWriter::new();
+        bw.write_u32(1, 2);
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cp = parse_chparam_info(&mut br, &[5]).unwrap();
+        assert_eq!(cp.mode(), SapMode::MsUsed);
+        assert_eq!(cp.ms_used.len(), 1);
+        assert_eq!(cp.ms_used[0], vec![true, false, true, true, false]);
+    }
+
+    #[test]
+    fn chparam_info_sap_mode_three_walks_sap_data_pair_packed() {
+        // sap_mode = 3 -> sap_data():
+        //   sap_coeff_all = 0
+        //   For one group with max_sfb = 4 -> 2 pair flags. Set both
+        //   so all 4 sfbs carry a dpcm.
+        //   delta_code_time omitted (num_window_groups == 1).
+        //   Then 2 huff-decoded raw indices (we use index 60 = DC, 0
+        //   bits payload — let's encode HCB_SCALEFAC[60]).
+        use crate::huffman::{HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN};
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 2); // sap_mode
+        bw.write_bit(false); // sap_coeff_all
+        bw.write_bit(true); // pair flag for sfb 0/1
+        bw.write_bit(true); // pair flag for sfb 2/3
+                            // 2 dpcm_alpha_q codewords (one per pair = sfbs 0 and 2).
+        bw.write_u32(HCB_SCALEFAC_CW[60], HCB_SCALEFAC_LEN[60] as u32);
+        bw.write_u32(HCB_SCALEFAC_CW[61], HCB_SCALEFAC_LEN[61] as u32);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cp = parse_chparam_info(&mut br, &[4]).unwrap();
+        assert_eq!(cp.mode(), SapMode::SapData);
+        let sd = cp.sap_data.expect("sap_data populated");
+        assert!(!sd.sap_coeff_all);
+        assert_eq!(sd.sap_coeff_used, vec![vec![true, true, true, true]]);
+        // dpcm_alpha_q row: [delta(60-60)=0, 0, delta(61-60)=1, 0].
+        assert_eq!(sd.dpcm_alpha_q, vec![vec![0, 0, 1, 0]]);
+    }
+
+    #[test]
+    fn chparam_info_sap_mode_three_all_flag_skips_pair_array() {
+        // sap_coeff_all = 1 fills sap_coeff_used with `true` and skips
+        // the pair-flag bits, but the dpcm_alpha_q stream is still one
+        // codeword per pair.
+        use crate::huffman::{HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN};
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 2);
+        bw.write_bit(true); // sap_coeff_all = 1
+        bw.write_u32(HCB_SCALEFAC_CW[60], HCB_SCALEFAC_LEN[60] as u32);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cp = parse_chparam_info(&mut br, &[2]).unwrap();
+        let sd = cp.sap_data.expect("sap_data populated");
+        assert!(sd.sap_coeff_all);
+        assert_eq!(sd.sap_coeff_used, vec![vec![true, true]]);
+        assert_eq!(sd.dpcm_alpha_q, vec![vec![0, 0]]);
+    }
+
+    #[test]
+    fn chparam_info_sap_mode_three_two_groups_emits_delta_code_time() {
+        // num_window_groups = 2 -> after sap_coeff_used, delta_code_time
+        // (1 bit) appears.
+        use crate::huffman::{HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN};
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 2);
+        bw.write_bit(true); // sap_coeff_all = 1 (no pair flags)
+        bw.write_bit(true); // delta_code_time
+                            // Group 0 max_sfb = 2 -> 1 codeword.
+        bw.write_u32(HCB_SCALEFAC_CW[60], HCB_SCALEFAC_LEN[60] as u32);
+        // Group 1 max_sfb = 2 -> 1 codeword.
+        bw.write_u32(HCB_SCALEFAC_CW[60], HCB_SCALEFAC_LEN[60] as u32);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cp = parse_chparam_info(&mut br, &[2, 2]).unwrap();
+        let sd = cp.sap_data.expect("sap_data populated");
+        assert!(sd.sap_coeff_all);
+        assert!(sd.delta_code_time);
+        assert_eq!(sd.dpcm_alpha_q.len(), 2);
+        assert_eq!(sd.dpcm_alpha_q[0], vec![0, 0]);
+        assert_eq!(sd.dpcm_alpha_q[1], vec![0, 0]);
     }
 }

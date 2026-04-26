@@ -328,8 +328,13 @@
 //!   `AcplCpeState` decorrelator + ducker) lives on the decoder so
 //!   IIR delay-lines and `acpl_<SET>_q_prev` survive across frames.
 //!   ASPX_ACPL_1's joint-MDCT residual layer (b_dual_maxsfb = 1 with
-//!   `chparam_info()`) is still gated — the parser bails after
-//!   companding_control until the joint MDCT body walker lands.
+//!   `chparam_info()`) now walks end-to-end as of round-18:
+//!   [`asf::parse_chparam_info`] (§4.2.10.1 Table 47) +
+//!   [`asf::parse_sap_data`] (Table 48) drive the joint shell,
+//!   `parse_aspx_acpl1_mdct_body` walks the dual M/S residuals (long
+//!   frame + single window group), and the decoder feeds both into
+//!   [`acpl_synth::run_acpl_1ch_pcm_stereo`] (x0 = M, x1 = S into
+//!   Pseudocode 116) for the full stereo synth.
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
@@ -344,12 +349,13 @@
 //!   `Q_low_prev` history) when a new substream starts mid-stream
 //!   isn't surfaced through the decoder API yet.
 //! * A-CPL data-path decoder hookup — `ASPX_ACPL_2` (mono MDCT body)
-//!   is fully wired as of round-17 (parser → synth → 2-channel PCM).
-//!   `ASPX_ACPL_1`'s joint-MDCT body (b_dual_maxsfb = 1 with
-//!   `chparam_info()` and a residual MDCT layer) is still gated —
-//!   the walker bails after companding_control. Multichannel
+//!   was fully wired in round-17, and `ASPX_ACPL_1` (joint-MDCT body
+//!   with `chparam_info()` driving M/S coupling) is now wired in
+//!   round-18: parser walks the full dual-residual body, decoder
+//!   IMDCTs both M and S spectra and feeds them as `x0` / `x1` into
+//!   the §5.7.7.5 channel-pair element. Multichannel
 //!   `5_X_codec_mode = ASPX_ACPL_3` (Pseudocodes 117-120 / `Transform`,
-//!   `ACplModule2`, `ACplModule3`) is also still pending — the four
+//!   `ACplModule2`, `ACplModule3`) is still pending — the four
 //!   §5.7.7.7 dequant tables (Tables 203-208) needed to plug those in
 //!   are already present.
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.

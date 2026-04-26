@@ -1072,6 +1072,73 @@ pub fn run_acpl_1ch_pcm(
     Some((left, right))
 }
 
+/// Run the §5.7.7 A-CPL channel-pair synthesis on a stereo PCM input
+/// (M / S channels from a joint-MDCT body, both already ASPX-extended on
+/// the M side per `aspx_data_1ch()`) and emit stereo PCM via QMF
+/// analysis → A-CPL → QMF synthesis.
+///
+/// Spec wiring (ETSI TS 103 190-1 §4.2.6.3 ASPX_ACPL_1):
+///   * `pcm_m` / `pcm_s` — joint-MDCT M (mid) and S (side) PCM streams,
+///     same length, multiple of 64 samples.
+///   * `cfg` — parsed `acpl_config_1ch(PARTIAL)` for the active substream.
+///   * `data` — parsed `acpl_data_1ch()` (§4.2.13.3 Table 61).
+///   * `state` — per-substream state carried across frames.
+///
+/// In the spec's `acpl_module()` (Pseudocode 116) the low subbands below
+/// `acpl_qmf_band` recover `(L, R)` via the inverse-M/S split
+/// `z0 = 0.5*(x0+x1)`, `z1 = 0.5*(x0-x1)`; the upper subbands re-mix the
+/// decorrelator output `y` (computed from `x0`) into the second channel
+/// using the parametric `alpha`/`beta` coefficients. We feed `pcm_m` into
+/// `x0` and `pcm_s` into `x1` here, matching the spec's M/S convention.
+pub fn run_acpl_1ch_pcm_stereo(
+    pcm_m: &[f32],
+    pcm_s: &[f32],
+    cfg: &AcplConfig1ch,
+    data: &AcplData1ch,
+    state: &mut AcplSubstreamState,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if pcm_m.is_empty() || pcm_m.len() % NUM_QMF_SUBBANDS != 0 || pcm_m.len() != pcm_s.len() {
+        return None;
+    }
+    let n_slots = pcm_m.len() / NUM_QMF_SUBBANDS;
+    if n_slots == 0 {
+        return None;
+    }
+    let mut ana_m = QmfAnalysisBank::new();
+    let mut ana_s = QmfAnalysisBank::new();
+    let x0 = ana_m.process_block(pcm_m);
+    let x1 = ana_s.process_block(pcm_s);
+    let alpha_q = differential_decode(&data.alpha1, cfg.num_param_bands, &mut state.alpha_diff);
+    let beta_q = differential_decode(&data.beta1, cfg.num_param_bands, &mut state.beta_diff);
+    let (alpha_dq, beta_dq) = dequantize_alpha_beta(&alpha_q, &beta_q, cfg.quant_mode);
+    if alpha_dq.is_empty() {
+        return None;
+    }
+    let frame = AcplCpeFrame {
+        x0: &x0,
+        x1: Some(&x1),
+        alpha_dq: &alpha_dq,
+        beta_dq: &beta_dq,
+        num_param_bands: cfg.num_param_bands,
+        acpl_qmf_band: cfg.qmf_band as u32,
+        steep: matches!(
+            data.framing.interpolation_type,
+            AcplInterpolationType::Steep
+        ),
+        param_timeslots: &data.framing.param_timeslots,
+    };
+    let out = run_pseudocode_115_pair(&mut state.cpe, frame);
+    let mut syn0 = QmfSynthesisBank::new();
+    let mut syn1 = QmfSynthesisBank::new();
+    let mut left = Vec::with_capacity(pcm_m.len());
+    let mut right = Vec::with_capacity(pcm_m.len());
+    for ts in 0..n_slots {
+        left.extend_from_slice(&syn0.process_slot(&out.z0[ts]));
+        right.extend_from_slice(&syn1.process_slot(&out.z1[ts]));
+    }
+    Some((left, right))
+}
+
 // =====================================================================
 // Tests
 // =====================================================================
@@ -1742,6 +1809,101 @@ mod tests {
             diffs > (left.len() - start) / 4,
             "channels too similar (diffs={diffs})"
         );
+    }
+
+    #[test]
+    fn run_acpl_1ch_pcm_stereo_emits_two_channels_distinct_from_l_r_passthrough() {
+        // Stereo (M/S) input variant — same shape as ACPL_2 but with x1
+        // populated. Verifies the spec's M/S split path runs end-to-end
+        // and produces non-silent, distinct channels.
+        use crate::acpl::{
+            AcplConfig1ch, AcplData1ch, AcplFramingData, AcplHuffParam, AcplInterpolationType,
+            AcplQuantMode,
+        };
+        let n_slots = 32usize;
+        let n = n_slots * NUM_QMF_SUBBANDS;
+        let mut pcm_m = vec![0.0f32; n];
+        let mut pcm_s = vec![0.0f32; n];
+        let f_m = 440.0_f32 / 48_000.0_f32;
+        let f_s = 220.0_f32 / 48_000.0_f32;
+        for i in 0..n {
+            pcm_m[i] = (2.0 * std::f32::consts::PI * f_m * i as f32).sin();
+            pcm_s[i] = 0.3 * (2.0 * std::f32::consts::PI * f_s * i as f32).sin();
+        }
+        let cfg = AcplConfig1ch {
+            num_param_bands_id: 0,
+            num_param_bands: 15,
+            quant_mode: AcplQuantMode::Fine,
+            // PARTIAL mode: nonzero qmf_band so the M/S split path
+            // engages on low subbands.
+            qmf_band: 8,
+        };
+        let alpha = AcplHuffParam {
+            values: vec![4i32; cfg.num_param_bands as usize],
+            direction_time: false,
+        };
+        let beta = AcplHuffParam {
+            values: vec![2i32; cfg.num_param_bands as usize],
+            direction_time: false,
+        };
+        let data = AcplData1ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![alpha],
+            beta1: vec![beta],
+        };
+        let mut state = AcplSubstreamState::new();
+        let (left, right) = run_acpl_1ch_pcm_stereo(&pcm_m, &pcm_s, &cfg, &data, &mut state)
+            .expect("stereo synth runs");
+        assert_eq!(left.len(), pcm_m.len());
+        assert_eq!(right.len(), pcm_m.len());
+        let start = 1024usize;
+        let e_l: f64 = left[start..].iter().map(|&s| (s as f64).powi(2)).sum();
+        let e_r: f64 = right[start..].iter().map(|&s| (s as f64).powi(2)).sum();
+        assert!(e_l > 1e-6, "left channel silent (e={e_l})");
+        assert!(e_r > 1e-6, "right channel silent (e={e_r})");
+        // The output must not be a literal pass-through of the input.
+        let mut diff_from_input = 0usize;
+        for i in start..left.len() {
+            if (left[i] - pcm_m[i]).abs() > 1e-3 {
+                diff_from_input += 1;
+            }
+        }
+        assert!(
+            diff_from_input > (left.len() - start) / 4,
+            "left channel matches input PCM (diff_from_input={diff_from_input})"
+        );
+    }
+
+    #[test]
+    fn run_acpl_1ch_pcm_stereo_rejects_mismatched_lengths() {
+        use crate::acpl::{
+            AcplConfig1ch, AcplData1ch, AcplFramingData, AcplInterpolationType, AcplQuantMode,
+        };
+        let pcm_m = vec![0.0f32; 64];
+        let pcm_s = vec![0.0f32; 128];
+        let cfg = AcplConfig1ch {
+            num_param_bands_id: 0,
+            num_param_bands: 15,
+            quant_mode: AcplQuantMode::Fine,
+            qmf_band: 0,
+        };
+        let data = AcplData1ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![],
+            beta1: vec![],
+        };
+        let mut state = AcplSubstreamState::new();
+        assert!(run_acpl_1ch_pcm_stereo(&pcm_m, &pcm_s, &cfg, &data, &mut state).is_none());
     }
 
     #[test]
