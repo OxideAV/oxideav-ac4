@@ -419,12 +419,8 @@ impl Decoder for Ac4Decoder {
             // Empty packet — emit a 0-sample frame so the pipeline
             // continues rather than erroring.
             return Ok(Frame::Audio(AudioFrame {
-                format: SampleFormat::S16,
-                channels: self.hint_channels,
-                sample_rate: self.hint_sample_rate,
                 samples: 0,
                 pts: pkt.pts,
-                time_base: TimeBase::new(1, self.hint_sample_rate as i64),
                 data: vec![Vec::new()],
             }));
         }
@@ -688,12 +684,8 @@ impl Decoder for Ac4Decoder {
             vec![vec![0u8; byte_count]]
         };
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels,
-            sample_rate,
             samples,
             pts: pkt.pts,
-            time_base: TimeBase::new(1, sample_rate as i64),
             data,
         }))
     }
@@ -780,10 +772,10 @@ mod tests {
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             panic!("expected audio");
         };
-        assert_eq!(af.channels, 2);
-        assert_eq!(af.sample_rate, 48_000);
+        // Per-frame channels / sample_rate / format are no longer carried
+        // on AudioFrame — the byte count below implicitly checks stereo
+        // S16 layout (1920 samples × 2 ch × 2 bytes).
         assert_eq!(af.samples, 1_920);
-        assert_eq!(af.format, SampleFormat::S16);
         assert_eq!(af.data.len(), 1);
         assert_eq!(af.data[0].len(), (1_920 * 2 * 2) as usize);
         // Samples are silent.
@@ -915,10 +907,11 @@ mod tests {
             panic!("expected audio");
         };
         // Mono frame, 48 kHz, 1920 samples at 24 fps.
-        assert_eq!(af.channels, 1);
-        assert_eq!(af.sample_rate, 48_000);
+        // Per-frame channels / sample_rate / format dropped — the byte
+        // count of the S16 data plane implicitly checks the layout
+        // (1920 samples × 1 ch × 2 bytes = 3840 bytes).
         assert_eq!(af.samples, 1_920);
-        assert_eq!(af.format, SampleFormat::S16);
+        assert_eq!(af.data[0].len(), 1_920 * 2);
         // substream parse must have succeeded.
         let sub = dec.last_substream.as_ref().unwrap();
         assert!(sub.tools.transform_info_primary.is_some());
@@ -981,7 +974,6 @@ mod tests {
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             panic!("expected audio");
         };
-        assert_eq!(af.channels, 1);
         assert_eq!(af.samples, 1_920);
         // Substream parse must have succeeded and scaled spectra is
         // populated.
@@ -1083,10 +1075,7 @@ mod tests {
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             panic!("expected audio");
         };
-        assert_eq!(af.channels, 2);
-        assert_eq!(af.sample_rate, 48_000);
         assert_eq!(af.samples, 1_920);
-        assert_eq!(af.format, SampleFormat::S16);
         // Both per-channel spectra should be populated.
         let sub = dec.last_substream.as_ref().unwrap();
         assert!(
@@ -1195,7 +1184,6 @@ mod tests {
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             panic!("expected audio");
         };
-        assert_eq!(af.channels, 2);
         assert_eq!(af.samples, 1_920);
         let sub = dec.last_substream.as_ref().unwrap();
         assert!(sub.tools.mdct_stereo_proc, "joint-stereo flag missing");
@@ -1393,7 +1381,6 @@ mod tests {
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             panic!("expected audio");
         };
-        assert_eq!(af.channels, 2);
         assert_eq!(af.samples, 1_920);
     }
 }
