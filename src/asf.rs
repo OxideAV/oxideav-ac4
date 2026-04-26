@@ -389,6 +389,12 @@ pub struct SubstreamTools {
     /// Parsed `acpl_config_1ch(FULL)` (§4.2.13.1 Table 59) for
     /// stereo `ASPX_ACPL_2` I-frame substreams. `None` otherwise.
     pub acpl_config_1ch_full: Option<crate::acpl::AcplConfig1ch>,
+    /// Parsed `acpl_data_1ch()` (§4.2.13.3 Table 61) when the surrounding
+    /// substream is one of the `ASPX_ACPL_{1,2}` paths and the walker
+    /// reached the body. `None` when ACPL data was either not present
+    /// (SIMPLE / mono ASPX / stereo ASPX) or could not be parsed because
+    /// the upstream MDCT body bailed first.
+    pub acpl_data_1ch: Option<crate::acpl::AcplData1ch>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -579,75 +585,79 @@ pub fn parse_mono_audio_data_outer(
             //   * aspx_config was parsed into tools above.
             if mode != MonoCodecMode::Simple && b_iframe && body_ok {
                 if let Some(cfg) = tools.aspx_config {
-                    let xover = br.read_u32(3)? as u8;
-                    tools.aspx_xover_subband_offset = Some(xover);
-                    let nats = aspx::num_aspx_timeslots(frame_len_base);
-                    let framing = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
-                    // Per Table 51: `aspx_qmode_env[0] = aspx_quant_mode_env`
-                    // by default, but FIXFIX with a single envelope drops
-                    // back to 0 (1.5 dB / Fine) regardless of the config.
-                    let qmode = if matches!(framing.int_class, aspx::AspxIntClass::FixFix)
-                        && framing.num_env == 1
-                    {
-                        aspx::AspxQuantStep::Fine
-                    } else {
-                        cfg.quant_mode_env
-                    };
-                    tools.aspx_qmode_env_primary = Some(qmode);
-                    // aspx_delta_dir(0) follows aspx_framing(0) per
-                    // Table 51 — fully determined by framing.num_env /
-                    // num_noise.
-                    let dd = aspx::parse_aspx_delta_dir(br, &framing)?;
-                    // Derive the §5.7.6.3.1 frequency tables and use
-                    // them to parse aspx_hfgen_iwc_1ch() (Table 55)
-                    // then two aspx_ec_data() calls (SIGNAL + NOISE)
-                    // per the aspx_data_1ch() body. Any derivation
-                    // error silently skips this block without clearing
-                    // the framing / delta_dir already stashed.
-                    if let Ok(tables) = aspx::derive_aspx_frequency_tables(&cfg, xover as u32) {
-                        let hfgen = aspx::parse_aspx_hfgen_iwc_1ch(
-                            br,
-                            cfg.num_noise_sbgroups(),
-                            tables.counts.num_sbg_sig_highres,
-                            nats,
-                        )?;
-                        tools.aspx_hfgen_iwc_1ch = Some(hfgen);
-                        // Signal envelopes — per Table 51, stereo_mode
-                        // is LEVEL (literal `0` in the Table 51 body)
-                        // for the 1-channel path.
-                        let sig = aspx::parse_aspx_ec_data(
-                            br,
-                            aspx::AspxDataType::Signal,
-                            framing.num_env,
-                            &framing.freq_res,
-                            qmode,
-                            aspx::AspxStereoMode::Level,
-                            &dd.sig_delta_dir,
-                            tables.counts,
-                        )?;
-                        tools.aspx_data_sig_primary = Some(sig);
-                        // Noise envelopes — per Table 51 freq_res /
-                        // qmode are `0` (both ignored by the NOISE
-                        // branch of Pseudocode 79).
-                        let noise = aspx::parse_aspx_ec_data(
-                            br,
-                            aspx::AspxDataType::Noise,
-                            framing.num_noise,
-                            &[],
-                            aspx::AspxQuantStep::Fine,
-                            aspx::AspxStereoMode::Level,
-                            &dd.noise_delta_dir,
-                            tables.counts,
-                        )?;
-                        tools.aspx_data_noise_primary = Some(noise);
-                        tools.aspx_frequency_tables = Some(tables);
-                    }
-                    tools.aspx_delta_dir_primary = Some(dd);
-                    tools.aspx_framing_primary = Some(framing);
+                    parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Walk the `aspx_data_1ch()` body (Table 51) at the current bit
+/// position into `tools`. Reads:
+///
+///   * `aspx_xover_subband_offset` (3 bits)
+///   * `aspx_framing(0)`
+///   * `aspx_delta_dir(0)`
+///   * `aspx_hfgen_iwc_1ch()`
+///   * `aspx_ec_data(SIGNAL)` + `aspx_ec_data(NOISE)`
+///
+/// The caller is responsible for arranging that the bitreader is sitting
+/// at the start of `aspx_data_1ch()`. Used by both the mono ASPX path
+/// (§4.2.6.1) and the stereo `ASPX_ACPL_{1,2}` paths (§4.2.6.3) — both
+/// follow exactly the Table-51 layout.
+pub(crate) fn parse_aspx_data_1ch_body(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Result<()> {
+    let xover = br.read_u32(3)? as u8;
+    tools.aspx_xover_subband_offset = Some(xover);
+    let nats = aspx::num_aspx_timeslots(frame_len_base);
+    let framing = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
+    let qmode = if matches!(framing.int_class, aspx::AspxIntClass::FixFix) && framing.num_env == 1 {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+    tools.aspx_qmode_env_primary = Some(qmode);
+    let dd = aspx::parse_aspx_delta_dir(br, &framing)?;
+    if let Ok(tables) = aspx::derive_aspx_frequency_tables(cfg, xover as u32) {
+        let hfgen = aspx::parse_aspx_hfgen_iwc_1ch(
+            br,
+            cfg.num_noise_sbgroups(),
+            tables.counts.num_sbg_sig_highres,
+            nats,
+        )?;
+        tools.aspx_hfgen_iwc_1ch = Some(hfgen);
+        let sig = aspx::parse_aspx_ec_data(
+            br,
+            aspx::AspxDataType::Signal,
+            framing.num_env,
+            &framing.freq_res,
+            qmode,
+            aspx::AspxStereoMode::Level,
+            &dd.sig_delta_dir,
+            tables.counts,
+        )?;
+        tools.aspx_data_sig_primary = Some(sig);
+        let noise = aspx::parse_aspx_ec_data(
+            br,
+            aspx::AspxDataType::Noise,
+            framing.num_noise,
+            &[],
+            aspx::AspxQuantStep::Fine,
+            aspx::AspxStereoMode::Level,
+            &dd.noise_delta_dir,
+            tables.counts,
+        )?;
+        tools.aspx_data_noise_primary = Some(noise);
+        tools.aspx_frequency_tables = Some(tables);
+    }
+    tools.aspx_delta_dir_primary = Some(dd);
+    tools.aspx_framing_primary = Some(framing);
     Ok(())
 }
 
@@ -685,6 +695,56 @@ fn decode_asf_long_mono_body(
     Some(scaled)
 }
 
+/// Walk the `ASPX_ACPL_2` MDCT body (§4.2.6.3 case `ASPX_ACPL_2`):
+///
+/// ```text
+/// spec_frontend;            1 bit
+/// sf_info(spec_frontend, 0, 0);
+/// sf_data(spec_frontend);
+/// ```
+///
+/// Returns `true` when the body parses cleanly enough that the bitreader
+/// is sitting at the start of the trailing `aspx_data_1ch()`. The decoded
+/// spectral coefficients (when long-frame + single window group) land on
+/// `tools.scaled_spec_primary`.
+fn parse_aspx_acpl2_mdct_body(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    frame_len_base: u32,
+) -> bool {
+    let sf_bit = match br.read_u32(1) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let frontend = SpecFrontend::from_bit(sf_bit);
+    tools.spec_frontend_primary = Some(frontend);
+    if !matches!(frontend, SpecFrontend::Asf) {
+        // SSF is gated on its own arithmetic-coded layer; we can't
+        // walk it yet.
+        return false;
+    }
+    let ti = match parse_asf_transform_info(br, frame_len_base) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    tools.transform_info_primary = Some(ti);
+    let psy = match parse_asf_psy_info(br, &ti, frame_len_base, false, false) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    tools.psy_info_primary = Some(psy.clone());
+    if !ti.b_long_frame || psy.num_window_groups != 1 {
+        return false;
+    }
+    match decode_asf_long_mono_body(br, &ti, &psy) {
+        Some(s) => {
+            tools.scaled_spec_primary = Some(s);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Parse the outer layers of a stereo `audio_data()` element
 /// (channel_pair_element / stereo_data).
 ///
@@ -710,31 +770,22 @@ pub fn parse_stereo_audio_data_outer(
         // A-CPL config is only 6 bits in PARTIAL mode, 3 in FULL).
         // Each stereo mode then runs companding_control with a
         // mode-specific channel count (2 for ASPX, 1 for ASPX_ACPL_*),
-        // which we also surface. The per-channel stereo_data /
-        // sf_data / aspx_data / acpl_data bodies remain Huffman-gated
-        // and unhandled at the outer-walker level — the dedicated
-        // [`crate::acpl`] parsers can be invoked directly once the
-        // surrounding QMF / aspx_data state machine is wired.
+        // which we also surface.
+        let mut acpl_cfg_active: Option<crate::acpl::AcplConfig1ch> = None;
         if b_iframe {
             tools.aspx_config = Some(aspx::parse_aspx_config(br)?);
             match mode {
                 StereoCodecMode::AspxAcpl1 => {
-                    tools.acpl_config_1ch_partial = Some(crate::acpl::parse_acpl_config_1ch(
-                        br,
-                        crate::acpl::Acpl1chMode::Partial,
-                    )?);
-                    // acpl_data_1ch() body still gated on
-                    // surrounding state machine (QMF subband layout
-                    // + sb_to_pb mapping not wired) — bail here so we
-                    // don't misread companding_control() out of place.
-                    return Ok(());
+                    let cfg =
+                        crate::acpl::parse_acpl_config_1ch(br, crate::acpl::Acpl1chMode::Partial)?;
+                    tools.acpl_config_1ch_partial = Some(cfg);
+                    acpl_cfg_active = Some(cfg);
                 }
                 StereoCodecMode::AspxAcpl2 => {
-                    tools.acpl_config_1ch_full = Some(crate::acpl::parse_acpl_config_1ch(
-                        br,
-                        crate::acpl::Acpl1chMode::Full,
-                    )?);
-                    return Ok(());
+                    let cfg =
+                        crate::acpl::parse_acpl_config_1ch(br, crate::acpl::Acpl1chMode::Full)?;
+                    tools.acpl_config_1ch_full = Some(cfg);
+                    acpl_cfg_active = Some(cfg);
                 }
                 _ => {}
             }
@@ -744,6 +795,51 @@ pub fn parse_stereo_audio_data_outer(
             _ => 1,
         };
         tools.companding = Some(aspx::parse_companding_control(br, nc)?);
+        // §4.2.6.3 ASPX_ACPL_{1,2}: after companding_control(1) follow
+        // the MDCT body (`stereo_data`-shaped for ACPL_1, mono for
+        // ACPL_2), then `aspx_data_1ch()` (Table 51) and
+        // `acpl_data_1ch()` (Table 61). Walk them when the upstream
+        // body parses cleanly.
+        if matches!(
+            mode,
+            StereoCodecMode::AspxAcpl1 | StereoCodecMode::AspxAcpl2
+        ) {
+            // Only the ASPX_ACPL_2 mono-frontend body is wired today —
+            // ASPX_ACPL_1's joint-MDCT residual layer (b_dual_maxsfb=1
+            // with chparam_info()) is more involved and would need a
+            // dedicated walker. For ACPL_1 we still surface the parsed
+            // config so callers can see the substream's tool mix.
+            let body_ok = match mode {
+                StereoCodecMode::AspxAcpl2 => parse_aspx_acpl2_mdct_body(br, tools, frame_len_base),
+                _ => false,
+            };
+            if b_iframe && body_ok {
+                if let Some(cfg) = tools.aspx_config {
+                    if parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base).is_ok() {
+                        if let Some(acfg) = acpl_cfg_active {
+                            // §4.2.13.3 Table 61: num_bands =
+                            // acpl_num_param_bands; start =
+                            // acpl_param_band (= sb_to_pb(qmf_band) for
+                            // PARTIAL, 0 for FULL).
+                            let start_band = if acfg.qmf_band == 0 {
+                                0
+                            } else {
+                                crate::acpl::sb_to_pb(acfg.qmf_band as u32, acfg.num_param_bands)
+                            };
+                            if let Ok(d) = crate::acpl::parse_acpl_data_1ch(
+                                br,
+                                acfg.num_param_bands,
+                                start_band,
+                                acfg.quant_mode,
+                            ) {
+                                tools.acpl_data_1ch = Some(d);
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         // For `StereoCodecMode::Aspx` (Table 22) the stereo_data()
         // body follows companding_control(2), then aspx_data_2ch()
         // closes the element. We parse stereo_data() with the same
@@ -1794,8 +1890,10 @@ mod tests {
     fn walk_stereo_aspx_acpl1_parses_acpl_config_partial() {
         // stereo_codec_mode = 10 (ASPX_ACPL_1): aspx_config + then
         // acpl_config_1ch(PARTIAL) (= 6 bits: 2 bands_id + 1 quant +
-        // 3 qmf_band_minus1). We bail before companding_control —
-        // companding stays None.
+        // 3 qmf_band_minus1). The walker now also consumes
+        // companding_control(1) and tries the MDCT body, but ACPL_1's
+        // joint-MDCT residual layer isn't wired so the body bails;
+        // config + companding still surface.
         let mut bw = BitWriter::new();
         bw.write_u32(5, 15);
         bw.write_bit(false);
@@ -1823,15 +1921,20 @@ mod tests {
         assert_eq!(acpl.quant_mode, crate::acpl::AcplQuantMode::Coarse);
         assert_eq!(acpl.qmf_band, 4);
         assert!(info.tools.acpl_config_1ch_full.is_none());
-        // We bail before companding_control — companding stays None.
-        assert!(info.tools.companding.is_none());
+        // companding_control is now consumed (was previously skipped);
+        // ACPL_1 body still bails so acpl_data_1ch stays None.
+        assert!(info.tools.companding.is_some());
+        assert!(info.tools.acpl_data_1ch.is_none());
     }
 
     #[test]
     fn walk_stereo_aspx_acpl2_parses_acpl_config_full() {
         // stereo_codec_mode = 11 (ASPX_ACPL_2): aspx_config + then
-        // acpl_config_1ch(FULL) (= 3 bits: 2 bands_id + 1 quant). Bails
-        // before companding.
+        // acpl_config_1ch(FULL) (= 3 bits: 2 bands_id + 1 quant). The
+        // walker now also reads companding_control(1) and attempts the
+        // mono MDCT body. For this synthetic frame with no real MDCT
+        // payload the body parse bails harmlessly; the config still
+        // surfaces.
         let mut bw = BitWriter::new();
         bw.write_u32(5, 15);
         bw.write_bit(false);
@@ -1859,6 +1962,10 @@ mod tests {
         // qmf_band stays 0 for FULL mode (not transmitted).
         assert_eq!(acpl.qmf_band, 0);
         assert!(info.tools.acpl_config_1ch_partial.is_none());
-        assert!(info.tools.companding.is_none());
+        // companding_control is now consumed (was previously skipped);
+        // ACPL_2 body parse fires but bails on the synthetic payload so
+        // acpl_data_1ch stays None.
+        assert!(info.tools.companding.is_some());
+        assert!(info.tools.acpl_data_1ch.is_none());
     }
 }

@@ -973,6 +973,106 @@ pub fn run_pseudocode_115_pair(state: &mut AcplCpeState, frame: AcplCpeFrame<'_>
 }
 
 // =====================================================================
+// §5.7.7 — top-level helpers wired into Ac4Decoder
+// =====================================================================
+
+use crate::acpl::{AcplConfig1ch, AcplData1ch, AcplInterpolationType};
+use crate::qmf::{QmfAnalysisBank, QmfSynthesisBank};
+
+/// Per-substream A-CPL persistent state — diff state for ALPHA and BETA
+/// plus the channel-pair `AcplCpeState` (decorrelator + ducker + prev
+/// arrays). Carried across AC-4 frames by the decoder.
+#[derive(Debug, Clone)]
+pub struct AcplSubstreamState {
+    pub alpha_diff: AcplDiffState,
+    pub beta_diff: AcplDiffState,
+    pub cpe: AcplCpeState,
+}
+
+impl AcplSubstreamState {
+    pub fn new() -> Self {
+        Self {
+            alpha_diff: AcplDiffState::new(),
+            beta_diff: AcplDiffState::new(),
+            cpe: AcplCpeState::new(DecorrelatorId::D0),
+        }
+    }
+}
+
+impl Default for AcplSubstreamState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Run the §5.7.7 A-CPL channel-pair synthesis on a mono PCM input
+/// (already ASPX-extended) and emit stereo PCM via QMF
+/// analysis → A-CPL → QMF synthesis.
+///
+/// Spec wiring (ETSI TS 103 190-1):
+///   * `pcm_in` — mono ASPX-extended PCM, length must be a multiple of
+///     64 (one QMF slot = 64 samples).
+///   * `cfg` — parsed `acpl_config_1ch()` (PARTIAL or FULL) for the
+///     active substream (§4.2.13.1 Table 59).
+///   * `data` — parsed `acpl_data_1ch()` (§4.2.13.3 Table 61).
+///   * `state` — per-substream state carried across frames.
+///
+/// Returns `(left, right)` interleaved-friendly PCM buffers, each the
+/// same length as `pcm_in`, or `None` if the input length isn't aligned
+/// to a QMF slot boundary or the parameters are inconsistent.
+pub fn run_acpl_1ch_pcm(
+    pcm_in: &[f32],
+    cfg: &AcplConfig1ch,
+    data: &AcplData1ch,
+    state: &mut AcplSubstreamState,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if pcm_in.is_empty() || pcm_in.len() % NUM_QMF_SUBBANDS != 0 {
+        return None;
+    }
+    let n_slots = pcm_in.len() / NUM_QMF_SUBBANDS;
+    if n_slots == 0 {
+        return None;
+    }
+    // Forward QMF analysis on the input PCM. `process_block` already
+    // returns the per-slot `[(re, im); 64]` columns we need.
+    let mut ana = QmfAnalysisBank::new();
+    let x0 = ana.process_block(pcm_in);
+    // Differential decode + dequantize ALPHA / BETA.
+    let alpha_q = differential_decode(&data.alpha1, cfg.num_param_bands, &mut state.alpha_diff);
+    let beta_q = differential_decode(&data.beta1, cfg.num_param_bands, &mut state.beta_diff);
+    let (alpha_dq, beta_dq) = dequantize_alpha_beta(&alpha_q, &beta_q, cfg.quant_mode);
+    if alpha_dq.is_empty() {
+        return None;
+    }
+    // Run the §5.7.7.5 channel-pair element. ASPX_ACPL_2 has x1 == None
+    // (single ASPX channel — the spec's "1-channel A-CPL").
+    let frame = AcplCpeFrame {
+        x0: &x0,
+        x1: None,
+        alpha_dq: &alpha_dq,
+        beta_dq: &beta_dq,
+        num_param_bands: cfg.num_param_bands,
+        acpl_qmf_band: cfg.qmf_band as u32,
+        steep: matches!(
+            data.framing.interpolation_type,
+            AcplInterpolationType::Steep
+        ),
+        param_timeslots: &data.framing.param_timeslots,
+    };
+    let out = run_pseudocode_115_pair(&mut state.cpe, frame);
+    // Inverse QMF synthesis for both output channels.
+    let mut syn0 = QmfSynthesisBank::new();
+    let mut syn1 = QmfSynthesisBank::new();
+    let mut left = Vec::with_capacity(pcm_in.len());
+    let mut right = Vec::with_capacity(pcm_in.len());
+    for ts in 0..n_slots {
+        left.extend_from_slice(&syn0.process_slot(&out.z0[ts]));
+        right.extend_from_slice(&syn1.process_slot(&out.z1[ts]));
+    }
+    Some((left, right))
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 
@@ -1571,5 +1671,102 @@ mod tests {
             assert!((z1.0 - 1.0).abs() < 1e-6);
             assert!((z1.1 - 0.5).abs() < 1e-6);
         }
+    }
+
+    // ----------------- run_acpl_1ch_pcm — PCM end-to-end --------------
+
+    #[test]
+    fn run_acpl_1ch_pcm_emits_two_channel_pcm_with_energy() {
+        // End-to-end smoke test: feed a synthetic mono sine into the
+        // §5.7.7.5 channel-pair pipeline (QMF analysis → A-CPL → QMF
+        // synthesis) and assert both output channels carry energy and
+        // come out the right length.
+        use crate::acpl::{
+            Acpl1chMode, AcplConfig1ch, AcplData1ch, AcplFramingData, AcplHuffParam,
+            AcplInterpolationType, AcplQuantMode,
+        };
+        let _ = Acpl1chMode::Full; // silence unused-import warning
+        let n_slots = 32usize;
+        let n = n_slots * NUM_QMF_SUBBANDS;
+        let mut pcm = vec![0.0f32; n];
+        let f = 440.0_f32 / 48_000.0_f32;
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f * i as f32).sin();
+        }
+        let cfg = AcplConfig1ch {
+            num_param_bands_id: 0,
+            num_param_bands: 15,
+            quant_mode: AcplQuantMode::Fine,
+            qmf_band: 0,
+        };
+        // Hand-built parsed acpl_data_1ch — single param set, alpha
+        // and beta carrying the F0 anchor index (huffman F0 cb_off
+        // gives signed 0 here).
+        let alpha = AcplHuffParam {
+            values: vec![4i32; cfg.num_param_bands as usize],
+            direction_time: false,
+        };
+        let beta = AcplHuffParam {
+            values: vec![2i32; cfg.num_param_bands as usize],
+            direction_time: false,
+        };
+        let data = AcplData1ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![alpha],
+            beta1: vec![beta],
+        };
+        let mut state = AcplSubstreamState::new();
+        let (left, right) = run_acpl_1ch_pcm(&pcm, &cfg, &data, &mut state).expect("synth runs");
+        assert_eq!(left.len(), pcm.len());
+        assert_eq!(right.len(), pcm.len());
+        // Both channels should carry energy in the steady-state tail.
+        let start = 1024usize;
+        let e_l: f64 = left[start..].iter().map(|&s| (s as f64).powi(2)).sum();
+        let e_r: f64 = right[start..].iter().map(|&s| (s as f64).powi(2)).sum();
+        assert!(e_l > 1e-6, "left channel silent (e={e_l})");
+        assert!(e_r > 1e-6, "right channel silent (e={e_r})");
+        // The two channels must differ — a non-zero alpha drives them
+        // apart.
+        let mut diffs = 0usize;
+        for (l, r) in left[start..].iter().zip(right[start..].iter()) {
+            if (l - r).abs() > 1e-6 {
+                diffs += 1;
+            }
+        }
+        assert!(
+            diffs > (left.len() - start) / 4,
+            "channels too similar (diffs={diffs})"
+        );
+    }
+
+    #[test]
+    fn run_acpl_1ch_pcm_rejects_misaligned_pcm() {
+        use crate::acpl::{
+            AcplConfig1ch, AcplData1ch, AcplFramingData, AcplInterpolationType, AcplQuantMode,
+        };
+        let pcm = vec![0.0f32; 65]; // not a multiple of 64
+        let cfg = AcplConfig1ch {
+            num_param_bands_id: 0,
+            num_param_bands: 15,
+            quant_mode: AcplQuantMode::Fine,
+            qmf_band: 0,
+        };
+        let data = AcplData1ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![],
+            beta1: vec![],
+        };
+        let mut state = AcplSubstreamState::new();
+        assert!(run_acpl_1ch_pcm(&pcm, &cfg, &data, &mut state).is_none());
     }
 }

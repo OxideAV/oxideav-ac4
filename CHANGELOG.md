@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A-CPL decoder wiring (round 17)**: `ASPX_ACPL_2` substreams now go
+  through the §5.7.7 channel-pair synthesis end-to-end. The asf walker
+  parses `aspx_data_1ch()` (Table 51) and `acpl_data_1ch()` (Table 61)
+  for the ASPX_ACPL_2 path; `Ac4Decoder` runs `acpl_synth::run_acpl_1ch_pcm`
+  (mono PCM → QMF analysis → §5.7.7.5 channel-pair → QMF synthesis × 2)
+  to emit a real stereo signal in place of the duplicate-of-primary
+  fallback. ASPX_ACPL_1's joint-MDCT body is still gated.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.1...v0.0.2) - 2026-04-25
 
 ### Other

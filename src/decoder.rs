@@ -19,11 +19,11 @@
 //! [`toc::Ac4FrameInfo`] surface for downstream tooling.
 
 use oxideav_core::Decoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
-};
+#[cfg(test)]
+use oxideav_core::TimeBase;
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
-use crate::{asf, aspx, mdct, qmf, sync, toc};
+use crate::{acpl_synth, asf, aspx, mdct, qmf, sync, toc};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac4Decoder::new(params)))
@@ -57,6 +57,11 @@ pub struct Ac4Decoder {
     /// `sine_idx_sb_prev` / `tsg_ptr_prev` / `num_atsg_sig_prev` bundle
     /// that Pseudocode 92 consults. Grown on demand as channels decode.
     aspx_ext_state: Vec<aspx::AspxChannelExtState>,
+    /// Per-substream A-CPL persistent state for the channel-pair
+    /// element (§5.7.7.5 Pseudocode 115). Only one substream is wired
+    /// in the foundation decoder; multichannel `ASPX_ACPL_3` would carry
+    /// a vector keyed by substream index.
+    acpl_state: acpl_synth::AcplSubstreamState,
 }
 
 impl Ac4Decoder {
@@ -72,6 +77,7 @@ impl Ac4Decoder {
             overlap: Vec::new(),
             prev_transform_length: 0,
             aspx_ext_state: Vec::new(),
+            acpl_state: acpl_synth::AcplSubstreamState::new(),
         }
     }
 
@@ -508,6 +514,18 @@ impl Decoder for Ac4Decoder {
         // Detach the inputs + the ASPX tables once so we can run IMDCT
         // (which mutates overlap state) and the ASPX extension without
         // a borrow conflict on self.
+        // Detach A-CPL config + parsed data so the synth call below
+        // doesn't conflict with the immutable borrow of `last_substream`
+        // when we later mutate decoder state.
+        let acpl_active_cfg = self.last_substream.as_ref().and_then(|sub| {
+            sub.tools
+                .acpl_config_1ch_full
+                .or(sub.tools.acpl_config_1ch_partial)
+        });
+        let acpl_active_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_1ch.clone());
         let (
             primary_in,
             secondary_in,
@@ -601,6 +619,14 @@ impl Decoder for Ac4Decoder {
         while self.aspx_ext_state.len() < channels as usize {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
         }
+        // §5.7.7 A-CPL: when the substream parsed `acpl_config_1ch` +
+        // `acpl_data_1ch` we run the channel-pair synthesis on the
+        // ASPX-extended primary PCM and emit two channels. The path
+        // owns the primary IMDCT + ASPX path so `pcm_per_channel[1]`
+        // ends up populated by the synth's `z1` output instead of by a
+        // duplicate-of-primary fallback.
+        let use_acpl =
+            channels as usize >= 2 && acpl_active_cfg.is_some() && acpl_active_data.is_some();
         if let Some((scaled, n)) = primary_in {
             if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
                 if use_aspx_ext {
@@ -620,13 +646,33 @@ impl Decoder for Ac4Decoder {
                         state,
                         num_ts_in_ats,
                     );
-                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                    if use_acpl {
+                        if let (Some(cfg), Some(data)) =
+                            (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
+                        {
+                            if let Some((left, right)) = acpl_synth::run_acpl_1ch_pcm(
+                                &extended,
+                                cfg,
+                                data,
+                                &mut self.acpl_state,
+                            ) {
+                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
+                                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
+                            } else {
+                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                            }
+                        } else {
+                            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                        }
+                    } else {
+                        pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                    }
                 } else {
                     pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
                 }
             }
         }
-        if channels as usize >= 2 {
+        if channels as usize >= 2 && !use_acpl {
             if let Some((scaled, n)) = secondary_in {
                 if n > 0 && n == samples as usize {
                     if use_aspx_ext {

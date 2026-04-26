@@ -307,6 +307,30 @@
 //!   end-to-end with the `acpl_qmf_band` M/S split below the
 //!   threshold and the alpha/beta-modulated decorrelator mix above.
 //!
+//! * **A-CPL decoder wiring** — [`asf::walk_ac4_substream`] now consumes
+//!   the full `aspx_data_1ch()` (Table 51) + `acpl_data_1ch()` (Table
+//!   61) tail of the `ASPX_ACPL_2` stereo path: the mono MDCT body
+//!   parser ([`asf::parse_aspx_acpl2_mdct_body`] internal) walks the
+//!   `spec_frontend; sf_info; sf_data` shape, then the shared
+//!   [`asf::parse_aspx_data_1ch_body`] helper reads the leading
+//!   xover-offset + framing + delta-dir + hfgen + ec_data, and finally
+//!   [`acpl::parse_acpl_data_1ch`] is invoked with `num_bands` =
+//!   `acpl_num_param_bands` and `start_band` =
+//!   `sb_to_pb(acpl_qmf_band, num_param_bands)` per Table 61.
+//!   The parsed payload lands on [`asf::SubstreamTools::acpl_data_1ch`].
+//!   [`decoder::Ac4Decoder`] now drives
+//!   [`acpl_synth::run_acpl_1ch_pcm`] (mono PCM → QMF analysis →
+//!   §5.7.7.5 channel-pair element → QMF synthesis × 2) when the
+//!   substream provides an `acpl_config_1ch` plus `acpl_data_1ch`,
+//!   emitting two PCM channels in place of the duplicate-of-primary
+//!   fallback. Per-substream
+//!   [`acpl_synth::AcplSubstreamState`] (alpha-diff + beta-diff +
+//!   `AcplCpeState` decorrelator + ducker) lives on the decoder so
+//!   IIR delay-lines and `acpl_<SET>_q_prev` survive across frames.
+//!   ASPX_ACPL_1's joint-MDCT residual layer (b_dual_maxsfb = 1 with
+//!   `chparam_info()`) is still gated — the parser bails after
+//!   companding_control until the joint MDCT body walker lands.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — coefficient
@@ -319,21 +343,15 @@
 //!   `master_reset` semantics (resetting `prev_chirp_array` / the
 //!   `Q_low_prev` history) when a new substream starts mid-stream
 //!   isn't surfaced through the decoder API yet.
-//! * A-CPL data-path decoder hookup — the [`acpl`] module fully
-//!   implements `acpl_config_1ch` / `acpl_config_2ch` /
-//!   `acpl_framing_data` / `acpl_huff_data` / `acpl_ec_data` /
-//!   `acpl_data_1ch` / `acpl_data_2ch` (§4.2.13 Tables 59..65) over
-//!   all 24 §A.3 Huffman codebooks ([`acpl_huffman`], Tables
-//!   A.34..A.57), and the [`acpl_synth`] module fully implements the
-//!   §5.7.7 QMF synthesis math (differential decode + dequant +
-//!   interpolation + decorrelator + ducker + ACplModule). What's
-//!   still missing is the [`decoder::Ac4Decoder`] wiring that
-//!   actually pumps the per-frame `acpl_data_*ch()` payloads through
-//!   [`acpl_synth::run_pseudocode_115_pair`] when an `ASPX_ACPL_*`
-//!   substream lands. Multichannel `5_X_codec_mode = ASPX_ACPL_3`
-//!   (Pseudocodes 117-120 / `Transform`, `ACplModule2`, `ACplModule3`)
-//!   is also still pending — the four §5.7.7.7 dequant tables
-//!   (Tables 203-208) needed to plug those in are already present.
+//! * A-CPL data-path decoder hookup — `ASPX_ACPL_2` (mono MDCT body)
+//!   is fully wired as of round-17 (parser → synth → 2-channel PCM).
+//!   `ASPX_ACPL_1`'s joint-MDCT body (b_dual_maxsfb = 1 with
+//!   `chparam_info()` and a residual MDCT layer) is still gated —
+//!   the walker bails after companding_control. Multichannel
+//!   `5_X_codec_mode = ASPX_ACPL_3` (Pseudocodes 117-120 / `Transform`,
+//!   `ACplModule2`, `ACplModule3`) is also still pending — the four
+//!   §5.7.7.7 dequant tables (Tables 203-208) needed to plug those in
+//!   are already present.
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
