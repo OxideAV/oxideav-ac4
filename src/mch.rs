@@ -1,4 +1,4 @@
-//! Multichannel `5_X_channel_element` walker family — round 19 scaffold.
+//! Multichannel `5_X_channel_element` walker family — round 20 wiring.
 //!
 //! ETSI TS 103 190-1 V1.4.1, §4.2.6.6 (`5_X_channel_element`) selects
 //! between four channel-element bodies via `coding_config` (Table 25):
@@ -26,20 +26,24 @@
 //!   bit-count for `max_sfb[0]` switches from `n_msfb_bits` to
 //!   `n_msfbl_bits` (Table 106 column 4).
 //!
-//! Round 19 lands the **type definitions** + **parser scaffolds** so
-//! r20 can wire them to `Ac4Decoder`. The mono-data LFE variant is
-//! fully wired (it's the simplest of the new walkers and is needed for
-//! 5.1 LFE). The remaining channel-data walkers parse the outer-shell
-//! shape (sf_info + N x chparam_info) without descending into the
-//! per-channel `sf_data` Huffman bodies — those wait for the
+//! Round 19 landed the type definitions + parser scaffolds plus the
+//! Cfg3Five outer-shell + LFE `mono_data(1)` walker. Round 20 wires the
+//! remaining three coding-config layouts (Cfg0Stereo2plusMono /
+//! Cfg1ThreeStereo / Cfg2FourMono) by introducing the
+//! `parse_two_channel_data()` outer (Table 26) and reusing
+//! `parse_mono_data(...)` for the trailing `mono_data(0)` calls. R20
+//! also splits `sf_info_lfe()` from the regular `sf_info()` parser —
+//! the leading `max_sfb` field now uses `n_msfbl_bits` from Table 106
+//! (column 4) instead of the regular `n_msfb_bits`, matching Table 21.
+//! The per-channel `sf_data(ASF)` Huffman bodies still wait for the
 //! Pseudocode 117/118 transform-matrix wiring in a future round.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
 
 use crate::asf::{
-    parse_asf_psy_info, parse_asf_transform_info, parse_chparam_info, AsfPsyInfo, AsfTransformInfo,
-    ChparamInfo, SubstreamTools,
+    parse_asf_psy_info, parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info,
+    AsfPsyInfo, AsfTransformInfo, ChparamInfo, SubstreamTools,
 };
 use crate::tables;
 
@@ -136,6 +140,26 @@ pub struct FiveChannelInfo {
     pub chparam: [ChparamInfo; 5],
 }
 
+/// Parsed `two_channel_data()` outer shell per Table 26.
+///
+/// Table 26 is a stripped-down stereo container — single shared
+/// `sf_info(ASF, 0, 0)` followed by `chparam_info()` (the full Table 47
+/// row including `sap_mode` / `ms_used` / `sap_data`) and then two
+/// `sf_data(ASF)` bodies. We parse the outer shell only — the
+/// `sf_data(ASF)` Huffman bodies are deferred to the `acpl_synth` /
+/// joint-MDCT decoder paths (Pseudocode 178 in §5.3.3 needs the
+/// transform-matrix wiring that's still outstanding for the multichannel
+/// elements).
+///
+/// Used by `5_X_channel_element` Cfg0 (twice — L/R and Ls/Rs) and Cfg1
+/// (after the leading `three_channel_data`).
+#[derive(Debug, Clone, Default)]
+pub struct TwoChannelData {
+    pub transform_info: Option<AsfTransformInfo>,
+    pub psy_info: Option<AsfPsyInfo>,
+    pub chparam: Option<ChparamInfo>,
+}
+
 /// Parsed `three_channel_data()` outer shell per Table 27.
 ///
 /// Holds the shared `sf_info` (transform_info + psy_info) and the
@@ -196,21 +220,39 @@ pub fn parse_mono_data(
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     out.transform_info = Some(ti);
     // `sf_info(ASF, 0, 0)` for non-LFE; `sf_info_lfe()` for LFE.
-    // Difference (per §4.3.6.2.1): `max_sfb[0]` field uses
-    // `n_msfbl_bits` instead of `n_msfb_bits`. The current
-    // [`parse_asf_psy_info`] helper drives `n_msfb_bits` via Table 106;
-    // for LFE we patch up after the fact by clamping `max_sfb_0` to
-    // the LFE-band cap and re-reading the field width. For r19 we
-    // approximate by reading the regular psy_info and then clamping —
-    // the LFE bit-count differs by 2-3 bits which would skew the
-    // bitreader for real streams. Leave a TODO and document in the
-    // returned struct.
-    //
-    // FIXME(r20): split parse_asf_psy_info into a `_lfe` variant that
-    // uses Table 106 column `n_msfbl_bits` for the leading max_sfb.
-    let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
+    // r20: dispatch to the dedicated `parse_asf_psy_info_lfe()` that
+    // uses Table 106 column `n_msfbl_bits` for `max_sfb[0]` instead of
+    // the regular `n_msfb_bits`. The two widths can differ by 2-4 bits
+    // (e.g. 48 kHz long-frame: 6 vs 3) so this matters for any real
+    // 5.1 / 7.1 stream LFE alignment.
+    let psy = if b_lfe {
+        parse_asf_psy_info_lfe(br, &ti)?
+    } else {
+        parse_asf_psy_info(br, &ti, frame_len_base, false, false)?
+    };
     out.psy_info = Some(psy);
     Ok(out)
+}
+
+/// `two_channel_data()` outer shell per Table 26.
+///
+/// Walks `sf_info(ASF, 0, 0)` + `chparam_info()`. The two `sf_data(ASF)`
+/// bodies that close the element are deferred — they need the same
+/// Pseudocode 178 transform-matrix wiring as the rest of the multichannel
+/// element family.
+pub fn parse_two_channel_data(
+    br: &mut BitReader<'_>,
+    frame_len_base: u32,
+) -> Result<TwoChannelData> {
+    let ti = parse_asf_transform_info(br, frame_len_base)?;
+    let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
+    let max_sfb_g = psy.max_sfb_0;
+    let chparam = parse_chparam_info(br, &[max_sfb_g])?;
+    Ok(TwoChannelData {
+        transform_info: Some(ti),
+        psy_info: Some(psy),
+        chparam: Some(chparam),
+    })
 }
 
 /// `three_channel_info()` per Table 30.
@@ -391,13 +433,48 @@ pub fn parse_5x_audio_data_outer(
                 _ => FiveXCodingConfig::Cfg3Five,
             };
             tools.five_x_coding_config = Some(coding_cfg);
-            // For r19 we walk only Cfg3 (five_channel_data) — the
-            // simplest single-element layout. Other configs require
-            // mixed parsers (two_channel_data, mono_data(0)) that
-            // overlap with the existing stereo/mono walkers; wire them
-            // in r20.
-            if matches!(coding_cfg, FiveXCodingConfig::Cfg3Five) {
-                tools.five_channel_data = Some(parse_five_channel_data(br, frame_len_base)?);
+            // r20: walk all four channel-element layouts' outer shells.
+            // The trailing `sf_data(ASF)` Huffman bodies still wait for
+            // the Pseudocode 178 transform-matrix wiring.
+            match coding_cfg {
+                FiveXCodingConfig::Cfg0Stereo2plusMono => {
+                    // Table 25 row 0: 1-bit `2ch_mode` selector
+                    // (b_2ch_mode), then two_channel_data twice (L/R
+                    // then Ls/Rs), then mono_data(0) for the centre.
+                    tools.b_2ch_mode = Some(br.read_bit()?);
+                    tools.two_channel_data.clear();
+                    tools
+                        .two_channel_data
+                        .push(parse_two_channel_data(br, frame_len_base)?);
+                    tools
+                        .two_channel_data
+                        .push(parse_two_channel_data(br, frame_len_base)?);
+                    tools.cfg0_centre_mono = Some(parse_mono_data(br, false, frame_len_base)?);
+                }
+                FiveXCodingConfig::Cfg1ThreeStereo => {
+                    // Table 25 row 1: three_channel_data + two_channel_data.
+                    tools.three_channel_data = Some(parse_three_channel_data(br, frame_len_base)?);
+                    tools.two_channel_data.clear();
+                    tools
+                        .two_channel_data
+                        .push(parse_two_channel_data(br, frame_len_base)?);
+                }
+                FiveXCodingConfig::Cfg2FourMono => {
+                    // Table 25 row 2: four_channel_data + mono_data(0).
+                    tools.four_channel_data = Some(parse_four_channel_data(br, frame_len_base)?);
+                    tools.cfg2_back_mono = Some(parse_mono_data(br, false, frame_len_base)?);
+                }
+                FiveXCodingConfig::Cfg3Five => {
+                    tools.five_channel_data = Some(parse_five_channel_data(br, frame_len_base)?);
+                }
+                FiveXCodingConfig::AcplLite2 => {
+                    // AcplLite2 is the ASPX_ACPL_{1,2} false-branch and
+                    // can't appear in the SIMPLE/ASPX 2-bit map.
+                    debug_assert!(
+                        false,
+                        "AcplLite2 unreachable from SIMPLE/ASPX 2-bit coding_config"
+                    );
+                }
             }
             // ASPX trailers (aspx_data_2ch + aspx_data_2ch +
             // aspx_data_1ch) deferred — they follow the same Table 51 /
@@ -477,12 +554,11 @@ mod tests {
     fn parse_mono_data_lfe_long_frame() {
         // mono_data(1) for frame_len_base=1920 long-frame:
         //   asf_transform_info: b_long_frame=1 -> tl=1920.
-        //   sf_info_lfe(): max_sfb[0] read with n_msfb_bits=6 (we use
-        //   the regular path for r19, see TODO in parse_mono_data) =
-        //   value 8.
+        //   sf_info_lfe(): max_sfb[0] read with n_msfbl_bits=3 (Table
+        //   106 column 4 for tl=1920) = value 5.
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_long_frame
-        bw.write_u32(8, 6); // max_sfb[0]
+        bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 for tl=1920
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -492,7 +568,33 @@ mod tests {
         let ti = lfe.transform_info.unwrap();
         assert_eq!(ti.transform_length_0, 1920);
         let psy = lfe.psy_info.unwrap();
-        assert_eq!(psy.max_sfb_0, 8);
+        assert_eq!(psy.max_sfb_0, 5);
+        // LFE psy_info has no grouping bits or window groups.
+        assert_eq!(psy.num_windows, 1);
+        assert_eq!(psy.num_window_groups, 1);
+        assert!(psy.scale_factor_grouping.is_empty());
+    }
+
+    #[test]
+    fn parse_mono_data_lfe_rejects_short_only_transform() {
+        // tl=480 -> n_msfbl_bits = 0 (LFE not permitted at this tl).
+        // Reach `parse_asf_psy_info_lfe` by feeding b_long_frame=0
+        // followed by a 2-bit `transf_length` selecting tl=480 at
+        // frame_len_base=1920. asf_transform_info Table 99 row for
+        // 1920 maps transf_length=0..=3 to {1920, 960, 480, 240}.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_long_frame=0
+        bw.write_u32(2, 2); // transf_length=2 -> tl=480 (Table 99)
+        bw.write_u32(2, 2); // transf_length[1]=2 -> tl=480 (no different framing)
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let err = parse_mono_data(&mut br, true, 1920).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("LFE") || msg.contains("transform_length"),
+            "expected LFE-rejection error, got: {msg}"
+        );
     }
 
     #[test]
@@ -614,13 +716,14 @@ mod tests {
     #[test]
     fn parse_5x_outer_simple_with_lfe_walks_lfe_mono_data() {
         // 5_X_codec_mode = SIMPLE, b_has_lfe = 1.
-        // mono_data(1): asf_transform_info long-frame + max_sfb=4.
+        // mono_data(1): asf_transform_info long-frame at 1920 +
+        // sf_info_lfe with n_msfbl_bits=3 -> value 4.
         // Then coding_config=3 + five_channel_data shell.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
                             // LFE mono_data(1):
         bw.write_bit(true); // b_long_frame
-        bw.write_u32(4, 6); // max_sfb[0]
+        bw.write_u32(4, 3); // max_sfb[0] -- n_msfbl_bits = 3 for tl=1920
                             // coding_config = 3, then five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true);
@@ -640,6 +743,148 @@ mod tests {
         assert_eq!(lfe.psy_info.as_ref().unwrap().max_sfb_0, 4);
         let d = tools.five_channel_data.as_ref().unwrap();
         assert_eq!(d.psy_info.as_ref().unwrap().max_sfb_0, 10);
+    }
+
+    #[test]
+    fn parse_two_channel_data_outer_walks_sf_info_plus_chparam() {
+        // Long-frame @1920, max_sfb=20, chparam_info sap_mode=0.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(20, 6); // max_sfb[0]
+        bw.write_u32(0, 2); // chparam sap_mode = 0
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d = parse_two_channel_data(&mut br, 1920).unwrap();
+        assert_eq!(d.transform_info.as_ref().unwrap().transform_length_0, 1920);
+        assert_eq!(d.psy_info.as_ref().unwrap().max_sfb_0, 20);
+        assert_eq!(d.chparam.as_ref().unwrap().sap_mode, 0);
+    }
+
+    #[test]
+    fn parse_5x_outer_simple_cfg0_walks_pair_pair_centre() {
+        // 5_X_codec_mode = SIMPLE (0). b_has_lfe=0, b_iframe=1.
+        // coding_config = 0 (Cfg0Stereo2plusMono).
+        // Then 1-bit `2ch_mode` + two_channel_data x2 + mono_data(0).
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 3); // SIMPLE
+                            // No LFE, no I-frame config.
+        bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
+        bw.write_bit(true); // b_2ch_mode
+                            // two_channel_data #1: long-frame, max_sfb=10, chparam=0.
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 2);
+        // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
+        bw.write_bit(true);
+        bw.write_u32(12, 6);
+        bw.write_u32(0, 2);
+        // mono_data(0): spec_frontend bit + transform + psy.
+        bw.write_bit(false); // spec_frontend = 0 (ASF)
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(8, 6); // max_sfb[0]
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(
+            tools.five_x_coding_config,
+            Some(FiveXCodingConfig::Cfg0Stereo2plusMono)
+        );
+        assert_eq!(tools.b_2ch_mode, Some(true));
+        assert_eq!(tools.two_channel_data.len(), 2);
+        assert_eq!(
+            tools.two_channel_data[0]
+                .psy_info
+                .as_ref()
+                .unwrap()
+                .max_sfb_0,
+            10
+        );
+        assert_eq!(
+            tools.two_channel_data[1]
+                .psy_info
+                .as_ref()
+                .unwrap()
+                .max_sfb_0,
+            12
+        );
+        let centre = tools.cfg0_centre_mono.as_ref().unwrap();
+        assert!(!centre.b_lfe);
+        assert_eq!(centre.spec_frontend_bit, 0);
+        assert_eq!(centre.psy_info.as_ref().unwrap().max_sfb_0, 8);
+    }
+
+    #[test]
+    fn parse_5x_outer_simple_cfg1_walks_three_plus_two() {
+        // SIMPLE, coding_config=1 -> three_channel_data + two_channel_data.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 3); // SIMPLE
+        bw.write_u32(1, 2); // coding_config = 1 (Cfg1ThreeStereo)
+                            // three_channel_data: long-frame, max_sfb=14, chel_matsel=0,
+                            // 2x chparam_info(sap_mode=0).
+        bw.write_bit(true);
+        bw.write_u32(14, 6);
+        bw.write_u32(0, 4);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        // two_channel_data: long-frame, max_sfb=18, chparam=0.
+        bw.write_bit(true);
+        bw.write_u32(18, 6);
+        bw.write_u32(0, 2);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(
+            tools.five_x_coding_config,
+            Some(FiveXCodingConfig::Cfg1ThreeStereo)
+        );
+        let three = tools.three_channel_data.as_ref().unwrap();
+        assert_eq!(three.psy_info.as_ref().unwrap().max_sfb_0, 14);
+        assert_eq!(tools.two_channel_data.len(), 1);
+        assert_eq!(
+            tools.two_channel_data[0]
+                .psy_info
+                .as_ref()
+                .unwrap()
+                .max_sfb_0,
+            18
+        );
+    }
+
+    #[test]
+    fn parse_5x_outer_simple_cfg2_walks_four_plus_mono() {
+        // SIMPLE, coding_config=2 -> four_channel_data + mono_data(0).
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 3); // SIMPLE
+        bw.write_u32(2, 2); // coding_config = 2 (Cfg2FourMono)
+                            // four_channel_data: long-frame, max_sfb=22, 4x chparam_info.
+        bw.write_bit(true);
+        bw.write_u32(22, 6);
+        for _ in 0..4 {
+            bw.write_u32(0, 2);
+        }
+        // mono_data(0): spec_frontend + transform + psy.
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(7, 6);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(
+            tools.five_x_coding_config,
+            Some(FiveXCodingConfig::Cfg2FourMono)
+        );
+        let four = tools.four_channel_data.as_ref().unwrap();
+        assert_eq!(four.psy_info.as_ref().unwrap().max_sfb_0, 22);
+        let back = tools.cfg2_back_mono.as_ref().unwrap();
+        assert!(!back.b_lfe);
+        assert_eq!(back.psy_info.as_ref().unwrap().max_sfb_0, 7);
     }
 
     #[test]

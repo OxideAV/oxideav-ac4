@@ -275,6 +275,58 @@ pub fn parse_asf_psy_info(
     Ok(info)
 }
 
+/// Parse `sf_info_lfe()` for the LFE channel of a 5.X / 7.X
+/// `mono_data(b_lfe=1)` body (ETSI TS 103 190-1 §4.2.8 / §4.3.6.2.1
+/// Table 21 / Table 106 column `n_msfbl_bits`).
+///
+/// Differences from the regular [`parse_asf_psy_info`]:
+///
+/// * The `max_sfb[0]` field is read with **`n_msfbl_bits`** width
+///   (Table 106 column 4) instead of `n_msfb_bits`. For long-frame
+///   transforms at 48 kHz this is `2..=3` bits rather than `4..=6`,
+///   matching the LFE band-count cap.
+/// * `b_dual_maxsfb` and `b_side_limited` aren't applicable (LFE is
+///   single-channel; there's no joint-MDCT side coding).
+/// * `b_long_frame` is forced to true per Table 21 — the LFE channel
+///   is restricted to long-frame transforms (no scale-factor grouping
+///   bits, `num_windows = num_window_groups = 1`).
+///
+/// The returned [`AsfPsyInfo`] therefore carries `max_sfb_0`,
+/// `num_windows = 1`, `num_window_groups = 1`, and an empty
+/// `scale_factor_grouping`. `max_sfb_1` / `max_sfb_side_*` are zero.
+///
+/// Returns `Error::invalid` if the transform length doesn't have an
+/// `n_msfbl_bits` entry in Table 106 (i.e. it isn't a permitted LFE
+/// transform length).
+pub fn parse_asf_psy_info_lfe(
+    br: &mut BitReader<'_>,
+    transform_info: &AsfTransformInfo,
+) -> Result<AsfPsyInfo> {
+    let mut info = AsfPsyInfo {
+        b_different_framing: false,
+        num_windows: 1,
+        num_window_groups: 1,
+        ..AsfPsyInfo::default()
+    };
+
+    // Table 106 column 4: n_msfbl_bits. 0 means the transform length
+    // isn't permitted for LFE — bail.
+    let (_nm0, _ns0, nml0) = tables::n_msfb_bits_48(transform_info.transform_length_0)
+        .ok_or_else(|| Error::invalid("ac4: asf_psy_info_lfe: unsupported transform_length"))?;
+    if nml0 == 0 {
+        return Err(Error::invalid(
+            "ac4: asf_psy_info_lfe: transform_length not permitted for LFE",
+        ));
+    }
+    info.max_sfb_0 = br.read_u32(nml0)?;
+
+    // LFE channel can be capped further by num_sfb_lfe per spec — we
+    // surface max_sfb_0 unmodified so the caller can clamp during
+    // sf_data decoding.
+
+    Ok(info)
+}
+
 /// `sap_mode` enum for `chparam_info()` (ETSI TS 103 190-1 §4.2.10.1
 /// Table 47 / §4.3.8.1).
 ///
@@ -575,6 +627,21 @@ pub struct SubstreamTools {
     pub five_x_coding_config: Option<crate::mch::FiveXCodingConfig>,
     /// Parsed LFE `mono_data(1)` payload from the 5.X / 7.X walkers.
     pub lfe_mono_data: Option<crate::mch::MonoLfeData>,
+    /// `b_2ch_mode` flag for 5.X Cfg0 (Table 25 — `coding_config == 0`).
+    /// Selects between L/R + Ls/Rs ordering; the centre channel always
+    /// follows.
+    pub b_2ch_mode: Option<bool>,
+    /// 5.X Cfg0 trailing `mono_data(0)` for the centre channel.
+    pub cfg0_centre_mono: Option<crate::mch::MonoLfeData>,
+    /// 5.X Cfg2 trailing `mono_data(0)` (the surround mono after
+    /// `four_channel_data`).
+    pub cfg2_back_mono: Option<crate::mch::MonoLfeData>,
+    /// Parsed `two_channel_data()` outer shells (Table 26) for the 5.X
+    /// `coding_config` Cfg0 (twice: `[L/R, Ls/Rs]`) and Cfg1 (once,
+    /// after `three_channel_data`). Length matches the spec's call
+    /// count for the resolved coding_config (`2` for Cfg0, `1` for Cfg1,
+    /// `0` for Cfg2/Cfg3).
+    pub two_channel_data: Vec<crate::mch::TwoChannelData>,
     /// Parsed `three_channel_data()` outer shell when the 5.X /
     /// 3.0 walker selected `coding_config == 1`.
     pub three_channel_data: Option<crate::mch::ThreeChannelData>,
@@ -1639,7 +1706,8 @@ pub fn walk_ac4_substream(
         2 => parse_stereo_audio_data_outer(&mut br, &mut tools, b_iframe, frame_len_base)?,
         // 5.0 / 5.1 — drive the `5_X_channel_element` walker
         // (§4.2.6.6 Table 25). r19 lands the outer-shell parse;
-        // inner sf_data bodies + ASPX/A-CPL trailers wait for r20.
+        // r20 fills in Cfg0/Cfg1/Cfg2 + LFE psy_info_lfe(); inner
+        // sf_data bodies + ASPX/A-CPL trailers wait for a later round.
         5 => {
             // 5.0 — no LFE.
             let _ = crate::mch::parse_5x_audio_data_outer(
@@ -1908,6 +1976,76 @@ mod tests {
         // num_windows = n_grp_bits + 1 = 4; one zero-bit => 2 groups.
         assert_eq!(psy.num_windows, 4);
         assert_eq!(psy.num_window_groups, 2);
+    }
+
+    #[test]
+    fn asf_psy_info_lfe_long_frame_2048_uses_3bit_max_sfb() {
+        // tl=2048 -> n_msfbl_bits = 3 (Table 106 column 4). max_sfb[0] = 7.
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let mut bw = BitWriter::new();
+        bw.write_u32(7, 3); // max_sfb[0] -- 3 bits, value 7
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let psy = parse_asf_psy_info_lfe(&mut br, &ti).unwrap();
+        assert_eq!(psy.max_sfb_0, 7);
+        assert_eq!(psy.num_windows, 1);
+        assert_eq!(psy.num_window_groups, 1);
+        assert_eq!(psy.max_sfb_1, 0);
+        assert!(psy.scale_factor_grouping.is_empty());
+    }
+
+    #[test]
+    fn asf_psy_info_lfe_long_frame_512_uses_2bit_max_sfb() {
+        // tl=512 -> n_msfbl_bits = 2 (Table 106). max_sfb[0] = 3.
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 512,
+            transform_length_1: 512,
+        };
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 2); // 2 bits, value 3
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let psy = parse_asf_psy_info_lfe(&mut br, &ti).unwrap();
+        assert_eq!(psy.max_sfb_0, 3);
+    }
+
+    #[test]
+    fn asf_psy_info_lfe_rejects_short_only_transforms() {
+        // tl=480 -> n_msfbl_bits = 0 in Table 106 (LFE not permitted).
+        let ti = AsfTransformInfo {
+            b_long_frame: false,
+            transf_length: [2, 2],
+            transform_length_0: 480,
+            transform_length_1: 480,
+        };
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let err = parse_asf_psy_info_lfe(&mut br, &ti).unwrap_err();
+        assert!(format!("{err}").contains("LFE"));
+    }
+
+    #[test]
+    fn asf_psy_info_lfe_rejects_unknown_transform() {
+        // tl=999 isn't in Table 106 at all.
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 999,
+            transform_length_1: 999,
+        };
+        let bytes = [0u8; 4];
+        let mut br = BitReader::new(&bytes);
+        let err = parse_asf_psy_info_lfe(&mut br, &ti).unwrap_err();
+        assert!(format!("{err}").contains("transform_length"));
     }
 
     #[test]

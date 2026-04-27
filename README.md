@@ -11,8 +11,16 @@ framework but usable standalone.
 > **Status**: Foundation. AC-4 is a complex codec. This crate parses the
 > bitstream framing, the table of contents (`ac4_toc()`), presentations
 > and substream descriptors per ETSI TS 103 190-1 V1.4.1, and exposes a
-> decoder that returns PCM silence with the right shape. Full audio
-> decoding (ASF / ASF-A2 / A-SPX subband coding) is not implemented yet.
+> decoder that emits PCM with the right shape. Mono ASF, stereo CPE
+> (split + joint MDCT), full A-SPX front-end, A-CPL channel-pair
+> synthesis (ASPX_ACPL_1 / ASPX_ACPL_2), DRC + DE + outer metadata
+> walker are all implemented. Round 20 unblocks the ETSI Huffman-table
+> audit (60 codebooks validated byte-for-byte against the canonical
+> ETSI accompaniment file in `tests/etsi_table_validation.rs`) and
+> wires the 5.X channel-element walker family's Cfg0 / Cfg1 / Cfg2
+> outer shells plus a Table-21-correct `sf_info_lfe()` parser. **352
+> tests**. Pending: per-channel `sf_data(ASF)` Huffman bodies for the
+> multichannel elements + ASPX_ACPL_3 transform synthesis.
 
 ## Specs
 
