@@ -18,9 +18,14 @@ framework but usable standalone.
 > audit (60 codebooks validated byte-for-byte against the canonical
 > ETSI accompaniment file in `tests/etsi_table_validation.rs`) and
 > wires the 5.X channel-element walker family's Cfg0 / Cfg1 / Cfg2
-> outer shells plus a Table-21-correct `sf_info_lfe()` parser. **352
+> outer shells plus a Table-21-correct `sf_info_lfe()` parser. Round 21
+> lands the §5.7.7.6.2 ASPX_ACPL_3 transform-matrix synthesis math
+> (Pseudocodes 118/119 — `Transform()`, `ACplModule2()`, `ACplModule3()`
+> and the full 5-channel pipeline `run_pseudocode_118_5x()`). **363
 > tests**. Pending: per-channel `sf_data(ASF)` Huffman bodies for the
-> multichannel elements + ASPX_ACPL_3 transform synthesis.
+> multichannel elements (still gated on Pseudocode 178 transform-matrix
+> wiring) + ASPX_ACPL_1/2 multichannel wrappers (Pseudocode 117) +
+> 5_X-walker glue from the bitstream into the new transform synthesis.
 
 ## Specs
 

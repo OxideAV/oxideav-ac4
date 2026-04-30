@@ -49,15 +49,25 @@
 //!   plus the decorrelator + ducker state for the full
 //!   `Pseudocode 115` channel-pair synthesis path.
 //!
+//! * **§5.7.7.6.2 Multichannel `ASPX_ACPL_3`** — [`transform`]
+//!   (Pseudocode 119), [`acpl_module2`] / [`acpl_module3`] (also
+//!   Pseudocode 119) and [`run_pseudocode_118_5x`] (Pseudocode 118)
+//!   synthesise the five output channels (`z0..z4`) from the two A-CPL
+//!   carrier channels (`x0`, `x1`), the centre passthrough `x2`, and the
+//!   six gamma matrices `g1..g6`. The three parallel decorrelator paths
+//!   (D0/D1/D2) are driven by `Transform()`-mixed inputs and routed
+//!   through `ACplModule2` (gamma+alpha+beta combiner) followed by
+//!   `ACplModule3` (beta3 cross-residual term) per the spec.
+//!
 //! What is NOT covered yet (TS 103 190-1):
 //!
-//! * Multichannel `5_X_codec_mode = ASPX_ACPL_3` (Pseudocode 117 /
-//!   Pseudocode 118) — needs `Transform`, `ACplModule2`, `ACplModule3`
-//!   and the gamma-driven 3-module pipeline; ALPHA / BETA / BETA3 /
-//!   GAMMA dequant tables are already in place to plug those in.
-//! * Hooking the synthesis into the frame-level decoder pipeline (the
-//!   asf walker still parses `acpl_data_*` but doesn't drive
-//!   [`acpl_module`]).
+//! * §5.7.7.6.1 ASPX_ACPL_1 / ASPX_ACPL_2 multichannel wrapper
+//!   (Pseudocode 117) — uses two parallel `ACplModule`s with `y0/y1`
+//!   driven by D0/D1; the building blocks are all here, but the 5-input
+//!   wrapper still needs wiring.
+//! * Hooking the multichannel synthesis into the frame-level decoder
+//!   pipeline (the asf walker still parses `acpl_data_*` but the 5_X
+//!   walker doesn't yet drive [`run_pseudocode_118_5x`]).
 
 use crate::acpl::{sb_to_pb, AcplHuffParam, AcplQuantMode};
 use crate::qmf::NUM_QMF_SUBBANDS;
@@ -970,6 +980,683 @@ pub fn run_pseudocode_115_pair(state: &mut AcplCpeState, frame: AcplCpeFrame<'_>
         update_param_prev(&mut state.beta_prev_sb, &beta_sb[last_idx]);
     }
     out
+}
+
+// =====================================================================
+// §5.7.7.6.2 Pseudocodes 118 / 119 — ASPX_ACPL_3 multichannel synthesis
+// =====================================================================
+
+/// Per-channel QMF matrix shape used throughout §5.7.7.6.2: a vector of
+/// per-timeslot `[ (re, im); NUM_QMF_SUBBANDS ]` columns.
+pub type AcplQmfMatrix = Vec<[(f32, f32); NUM_QMF_SUBBANDS]>;
+
+/// `Transform(g1, g2, num_pset, x0, x1)` per §5.7.7.6.2 Pseudocode 119.
+///
+/// Linearly mixes the two A-CPL carrier channels (`x0`, `x1`) by the
+/// interpolated gamma matrices `g1`, `g2`:
+///
+/// ```text
+///   v[ts][sb] = x0[ts][sb] * interp_g1[ts][sb]
+///             + x1[ts][sb] * interp_g2[ts][sb]
+/// ```
+///
+/// `g1_pb` / `g2_pb` are per-`(pset, pb)` matrices; we fan them out to
+/// per-subband via [`expand_pb_to_sb`] and then the §5.7.7.3 [`interpolate`]
+/// call walks them across timeslots. `prev_g1` / `prev_g2` carry the
+/// previous frame's last-set `[sb]` row (zero on the first frame, per the
+/// spec).
+///
+/// The output is `[ts][sb]` shaped, matching the rest of the §5.7.7
+/// per-slot interfaces.
+#[allow(clippy::too_many_arguments)]
+pub fn transform(
+    x0: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+    x1: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+    g1_pb: &[Vec<f32>],
+    g2_pb: &[Vec<f32>],
+    num_param_bands: u32,
+    prev_g1: &[f32],
+    prev_g2: &[f32],
+    steep: bool,
+    param_timeslots: &[u8],
+) -> Vec<[(f32, f32); NUM_QMF_SUBBANDS]> {
+    let num_ts = x0.len();
+    debug_assert_eq!(x1.len(), num_ts);
+    let num_pset = g1_pb.len() as u32;
+    let g1_sb = expand_pb_to_sb(g1_pb, num_param_bands);
+    let g2_sb = expand_pb_to_sb(g2_pb, num_param_bands);
+    let g1_inp = InterpInputs {
+        by_pset: &g1_sb,
+        prev: prev_g1,
+    };
+    let g2_inp = InterpInputs {
+        by_pset: &g2_sb,
+        prev: prev_g2,
+    };
+    let mut out = Vec::with_capacity(num_ts);
+    for ts in 0..num_ts {
+        let mut v_col = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
+        for sb in 0..NUM_QMF_SUBBANDS as u32 {
+            let g1 = interpolate(
+                &g1_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let g2 = interpolate(
+                &g2_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let (x0r, x0i) = x0[ts][sb as usize];
+            let (x1r, x1i) = x1[ts][sb as usize];
+            v_col[sb as usize] = (x0r * g1 + x1r * g2, x0i * g1 + x1i * g2);
+        }
+        out.push(v_col);
+    }
+    out
+}
+
+/// `ACplModule2(g1, g2, a, b, num_pset, x0, x1, y)` per §5.7.7.6.2
+/// Pseudocode 119.
+///
+/// Builds the (z0, z1) channel pair from the two A-CPL carrier inputs,
+/// the gamma + alpha + beta parameter matrices, and the decorrelator
+/// output `y`:
+///
+/// ```text
+///   z0 = 0.5*(x0*(g1+g1*a) + x1*(g2+g2*a) + y*b)
+///   z1 = 0.5*(x0*(g1-g1*a) + x1*(g2-g2*a) - y*b)
+/// ```
+///
+/// The interpolations are taken on the full `g1`, `g2`, `g1*a`, `g2*a`
+/// and `b` per-`pb` matrices (computed from the dequantised arrays
+/// before the call). Per the spec the interpolations are computed on
+/// the products `g*a` (not on `g` and `a` separately) because that's
+/// the point at which time-interpolation must be evaluated.
+///
+/// `prev_*` are the previous-frame `[sb]` rows for each interpolated
+/// matrix (zero on the first frame).
+#[allow(clippy::too_many_arguments)]
+pub fn acpl_module2(
+    x0: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+    x1: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+    y: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+    g1_pb: &[Vec<f32>],
+    g2_pb: &[Vec<f32>],
+    g1a_pb: &[Vec<f32>],
+    g2a_pb: &[Vec<f32>],
+    b_pb: &[Vec<f32>],
+    num_param_bands: u32,
+    steep: bool,
+    param_timeslots: &[u8],
+) -> (AcplQmfMatrix, AcplQmfMatrix) {
+    let num_ts = x0.len();
+    debug_assert_eq!(x1.len(), num_ts);
+    debug_assert_eq!(y.len(), num_ts);
+    let num_pset = g1_pb.len() as u32;
+    let g1_sb = expand_pb_to_sb(g1_pb, num_param_bands);
+    let g2_sb = expand_pb_to_sb(g2_pb, num_param_bands);
+    let g1a_sb = expand_pb_to_sb(g1a_pb, num_param_bands);
+    let g2a_sb = expand_pb_to_sb(g2a_pb, num_param_bands);
+    let b_sb = expand_pb_to_sb(b_pb, num_param_bands);
+    let zero_prev = vec![0.0f32; NUM_QMF_SUBBANDS];
+    let g1_inp = InterpInputs {
+        by_pset: &g1_sb,
+        prev: &zero_prev,
+    };
+    let g2_inp = InterpInputs {
+        by_pset: &g2_sb,
+        prev: &zero_prev,
+    };
+    let g1a_inp = InterpInputs {
+        by_pset: &g1a_sb,
+        prev: &zero_prev,
+    };
+    let g2a_inp = InterpInputs {
+        by_pset: &g2a_sb,
+        prev: &zero_prev,
+    };
+    let b_inp = InterpInputs {
+        by_pset: &b_sb,
+        prev: &zero_prev,
+    };
+
+    let mut z0_out = Vec::with_capacity(num_ts);
+    let mut z1_out = Vec::with_capacity(num_ts);
+    for ts in 0..num_ts {
+        let mut z0_col = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
+        let mut z1_col = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
+        for sb in 0..NUM_QMF_SUBBANDS as u32 {
+            let g1 = interpolate(
+                &g1_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let g2 = interpolate(
+                &g2_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let g1a = interpolate(
+                &g1a_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let g2a = interpolate(
+                &g2a_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let b = interpolate(
+                &b_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let sb_i = sb as usize;
+            let (x0r, x0i) = x0[ts][sb_i];
+            let (x1r, x1i) = x1[ts][sb_i];
+            let (yr, yi) = y[ts][sb_i];
+            z0_col[sb_i] = (
+                0.5 * (x0r * (g1 + g1a) + x1r * (g2 + g2a) + yr * b),
+                0.5 * (x0i * (g1 + g1a) + x1i * (g2 + g2a) + yi * b),
+            );
+            z1_col[sb_i] = (
+                0.5 * (x0r * (g1 - g1a) + x1r * (g2 - g2a) - yr * b),
+                0.5 * (x0i * (g1 - g1a) + x1i * (g2 - g2a) - yi * b),
+            );
+        }
+        z0_out.push(z0_col);
+        z1_out.push(z1_col);
+    }
+    (z0_out, z1_out)
+}
+
+/// `ACplModule3(b3, a, num_pset, z0, z1, y2)` per §5.7.7.6.2
+/// Pseudocode 119.
+///
+/// Adds a cross-residual decorrelator term to an existing `(z0, z1)`
+/// pair using `beta3` and the alpha matrix:
+///
+/// ```text
+///   z0 += 0.25 * y2 * (b3 + b3*a)
+///   z1 += 0.25 * y2 * (b3 - b3*a)
+/// ```
+///
+/// The dequantised `b3_pb` and `b3a_pb` per-`(pset, pb)` matrices are
+/// fanned out to subbands via [`expand_pb_to_sb`] and run through
+/// [`interpolate`] across timeslots. The `(z0, z1)` slices are mutated
+/// in-place to match the spec's `z0[ts][sb] += ...` form.
+#[allow(clippy::too_many_arguments)]
+pub fn acpl_module3(
+    z0: &mut [[(f32, f32); NUM_QMF_SUBBANDS]],
+    z1: &mut [[(f32, f32); NUM_QMF_SUBBANDS]],
+    y2: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+    b3_pb: &[Vec<f32>],
+    b3a_pb: &[Vec<f32>],
+    num_param_bands: u32,
+    steep: bool,
+    param_timeslots: &[u8],
+) {
+    let num_ts = z0.len();
+    debug_assert_eq!(z1.len(), num_ts);
+    debug_assert_eq!(y2.len(), num_ts);
+    let num_pset = b3_pb.len() as u32;
+    let b3_sb = expand_pb_to_sb(b3_pb, num_param_bands);
+    let b3a_sb = expand_pb_to_sb(b3a_pb, num_param_bands);
+    let zero_prev = vec![0.0f32; NUM_QMF_SUBBANDS];
+    let b3_inp = InterpInputs {
+        by_pset: &b3_sb,
+        prev: &zero_prev,
+    };
+    let b3a_inp = InterpInputs {
+        by_pset: &b3a_sb,
+        prev: &zero_prev,
+    };
+    for ts in 0..num_ts {
+        for sb in 0..NUM_QMF_SUBBANDS as u32 {
+            let b3 = interpolate(
+                &b3_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let b3a = interpolate(
+                &b3a_inp,
+                num_pset,
+                sb,
+                ts as u32,
+                num_ts as u32,
+                steep,
+                param_timeslots,
+            );
+            let sb_i = sb as usize;
+            let (yr, yi) = y2[ts][sb_i];
+            z0[ts][sb_i].0 += 0.25 * yr * (b3 + b3a);
+            z0[ts][sb_i].1 += 0.25 * yi * (b3 + b3a);
+            z1[ts][sb_i].0 += 0.25 * yr * (b3 - b3a);
+            z1[ts][sb_i].1 += 0.25 * yi * (b3 - b3a);
+        }
+    }
+}
+
+/// Helper: per-`(pset, pb)` element-wise multiply of two per-band
+/// matrices. Returned matrix has the same shape as `a`. For mismatched
+/// inner-row lengths the shorter wins.
+fn pb_matrix_mul(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b.iter())
+        .map(|(ar, br)| {
+            let n = ar.len().min(br.len());
+            let mut row = Vec::with_capacity(n);
+            for i in 0..n {
+                row.push(ar[i] * br[i]);
+            }
+            row
+        })
+        .collect()
+}
+
+/// Helper: per-`(pset, pb)` element-wise sum of three per-band
+/// matrices. Used to build `g1+g3+g5` and `g2+g4+g6` for the third
+/// `Transform()` call in Pseudocode 118.
+fn pb_matrix_sum3(a: &[Vec<f32>], b: &[Vec<f32>], c: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    a.iter()
+        .zip(b.iter())
+        .zip(c.iter())
+        .map(|((ar, br), cr)| {
+            let n = ar.len().min(br.len()).min(cr.len());
+            let mut row = Vec::with_capacity(n);
+            for i in 0..n {
+                row.push(ar[i] + br[i] + cr[i]);
+            }
+            row
+        })
+        .collect()
+}
+
+/// Helper: scalar-multiply each element of a `(pset, pb)` matrix.
+fn pb_matrix_scale(a: &[Vec<f32>], s: f32) -> Vec<Vec<f32>> {
+    a.iter()
+        .map(|row| row.iter().map(|&v| v * s).collect())
+        .collect()
+}
+
+/// Persistent state for the §5.7.7.6.2 ASPX_ACPL_3 multichannel
+/// pipeline: three parallel `D0`/`D1`/`D2` decorrelator + ducker pairs
+/// (one per `Transform()` output) plus the running `prev` matrices for
+/// the gamma interpolations.
+#[derive(Debug, Clone)]
+pub struct AcplMchState {
+    pub d0: InputSignalModifier,
+    pub d1: InputSignalModifier,
+    pub d2: InputSignalModifier,
+    pub ducker0: TransientDucker,
+    pub ducker1: TransientDucker,
+    pub ducker2: TransientDucker,
+    /// `acpl_g1_prev[sb]` — last-frame's per-sb gamma1 row.
+    pub g1_prev_sb: Vec<f32>,
+    pub g2_prev_sb: Vec<f32>,
+    pub g3_prev_sb: Vec<f32>,
+    pub g4_prev_sb: Vec<f32>,
+}
+
+impl AcplMchState {
+    pub fn new() -> Self {
+        Self {
+            d0: InputSignalModifier::new(DecorrelatorId::D0),
+            d1: InputSignalModifier::new(DecorrelatorId::D1),
+            d2: InputSignalModifier::new(DecorrelatorId::D2),
+            ducker0: TransientDucker::new(),
+            ducker1: TransientDucker::new(),
+            ducker2: TransientDucker::new(),
+            g1_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
+            g2_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
+            g3_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
+            g4_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
+        }
+    }
+}
+
+impl Default for AcplMchState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Inputs to one full §5.7.7.6.2 ASPX_ACPL_3 multichannel synthesis pass.
+///
+/// All matrices are per-`(pset, pb)`. The dequantisation pipeline must
+/// have already converted the Huffman-decoded indices via
+/// [`dequantize_alpha_beta`] / [`dequantize_beta3`] / [`dequantize_gamma`].
+pub struct AcplMchFrame<'a> {
+    /// `x0[ts][sb]` — first A-CPL carrier (left/L for ASPX_ACPL_3).
+    pub x0: &'a [[(f32, f32); NUM_QMF_SUBBANDS]],
+    /// `x1[ts][sb]` — second A-CPL carrier (right/R for ASPX_ACPL_3).
+    pub x1: &'a [[(f32, f32); NUM_QMF_SUBBANDS]],
+    /// `x2[ts][sb]` — centre channel passthrough.
+    pub x2: &'a [[(f32, f32); NUM_QMF_SUBBANDS]],
+    /// `acpl_alpha_1_dq[pset][pb]` (left side).
+    pub alpha_1_dq: &'a [Vec<f32>],
+    /// `acpl_alpha_2_dq[pset][pb]` (right side).
+    pub alpha_2_dq: &'a [Vec<f32>],
+    /// `acpl_beta_1_dq[pset][pb]`.
+    pub beta_1_dq: &'a [Vec<f32>],
+    /// `acpl_beta_2_dq[pset][pb]`.
+    pub beta_2_dq: &'a [Vec<f32>],
+    /// `acpl_beta_3_dq[pset][pb]` — the cross-residual term used by
+    /// `ACplModule3`.
+    pub beta_3_dq: &'a [Vec<f32>],
+    /// `g1_dq[pset][pb]` .. `g6_dq[pset][pb]` per §5.7.7.7 Tables 207-208.
+    pub g1_dq: &'a [Vec<f32>],
+    pub g2_dq: &'a [Vec<f32>],
+    pub g3_dq: &'a [Vec<f32>],
+    pub g4_dq: &'a [Vec<f32>],
+    pub g5_dq: &'a [Vec<f32>],
+    pub g6_dq: &'a [Vec<f32>],
+    pub num_param_bands: u32,
+    pub steep: bool,
+    pub param_timeslots: &'a [u8],
+}
+
+/// Output channels from [`run_pseudocode_118_5x`] — `(L, R, C, Ls, Rs)`
+/// indexed as `(z0, z2, z4, z1, z3)` in the spec.
+pub struct AcplMchOutput {
+    pub z0: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // L
+    pub z2: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // R
+    pub z4: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // C
+    pub z1: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // Ls
+    pub z3: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // Rs
+}
+
+/// Run the full §5.7.7.6.2 Pseudocode 118 ASPX_ACPL_3 multichannel
+/// pipeline. Produces the five output channels (L, Ls, R, Rs, C) from
+/// the two A-CPL carriers, the centre channel and the gamma+alpha+beta
+/// matrices.
+///
+/// Pipeline (verbatim from Pseudocode 118):
+///
+/// 1. `x0in = x0*(1+2*sqrt(0.5))`, `x1in = x1*(1+2*sqrt(0.5))`.
+/// 2. `v1 = Transform(g1, g2, x0in, x1in)`,
+///    `v2 = Transform(g3, g4, x0in, x1in)`,
+///    `v3 = Transform(g1+g3+g5, g2+g4+g6, x0in, x1in)`.
+/// 3. `u0 = D0(v1)`, `u1 = D1(v2)`, `u2 = D2(v3)`.
+/// 4. `y0 = ducker(u0)`, `y1 = ducker(u1)`, `y2 = ducker(u2)`.
+/// 5. `(z0, z1) = ACplModule2(g1, g2, alpha_1, beta_1, x0in, x1in, y0)`.
+/// 6. `(z2, z3) = ACplModule2(g3, g4, alpha_2, beta_2, x0in, x1in, y1)`.
+/// 7. `(z4, z5) = ACplModule2(g5, g6, 1, 0, x0in, x1in, 0)`.
+/// 8. `(z0, z1) = ACplModule3(beta_3, alpha_1, z0, z1, y2)`.
+/// 9. `(z2, z3) = ACplModule3(beta_3, alpha_2, z2, z3, y2)`.
+/// 10. `(z4, z5) = ACplModule3(-beta_3, 1, z4, z5, y2)`.
+/// 11. `z1 *= sqrt(2)`, `z3 *= sqrt(2)`, `z4 *= sqrt(2)`.
+/// 12. `z4 = x2` (note: per the spec text, z4 is initialised from
+///     `ACplModule2(g5, g6, ..)` and then has the ACplModule3 correction
+///     and `*sqrt(2)` applied — but the surrounding text in §5.7.7.6.2
+///     reads "z4 = x2" outside the pseudocode body. We follow the
+///     pseudocode literally: the centre channel is the synthesised z4;
+///     a caller wanting the spec's "z4 = x2" passthrough can override
+///     [`AcplMchOutput::z4`] after the fact).
+pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) -> AcplMchOutput {
+    let num_ts = frame.x0.len();
+    debug_assert_eq!(frame.x1.len(), num_ts);
+    debug_assert_eq!(frame.x2.len(), num_ts);
+
+    // Step 1: x0in = x0 * (1 + 2*sqrt(0.5)), x1in = x1 * (1 + 2*sqrt(0.5)).
+    // 1 + 2*sqrt(0.5) = 1 + sqrt(2).
+    let scale = 1.0 + 2.0 * (0.5f32).sqrt();
+    let scale_x = |x: &[[(f32, f32); NUM_QMF_SUBBANDS]]| -> Vec<[(f32, f32); NUM_QMF_SUBBANDS]> {
+        x.iter()
+            .map(|col| {
+                let mut out = *col;
+                for sb in 0..NUM_QMF_SUBBANDS {
+                    out[sb].0 *= scale;
+                    out[sb].1 *= scale;
+                }
+                out
+            })
+            .collect()
+    };
+    let x0in = scale_x(frame.x0);
+    let x1in = scale_x(frame.x1);
+
+    // Step 2: build the three Transform() outputs.
+    let g_sum_1 = pb_matrix_sum3(frame.g1_dq, frame.g3_dq, frame.g5_dq);
+    let g_sum_2 = pb_matrix_sum3(frame.g2_dq, frame.g4_dq, frame.g6_dq);
+    let v1 = transform(
+        &x0in,
+        &x1in,
+        frame.g1_dq,
+        frame.g2_dq,
+        frame.num_param_bands,
+        &state.g1_prev_sb,
+        &state.g2_prev_sb,
+        frame.steep,
+        frame.param_timeslots,
+    );
+    let v2 = transform(
+        &x0in,
+        &x1in,
+        frame.g3_dq,
+        frame.g4_dq,
+        frame.num_param_bands,
+        &state.g3_prev_sb,
+        &state.g4_prev_sb,
+        frame.steep,
+        frame.param_timeslots,
+    );
+    let v3 = transform(
+        &x0in,
+        &x1in,
+        &g_sum_1,
+        &g_sum_2,
+        frame.num_param_bands,
+        &vec![0.0; NUM_QMF_SUBBANDS],
+        &vec![0.0; NUM_QMF_SUBBANDS],
+        frame.steep,
+        frame.param_timeslots,
+    );
+
+    // Step 3: u_x = decorrelator_x(v_x).
+    let mut u0 = Vec::with_capacity(num_ts);
+    let mut u1 = Vec::with_capacity(num_ts);
+    let mut u2 = Vec::with_capacity(num_ts);
+    for ts in 0..num_ts {
+        let mut col0 = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
+        let mut col1 = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
+        let mut col2 = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
+        for sb in 0..NUM_QMF_SUBBANDS as u32 {
+            col0[sb as usize] = state.d0.process_sample(sb, v1[ts][sb as usize]);
+            col1[sb as usize] = state.d1.process_sample(sb, v2[ts][sb as usize]);
+            col2[sb as usize] = state.d2.process_sample(sb, v3[ts][sb as usize]);
+        }
+        u0.push(col0);
+        u1.push(col1);
+        u2.push(col2);
+    }
+
+    // Step 4: y_x = ducker(u_x).
+    let apply_ducker = |u: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+                        ducker: &mut TransientDucker|
+     -> Vec<[(f32, f32); NUM_QMF_SUBBANDS]> {
+        u.iter()
+            .map(|col| {
+                let p_energy = compute_p_energy(col, frame.num_param_bands);
+                let duck = ducker.update(&p_energy);
+                apply_transient_ducker(col, &duck, frame.num_param_bands)
+            })
+            .collect()
+    };
+    let y0 = apply_ducker(&u0, &mut state.ducker0);
+    let y1 = apply_ducker(&u1, &mut state.ducker1);
+    let y2 = apply_ducker(&u2, &mut state.ducker2);
+
+    // Step 5: (z0, z1) = ACplModule2(g1, g2, alpha_1, beta_1, x0in, x1in, y0).
+    // Per Pseudocode 119 the (g1*a) / (g2*a) interpolations sample the
+    // *product* matrices — we precompute them at parameter-band granularity.
+    let g1_a1 = pb_matrix_mul(frame.g1_dq, frame.alpha_1_dq);
+    let g2_a1 = pb_matrix_mul(frame.g2_dq, frame.alpha_1_dq);
+    let (mut z0, mut z1) = acpl_module2(
+        &x0in,
+        &x1in,
+        &y0,
+        frame.g1_dq,
+        frame.g2_dq,
+        &g1_a1,
+        &g2_a1,
+        frame.beta_1_dq,
+        frame.num_param_bands,
+        frame.steep,
+        frame.param_timeslots,
+    );
+
+    // Step 6: (z2, z3) = ACplModule2(g3, g4, alpha_2, beta_2, x0in, x1in, y1).
+    let g3_a2 = pb_matrix_mul(frame.g3_dq, frame.alpha_2_dq);
+    let g4_a2 = pb_matrix_mul(frame.g4_dq, frame.alpha_2_dq);
+    let (mut z2, mut z3) = acpl_module2(
+        &x0in,
+        &x1in,
+        &y1,
+        frame.g3_dq,
+        frame.g4_dq,
+        &g3_a2,
+        &g4_a2,
+        frame.beta_2_dq,
+        frame.num_param_bands,
+        frame.steep,
+        frame.param_timeslots,
+    );
+
+    // Step 7: (z4, z5) = ACplModule2(g5, g6, 1, 0, x0in, x1in, 0).
+    // a == 1 → g*a == g; b == 0 → no decorrelator term; y == 0 too.
+    let zero_y = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+    // β = 0 across all bands. The shape follows the gamma matrices.
+    let zero_pb: Vec<Vec<f32>> = frame
+        .g5_dq
+        .iter()
+        .map(|row| vec![0.0f32; row.len()])
+        .collect();
+    let (mut z4, _z5) = acpl_module2(
+        &x0in,
+        &x1in,
+        &zero_y,
+        frame.g5_dq,
+        frame.g6_dq,
+        frame.g5_dq, // g5 * 1
+        frame.g6_dq, // g6 * 1
+        &zero_pb,
+        frame.num_param_bands,
+        frame.steep,
+        frame.param_timeslots,
+    );
+    // _z5 is a temporary per the spec note ("Note that z5 is used as a
+    // temporary variable only and does not constitute an output channel.").
+
+    // Step 8: (z0, z1) += ACplModule3(beta_3, alpha_1, z0, z1, y2).
+    let b3_a1 = pb_matrix_mul(frame.beta_3_dq, frame.alpha_1_dq);
+    acpl_module3(
+        &mut z0,
+        &mut z1,
+        &y2,
+        frame.beta_3_dq,
+        &b3_a1,
+        frame.num_param_bands,
+        frame.steep,
+        frame.param_timeslots,
+    );
+
+    // Step 9: (z2, z3) += ACplModule3(beta_3, alpha_2, z2, z3, y2).
+    let b3_a2 = pb_matrix_mul(frame.beta_3_dq, frame.alpha_2_dq);
+    acpl_module3(
+        &mut z2,
+        &mut z3,
+        &y2,
+        frame.beta_3_dq,
+        &b3_a2,
+        frame.num_param_bands,
+        frame.steep,
+        frame.param_timeslots,
+    );
+
+    // Step 10: (z4, z5) += ACplModule3(-beta_3, 1, z4, z5, y2). a == 1 →
+    // beta3*a == beta3 (i.e. b3a == b3 with a sign flip on b3 — but the
+    // spec writes -b3 for this row). So b3 is negated and b3a == -b3 too.
+    let neg_b3 = pb_matrix_scale(frame.beta_3_dq, -1.0);
+    let neg_b3_a = pb_matrix_scale(frame.beta_3_dq, -1.0); // a == 1 → -b3*1 = -b3.
+    let mut z5_dummy = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+    acpl_module3(
+        &mut z4,
+        &mut z5_dummy,
+        &y2,
+        &neg_b3,
+        &neg_b3_a,
+        frame.num_param_bands,
+        frame.steep,
+        frame.param_timeslots,
+    );
+
+    // Step 11: z1 *= sqrt(2), z3 *= sqrt(2), z4 *= sqrt(2).
+    let sq2 = (2.0f32).sqrt();
+    let scale_inplace = |z: &mut [[(f32, f32); NUM_QMF_SUBBANDS]], s: f32| {
+        for col in z.iter_mut() {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                col[sb].0 *= s;
+                col[sb].1 *= s;
+            }
+        }
+    };
+    scale_inplace(&mut z1, sq2);
+    scale_inplace(&mut z3, sq2);
+    scale_inplace(&mut z4, sq2);
+
+    // Update state's prev arrays from the last param set's expanded
+    // [sb] rows (gammas only — alpha/beta state lives elsewhere if a
+    // caller wants to chain it).
+    let update_prev = |prev: &mut Vec<f32>, src_pb: &[Vec<f32>]| {
+        if !src_pb.is_empty() {
+            let last = &src_pb[src_pb.len() - 1];
+            let sb = expand_pb_to_sb(std::slice::from_ref(last), frame.num_param_bands);
+            update_param_prev(prev, &sb[0]);
+        }
+    };
+    update_prev(&mut state.g1_prev_sb, frame.g1_dq);
+    update_prev(&mut state.g2_prev_sb, frame.g2_dq);
+    update_prev(&mut state.g3_prev_sb, frame.g3_dq);
+    update_prev(&mut state.g4_prev_sb, frame.g4_dq);
+
+    AcplMchOutput { z0, z2, z4, z1, z3 }
 }
 
 // =====================================================================
@@ -1930,5 +2617,341 @@ mod tests {
         };
         let mut state = AcplSubstreamState::new();
         assert!(run_acpl_1ch_pcm(&pcm, &cfg, &data, &mut state).is_none());
+    }
+
+    // =====================================================================
+    // §5.7.7.6.2 — ASPX_ACPL_3 multichannel transform synthesis tests
+    // (Pseudocodes 117 / 118 / 119 wiring + helpers)
+    // =====================================================================
+
+    /// `Transform()` with `g1 = 1, g2 = 0` should pass `x0` through and
+    /// drop `x1`. `g1 = 0, g2 = 1` should pass `x1` through.
+    #[test]
+    fn transform_unit_gammas_select_carriers() {
+        let num_ts = 8usize;
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x1 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            x0[ts][10] = (1.0, 0.0);
+            x1[ts][10] = (0.0, 1.0);
+        }
+        let g1 = vec![vec![1.0f32; 15]];
+        let g2 = vec![vec![0.0f32; 15]];
+        let prev = vec![1.0f32; NUM_QMF_SUBBANDS];
+        let prev_zero = vec![0.0f32; NUM_QMF_SUBBANDS];
+        // num_pset == 1, prev_g1 = 1.0 across sb -> interpolation stays
+        // at 1.0 (start at prev=1.0, target=1.0, no ramp).
+        let v = transform(&x0, &x1, &g1, &g2, 15, &prev, &prev_zero, false, &[]);
+        for ts in 0..num_ts {
+            // sb=10: v = x0 * 1 + x1 * 0 = x0.
+            let (vr, vi) = v[ts][10];
+            assert!((vr - 1.0).abs() < 1e-5, "ts={ts} vr={vr}, expected x0=1.0");
+            assert!((vi - 0.0).abs() < 1e-5, "ts={ts} vi={vi}");
+            // sb=20: both x0 and x1 are zero, result must be zero.
+            assert_eq!(v[ts][20], (0.0, 0.0));
+        }
+
+        // Now flip: g1 = 0 → x1 carries through.
+        let g1 = vec![vec![0.0f32; 15]];
+        let g2 = vec![vec![1.0f32; 15]];
+        let prev_g2 = vec![1.0f32; NUM_QMF_SUBBANDS];
+        let v = transform(&x0, &x1, &g1, &g2, 15, &prev_zero, &prev_g2, false, &[]);
+        for ts in 0..num_ts {
+            let (vr, vi) = v[ts][10];
+            assert!((vr - 0.0).abs() < 1e-5);
+            assert!((vi - 1.0).abs() < 1e-5);
+        }
+    }
+
+    /// `Transform()` with mixed gammas should produce the linear
+    /// combination `x0*g1 + x1*g2` after the smooth-interpolation ramp.
+    #[test]
+    fn transform_mixes_two_carriers_with_gammas() {
+        let num_ts = 4usize;
+        let mut x0 = vec![[(2.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x1 = vec![[(0.0f32, 3.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        // Make g1 = 0.5 across all bands, g2 = 0.25. With prev = same
+        // values, smooth interpolation collapses to constant gammas.
+        let g1 = vec![vec![0.5f32; 15]];
+        let g2 = vec![vec![0.25f32; 15]];
+        let prev_g1 = vec![0.5f32; NUM_QMF_SUBBANDS];
+        let prev_g2 = vec![0.25f32; NUM_QMF_SUBBANDS];
+        let v = transform(&x0, &x1, &g1, &g2, 15, &prev_g1, &prev_g2, false, &[]);
+        for ts in 0..num_ts {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                let (vr, vi) = v[ts][sb];
+                // x0 contributes (2 * 0.5, 0). x1 contributes (0, 3 * 0.25).
+                assert!((vr - 1.0).abs() < 1e-5, "ts={ts} sb={sb} vr={vr}");
+                assert!((vi - 0.75).abs() < 1e-5, "ts={ts} sb={sb} vi={vi}");
+            }
+        }
+        // Quiet unused-mut warnings.
+        let _ = (&mut x0, &mut x1);
+    }
+
+    /// `acpl_module2()` with g1=g2=g1*a=g2*a=b=0 must yield silent z0,z1.
+    #[test]
+    fn acpl_module2_zero_gammas_is_silent() {
+        let num_ts = 4usize;
+        let x0 = vec![[(1.0f32, 0.5f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x1 = vec![[(0.5f32, 1.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let y = vec![[(2.0f32, 2.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let zero = vec![vec![0.0f32; 15]];
+        let (z0, z1) = acpl_module2(
+            &x0,
+            &x1,
+            &y,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            15,
+            false,
+            &[],
+        );
+        for ts in 0..num_ts {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                assert_eq!(z0[ts][sb], (0.0, 0.0));
+                assert_eq!(z1[ts][sb], (0.0, 0.0));
+            }
+        }
+    }
+
+    /// `acpl_module2()` with g1=1, g2=0, a=0, b=0 (so g1a = g2a = 0):
+    ///   z0 = 0.5 * (x0 * (g1+g1a) + x1 * (g2+g2a) + y*b)
+    ///       = 0.5 * x0 * 1
+    ///   z1 = 0.5 * x0 * (1-0) = 0.5 * x0
+    /// → both z0 and z1 collapse to 0.5*x0.
+    #[test]
+    fn acpl_module2_unit_g1_zero_alpha_beta_passes_half_x0_to_both() {
+        let num_ts = 4usize;
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x1 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let y = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            x0[ts][5] = (4.0, 2.0);
+        }
+        let g1 = vec![vec![1.0f32; 15]];
+        let g2 = vec![vec![0.0f32; 15]];
+        let g1a = vec![vec![0.0f32; 15]]; // a=0 → g1*a=0
+        let g2a = vec![vec![0.0f32; 15]];
+        let b = vec![vec![0.0f32; 15]];
+        let (z0, z1) = acpl_module2(&x0, &x1, &y, &g1, &g2, &g1a, &g2a, &b, 15, false, &[]);
+        // smooth interpolation with prev=0, target=1 → at ts=num_ts-1, g1
+        // hits 1.0, but z formula has g1+g1a so 1+0=1; z = 0.5*x0*1 = 0.5*x0.
+        // Just assert the last ts converges.
+        let last = num_ts - 1;
+        let (z0r, z0i) = z0[last][5];
+        let (z1r, z1i) = z1[last][5];
+        assert!((z0r - 2.0).abs() < 1e-5, "z0r={z0r} expected 2.0");
+        assert!((z0i - 1.0).abs() < 1e-5, "z0i={z0i} expected 1.0");
+        assert!((z1r - 2.0).abs() < 1e-5, "z1r={z1r}");
+        assert!((z1i - 1.0).abs() < 1e-5, "z1i={z1i}");
+    }
+
+    /// `acpl_module3()` adds a beta3-driven decorrelator residual.
+    /// With b3=1, b3a=0 (i.e. a=0): z0 += 0.25*y*1 = 0.25*y, z1 += same.
+    #[test]
+    fn acpl_module3_adds_decorrelator_residual() {
+        let num_ts = 4usize;
+        let mut z0 = vec![[(1.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut z1 = vec![[(0.0f32, 1.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let y2 = vec![[(4.0f32, 4.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let b3 = vec![vec![1.0f32; 15]];
+        let b3a = vec![vec![0.0f32; 15]];
+        acpl_module3(&mut z0, &mut z1, &y2, &b3, &b3a, 15, false, &[]);
+        // After ramp completes (ts=num_ts-1) b3 = 1.0, b3a = 0:
+        //   z0 += 0.25 * y2 * (1 + 0) = 0.25 * (4, 4) = (1, 1)
+        //   z1 += 0.25 * y2 * (1 - 0) = (1, 1)
+        let last = num_ts - 1;
+        let (z0r, z0i) = z0[last][7];
+        assert!((z0r - 2.0).abs() < 1e-5, "z0r={z0r}");
+        assert!((z0i - 1.0).abs() < 1e-5, "z0i={z0i}");
+        let (z1r, z1i) = z1[last][7];
+        assert!((z1r - 1.0).abs() < 1e-5, "z1r={z1r}");
+        assert!((z1i - 2.0).abs() < 1e-5, "z1i={z1i}");
+    }
+
+    /// `acpl_module3()` with all-zero beta3 is a no-op.
+    #[test]
+    fn acpl_module3_zero_beta3_is_noop() {
+        let num_ts = 4usize;
+        let mut z0 = vec![[(7.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut z1 = vec![[(0.0f32, 7.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let y2 = vec![[(99.0f32, -99.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let zero = vec![vec![0.0f32; 15]];
+        acpl_module3(&mut z0, &mut z1, &y2, &zero, &zero, 15, false, &[]);
+        for ts in 0..num_ts {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                assert_eq!(z0[ts][sb], (7.0, 0.0));
+                assert_eq!(z1[ts][sb], (0.0, 7.0));
+            }
+        }
+    }
+
+    /// Smoke test for the full §5.7.7.6.2 ASPX_ACPL_3 pipeline. Feed
+    /// non-zero L/R/C carriers and verify all 5 outputs are populated and
+    /// finite.
+    #[test]
+    fn run_pseudocode_118_5x_emits_five_finite_channels() {
+        let num_ts = 16usize;
+        let num_pb = 9u32;
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x1 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x2 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            for sb in 0..32 {
+                let p = (ts as f32) * 0.2 + sb as f32 * 0.05;
+                x0[ts][sb] = (0.1 * p.cos(), 0.1 * p.sin());
+                x1[ts][sb] = (0.05 * p.sin(), 0.05 * p.cos());
+                x2[ts][sb] = (0.03 * (p * 1.3).cos(), 0.0);
+            }
+        }
+        let alpha_1 = vec![vec![0.4f32; num_pb as usize]];
+        let alpha_2 = vec![vec![-0.2f32; num_pb as usize]];
+        let beta_1 = vec![vec![0.3f32; num_pb as usize]];
+        let beta_2 = vec![vec![0.2f32; num_pb as usize]];
+        let beta_3 = vec![vec![0.15f32; num_pb as usize]];
+        let g1 = vec![vec![0.6f32; num_pb as usize]];
+        let g2 = vec![vec![0.3f32; num_pb as usize]];
+        let g3 = vec![vec![0.2f32; num_pb as usize]];
+        let g4 = vec![vec![0.5f32; num_pb as usize]];
+        let g5 = vec![vec![0.1f32; num_pb as usize]];
+        let g6 = vec![vec![0.1f32; num_pb as usize]];
+        let mut state = AcplMchState::new();
+        let frame = AcplMchFrame {
+            x0: &x0,
+            x1: &x1,
+            x2: &x2,
+            alpha_1_dq: &alpha_1,
+            alpha_2_dq: &alpha_2,
+            beta_1_dq: &beta_1,
+            beta_2_dq: &beta_2,
+            beta_3_dq: &beta_3,
+            g1_dq: &g1,
+            g2_dq: &g2,
+            g3_dq: &g3,
+            g4_dq: &g4,
+            g5_dq: &g5,
+            g6_dq: &g6,
+            num_param_bands: num_pb,
+            steep: false,
+            param_timeslots: &[],
+        };
+        let out = run_pseudocode_118_5x(&mut state, frame);
+        assert_eq!(out.z0.len(), num_ts);
+        assert_eq!(out.z1.len(), num_ts);
+        assert_eq!(out.z2.len(), num_ts);
+        assert_eq!(out.z3.len(), num_ts);
+        assert_eq!(out.z4.len(), num_ts);
+        // No NaN / Inf in any output channel.
+        for z in [&out.z0, &out.z1, &out.z2, &out.z3, &out.z4] {
+            for col in z.iter() {
+                for sb in 0..NUM_QMF_SUBBANDS {
+                    assert!(
+                        col[sb].0.is_finite() && col[sb].1.is_finite(),
+                        "non-finite output: {:?}",
+                        col[sb]
+                    );
+                }
+            }
+        }
+        // Carriers are non-zero; the synthesis must produce non-zero
+        // energy on all five channels.
+        for (name, z) in [
+            ("z0=L", &out.z0),
+            ("z1=Ls", &out.z1),
+            ("z2=R", &out.z2),
+            ("z3=Rs", &out.z3),
+            ("z4=C", &out.z4),
+        ] {
+            let e: f64 = z
+                .iter()
+                .flat_map(|col| col.iter())
+                .map(|s| (s.0 as f64).powi(2) + (s.1 as f64).powi(2))
+                .sum();
+            assert!(e > 0.0, "channel {name} silent (energy {e})");
+        }
+        // Gamma prev arrays should be populated after the call.
+        assert_eq!(state.g1_prev_sb.len(), NUM_QMF_SUBBANDS);
+        for sb in 0..NUM_QMF_SUBBANDS {
+            assert!((state.g1_prev_sb[sb] - 0.6).abs() < 1e-6);
+        }
+    }
+
+    /// All-zero alpha/beta/beta3 + matching gamma should still produce
+    /// valid, finite output. This covers the "no decorrelator coupling"
+    /// path through the 5_X synthesis.
+    #[test]
+    fn run_pseudocode_118_5x_zero_alpha_beta_remains_finite() {
+        let num_ts = 8usize;
+        let num_pb = 9u32;
+        let x0 = vec![[(0.5f32, 0.5f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x1 = vec![[(0.5f32, -0.5f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x2 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let zero = vec![vec![0.0f32; num_pb as usize]];
+        let g1 = vec![vec![1.0f32; num_pb as usize]]; // g1 != 0 so v1 isn't trivially silent
+        let mut state = AcplMchState::new();
+        let frame = AcplMchFrame {
+            x0: &x0,
+            x1: &x1,
+            x2: &x2,
+            alpha_1_dq: &zero,
+            alpha_2_dq: &zero,
+            beta_1_dq: &zero,
+            beta_2_dq: &zero,
+            beta_3_dq: &zero,
+            g1_dq: &g1,
+            g2_dq: &zero,
+            g3_dq: &zero,
+            g4_dq: &zero,
+            g5_dq: &zero,
+            g6_dq: &zero,
+            num_param_bands: num_pb,
+            steep: false,
+            param_timeslots: &[],
+        };
+        let out = run_pseudocode_118_5x(&mut state, frame);
+        for col in out.z0.iter() {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                assert!(col[sb].0.is_finite());
+                assert!(col[sb].1.is_finite());
+            }
+        }
+    }
+
+    /// Smoke test for `pb_matrix_*` helpers used inside Pseudocode 118.
+    #[test]
+    fn pb_matrix_helpers() {
+        let a = vec![vec![1.0f32, 2.0, 3.0]];
+        let b = vec![vec![10.0f32, 20.0, 30.0]];
+        let c = vec![vec![100.0f32, 200.0, 300.0]];
+        let prod = pb_matrix_mul(&a, &b);
+        assert_eq!(prod, vec![vec![10.0, 40.0, 90.0]]);
+        let sum = pb_matrix_sum3(&a, &b, &c);
+        assert_eq!(sum, vec![vec![111.0, 222.0, 333.0]]);
+        let scaled = pb_matrix_scale(&a, -2.0);
+        assert_eq!(scaled, vec![vec![-2.0, -4.0, -6.0]]);
+    }
+
+    /// Spec consistency: the `(1 + 2*sqrt(0.5))` scaling factor applied
+    /// to x0/x1 in Pseudocode 118 must equal `1 + sqrt(2)` ≈ 2.414...
+    #[test]
+    fn pseudocode_118_scaling_factor() {
+        let s = 1.0f32 + 2.0 * (0.5f32).sqrt();
+        let expected = 1.0f32 + (2.0f32).sqrt();
+        assert!((s - expected).abs() < 1e-6);
+    }
+
+    /// `AcplMchState::new()` should initialise prev arrays to zero.
+    #[test]
+    fn acpl_mch_state_zero_init() {
+        let s = AcplMchState::new();
+        assert!(s.g1_prev_sb.iter().all(|&v| v == 0.0));
+        assert!(s.g2_prev_sb.iter().all(|&v| v == 0.0));
+        assert!(s.g3_prev_sb.iter().all(|&v| v == 0.0));
+        assert!(s.g4_prev_sb.iter().all(|&v| v == 0.0));
+        assert_eq!(s.g1_prev_sb.len(), NUM_QMF_SUBBANDS);
     }
 }

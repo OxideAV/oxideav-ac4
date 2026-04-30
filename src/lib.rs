@@ -353,11 +353,14 @@
 //!   with `chparam_info()` driving M/S coupling) is now wired in
 //!   round-18: parser walks the full dual-residual body, decoder
 //!   IMDCTs both M and S spectra and feeds them as `x0` / `x1` into
-//!   the §5.7.7.5 channel-pair element. Multichannel
-//!   `5_X_codec_mode = ASPX_ACPL_3` (Pseudocodes 117-120 / `Transform`,
-//!   `ACplModule2`, `ACplModule3`) is still pending — the four
-//!   §5.7.7.7 dequant tables (Tables 203-208) needed to plug those in
-//!   are already present.
+//!   the §5.7.7.5 channel-pair element. Round-21 lands the §5.7.7.6.2
+//!   ASPX_ACPL_3 transform-matrix synthesis math (`Transform()`,
+//!   `ACplModule2()`, `ACplModule3()`, `run_pseudocode_118_5x()` —
+//!   Pseudocodes 118 / 119); the 5_X-walker glue from the bitstream
+//!   into the new transform synthesis is the next round's scope.
+//!   Multichannel `5_X_codec_mode = ASPX_ACPL_1` / `ASPX_ACPL_2`
+//!   wrappers (Pseudocode 117) are still pending — the building blocks
+//!   are all in place but the 5-input wrapper is not wired.
 //! * Speech Spectral Frontend (SSF) arithmetic-coded path.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into

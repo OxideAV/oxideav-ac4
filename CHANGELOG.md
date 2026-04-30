@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 21 — ASPX_ACPL_3 transform synthesis (Pseudocodes 118/119)**:
+  - New §5.7.7.6.2 multichannel pipeline in `acpl_synth.rs`:
+    `transform()` (Pseudocode 119) linearly mixes the two A-CPL
+    carriers `(x0, x1)` by interpolated gamma matrices `g1, g2`;
+    `acpl_module2()` (Pseudocode 119) builds the `(z0, z1)` channel
+    pair from `g1+g1*a`, `g2+g2*a` and the beta-weighted decorrelator
+    output; `acpl_module3()` (Pseudocode 119) adds the beta3-driven
+    cross-residual term `0.25*y2*(b3 ± b3*a)` to an existing pair.
+  - New `run_pseudocode_118_5x()` runs the full 5-channel synthesis
+    end-to-end: x0/x1 input scaling by `(1 + 2*sqrt(0.5))`, three
+    parallel `Transform()` outputs into the D0/D1/D2 decorrelators
+    + transient duckers (one persistent state per path), three
+    `ACplModule2()` channel-pair builds (L/Ls, R/Rs, C with `a=1, b=0`),
+    three `ACplModule3()` cross-residual corrections, and the final
+    `sqrt(2)` channel scaling for `z1`, `z3`, `z4`.
+  - New `AcplMchState` (D0/D1/D2 + 3x ducker + per-pset prev gammas),
+    `AcplMchFrame` (5 input channels + 6 gammas + 5 alpha/beta arrays
+    + interpolation control), `AcplMchOutput` (z0/z1/z2/z3/z4) and
+    `AcplQmfMatrix` type alias.
+  - 11 new lib tests (352 → 363 total): unit-gamma `Transform()`,
+    mixed-gamma combinator, `ACplModule2` zero-coupling, half-x0
+    passthrough, `ACplModule3` residual + no-op cases, full
+    `run_pseudocode_118_5x()` 5-channel smoke test (finite + non-zero
+    on all five outputs), zero-alpha-beta degenerate path, `pb_matrix_*`
+    helpers, scaling-factor invariant `1 + 2*sqrt(0.5) == 1 + sqrt(2)`,
+    `AcplMchState::new()` zero-init.
+
 - **Round 20 — ETSI Huffman table audit + 5.X coding-config wiring**:
   - New `tests/etsi_table_validation.rs` integration suite parses the
     canonical ETSI accompaniment file
