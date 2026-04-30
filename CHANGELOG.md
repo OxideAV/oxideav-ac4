@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.2...v0.0.3) - 2026-04-30
+
+### Other
+
+- round 21 — ASPX_ACPL_3 transform synthesis (Pseudocodes 118/119)
+- round 20 — ETSI Huffman table audit + 5.X cfg0/1/2 + sf_info_lfe
+- round 19 — design 5_X channel-element walker family
+- round 18 — wire ASPX_ACPL_1 joint-MDCT residual layer
+- round 17 — wire A-CPL synthesis into Ac4Decoder
+- adopt slim AudioFrame shape
+- land §5.7.7 A-CPL QMF synthesis math (round-16)
+- outer §4.2.14.1 metadata() walker + §5.7.7.2 sb_to_pb
+- A.4 Huffman codebooks + dialog_enhancement parser
+- A.3 Huffman codebooks + acpl_data_*ch parser
+- A.5 Huffman codebook + drc_frame parser
+- implement complex-covariance TNS (chirp + α0 + α1) — round-11
+- land §5.7.6.4.2.2 A-SPX limiter (P72 + P96..101) — round-10
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **Round 21 — ASPX_ACPL_3 transform synthesis (Pseudocodes 118/119)**:
