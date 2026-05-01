@@ -214,4 +214,74 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         assert_eq!(ext_decode(&mut br).unwrap(), 37);
     }
+
+    /// All 13 ASF Huffman codebooks (SCALEFAC, SNF, HCB1..HCB11) paired up
+    /// for a single sweep test rather than 13 individual tests.
+    fn all_asf_tables() -> Vec<(&'static str, &'static [u8], &'static [u32])> {
+        vec![
+            ("ASF_HCB_SCALEFAC", HCB_SCALEFAC_LEN, HCB_SCALEFAC_CW),
+            ("ASF_HCB_SNF", HCB_SNF_LEN, HCB_SNF_CW),
+            ("ASF_HCB_1", HCB1_LEN, HCB1_CW),
+            ("ASF_HCB_2", HCB2_LEN, HCB2_CW),
+            ("ASF_HCB_3", HCB3_LEN, HCB3_CW),
+            ("ASF_HCB_4", HCB4_LEN, HCB4_CW),
+            ("ASF_HCB_5", HCB5_LEN, HCB5_CW),
+            ("ASF_HCB_6", HCB6_LEN, HCB6_CW),
+            ("ASF_HCB_7", HCB7_LEN, HCB7_CW),
+            ("ASF_HCB_8", HCB8_LEN, HCB8_CW),
+            ("ASF_HCB_9", HCB9_LEN, HCB9_CW),
+            ("ASF_HCB_10", HCB10_LEN, HCB10_CW),
+            ("ASF_HCB_11", HCB11_LEN, HCB11_CW),
+        ]
+    }
+
+    /// Roundtrip the shortest entry of every ASF codebook through
+    /// `huff_decode`. Pairs with `all_asf_tables_decode_last_entry` for
+    /// coverage at both ends of the bit-width range.
+    #[test]
+    fn all_asf_tables_decode_shortest_entry() {
+        for (name, lens, cws) in all_asf_tables() {
+            let (sym_idx, &min_len) = lens
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, &l)| l)
+                .expect("non-empty codebook");
+            let cw = cws[sym_idx];
+
+            let mut bw = BitWriter::new();
+            bw.write_u32(cw, min_len as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = huff_decode(&mut br, lens, cws)
+                .unwrap_or_else(|e| panic!("{name}: decode failed at sym_idx={sym_idx}: {e:?}"));
+            assert_eq!(
+                got as usize, sym_idx,
+                "{name}: decoded {got}, expected {sym_idx} (cw=0x{cw:x}, len={min_len})"
+            );
+        }
+    }
+
+    /// Roundtrip the last entry (often a long codeword at the tail) of
+    /// every ASF codebook.
+    #[test]
+    fn all_asf_tables_decode_last_entry() {
+        for (name, lens, cws) in all_asf_tables() {
+            let last = lens.len() - 1;
+            let l = lens[last];
+            let cw = cws[last];
+
+            let mut bw = BitWriter::new();
+            bw.write_u32(cw, l as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = huff_decode(&mut br, lens, cws)
+                .unwrap_or_else(|e| panic!("{name}: decode failed for last entry: {e:?}"));
+            assert_eq!(
+                got as usize, last,
+                "{name}: decoded {got}, expected {last} (cw=0x{cw:x}, len={l})"
+            );
+        }
+    }
 }

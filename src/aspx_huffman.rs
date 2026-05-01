@@ -299,3 +299,262 @@ pub static ASPX_HCB_NOISE_BALANCE_DT_CW: &[u32] = &[
     0x00003e, 0x00000e, 0x000006, 0x000000, 0x000002, 0x00001e, 0x0000fe, 0x0001f8, 0x0007ed,
     0x0003f2, 0x0007ee, 0x0007ef, 0x0007f8, 0x0007f9, 0x0007fa, 0x0007fb,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::huffman::huff_decode;
+    use oxideav_core::bits::{BitReader, BitWriter};
+
+    /// One row of the §A.2 sweep: `(name, len_table, cw_table, codebook_length)`.
+    type AspxTableRow = (&'static str, &'static [u8], &'static [u32], usize);
+
+    /// All 18 A-SPX codebooks paired up so we can sweep them with one helper.
+    fn all_aspx_tables() -> Vec<AspxTableRow> {
+        vec![
+            (
+                "ASPX_HCB_ENV_LEVEL_15_F0",
+                ASPX_HCB_ENV_LEVEL_15_F0_LEN,
+                ASPX_HCB_ENV_LEVEL_15_F0_CW,
+                71,
+            ),
+            (
+                "ASPX_HCB_ENV_LEVEL_15_DF",
+                ASPX_HCB_ENV_LEVEL_15_DF_LEN,
+                ASPX_HCB_ENV_LEVEL_15_DF_CW,
+                141,
+            ),
+            (
+                "ASPX_HCB_ENV_LEVEL_15_DT",
+                ASPX_HCB_ENV_LEVEL_15_DT_LEN,
+                ASPX_HCB_ENV_LEVEL_15_DT_CW,
+                141,
+            ),
+            (
+                "ASPX_HCB_ENV_BALANCE_15_F0",
+                ASPX_HCB_ENV_BALANCE_15_F0_LEN,
+                ASPX_HCB_ENV_BALANCE_15_F0_CW,
+                25,
+            ),
+            (
+                "ASPX_HCB_ENV_BALANCE_15_DF",
+                ASPX_HCB_ENV_BALANCE_15_DF_LEN,
+                ASPX_HCB_ENV_BALANCE_15_DF_CW,
+                49,
+            ),
+            (
+                "ASPX_HCB_ENV_BALANCE_15_DT",
+                ASPX_HCB_ENV_BALANCE_15_DT_LEN,
+                ASPX_HCB_ENV_BALANCE_15_DT_CW,
+                49,
+            ),
+            (
+                "ASPX_HCB_ENV_LEVEL_30_F0",
+                ASPX_HCB_ENV_LEVEL_30_F0_LEN,
+                ASPX_HCB_ENV_LEVEL_30_F0_CW,
+                36,
+            ),
+            (
+                "ASPX_HCB_ENV_LEVEL_30_DF",
+                ASPX_HCB_ENV_LEVEL_30_DF_LEN,
+                ASPX_HCB_ENV_LEVEL_30_DF_CW,
+                71,
+            ),
+            (
+                "ASPX_HCB_ENV_LEVEL_30_DT",
+                ASPX_HCB_ENV_LEVEL_30_DT_LEN,
+                ASPX_HCB_ENV_LEVEL_30_DT_CW,
+                71,
+            ),
+            (
+                "ASPX_HCB_ENV_BALANCE_30_F0",
+                ASPX_HCB_ENV_BALANCE_30_F0_LEN,
+                ASPX_HCB_ENV_BALANCE_30_F0_CW,
+                13,
+            ),
+            (
+                "ASPX_HCB_ENV_BALANCE_30_DF",
+                ASPX_HCB_ENV_BALANCE_30_DF_LEN,
+                ASPX_HCB_ENV_BALANCE_30_DF_CW,
+                25,
+            ),
+            (
+                "ASPX_HCB_ENV_BALANCE_30_DT",
+                ASPX_HCB_ENV_BALANCE_30_DT_LEN,
+                ASPX_HCB_ENV_BALANCE_30_DT_CW,
+                25,
+            ),
+            (
+                "ASPX_HCB_NOISE_LEVEL_F0",
+                ASPX_HCB_NOISE_LEVEL_F0_LEN,
+                ASPX_HCB_NOISE_LEVEL_F0_CW,
+                30,
+            ),
+            (
+                "ASPX_HCB_NOISE_LEVEL_DF",
+                ASPX_HCB_NOISE_LEVEL_DF_LEN,
+                ASPX_HCB_NOISE_LEVEL_DF_CW,
+                59,
+            ),
+            (
+                "ASPX_HCB_NOISE_LEVEL_DT",
+                ASPX_HCB_NOISE_LEVEL_DT_LEN,
+                ASPX_HCB_NOISE_LEVEL_DT_CW,
+                59,
+            ),
+            (
+                "ASPX_HCB_NOISE_BALANCE_F0",
+                ASPX_HCB_NOISE_BALANCE_F0_LEN,
+                ASPX_HCB_NOISE_BALANCE_F0_CW,
+                13,
+            ),
+            (
+                "ASPX_HCB_NOISE_BALANCE_DF",
+                ASPX_HCB_NOISE_BALANCE_DF_LEN,
+                ASPX_HCB_NOISE_BALANCE_DF_CW,
+                25,
+            ),
+            (
+                "ASPX_HCB_NOISE_BALANCE_DT",
+                ASPX_HCB_NOISE_BALANCE_DT_LEN,
+                ASPX_HCB_NOISE_BALANCE_DT_CW,
+                25,
+            ),
+        ]
+    }
+
+    /// Each table's len[]/cw[] pair must match its declared codebook_length.
+    #[test]
+    fn all_aspx_tables_have_declared_length() {
+        for (name, lens, cws, n) in all_aspx_tables() {
+            assert_eq!(lens.len(), n, "{name}: len-array length mismatch");
+            assert_eq!(cws.len(), n, "{name}: cw-array length mismatch");
+        }
+    }
+
+    /// Every codeword has to fit inside its declared bit-length.
+    #[test]
+    fn all_aspx_codewords_fit_in_declared_length() {
+        for (name, lens, cws, _) in all_aspx_tables() {
+            for (i, (&l, &c)) in lens.iter().zip(cws.iter()).enumerate() {
+                assert!(
+                    l > 0 && l <= 32,
+                    "{name}[{i}]: declared length {l} out of supported range"
+                );
+                let max = if l == 32 { u32::MAX } else { (1u32 << l) - 1 };
+                assert!(
+                    c <= max,
+                    "{name}[{i}]: codeword 0x{c:x} exceeds {l}-bit limit"
+                );
+            }
+        }
+    }
+
+    /// Kraft equality: a complete prefix code satisfies Σ 2^(-len_i) == 1.
+    /// 32-bit denominator is plenty for the widest 23-bit codeword
+    /// (`ASPX_HCB_ENV_LEVEL_30_DF`).
+    #[test]
+    fn all_aspx_tables_kraft_sum_equals_one() {
+        let denom: u128 = 1u128 << 32;
+        for (name, lens, _, _) in all_aspx_tables() {
+            let mut sum: u128 = 0;
+            for &l in lens {
+                sum += denom >> l as u128;
+            }
+            assert_eq!(sum, denom, "{name}: Kraft sum != 1");
+        }
+    }
+
+    /// Pair-by-pair prefix-code check: equal-length codewords must be
+    /// distinct, shorter codewords must not be a prefix of longer ones.
+    #[test]
+    fn all_aspx_tables_are_prefix_codes() {
+        for (name, lens, cws, _) in all_aspx_tables() {
+            for i in 0..lens.len() {
+                let li = lens[i];
+                let ci = cws[i];
+                for j in (i + 1)..lens.len() {
+                    let lj = lens[j];
+                    let cj = cws[j];
+                    if li == lj {
+                        assert_ne!(
+                            ci, cj,
+                            "{name} collision at {i},{j}: same length {li} cw 0x{ci:x}"
+                        );
+                    } else {
+                        let (sl, sc, ll, lc) = if li < lj {
+                            (li, ci, lj, cj)
+                        } else {
+                            (lj, cj, li, ci)
+                        };
+                        let prefix = lc >> (ll - sl);
+                        assert_ne!(
+                            prefix, sc,
+                            "{name} prefix conflict at {i},{j}: \
+                             {sl}-bit cw 0x{sc:x} prefixes {ll}-bit cw 0x{lc:x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// End-to-end roundtrip: for every codebook, encode the shortest entry
+    /// (the one that gets the 1-bit codeword in DF/DT codebooks, or the
+    /// shortest in F0 codebooks) via `BitWriter`, then decode through
+    /// `huff_decode` and verify the recovered symbol index matches.
+    ///
+    /// This is a single sweep across all 18 A-SPX codebooks rather than
+    /// 18 individual tests — the loop body is identical in each case and
+    /// the assertion message names the failing codebook.
+    #[test]
+    fn all_aspx_tables_decode_shortest_entry() {
+        for (name, lens, cws, _) in all_aspx_tables() {
+            // Pick the entry with the smallest length (most-frequent symbol).
+            let (sym_idx, &min_len) = lens
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, &l)| l)
+                .expect("non-empty codebook");
+            let cw = cws[sym_idx];
+
+            let mut bw = BitWriter::new();
+            bw.write_u32(cw, min_len as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = huff_decode(&mut br, lens, cws)
+                .unwrap_or_else(|e| panic!("{name}: decode failed for sym_idx={sym_idx}: {e:?}"));
+            assert_eq!(
+                got as usize, sym_idx,
+                "{name}: decoded {got}, expected {sym_idx} (cw=0x{cw:x}, len={min_len})"
+            );
+        }
+    }
+
+    /// End-to-end roundtrip: for every codebook, encode and decode the
+    /// **last** entry (often a long codeword at the codebook tail).
+    /// Shortest + longest gives high-confidence coverage that the encoded
+    /// bit pattern aligns with the decoder's MSB-first walk for every
+    /// codebook width in the spec.
+    #[test]
+    fn all_aspx_tables_decode_last_entry() {
+        for (name, lens, cws, _) in all_aspx_tables() {
+            let last = lens.len() - 1;
+            let l = lens[last];
+            let cw = cws[last];
+
+            let mut bw = BitWriter::new();
+            bw.write_u32(cw, l as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = huff_decode(&mut br, lens, cws)
+                .unwrap_or_else(|e| panic!("{name}: decode failed for last entry: {e:?}"));
+            assert_eq!(
+                got as usize, last,
+                "{name}: decoded {got}, expected {last} (cw=0x{cw:x}, len={l})"
+            );
+        }
+    }
+}

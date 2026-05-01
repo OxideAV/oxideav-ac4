@@ -603,6 +603,65 @@ mod tests {
         }
     }
 
+    /// End-to-end roundtrip: for every ACPL codebook, encode the
+    /// shortest codeword (typically the centre/most-frequent symbol),
+    /// then decode through `huff_decode` and verify the symbol index
+    /// recovers cleanly. One sweep over all 24 codebooks rather than 24
+    /// individual tests; the assertion message names the failing one.
+    #[test]
+    fn all_acpl_tables_decode_shortest_entry() {
+        use crate::huffman::huff_decode;
+        use oxideav_core::bits::{BitReader, BitWriter};
+
+        for (name, lens, cws, _, _) in all_acpl_tables() {
+            let (sym_idx, &min_len) = lens
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, &l)| l)
+                .expect("non-empty codebook");
+            let cw = cws[sym_idx];
+
+            let mut bw = BitWriter::new();
+            bw.write_u32(cw, min_len as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = huff_decode(&mut br, lens, cws)
+                .unwrap_or_else(|e| panic!("{name}: decode failed for sym_idx={sym_idx}: {e:?}"));
+            assert_eq!(
+                got as usize, sym_idx,
+                "{name}: decoded {got}, expected {sym_idx} (cw=0x{cw:x}, len={min_len})"
+            );
+        }
+    }
+
+    /// End-to-end roundtrip for the last entry of every ACPL codebook.
+    /// The tail is usually a long codeword; pairing this with the
+    /// shortest-entry sweep gives wide coverage of the bit-width range.
+    #[test]
+    fn all_acpl_tables_decode_last_entry() {
+        use crate::huffman::huff_decode;
+        use oxideav_core::bits::{BitReader, BitWriter};
+
+        for (name, lens, cws, _, _) in all_acpl_tables() {
+            let last = lens.len() - 1;
+            let l = lens[last];
+            let cw = cws[last];
+
+            let mut bw = BitWriter::new();
+            bw.write_u32(cw, l as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = huff_decode(&mut br, lens, cws)
+                .unwrap_or_else(|e| panic!("{name}: decode failed for last entry: {e:?}"));
+            assert_eq!(
+                got as usize, last,
+                "{name}: decoded {got}, expected {last} (cw=0x{cw:x}, len={l})"
+            );
+        }
+    }
+
     /// Pair-by-pair prefix-code property: equal-length codewords must
     /// be distinct, and shorter codewords must not be a prefix of
     /// longer ones. This catches transcription bugs that Kraft alone
