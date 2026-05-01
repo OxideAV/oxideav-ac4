@@ -52,12 +52,24 @@ framework but usable standalone.
 > Pseudocode-118 5_X synthesis pipeline. The Table-52 `aspx_data_2ch()`
 > body parser was factored out of the stereo CPE ASPX path into a
 > shared `parse_aspx_data_2ch_body()` helper — both the stereo CPE
-> mode and the 5_X ASPX_ACPL_3 mode use the same parser. **387 tests**.
-> Pending: ASPX_ACPL_1 / ASPX_ACPL_2 inner body walker for the 5_X
-> path (still relies on the future joint-MDCT residual layer + per-
-> ACplModule `acpl_data_1ch` pair extraction); 7_X-channel-element
-> walker; ASF short-frame `sf_data` walk for the mono / stereo paths
-> (the grouped walker added here covers the multichannel layouts only).
+> mode and the 5_X ASPX_ACPL_3 mode use the same parser. Round 25 wires
+> the **ASPX_ACPL_1 / ASPX_ACPL_2 inner body walker** in
+> `parse_5x_audio_data_outer` per §4.2.6.6 Table 25
+> (`case ASPX_ACPL_1: case ASPX_ACPL_2:`): a new
+> `parse_aspx_acpl_1_2_inner_body()` helper walks
+> `two_channel_data() / three_channel_data()` (selected by the 1-bit
+> `coding_config`), the ASPX_ACPL_1-only joint-MDCT residual layer
+> (`max_sfb_master + 2x chparam_info + 2x sf_data(ASF)` over the
+> dominant transform length signalled by the upstream channel data —
+> `n_side_bits` is derived per the §4.2.6.6 NOTE), the optional Cfg0
+> trailer `mono_data(0)`, then `aspx_data_2ch()` + `aspx_data_1ch()` and
+> finally the **two parallel `acpl_data_1ch()` calls** per Pseudocode 117.
+> The pair lands in `tools.acpl_data_1ch_pair[0/1]` (D0 / D1
+> ACplModule). The walker is try-and-bail: any inner Huffman / parse
+> miss leaves the already-populated `tools.*` slots intact and returns
+> silently. **395 tests**. Pending: 7_X-channel-element walker;
+> ASF short-frame `sf_data` walk for the mono / stereo paths
+> (the grouped walker added in r24 covers the multichannel layouts only).
 
 ## Specs
 

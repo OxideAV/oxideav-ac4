@@ -650,9 +650,12 @@ pub fn parse_5x_audio_data_outer(
                 FiveXCodingConfig::AcplLite2
             };
             tools.five_x_coding_config = Some(coding_cfg);
-            // The remainder (max_sfb_master + 2x chparam_info + 2x
-            // sf_data + optional mono_data(0) + aspx + acpl trailers)
-            // is wired in r20+.
+            // r25: walk the inner body per §4.2.6.6 Table 25 row
+            // `case ASPX_ACPL_1: case ASPX_ACPL_2:`. The walker is
+            // try-and-bail: any inner Huffman / parse miss leaves the
+            // already-populated tools intact and returns silently. The
+            // outer walker still returns Ok(()).
+            let _ = parse_aspx_acpl_1_2_inner_body(br, tools, mode, cc, b_iframe, frame_len_base);
         }
         FiveXCodecMode::AspxAcpl3 => {
             tools.companding = Some(crate::aspx::parse_companding_control(br, 2)?);
@@ -692,6 +695,190 @@ pub fn parse_5x_audio_data_outer(
             }
         }
         FiveXCodecMode::Reserved(_) => {}
+    }
+    Ok(())
+}
+
+// =====================================================================
+// 5_X ASPX_ACPL_1 / ASPX_ACPL_2 inner body walker (round 25)
+// =====================================================================
+
+/// Walk the inner body of `5_X_channel_element` for the
+/// `ASPX_ACPL_1` / `ASPX_ACPL_2` modes per §4.2.6.6 Table 25 (the
+/// `case ASPX_ACPL_1: case ASPX_ACPL_2:` arm) — the bits *after*
+/// `companding_control(3)` and the 1-bit `coding_config`.
+///
+/// The body shape (in Table 25 order):
+/// ```text
+/// if (coding_config) { three_channel_data(); }
+/// else               { two_channel_data();   }
+/// if (5_X_codec_mode == ASPX_ACPL_1) {
+///     max_sfb_master;            // n_side_bits — joint-MDCT residual
+///     chparam_info();            // ACPL_1 residual ch0
+///     chparam_info();            // ACPL_1 residual ch1
+///     sf_data(ASF);              // ACPL_1 residual ch0
+///     sf_data(ASF);              // ACPL_1 residual ch1
+/// }
+/// if (coding_config == 0) {
+///     mono_data(0);              // centre / surround mono
+/// }
+/// aspx_data_2ch();
+/// aspx_data_1ch();
+/// acpl_data_1ch();               // -> tools.acpl_data_1ch_pair[0]
+/// acpl_data_1ch();               // -> tools.acpl_data_1ch_pair[1]
+/// ```
+///
+/// `n_side_bits` is derived per the §4.2.6.6 NOTE: largest signalled
+/// transform length from the preceding two/three_channel_data() above
+/// (look up Table 106 column `n_side_bits`).
+///
+/// The walker is **try-and-bail**: every step bails silently on the
+/// first parse miss, leaving the already-populated `tools.*` fields
+/// intact. It always returns `Ok(())` to the caller — the outer
+/// walker's contract is that an inner-body miss is non-fatal.
+///
+/// Like the round-24 ASPX_ACPL_3 walker, the deeper aspx_data /
+/// acpl_data steps are gated on `b_iframe && tools.aspx_config.is_some()`
+/// so non-iframe paths simply consume what they can of the upstream
+/// channel data and stop.
+fn parse_aspx_acpl_1_2_inner_body(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    mode: FiveXCodecMode,
+    coding_config_bit: bool,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Result<()> {
+    debug_assert!(matches!(
+        mode,
+        FiveXCodecMode::AspxAcpl1 | FiveXCodecMode::AspxAcpl2
+    ));
+    // 1) two_channel_data() OR three_channel_data().
+    let largest_tl: Option<u32> = if coding_config_bit {
+        // three_channel_data().
+        match parse_three_channel_data(br, frame_len_base) {
+            Ok(d) => {
+                let tl = d.transform_info.as_ref().map(|ti| ti.transform_length_0);
+                tools.three_channel_data = Some(d);
+                tl
+            }
+            Err(_) => return Ok(()),
+        }
+    } else {
+        // two_channel_data().
+        match parse_two_channel_data(br, frame_len_base) {
+            Ok(d) => {
+                let tl = d.transform_info.as_ref().map(|ti| ti.transform_length_0);
+                tools.two_channel_data.clear();
+                tools.two_channel_data.push(d);
+                tl
+            }
+            Err(_) => return Ok(()),
+        }
+    };
+
+    // 2) ASPX_ACPL_1 only: max_sfb_master + chparam_info×2 + sf_data×2
+    //    (joint-MDCT residual layer).
+    if matches!(mode, FiveXCodecMode::AspxAcpl1) {
+        let Some(tl) = largest_tl else {
+            return Ok(());
+        };
+        let Some((_n_msfb, n_side, _n_msfbl)) = tables::n_msfb_bits_48(tl) else {
+            return Ok(());
+        };
+        let Some(num_sfb_cap) = tables::num_sfb_48(tl) else {
+            return Ok(());
+        };
+        let max_sfb_master = match br.read_u32(n_side) {
+            Ok(v) => v.min(num_sfb_cap),
+            Err(_) => return Ok(()),
+        };
+        if max_sfb_master == 0 {
+            // No bands signalled — chparam_info()×2 still run with the
+            // empty bound, but the sf_data bodies would be degenerate.
+            // Bail rather than feed an empty bound through downstream.
+            return Ok(());
+        }
+        // Two chparam_info() calls — one per ACPL_1 residual channel.
+        // Per Pseudocode 5 / §4.2.10 the per-group max_sfb here is just
+        // max_sfb_master (joint-MDCT residual layer is a single window
+        // group at the dominant transform length).
+        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
+            return Ok(());
+        }
+        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
+            return Ok(());
+        }
+        // Two sf_data(ASF) bodies — pair the channels' residual MDCT
+        // spectra. We reuse the ASF long-frame body decoder with the
+        // explicit max_sfb_master bound. We synthesise the
+        // AsfTransformInfo on the fly (long-frame at `tl`) since the
+        // joint-MDCT residual layer always shares the dominant
+        // transform length.
+        let synth_ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0; 2],
+            transform_length_0: tl,
+            transform_length_1: tl,
+        };
+        let body0 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
+        let Some(_b0) = body0 else { return Ok(()) };
+        let body1 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
+        if body1.is_none() {
+            return Ok(());
+        }
+    }
+
+    // 3) Cfg0 only: mono_data(0) — centre / surround mono.
+    if !coding_config_bit {
+        match parse_mono_data(br, false, frame_len_base) {
+            Ok(m) => tools.cfg0_centre_mono = Some(m),
+            Err(_) => return Ok(()),
+        }
+    }
+
+    // 4) ASPX trailers + ACPL pair are I-frame-gated and need a parsed
+    //    aspx_config in scope — same gate as ASPX_ACPL_3 (round 24).
+    if !b_iframe {
+        return Ok(());
+    }
+    let Some(aspx_cfg) = tools.aspx_config else {
+        return Ok(());
+    };
+    // aspx_data_2ch() then aspx_data_1ch().
+    if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base).is_err()
+    {
+        return Ok(());
+    }
+    if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base).is_err()
+    {
+        return Ok(());
+    }
+    // acpl_data_1ch()×2 — pair entries [0] / [1] per Pseudocode 117.
+    // The active acpl_config_1ch was parsed earlier in the I-frame
+    // header — `acpl_config_1ch_partial` for ASPX_ACPL_1, full for ACPL_2.
+    let acpl_cfg = match mode {
+        FiveXCodecMode::AspxAcpl1 => tools.acpl_config_1ch_partial,
+        FiveXCodecMode::AspxAcpl2 => tools.acpl_config_1ch_full,
+        _ => None,
+    };
+    let Some(acfg) = acpl_cfg else {
+        return Ok(());
+    };
+    let start_band = if acfg.qmf_band == 0 {
+        0
+    } else {
+        crate::acpl::sb_to_pb(acfg.qmf_band as u32, acfg.num_param_bands)
+    };
+    if let Ok(d0) =
+        crate::acpl::parse_acpl_data_1ch(br, acfg.num_param_bands, start_band, acfg.quant_mode)
+    {
+        tools.acpl_data_1ch_pair[0] = Some(d0);
+        if let Ok(d1) =
+            crate::acpl::parse_acpl_data_1ch(br, acfg.num_param_bands, start_band, acfg.quant_mode)
+        {
+            tools.acpl_data_1ch_pair[1] = Some(d1);
+        }
     }
     Ok(())
 }
@@ -1679,5 +1866,299 @@ mod tests {
         assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl3));
         let cfg = tools.acpl_config_2ch.expect("acpl_config_2ch parsed");
         assert_eq!(cfg.num_param_bands, 15);
+    }
+
+    // =================================================================
+    // Round 25: ASPX_ACPL_1 / ASPX_ACPL_2 inner body walker
+    // =================================================================
+
+    /// Helper — write a `companding_control(3)` element with all
+    /// channels companded on (sync_flag=true compresses the per-channel
+    /// loop to a single `compand_on=true` bit and skips compand_avg).
+    fn write_companding_3_all_on(bw: &mut oxideav_core::bits::BitWriter) {
+        bw.write_bit(true); // sync_flag
+        bw.write_bit(true); // compand_on (sync=1 → only 1 channel-bit)
+    }
+
+    /// Helper — write a 15-bit all-zero `aspx_config()` payload.
+    fn write_zero_aspx_config(bw: &mut oxideav_core::bits::BitWriter) {
+        bw.write_u32(0, 15);
+    }
+
+    /// Helper — write a PARTIAL `acpl_config_1ch()`: 2-bit
+    /// num_param_bands_id + 1-bit quant_mode + 3-bit qmf_band_minus1.
+    fn write_acpl_config_1ch_partial(bw: &mut oxideav_core::bits::BitWriter) {
+        bw.write_u32(0, 2); // id = 0 (15 bands)
+        bw.write_bit(false); // quant_mode = Fine
+        bw.write_u32(0, 3); // qmf_band_minus1 = 0 -> qmf_band = 1
+    }
+
+    /// Helper — write a FULL `acpl_config_1ch()`: 2-bit + 1-bit (no
+    /// qmf_band field).
+    fn write_acpl_config_1ch_full(bw: &mut oxideav_core::bits::BitWriter) {
+        bw.write_u32(0, 2); // id = 0 (15 bands)
+        bw.write_bit(false); // quant_mode = Fine
+    }
+
+    /// `parse_5x_audio_data_outer` for ASPX_ACPL_2 on a non-iframe
+    /// shouldn't reach the ACPL pair walker (gated on b_iframe +
+    /// in-scope aspx_config). The outer must still consume
+    /// companding_control(3) + 1-bit coding_config and try to parse the
+    /// inner channel data — but the per-side acpl_data slots stay
+    /// `None`.
+    #[test]
+    fn parse_5x_aspx_acpl_2_non_iframe_leaves_acpl_pair_none() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
+        write_companding_3_all_on(&mut bw);
+        bw.write_bit(false); // coding_config = 0 -> two_channel_data + mono(0)
+                             // two_channel_data() outer + 2x sf_data:
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(8, 6); // max_sfb[0]
+        bw.write_u32(0, 2); // chparam sap_mode = 0
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        // mono_data(0): spec_frontend bit + asf_transform_info long +
+        // sf_info(ASF, 0, 0).
+        bw.write_bit(false); // spec_frontend = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(8, 6); // max_sfb[0] (n_msfb_bits=6 @ tl=1920)
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl2));
+        assert_eq!(
+            tools.five_x_coding_config,
+            Some(FiveXCodingConfig::AcplLite2)
+        );
+        assert_eq!(tools.two_channel_data.len(), 1);
+        assert!(tools.cfg0_centre_mono.is_some());
+        assert!(tools.acpl_data_1ch_pair[0].is_none());
+        assert!(tools.acpl_data_1ch_pair[1].is_none());
+    }
+
+    /// ASPX_ACPL_1 non-iframe with `coding_config = 1`
+    /// (three_channel_data branch, no Cfg0 mono_data trailer).
+    /// Walker should populate `three_channel_data` but the joint-MDCT
+    /// residual layer + ACPL pair are gated and stay unset.
+    #[test]
+    fn parse_5x_aspx_acpl_1_non_iframe_walks_three_channel_data() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 3); // 5_X_codec_mode = ASPX_ACPL_1
+        write_companding_3_all_on(&mut bw);
+        bw.write_bit(true); // coding_config = 1 -> three_channel_data
+                            // three_channel_data outer:
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(10, 6); // max_sfb[0]
+        bw.write_u32(0, 4); // chel_matsel
+        bw.write_u32(0, 2); // chparam_info #0
+        bw.write_u32(0, 2); // chparam_info #1
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        // Joint-MDCT residual layer (ASPX_ACPL_1 only): max_sfb_master
+        // is read with n_side_bits=5 @ tl=1920 (Table 106).
+        bw.write_u32(8, 5); // max_sfb_master = 8
+        bw.write_u32(0, 2); // chparam_info residual ch0 (sap_mode=0)
+        bw.write_u32(0, 2); // chparam_info residual ch1
+        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch0 sf_data
+        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch1 sf_data
+                                                // Pad to be safe.
+        bw.align_to_byte();
+        while bw.byte_len() < 64 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl1));
+        assert_eq!(
+            tools.five_x_coding_config,
+            Some(FiveXCodingConfig::Cfg1ThreeStereo)
+        );
+        let three = tools.three_channel_data.as_ref().expect("3ch parsed");
+        assert_eq!(three.psy_info.as_ref().unwrap().max_sfb_0, 10);
+        // Non-iframe: joint-MDCT residual layer is walked but ACPL pair
+        // stays None (no aspx_config in scope).
+        assert!(tools.acpl_data_1ch_pair[0].is_none());
+        assert!(tools.acpl_data_1ch_pair[1].is_none());
+    }
+
+    /// ASPX_ACPL_2 I-frame with `coding_config = 1`
+    /// (three_channel_data branch). The outer parses aspx_config +
+    /// acpl_config_1ch(FULL) before the body. The walker exercises
+    /// three_channel_data + aspx_data_2ch + aspx_data_1ch + 2x
+    /// acpl_data_1ch. The downstream Huffman walks may bail silently
+    /// on a degenerate aspx_config (zero start_freq), but the parsed
+    /// configs and the upstream three_channel_data must surface on
+    /// tools.
+    #[test]
+    fn parse_5x_aspx_acpl_2_iframe_parses_configs_and_three_channel() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
+        write_zero_aspx_config(&mut bw);
+        write_acpl_config_1ch_full(&mut bw);
+        write_companding_3_all_on(&mut bw);
+        bw.write_bit(true); // coding_config = 1 -> three_channel_data
+                            // three_channel_data outer:
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(10, 6); // max_sfb[0]
+        bw.write_u32(0, 4); // chel_matsel
+        bw.write_u32(0, 2); // chparam_info #0
+        bw.write_u32(0, 2); // chparam_info #1
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        // Pad with zeros for downstream aspx/acpl walkers (which are
+        // try-and-bail).
+        bw.align_to_byte();
+        while bw.byte_len() < 256 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl2));
+        assert!(tools.aspx_config.is_some());
+        let cfg_full = tools.acpl_config_1ch_full.expect("FULL config parsed");
+        assert_eq!(cfg_full.num_param_bands, 15);
+        assert_eq!(cfg_full.qmf_band, 0); // FULL has no qmf_band
+        let three = tools.three_channel_data.as_ref().expect("3ch parsed");
+        assert_eq!(three.psy_info.as_ref().unwrap().max_sfb_0, 10);
+    }
+
+    /// ASPX_ACPL_1 I-frame with `coding_config = 0` (two_channel_data
+    /// branch — pulls the joint-MDCT residual layer + Cfg0
+    /// `mono_data(0)` trailer). Validates that:
+    ///   * aspx_config is parsed,
+    ///   * acpl_config_1ch_partial is parsed (with non-zero qmf_band),
+    ///   * two_channel_data lands in the slot,
+    ///   * cfg0_centre_mono is populated by the trailing mono_data(0).
+    ///
+    /// Downstream aspx_data / acpl_data may bail silently on the
+    /// all-zero pad; the test just asserts non-fatal completion.
+    #[test]
+    fn parse_5x_aspx_acpl_1_iframe_walks_residual_and_mono_trailer() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 3); // 5_X_codec_mode = ASPX_ACPL_1
+        write_zero_aspx_config(&mut bw);
+        write_acpl_config_1ch_partial(&mut bw);
+        write_companding_3_all_on(&mut bw);
+        bw.write_bit(false); // coding_config = 0 -> two_channel_data
+                             // two_channel_data outer (Table 26):
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(12, 6); // max_sfb[0]
+        bw.write_u32(0, 2); // chparam sap_mode = 0
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        // Joint-MDCT residual layer (ASPX_ACPL_1):
+        // max_sfb_master uses n_side_bits = 5 @ tl=1920.
+        bw.write_u32(6, 5); // max_sfb_master = 6
+        bw.write_u32(0, 2); // chparam residual ch0
+        bw.write_u32(0, 2); // chparam residual ch1
+        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 0);
+        // Cfg0 trailer: mono_data(0) for the centre channel.
+        bw.write_bit(false); // spec_frontend = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(7, 6); // max_sfb[0] for centre mono
+                            // Pad for downstream aspx_data / acpl_data.
+        bw.align_to_byte();
+        while bw.byte_len() < 256 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl1));
+        assert!(tools.aspx_config.is_some());
+        let cfg_partial = tools
+            .acpl_config_1ch_partial
+            .expect("PARTIAL config parsed");
+        assert_eq!(cfg_partial.num_param_bands, 15);
+        assert_eq!(cfg_partial.qmf_band, 1); // qmf_band_minus1=0 -> 1
+        assert_eq!(tools.two_channel_data.len(), 1);
+        assert_eq!(
+            tools.two_channel_data[0]
+                .psy_info
+                .as_ref()
+                .unwrap()
+                .max_sfb_0,
+            12
+        );
+        let centre = tools
+            .cfg0_centre_mono
+            .as_ref()
+            .expect("Cfg0 centre mono walked");
+        assert_eq!(centre.psy_info.as_ref().unwrap().max_sfb_0, 7);
+    }
+
+    /// Truncated input mid-`three_channel_data` for ASPX_ACPL_2 should
+    /// leave `three_channel_data` `None` (the channel-data parser
+    /// errored) without panicking and without setting any of the
+    /// downstream slots. The outer walker still returns Ok(()).
+    #[test]
+    fn parse_5x_aspx_acpl_2_truncated_channel_data_bails() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
+        write_companding_3_all_on(&mut bw);
+        bw.write_bit(true); // coding_config = 1 -> three_channel_data
+                            // start three_channel_data but truncate after b_long_frame
+                            // (no max_sfb bits).
+        bw.write_bit(true);
+        // intentionally cut here — the next byte boundary won't have
+        // the 6-bit max_sfb field complete.
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        // The truncation lands inside `parse_three_channel_data` which
+        // returns Err — that's caught by the inner walker's
+        // try-and-bail and we surface Ok(()).
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl2));
+        assert!(tools.three_channel_data.is_none());
+        assert!(tools.acpl_data_1ch_pair[0].is_none());
+        assert!(tools.acpl_data_1ch_pair[1].is_none());
+    }
+
+    /// max_sfb_master = 0 in the joint-MDCT residual layer should bail
+    /// silently — the chparam_info / sf_data trailers would be
+    /// degenerate. Subsequent aspx/acpl trailers stay unset.
+    #[test]
+    fn parse_5x_aspx_acpl_1_iframe_zero_max_sfb_master_bails() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 3); // 5_X_codec_mode = ASPX_ACPL_1
+        write_zero_aspx_config(&mut bw);
+        write_acpl_config_1ch_partial(&mut bw);
+        write_companding_3_all_on(&mut bw);
+        bw.write_bit(true); // coding_config = 1 -> three_channel_data
+                            // three_channel_data outer:
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(10, 6); // max_sfb[0]
+        bw.write_u32(0, 4); // chel_matsel
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        // max_sfb_master = 0 (n_side_bits = 5 @ tl=1920).
+        bw.write_u32(0, 5);
+        bw.align_to_byte();
+        while bw.byte_len() < 64 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl1));
+        assert!(tools.three_channel_data.is_some());
+        assert!(tools.acpl_data_1ch_pair[0].is_none());
+        assert!(tools.acpl_data_1ch_pair[1].is_none());
     }
 }

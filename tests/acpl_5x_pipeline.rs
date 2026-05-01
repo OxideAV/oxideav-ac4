@@ -323,3 +323,228 @@ fn five_x_aspx_acpl_1_walker_to_synthesis_glue() {
     assert!(e(&out.left_surround) > 1e-6, "Ls silent");
     assert!(e(&out.right_surround) > 1e-6, "Rs silent");
 }
+
+/// Round-25 wiring contract: with the inner-body walker for
+/// `ASPX_ACPL_1/2` now plumbed (`mch::parse_aspx_acpl_1_2_inner_body`
+/// gated behind `parse_5x_audio_data_outer`), a non-iframe ASPX_ACPL_2
+/// header that includes a real `three_channel_data()` outer shell now
+/// flows through the walker into `tools.three_channel_data` (which the
+/// r22 walker treated as opaque). The downstream A-CPL pair entries
+/// stay `None` on a non-iframe (no aspx_config in scope), so we stage
+/// them by hand to drive the synthesis pipeline. Verifies the
+/// type-contract end-to-end: walker populates the upstream channel
+/// data, downstream synthesis still consumes a staged data pair.
+#[test]
+fn five_x_aspx_acpl_2_walker_inner_body_populates_three_channel_data() {
+    use oxideav_ac4::asf::SubstreamTools;
+    use oxideav_ac4::mch::FiveXCodingConfig;
+
+    let mut bw = BitWriter::new();
+    bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
+                        // companding_control(3): sync_flag=1, compand_on=1.
+    bw.write_bit(true);
+    bw.write_bit(true);
+    bw.write_bit(true); // coding_config = 1 -> three_channel_data
+                        // three_channel_data outer:
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(10, 6); // max_sfb[0]
+    bw.write_u32(0, 4); // chel_matsel
+    bw.write_u32(0, 2); // chparam_info #0
+    bw.write_u32(0, 2); // chparam_info #1
+                        // 3x sf_data(ASF) bodies — each one-section, all-zero spectra:
+                        // sect_cb=0 (4 bits), sect_len_incr (3 bits, 7-escape over max_sfb=10):
+                        //   max_sfb-1 = 9, esc=7 -> write 7 then 2.
+                        // scalefac reference (8 bits) = 120.
+                        // snf b_data_exists = 0 (1 bit).
+    for _ in 0..3 {
+        bw.write_u32(0, 4); // sect_cb=0
+        bw.write_u32(7, 3); // sect_len_incr (esc)
+        bw.write_u32(2, 3); // sect_len_incr remainder
+        bw.write_u32(120, 8); // scalefac reference
+        bw.write_bit(false); // b_snf_data_exists=0
+    }
+    bw.align_to_byte();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    let mut tools = SubstreamTools::default();
+    parse_5x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+    assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl2));
+    assert_eq!(
+        tools.five_x_coding_config,
+        Some(FiveXCodingConfig::Cfg1ThreeStereo)
+    );
+    // The new r25 walker populates this slot from the bitstream — r22
+    // would have left it None.
+    let three = tools
+        .three_channel_data
+        .as_ref()
+        .expect("r25 walker populates three_channel_data on the ASPX_ACPL_{1,2} body");
+    assert_eq!(three.psy_info.as_ref().unwrap().max_sfb_0, 10);
+
+    // Downstream: stage acpl_config + pair (non-iframe path), then
+    // drive the synthesis pipeline as in the r22 contract test.
+    let cfg = AcplConfig1ch {
+        num_param_bands_id: 0,
+        num_param_bands: 15,
+        quant_mode: AcplQuantMode::Fine,
+        qmf_band: 0,
+    };
+    tools.acpl_config_1ch_full = Some(cfg);
+    tools.acpl_data_1ch_pair[0] = Some(stub_data_1ch(2, 1, cfg.num_param_bands));
+    tools.acpl_data_1ch_pair[1] = Some(stub_data_1ch(-1, 2, cfg.num_param_bands));
+
+    let n_slots = 64usize;
+    let n = n_slots * NUM_QMF_SUBBANDS;
+    let pcm_l = sine_pcm(n, 440.0, 1.0);
+    let pcm_r = sine_pcm(n, 220.0, 0.7);
+    let pcm_c = sine_pcm(n, 660.0, 0.3);
+    let cfg_active = tools.acpl_config_1ch_full.as_ref().unwrap();
+    let data_1 = tools.acpl_data_1ch_pair[0].as_ref().unwrap();
+    let data_2 = tools.acpl_data_1ch_pair[1].as_ref().unwrap();
+    let mut state = Acpl5xPairPcmState::new();
+    let out = run_acpl_5x_pair_pcm(
+        Acpl5xPairMode::AspxAcpl2,
+        &pcm_l,
+        &pcm_r,
+        &pcm_c,
+        None,
+        None,
+        cfg_active,
+        data_1,
+        cfg_active,
+        data_2,
+        &mut state,
+    )
+    .expect("synth runs");
+    assert_eq!(out.left.len(), n);
+    assert_eq!(out.centre.len(), n);
+    for s in out.left.iter().chain(&out.right).chain(&out.centre) {
+        assert!(s.is_finite());
+    }
+}
+
+/// Round-25 wiring contract for the ASPX_ACPL_1 path: the inner-body
+/// walker now also walks the joint-MDCT residual layer
+/// (`max_sfb_master + 2x chparam_info + 2x sf_data(ASF)`) on top of
+/// the upstream `two_channel_data()` / `three_channel_data()`. We feed
+/// a Cfg0 (two_channel_data branch) frame on the non-iframe path,
+/// assert the upstream channel data is parsed, and that the trailing
+/// `mono_data(0)` for the centre channel ends up in
+/// `tools.cfg0_centre_mono`. Synthesis is driven from staged ACPL data
+/// (matching the r22 contract).
+#[test]
+fn five_x_aspx_acpl_1_walker_inner_body_populates_two_channel_and_centre() {
+    use oxideav_ac4::asf::SubstreamTools;
+    use oxideav_ac4::mch::FiveXCodingConfig;
+
+    let mut bw = BitWriter::new();
+    bw.write_u32(2, 3); // 5_X_codec_mode = ASPX_ACPL_1
+                        // companding_control(3): sync_flag=1, compand_on=1.
+    bw.write_bit(true);
+    bw.write_bit(true);
+    bw.write_bit(false); // coding_config = 0 -> two_channel_data + Cfg0 mono
+                         // two_channel_data outer (Table 26):
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(8, 6); // max_sfb[0]
+    bw.write_u32(0, 2); // chparam sap_mode = 0
+                        // 2x sf_data(ASF) bodies (max_sfb=8, transf_length_idx=0):
+                        //   sect_cb=0 (4) + sect_len_incr=7 (3) + sect_len_incr=0 (3)
+                        //   + scalefac ref (8) + snf b_data_exists (1).
+    for _ in 0..2 {
+        bw.write_u32(0, 4);
+        bw.write_u32(7, 3);
+        bw.write_u32(0, 3);
+        bw.write_u32(120, 8);
+        bw.write_bit(false);
+    }
+    // Joint-MDCT residual layer: max_sfb_master=4 (n_side_bits=5 @1920),
+    // 2x chparam (sap_mode=0), 2x sf_data with max_sfb=4.
+    bw.write_u32(4, 5);
+    bw.write_u32(0, 2);
+    bw.write_u32(0, 2);
+    for _ in 0..2 {
+        bw.write_u32(0, 4); // sect_cb=0
+        bw.write_u32(3, 3); // sect_len_incr (max_sfb-1 = 3, no escape)
+        bw.write_u32(120, 8); // scalefac ref
+        bw.write_bit(false); // snf
+    }
+    // Cfg0 trailer: mono_data(0).
+    bw.write_bit(false); // spec_frontend = ASF
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(5, 6); // max_sfb[0] for centre mono
+    bw.align_to_byte();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    let mut tools = SubstreamTools::default();
+    parse_5x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+    assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl1));
+    assert_eq!(
+        tools.five_x_coding_config,
+        Some(FiveXCodingConfig::AcplLite2)
+    );
+    // r25 walker populates the upstream two_channel_data slot.
+    assert_eq!(tools.two_channel_data.len(), 1);
+    assert_eq!(
+        tools.two_channel_data[0]
+            .psy_info
+            .as_ref()
+            .unwrap()
+            .max_sfb_0,
+        8
+    );
+    // r25 walker also lands the Cfg0 centre `mono_data(0)`.
+    let centre = tools
+        .cfg0_centre_mono
+        .as_ref()
+        .expect("Cfg0 centre mono walked");
+    assert_eq!(centre.psy_info.as_ref().unwrap().max_sfb_0, 5);
+
+    // Stage ACPL pair (PARTIAL config for ASPX_ACPL_1) and drive
+    // run_acpl_5x_pair_pcm.
+    let cfg = AcplConfig1ch {
+        num_param_bands_id: 0,
+        num_param_bands: 15,
+        quant_mode: AcplQuantMode::Fine,
+        qmf_band: 4,
+    };
+    tools.acpl_config_1ch_partial = Some(cfg);
+    tools.acpl_data_1ch_pair[0] = Some(stub_data_1ch(3, 1, cfg.num_param_bands));
+    tools.acpl_data_1ch_pair[1] = Some(stub_data_1ch(-2, 2, cfg.num_param_bands));
+
+    let n_slots = 32usize;
+    let n = n_slots * NUM_QMF_SUBBANDS;
+    let pcm_l = sine_pcm(n, 440.0, 1.0);
+    let pcm_r = sine_pcm(n, 220.0, 0.7);
+    let pcm_c = sine_pcm(n, 660.0, 0.3);
+    let pcm_ls = sine_pcm(n, 110.0, 0.5);
+    let pcm_rs = sine_pcm(n, 880.0, 0.4);
+    let cfg_active = tools.acpl_config_1ch_partial.as_ref().unwrap();
+    let data_1 = tools.acpl_data_1ch_pair[0].as_ref().unwrap();
+    let data_2 = tools.acpl_data_1ch_pair[1].as_ref().unwrap();
+    let mut state = Acpl5xPairPcmState::new();
+    let out = run_acpl_5x_pair_pcm(
+        Acpl5xPairMode::AspxAcpl1,
+        &pcm_l,
+        &pcm_r,
+        &pcm_c,
+        Some(&pcm_ls),
+        Some(&pcm_rs),
+        cfg_active,
+        data_1,
+        cfg_active,
+        data_2,
+        &mut state,
+    )
+    .expect("synth runs");
+    assert_eq!(out.left.len(), n);
+    for s in out
+        .left
+        .iter()
+        .chain(&out.right)
+        .chain(&out.centre)
+        .chain(&out.left_surround)
+        .chain(&out.right_surround)
+    {
+        assert!(s.is_finite());
+    }
+}

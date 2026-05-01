@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 25 — ASPX_ACPL_1 / ASPX_ACPL_2 inner body walker**
+  (TS 103 190-1 §4.2.6.6 Table 25 + §5.7.7.6.1 Pseudocode 117):
+  - New `parse_aspx_acpl_1_2_inner_body()` helper in `mch.rs` walks the
+    bits past the existing `companding_control(3) + 1-bit
+    coding_config` selector for the 5_X `ASPX_ACPL_1` / `ASPX_ACPL_2`
+    paths. The body shape (Table 25):
+    `two_channel_data()` OR `three_channel_data()` →
+    [ASPX_ACPL_1 only] `max_sfb_master (n_side_bits) +
+     chparam_info()×2 + sf_data(ASF)×2` joint-MDCT residual layer →
+    [coding_config==0 only] `mono_data(0)` centre/surround trailer →
+    `aspx_data_2ch() + aspx_data_1ch() + acpl_data_1ch()×2`.
+    The two acpl_data_1ch payloads land in
+    `tools.acpl_data_1ch_pair[0]` (D0-side) and
+    `tools.acpl_data_1ch_pair[1]` (D1-side) per Pseudocode 117 — the
+    same pair the §5.7.7.6.1 `run_acpl_5x_pair_pcm()` PCM driver
+    consumes.
+  - `n_side_bits` is derived per the §4.2.6.6 NOTE: largest signalled
+    transform length from the preceding `two_channel_data()` /
+    `three_channel_data()` (look up `tables::n_msfb_bits_48` Table 106
+    column 2). The joint-MDCT residual sf_data bodies reuse
+    `decode_asf_long_mono_body_with_max_sfb()` against a synthesised
+    long-frame `AsfTransformInfo` at the dominant transform length.
+  - The walker is **try-and-bail**: every step returns `Ok(())` to the
+    outer walker on any inner Huffman / parse miss, leaving the
+    already-populated `tools.*` slots intact (matching the round-24
+    ASPX_ACPL_3 walker contract). Deeper aspx_data / acpl_data steps
+    are gated on `b_iframe && tools.aspx_config.is_some()` —
+    non-iframe paths simply consume what they can of the upstream
+    channel data and stop.
+  - Active `acpl_config_1ch` for the pair-extraction step is selected
+    by codec mode: `acpl_config_1ch_partial` for ASPX_ACPL_1 (with
+    `start_band` derived from `qmf_band` via `acpl::sb_to_pb()`),
+    `acpl_config_1ch_full` for ASPX_ACPL_2 (start_band always 0).
+  - 6 new lib tests + 2 new `tests/acpl_5x_pipeline.rs` integration
+    tests (387 → 395 total): non-iframe ASPX_ACPL_2 `coding_config==0`
+    path lands `two_channel_data` + `cfg0_centre_mono` and leaves the
+    ACPL pair `None` (gated); non-iframe ASPX_ACPL_1
+    `coding_config==1` path lands `three_channel_data` and walks the
+    joint-MDCT residual layer; I-frame ASPX_ACPL_2 with
+    `three_channel_data` parses `aspx_config + acpl_config_1ch_full`
+    out of the bitstream and walks the channel data; I-frame
+    ASPX_ACPL_1 with Cfg0 walks the residual layer + Cfg0 mono trailer
+    end-to-end; truncated `three_channel_data` mid-bitstream bails
+    silently with `Ok(())`; `max_sfb_master == 0` in the residual
+    layer bails silently. Two integration tests assert the
+    walker → synthesis glue: a real Table-27 `three_channel_data()`
+    body now flows into `tools.three_channel_data` (which the r22
+    walker treated as opaque), and the staged ACPL pair drives
+    `run_acpl_5x_pair_pcm()` end-to-end for both ASPX_ACPL_1 and
+    ASPX_ACPL_2 modes.
+
 - **Round 24 — Grouped multichannel `sf_data(ASF)` walker + ASPX_ACPL_3
   inner body walker** (TS 103 190-1 §4.2.6.6 + §5.4.4.4 + Table 52 / 62):
   - `decode_mch_sf_data_channels()` in `mch.rs` now also handles the
