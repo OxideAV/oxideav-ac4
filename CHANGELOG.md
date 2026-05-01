@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 23 — Multichannel `sf_data(ASF)` Huffman codebook table walk**
+  (TS 103 190-1 §4.2.6.7-10 Tables 26 / 27 / 28 / 29):
+  - New `decode_mch_sf_data_channels()` helper in `mch.rs` walks
+    `n_channels` consecutive `sf_data(ASF)` bodies sharing the head
+    `(transform_info, psy_info)` pair. Each body decodes
+    `asf_section_data` then `asf_spectral_data` then `asf_scalefac_data`
+    then `asf_snf_data` per §4.2.8.3-6, producing one dequantised + scaled
+    MDCT spectrum per channel of length `sfb_offset[max_sfb]`.
+  - `parse_two_channel_data()` / `parse_three_channel_data()` /
+    `parse_four_channel_data()` / `parse_five_channel_data()` now walk
+    the trailing 2 / 3 / 4 / 5 `sf_data(ASF)` calls and store the
+    per-channel scaled spectra on each `*ChannelData::scaled_spec_per_channel`
+    (new `Vec<Option<Vec<f32>>>` field). For the long-frame,
+    single-window-group case every slot is populated; short / grouped
+    frames push `Some(...)` for none of the slots and let the outer
+    shell still parse cleanly.
+  - Huffman codebook IDs wired (per Annex A.1, all reused from the
+    mono / stereo paths — there is no separate "MCH" codebook set):
+    `HCB_1` (`ASF_HCB_1_LEN/CW`, 81 entries) through `HCB_11`
+    (`ASF_HCB_11_LEN/CW`, 289 entries) for spectral lines,
+    `HCB_SCALEFAC` (`ASF_HCB_SCALEFAC_LEN/CW`, 121 entries) for
+    scale-factor DPCM, and `HCB_SNF` (`ASF_HCB_SNF_LEN/CW`, 22 entries)
+    for spectral noise fill. Round 22's
+    `decode_asf_long_mono_body_with_max_sfb` was raised from `fn` to
+    `pub(crate) fn` so `mch.rs` can drive one body per channel from the
+    shared `sf_info` block.
+  - Removed the previous "scaffold values" comments / TODOs from
+    `mch.rs` for the per-channel `sf_data(ASF)` paths — the per-channel
+    spectra now flow through the validated ASF Huffman codebook suite
+    (audited byte-for-byte in r20's `etsi_table_validation.rs` against
+    `docs/audio/ac4/ts_10319001v010401p0-tables.c`).
+  - 6 new tests (374 → 380 total): all-zero two-channel sf_data round
+    trip with sfb-offset length pin, short-frame guard returns all-`None`,
+    `parse_three_channel_data` decodes 3 bodies with all-zero spectra
+    pin, `parse_four_channel_data` + `parse_five_channel_data`
+    per-channel-count pin, truncated `sf_data` graceful partial decode,
+    `parse_two_channel_data` per-channel length-matches-sfb-offset pin.
+    The pre-existing 5_X outer-walker tests (`parse_5x_outer_simple_*`)
+    were extended to feed valid all-zero `sf_data(ASF)` trailers so they
+    still exercise the outer dispatch end-to-end.
+
 - **Round 22 — ASPX_ACPL_1/2 multichannel wrapper (Pseudocode 117) +
   5_X-walker glue**:
   - New §5.7.7.6.1 multichannel pipeline in `acpl_synth.rs`:

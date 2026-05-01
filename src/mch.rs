@@ -35,15 +35,28 @@
 //! also splits `sf_info_lfe()` from the regular `sf_info()` parser —
 //! the leading `max_sfb` field now uses `n_msfbl_bits` from Table 106
 //! (column 4) instead of the regular `n_msfb_bits`, matching Table 21.
-//! The per-channel `sf_data(ASF)` Huffman bodies still wait for the
-//! Pseudocode 117/118 transform-matrix wiring in a future round.
+//!
+//! Round 23 wires the per-channel `sf_data(ASF)` Huffman bodies for
+//! the multichannel layouts. Tables 26 / 27 / 28 / 29 each emit N
+//! independent `sf_data(ASF)` calls (2 / 3 / 4 / 5) right after the
+//! shared `sf_info(ASF, 0, 0)` + `*_channel_info()` block. We reuse the
+//! ASF Huffman codebook suite (`HCB_1` .. `HCB_11` for spectral lines,
+//! `HCB_SCALEFAC` for scale-factor DPCM, `HCB_SNF` for noise fill) —
+//! the multichannel paths use the same codebook IDs as mono / stereo
+//! per Annex A.1 of TS 103 190-1 (no separate "MCH" codebook set
+//! exists — the Huffman tables are sample-rate-independent and
+//! codec-mode-independent). The per-channel scaled spectra land on the
+//! `scaled_spec_per_channel` field of each `*ChannelData` for the
+//! long-frame, single-window-group case; short / grouped frames still
+//! parse the outer shells and leave the per-channel slot `None`.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
 
 use crate::asf::{
-    parse_asf_psy_info, parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info,
-    AsfPsyInfo, AsfTransformInfo, ChparamInfo, SubstreamTools,
+    decode_asf_long_mono_body_with_max_sfb, parse_asf_psy_info, parse_asf_psy_info_lfe,
+    parse_asf_transform_info, parse_chparam_info, AsfPsyInfo, AsfTransformInfo, ChparamInfo,
+    SubstreamTools,
 };
 use crate::tables;
 
@@ -153,41 +166,61 @@ pub struct FiveChannelInfo {
 ///
 /// Used by `5_X_channel_element` Cfg0 (twice — L/R and Ls/Rs) and Cfg1
 /// (after the leading `three_channel_data`).
+///
+/// Round 23 added `scaled_spec_per_channel` — when the body is decoded
+/// in the long-frame, single-window-group case, each `Some(...)` entry
+/// carries the dequantised + scaled MDCT spectrum for that channel.
+/// Entries are `None` when the per-channel `sf_data(ASF)` walk bailed
+/// (short frame, grouped, or Huffman error).
 #[derive(Debug, Clone, Default)]
 pub struct TwoChannelData {
     pub transform_info: Option<AsfTransformInfo>,
     pub psy_info: Option<AsfPsyInfo>,
     pub chparam: Option<ChparamInfo>,
+    /// Per-channel scaled MDCT spectra. Length = 2 once the body has
+    /// been walked. Each entry's `Vec<f32>` is `sfb_offset[max_sfb]`
+    /// long.
+    pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
 }
 
-/// Parsed `three_channel_data()` outer shell per Table 27.
+/// Parsed `three_channel_data()` outer shell + per-channel sf_data
+/// bodies per Table 27.
 ///
 /// Holds the shared `sf_info` (transform_info + psy_info) and the
-/// `three_channel_info` (chel_matsel + 2x chparam_info). The three
-/// `sf_data(ASF)` bodies are deferred — their decode requires Pseudocode
-/// 178 (Table 178) transform-matrix application against three independent
-/// channel residuals.
+/// `three_channel_info` (chel_matsel + 2x chparam_info). Round 23 also
+/// walks the three trailing `sf_data(ASF)` bodies into
+/// `scaled_spec_per_channel` (length 3).
 #[derive(Debug, Clone, Default)]
 pub struct ThreeChannelData {
     pub transform_info: Option<AsfTransformInfo>,
     pub psy_info: Option<AsfPsyInfo>,
     pub info: Option<ThreeChannelInfo>,
+    /// Per-channel scaled MDCT spectra (length 3). See [`TwoChannelData`].
+    pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
 }
 
-/// Parsed `four_channel_data()` outer shell per Table 28.
+/// Parsed `four_channel_data()` outer shell + per-channel sf_data
+/// bodies per Table 28. Round 23 walks the four trailing `sf_data(ASF)`
+/// bodies into `scaled_spec_per_channel` (length 4).
 #[derive(Debug, Clone, Default)]
 pub struct FourChannelData {
     pub transform_info: Option<AsfTransformInfo>,
     pub psy_info: Option<AsfPsyInfo>,
     pub info: Option<FourChannelInfo>,
+    /// Per-channel scaled MDCT spectra (length 4). See [`TwoChannelData`].
+    pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
 }
 
-/// Parsed `five_channel_data()` outer shell per Table 29.
+/// Parsed `five_channel_data()` outer shell + per-channel sf_data
+/// bodies per Table 29. Round 23 walks the five trailing `sf_data(ASF)`
+/// bodies into `scaled_spec_per_channel` (length 5).
 #[derive(Debug, Clone, Default)]
 pub struct FiveChannelData {
     pub transform_info: Option<AsfTransformInfo>,
     pub psy_info: Option<AsfPsyInfo>,
     pub info: Option<FiveChannelInfo>,
+    /// Per-channel scaled MDCT spectra (length 5). See [`TwoChannelData`].
+    pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
 }
 
 // =====================================================================
@@ -234,12 +267,14 @@ pub fn parse_mono_data(
     Ok(out)
 }
 
-/// `two_channel_data()` outer shell per Table 26.
+/// `two_channel_data()` outer shell + per-channel `sf_data(ASF)` bodies
+/// per Table 26.
 ///
-/// Walks `sf_info(ASF, 0, 0)` + `chparam_info()`. The two `sf_data(ASF)`
-/// bodies that close the element are deferred — they need the same
-/// Pseudocode 178 transform-matrix wiring as the rest of the multichannel
-/// element family.
+/// Walks `sf_info(ASF, 0, 0)` + `chparam_info()` then two
+/// `sf_data(ASF)` bodies. For the long-frame, single-window-group case
+/// the per-channel scaled spectra land on `scaled_spec_per_channel`
+/// (length 2). Short / grouped frames push `None` for each channel —
+/// the outer shell still parses cleanly.
 pub fn parse_two_channel_data(
     br: &mut BitReader<'_>,
     frame_len_base: u32,
@@ -248,10 +283,12 @@ pub fn parse_two_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let chparam = parse_chparam_info(br, &[max_sfb_g])?;
+    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 2);
     Ok(TwoChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         chparam: Some(chparam),
+        scaled_spec_per_channel: scaled,
     })
 }
 
@@ -300,7 +337,12 @@ pub fn parse_five_channel_info(
     })
 }
 
-/// `three_channel_data()` per Table 27 — outer shell only.
+/// `three_channel_data()` per Table 27 — outer shell + 3x `sf_data(ASF)`.
+///
+/// Round 23 wires the three trailing `sf_data(ASF)` bodies through the
+/// shared `(transform_info, psy_info)` pair. Each per-channel scaled
+/// spectrum lands on `scaled_spec_per_channel[i]` for the long-frame,
+/// single-window-group case.
 pub fn parse_three_channel_data(
     br: &mut BitReader<'_>,
     frame_len_base: u32,
@@ -309,14 +351,16 @@ pub fn parse_three_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let info = parse_three_channel_info(br, &[max_sfb_g])?;
+    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 3);
     Ok(ThreeChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
+        scaled_spec_per_channel: scaled,
     })
 }
 
-/// `four_channel_data()` per Table 28 — outer shell only.
+/// `four_channel_data()` per Table 28 — outer shell + 4x `sf_data(ASF)`.
 pub fn parse_four_channel_data(
     br: &mut BitReader<'_>,
     frame_len_base: u32,
@@ -325,14 +369,16 @@ pub fn parse_four_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let info = parse_four_channel_info(br, &[max_sfb_g])?;
+    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 4);
     Ok(FourChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
+        scaled_spec_per_channel: scaled,
     })
 }
 
-/// `five_channel_data()` per Table 29 — outer shell only.
+/// `five_channel_data()` per Table 29 — outer shell + 5x `sf_data(ASF)`.
 pub fn parse_five_channel_data(
     br: &mut BitReader<'_>,
     frame_len_base: u32,
@@ -341,11 +387,51 @@ pub fn parse_five_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let info = parse_five_channel_info(br, &[max_sfb_g])?;
+    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 5);
     Ok(FiveChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
+        scaled_spec_per_channel: scaled,
     })
+}
+
+/// Walk `n_channels` consecutive `sf_data(ASF)` bodies sharing the same
+/// `(transform_info, psy_info)` per Tables 26 / 27 / 28 / 29 of TS 103
+/// 190-1.
+///
+/// Each body decodes as one `asf_section_data()` then `asf_spectral_data()`
+/// then `asf_scalefac_data()` then `asf_snf_data()` chain (§4.2.8.3-6) and
+/// produces a dequantised + scaled MDCT spectrum of length
+/// `sfb_offset[max_sfb]`. The Huffman codebooks reused from
+/// [`crate::huffman`] are: `HCB_1` .. `HCB_11` for spectral lines (per
+/// `sect_cb`), `HCB_SCALEFAC` (codebook ID `SCF`, 121 entries) for
+/// scale-factor DPCM and `HCB_SNF` (22 entries) for spectral noise
+/// fill. Annex A.1 shares the codebooks across mono / stereo /
+/// multichannel — there is no separate "MCH" codebook set.
+///
+/// Bodies past a Huffman / bit-stream miss return `None` for the
+/// remaining channels (we can't re-sync mid-bitstream); the entries
+/// before the miss are still populated. Short / grouped frames return
+/// all-`None` since this round only handles the long-frame,
+/// single-window-group case.
+pub(crate) fn decode_mch_sf_data_channels(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+    n_channels: usize,
+) -> Vec<Option<Vec<f32>>> {
+    let mut out = vec![None; n_channels];
+    if !ti.b_long_frame || psy.num_window_groups != 1 {
+        return out;
+    }
+    for slot in out.iter_mut() {
+        match decode_asf_long_mono_body_with_max_sfb(br, ti, psy.max_sfb_0) {
+            Some(v) => *slot = Some(v),
+            None => break,
+        }
+    }
+    out
 }
 
 // =====================================================================
@@ -434,8 +520,12 @@ pub fn parse_5x_audio_data_outer(
             };
             tools.five_x_coding_config = Some(coding_cfg);
             // r20: walk all four channel-element layouts' outer shells.
-            // The trailing `sf_data(ASF)` Huffman bodies still wait for
-            // the Pseudocode 178 transform-matrix wiring.
+            // r23: also walks the trailing `sf_data(ASF)` Huffman bodies
+            // (one per channel) for the long-frame, single-window-group
+            // case, depositing the dequantised spectra on each
+            // `*ChannelData::scaled_spec_per_channel`. Short / grouped
+            // frames still parse the outer shell and leave the per-
+            // channel slots `None`.
             match coding_cfg {
                 FiveXCodingConfig::Cfg0Stereo2plusMono => {
                     // Table 25 row 0: 1-bit `2ch_mode` selector
@@ -525,6 +615,44 @@ pub fn n_msfbl_bits_48(transform_length: u32) -> Option<u32> {
 mod tests {
     use super::*;
     use oxideav_core::bits::BitWriter;
+
+    /// Append a minimal "all-zero spectra" `sf_data(ASF)` body to the
+    /// writer for one channel. Walks (per §4.2.8.3-6 + r23 wiring):
+    ///
+    ///   * `asf_section_data`: one section with `sect_cb = 0` covering
+    ///     all `max_sfb` bands (4 bits sect_cb + N bits sect_len_incr,
+    ///     where N = 3 for `transf_length_idx <= 2`, with 7-escape
+    ///     accumulation when `max_sfb > 7`).
+    ///   * `asf_spectral_data`: empty (cb=0 emits no bits).
+    ///   * `asf_scalefac_data`: 8 bits `reference_scale_factor` only —
+    ///     all bands have `cb == 0`, so no DPCM codewords.
+    ///   * `asf_snf_data`: 1 bit `b_snf_data_exists = 0`.
+    ///
+    /// The decoder reads the body and produces an all-zero scaled
+    /// spectrum of length `sfb_offset[max_sfb]`.
+    fn write_zero_sf_data_body(bw: &mut BitWriter, max_sfb: u32, transf_length_idx: u32) {
+        let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
+            (3, 7)
+        } else {
+            (5, 31)
+        };
+        // sect_cb = 0.
+        bw.write_u32(0, 4);
+        // sect_len = 1 + sum of increments; we want sect_len == max_sfb.
+        // So we need the sum of increments to equal max_sfb - 1.
+        let mut remaining = max_sfb.saturating_sub(1);
+        while remaining >= sect_esc_val {
+            bw.write_u32(sect_esc_val, n_sect_bits);
+            remaining -= sect_esc_val;
+        }
+        bw.write_u32(remaining, n_sect_bits);
+        // asf_spectral_data: nothing (cb=0).
+        // asf_scalefac_data: reference_scale_factor (any value works
+        // since no bands have non-zero quants).
+        bw.write_u32(120, 8);
+        // asf_snf_data: b_snf_data_exists = 0.
+        bw.write_bit(false);
+    }
 
     #[test]
     fn five_x_codec_mode_round_trip() {
@@ -647,12 +775,16 @@ mod tests {
         // sf_info(ASF, 0, 0) at frame_len_base=1920 long-frame:
         //   b_long_frame=1; max_sfb[0]=12 (6 bits).
         // three_channel_info: chel_matsel=3, two chparam_info(None).
+        // r23: trailing 3x sf_data(ASF) bodies (all-zero spectra).
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_long_frame
         bw.write_u32(12, 6); // max_sfb[0]
         bw.write_u32(3, 4); // chel_matsel
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 12, 0);
+        }
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -661,16 +793,26 @@ mod tests {
         assert_eq!(psy.max_sfb_0, 12);
         let info = d.info.unwrap();
         assert_eq!(info.chel_matsel, 3);
+        assert_eq!(d.scaled_spec_per_channel.len(), 3);
+        // All-zero spectra: every channel slot is Some(vec![0.0; ...]).
+        for ch in &d.scaled_spec_per_channel {
+            let v = ch.as_ref().expect("per-channel sf_data should decode");
+            assert!(v.iter().all(|&s| s == 0.0));
+        }
     }
 
     #[test]
     fn parse_five_channel_data_outer_shell() {
+        // r23: trailing 5x sf_data(ASF) bodies.
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_long_frame
         bw.write_u32(20, 6); // max_sfb[0]
         bw.write_u32(0xF, 4); // chel_matsel
         for _ in 0..5 {
             bw.write_u32(0, 2);
+        }
+        for _ in 0..5 {
+            write_zero_sf_data_body(&mut bw, 20, 0);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -679,13 +821,17 @@ mod tests {
         let info = d.info.unwrap();
         assert_eq!(info.chel_matsel, 0xF);
         assert_eq!(info.chparam.len(), 5);
+        assert_eq!(d.scaled_spec_per_channel.len(), 5);
+        for ch in &d.scaled_spec_per_channel {
+            assert!(ch.is_some());
+        }
     }
 
     #[test]
     fn parse_5x_outer_simple_cfg3_five_channel() {
         // 5_X_codec_mode = SIMPLE (0). b_has_lfe=0, b_iframe=1.
         // No companding (SIMPLE). coding_config = 3 (five_channel_data).
-        // Then five_channel_data outer shell.
+        // Then five_channel_data outer shell + 5x sf_data(ASF).
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
                             // No I-frame config (SIMPLE).
@@ -698,6 +844,9 @@ mod tests {
         bw.write_u32(0, 4); // chel_matsel
         for _ in 0..5 {
             bw.write_u32(0, 2); // chparam_info
+        }
+        for _ in 0..5 {
+            write_zero_sf_data_body(&mut bw, 15, 0);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -718,7 +867,7 @@ mod tests {
         // 5_X_codec_mode = SIMPLE, b_has_lfe = 1.
         // mono_data(1): asf_transform_info long-frame at 1920 +
         // sf_info_lfe with n_msfbl_bits=3 -> value 4.
-        // Then coding_config=3 + five_channel_data shell.
+        // Then coding_config=3 + five_channel_data shell + 5x sf_data.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
                             // LFE mono_data(1):
@@ -731,6 +880,9 @@ mod tests {
         bw.write_u32(0, 4);
         for _ in 0..5 {
             bw.write_u32(0, 2);
+        }
+        for _ in 0..5 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -747,11 +899,14 @@ mod tests {
 
     #[test]
     fn parse_two_channel_data_outer_walks_sf_info_plus_chparam() {
-        // Long-frame @1920, max_sfb=20, chparam_info sap_mode=0.
+        // Long-frame @1920, max_sfb=20, chparam_info sap_mode=0,
+        // r23: + 2 sf_data(ASF) all-zero bodies.
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_long_frame
         bw.write_u32(20, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
+        write_zero_sf_data_body(&mut bw, 20, 0);
+        write_zero_sf_data_body(&mut bw, 20, 0);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -759,6 +914,8 @@ mod tests {
         assert_eq!(d.transform_info.as_ref().unwrap().transform_length_0, 1920);
         assert_eq!(d.psy_info.as_ref().unwrap().max_sfb_0, 20);
         assert_eq!(d.chparam.as_ref().unwrap().sap_mode, 0);
+        assert_eq!(d.scaled_spec_per_channel.len(), 2);
+        assert!(d.scaled_spec_per_channel.iter().all(|c| c.is_some()));
     }
 
     #[test]
@@ -766,6 +923,9 @@ mod tests {
         // 5_X_codec_mode = SIMPLE (0). b_has_lfe=0, b_iframe=1.
         // coding_config = 0 (Cfg0Stereo2plusMono).
         // Then 1-bit `2ch_mode` + two_channel_data x2 + mono_data(0).
+        // r23: each two_channel_data trails 2x sf_data(ASF). The
+        // mono_data(0) shell isn't yet sf_data-extended, so no trailer
+        // there.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
                             // No LFE, no I-frame config.
@@ -775,11 +935,15 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
+        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #2
+                                                 // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        // mono_data(0): spec_frontend bit + transform + psy.
+        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #2
+                                                 // mono_data(0): spec_frontend bit + transform + psy.
         bw.write_bit(false); // spec_frontend = 0 (ASF)
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
@@ -819,6 +983,7 @@ mod tests {
     #[test]
     fn parse_5x_outer_simple_cfg1_walks_three_plus_two() {
         // SIMPLE, coding_config=1 -> three_channel_data + two_channel_data.
+        // r23: 3+2 sf_data(ASF) trailers.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
         bw.write_u32(1, 2); // coding_config = 1 (Cfg1ThreeStereo)
@@ -829,10 +994,15 @@ mod tests {
         bw.write_u32(0, 4);
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 14, 0);
+        }
         // two_channel_data: long-frame, max_sfb=18, chparam=0.
         bw.write_bit(true);
         bw.write_u32(18, 6);
         bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 18, 0);
+        write_zero_sf_data_body(&mut bw, 18, 0);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -858,6 +1028,7 @@ mod tests {
     #[test]
     fn parse_5x_outer_simple_cfg2_walks_four_plus_mono() {
         // SIMPLE, coding_config=2 -> four_channel_data + mono_data(0).
+        // r23: 4 sf_data(ASF) trailers from four_channel_data.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
         bw.write_u32(2, 2); // coding_config = 2 (Cfg2FourMono)
@@ -866,6 +1037,9 @@ mod tests {
         bw.write_u32(22, 6);
         for _ in 0..4 {
             bw.write_u32(0, 2);
+        }
+        for _ in 0..4 {
+            write_zero_sf_data_body(&mut bw, 22, 0);
         }
         // mono_data(0): spec_frontend + transform + psy.
         bw.write_bit(false);
@@ -918,5 +1092,211 @@ mod tests {
         // acpl_config_2ch is gated on b_iframe=1 — should be None.
         assert!(tools.acpl_config_2ch.is_none());
         assert!(tools.companding.is_some());
+    }
+
+    // =================================================================
+    // Round 23: per-channel sf_data(ASF) wiring tests
+    // =================================================================
+
+    /// `decode_mch_sf_data_channels` should produce one `Some(Vec<f32>)`
+    /// per channel for the long-frame, single-window-group all-zero
+    /// case, and the spectrum length should match
+    /// `sfb_offset[max_sfb]`.
+    #[test]
+    fn decode_mch_sf_data_long_frame_all_zero_two_channels() {
+        let mut bw = BitWriter::new();
+        // Two stacked sf_data bodies for max_sfb=8 at tl=1920.
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 1920,
+            transform_length_1: 1920,
+        };
+        let psy = AsfPsyInfo {
+            max_sfb_0: 8,
+            num_windows: 1,
+            num_window_groups: 1,
+            ..Default::default()
+        };
+        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
+        assert_eq!(out.len(), 2);
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let expected_len = sfbo[8] as usize;
+        for slot in &out {
+            let v = slot.as_ref().expect("each channel decodes");
+            assert_eq!(v.len(), expected_len);
+            assert!(v.iter().all(|&s| s == 0.0));
+        }
+    }
+
+    /// `decode_mch_sf_data_channels` returns `None` for **all** channels
+    /// when the input doesn't satisfy the long-frame /
+    /// single-window-group precondition. The bit reader is left
+    /// untouched (no bits consumed) so downstream parsers can recover.
+    #[test]
+    fn decode_mch_sf_data_short_frame_returns_all_none() {
+        let bytes = [0xFFu8; 4];
+        let mut br = BitReader::new(&bytes);
+        let ti = AsfTransformInfo {
+            b_long_frame: false,
+            transf_length: [0, 0],
+            transform_length_0: 480,
+            transform_length_1: 480,
+        };
+        let psy = AsfPsyInfo {
+            max_sfb_0: 6,
+            num_windows: 4,
+            num_window_groups: 2,
+            ..Default::default()
+        };
+        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 5);
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|c| c.is_none()));
+    }
+
+    /// `parse_three_channel_data` populates all three
+    /// `scaled_spec_per_channel` slots with vectors of the correct
+    /// length when the trailing `sf_data(ASF)` bodies decode cleanly.
+    /// This is the per-channel walk anchored to Tables 27 + Annex A.1
+    /// (codebooks `HCB_1..HCB_11`, `HCB_SCALEFAC`, `HCB_SNF`).
+    #[test]
+    fn parse_three_channel_data_decodes_three_sf_data_bodies() {
+        // Long-frame at fl_base=1920, max_sfb=10, chel_matsel=1,
+        // 2x chparam_info(sap_mode=0), then 3x all-zero sf_data(ASF).
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(10, 6); // max_sfb[0]
+        bw.write_u32(1, 4); // chel_matsel
+        bw.write_u32(0, 2); // chparam_info #0
+        bw.write_u32(0, 2); // chparam_info #1
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d = parse_three_channel_data(&mut br, 1920).unwrap();
+        assert_eq!(d.scaled_spec_per_channel.len(), 3);
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let expected_len = sfbo[10] as usize;
+        for ch in &d.scaled_spec_per_channel {
+            let v = ch.as_ref().unwrap();
+            assert_eq!(v.len(), expected_len);
+            assert!(v.iter().all(|&s| s == 0.0));
+        }
+    }
+
+    /// `parse_four_channel_data` populates four per-channel slots and
+    /// `parse_five_channel_data` populates five slots. The parser
+    /// progresses linearly through the bit-stream, consuming exactly
+    /// N body's worth of bits for an N-channel layout.
+    #[test]
+    fn parse_four_and_five_channel_data_emit_correct_per_channel_counts() {
+        // four_channel_data: 4 sf_data bodies.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_u32(8, 6); // max_sfb[0]
+        for _ in 0..4 {
+            bw.write_u32(0, 2); // chparam_info
+        }
+        for _ in 0..4 {
+            write_zero_sf_data_body(&mut bw, 8, 0);
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d4 = parse_four_channel_data(&mut br, 1920).unwrap();
+        assert_eq!(d4.scaled_spec_per_channel.len(), 4);
+        assert_eq!(
+            d4.scaled_spec_per_channel
+                .iter()
+                .filter(|c| c.is_some())
+                .count(),
+            4
+        );
+
+        // five_channel_data: 5 sf_data bodies.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_u32(6, 6); // max_sfb[0]
+        bw.write_u32(0, 4); // chel_matsel
+        for _ in 0..5 {
+            bw.write_u32(0, 2);
+        }
+        for _ in 0..5 {
+            write_zero_sf_data_body(&mut bw, 6, 0);
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d5 = parse_five_channel_data(&mut br, 1920).unwrap();
+        assert_eq!(d5.scaled_spec_per_channel.len(), 5);
+        assert!(d5.scaled_spec_per_channel.iter().all(|c| c.is_some()));
+    }
+
+    /// When the bit-stream is truncated mid-way through the multichannel
+    /// `sf_data(ASF)` walk, the channels parsed before the truncation
+    /// retain their `Some(...)` slots while the remaining ones stay
+    /// `None`. The walker must not panic.
+    #[test]
+    fn parse_three_channel_data_truncated_sf_data_yields_partial_decode() {
+        // Long-frame at fl_base=1920, max_sfb=12, chel_matsel=2,
+        // 2x chparam_info(sap_mode=0), then ONLY ONE sf_data body (the
+        // walker should consume that one, then bail on the second).
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.write_u32(12, 6);
+        bw.write_u32(2, 4);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d = parse_three_channel_data(&mut br, 1920).unwrap();
+        assert_eq!(d.scaled_spec_per_channel.len(), 3);
+        // First channel decoded; rest bailed.
+        assert!(d.scaled_spec_per_channel[0].is_some());
+        // We can't assert which exact remaining slots are None vs. Some
+        // — depending on byte alignment, the bit reader may have a few
+        // leftover zero-padding bits that get re-interpreted as a
+        // partial section header. What we DO require is that at least
+        // one of the trailing slots is `None` and that the function
+        // didn't panic.
+        let some_count = d
+            .scaled_spec_per_channel
+            .iter()
+            .filter(|c| c.is_some())
+            .count();
+        assert!(some_count < 3, "expected at least one None slot");
+    }
+
+    /// `parse_two_channel_data` populates two scaled-spec slots and the
+    /// per-channel vectors have the exact length dictated by
+    /// `sfb_offset_48(transform_length_0)[max_sfb_0]`.
+    #[test]
+    fn parse_two_channel_data_per_channel_lengths_match_sfb_offset() {
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(15, 6); // max_sfb[0]
+        bw.write_u32(0, 2); // chparam_info sap_mode = 0
+        write_zero_sf_data_body(&mut bw, 15, 0);
+        write_zero_sf_data_body(&mut bw, 15, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d = parse_two_channel_data(&mut br, 1920).unwrap();
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let expected_len = sfbo[15] as usize;
+        assert_eq!(d.scaled_spec_per_channel.len(), 2);
+        for ch in &d.scaled_spec_per_channel {
+            let v = ch.as_ref().unwrap();
+            assert_eq!(v.len(), expected_len);
+        }
     }
 }

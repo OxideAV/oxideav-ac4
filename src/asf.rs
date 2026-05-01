@@ -1196,7 +1196,13 @@ fn parse_aspx_acpl1_mdct_body(
 /// (caller-provided) instead of pulling it from the psy_info — useful
 /// for joint-MDCT bodies where M and S channels carry distinct
 /// `max_sfb_0` / `max_sfb_side_0` bounds.
-fn decode_asf_long_mono_body_with_max_sfb(
+///
+/// Round-23 raised this to `pub(crate)` so the multichannel
+/// [`crate::mch`] walkers (Tables 27 / 28 / 29) can drive one
+/// `sf_data(ASF)` body per channel from the shared `sf_info(ASF, 0, 0)`
+/// at the head of `three_channel_data` / `four_channel_data` /
+/// `five_channel_data`.
+pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
     max_sfb_in: u32,
