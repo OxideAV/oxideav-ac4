@@ -932,6 +932,149 @@ pub(crate) fn parse_aspx_data_1ch_body(
     Ok(())
 }
 
+/// Walk the `aspx_data_2ch()` body (Table 52) at the current bit
+/// position into `tools`. Reads:
+///
+///   * `aspx_xover_subband_offset` (3 bits)
+///   * `aspx_framing(0)` for channel 0
+///   * `aspx_balance` (1 bit) — when 0, `aspx_framing(1)` follows
+///   * `aspx_delta_dir(0)` and `aspx_delta_dir(1)`
+///   * `aspx_hfgen_iwc_2ch(aspx_balance)`
+///   * 4x `aspx_ec_data` calls: ch0/ch1 SIGNAL, ch0/ch1 NOISE
+///
+/// Used by both the stereo CPE `ASPX` mode (§4.2.6.3, Table 22) and
+/// the 5.X `ASPX_ACPL_3` mode (§4.2.6.6, Table 25). Both follow the
+/// same Table-52 layout.
+///
+/// The caller is responsible for arranging that the bitreader is
+/// sitting at the start of `aspx_data_2ch()`. `cfg` is the active
+/// `aspx_config()` (drives quant_mode_env + num_noise_sbgroups).
+pub(crate) fn parse_aspx_data_2ch_body(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Result<()> {
+    let xover = br.read_u32(3)? as u8;
+    tools.aspx_xover_subband_offset = Some(xover);
+    let nats = aspx::num_aspx_timeslots(frame_len_base);
+    let framing_ch0 = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
+    // Per Table 52: `aspx_qmode_env[0] = aspx_qmode_env[1]
+    // = aspx_quant_mode_env` then clamp to 0 on FIXFIX +
+    // num_env == 1.
+    let qmode_ch0 = if matches!(framing_ch0.int_class, aspx::AspxIntClass::FixFix)
+        && framing_ch0.num_env == 1
+    {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+    tools.aspx_qmode_env_primary = Some(qmode_ch0);
+    // Table 52: aspx_balance (1 bit). If 0, aspx_framing(1)
+    // follows for channel 1; otherwise channel 1 reuses
+    // channel 0's framing.
+    let balance = br.read_bit()?;
+    tools.aspx_balance = Some(balance);
+    let framing_ch1_ref;
+    if !balance {
+        let framing_ch1 = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
+        // Per Table 52 the ch1 qmode is recomputed against the ch1
+        // framing (and re-clamped on FIXFIX + num_env == 1).
+        let qmode_ch1 = if matches!(framing_ch1.int_class, aspx::AspxIntClass::FixFix)
+            && framing_ch1.num_env == 1
+        {
+            aspx::AspxQuantStep::Fine
+        } else {
+            cfg.quant_mode_env
+        };
+        tools.aspx_qmode_env_secondary = Some(qmode_ch1);
+        tools.aspx_framing_secondary = Some(framing_ch1);
+        framing_ch1_ref = tools.aspx_framing_secondary.as_ref();
+    } else {
+        // Shared framing; copy the ch0 qmode across.
+        tools.aspx_qmode_env_secondary = Some(qmode_ch0);
+        framing_ch1_ref = Some(&framing_ch0);
+    }
+    // aspx_delta_dir(0) then aspx_delta_dir(1) per Table 52.
+    let dd0 = aspx::parse_aspx_delta_dir(br, &framing_ch0)?;
+    let f_ch1 = framing_ch1_ref.unwrap_or(&framing_ch0);
+    let dd1 = aspx::parse_aspx_delta_dir(br, f_ch1)?;
+    // §5.7.6.3.1 derivation feeds aspx_hfgen_iwc_2ch() (Table 56)
+    // then four aspx_ec_data() calls (ch0/ch1 SIGNAL, ch0/ch1
+    // NOISE) per Table 52.
+    if let Ok(tables) = aspx::derive_aspx_frequency_tables(cfg, xover as u32) {
+        let hfgen = aspx::parse_aspx_hfgen_iwc_2ch(
+            br,
+            balance,
+            cfg.num_noise_sbgroups(),
+            tables.counts.num_sbg_sig_highres,
+            nats,
+        )?;
+        tools.aspx_hfgen_iwc_2ch = Some(hfgen);
+        let qmode_ch1_effective = tools.aspx_qmode_env_secondary.unwrap_or(qmode_ch0);
+        // ch0 SIGNAL: stereo_mode = LEVEL (Table 52).
+        let sig0 = aspx::parse_aspx_ec_data(
+            br,
+            aspx::AspxDataType::Signal,
+            framing_ch0.num_env,
+            &framing_ch0.freq_res,
+            qmode_ch0,
+            aspx::AspxStereoMode::Level,
+            &dd0.sig_delta_dir,
+            tables.counts,
+        )?;
+        tools.aspx_data_sig_primary = Some(sig0);
+        // ch1 SIGNAL: BALANCE when aspx_balance == 1 else LEVEL
+        // (Table 52).
+        let sm_ch1 = if balance {
+            aspx::AspxStereoMode::Balance
+        } else {
+            aspx::AspxStereoMode::Level
+        };
+        let sig1 = aspx::parse_aspx_ec_data(
+            br,
+            aspx::AspxDataType::Signal,
+            f_ch1.num_env,
+            &f_ch1.freq_res,
+            qmode_ch1_effective,
+            sm_ch1,
+            &dd1.sig_delta_dir,
+            tables.counts,
+        )?;
+        tools.aspx_data_sig_secondary = Some(sig1);
+        // ch0 NOISE.
+        let noise0 = aspx::parse_aspx_ec_data(
+            br,
+            aspx::AspxDataType::Noise,
+            framing_ch0.num_noise,
+            &[],
+            aspx::AspxQuantStep::Fine,
+            aspx::AspxStereoMode::Level,
+            &dd0.noise_delta_dir,
+            tables.counts,
+        )?;
+        tools.aspx_data_noise_primary = Some(noise0);
+        // ch1 NOISE mirrors ch1 SIGNAL stereo_mode.
+        let noise1 = aspx::parse_aspx_ec_data(
+            br,
+            aspx::AspxDataType::Noise,
+            f_ch1.num_noise,
+            &[],
+            aspx::AspxQuantStep::Fine,
+            sm_ch1,
+            &dd1.noise_delta_dir,
+            tables.counts,
+        )?;
+        tools.aspx_data_noise_secondary = Some(noise1);
+        tools.aspx_frequency_tables = Some(tables);
+    }
+    tools.aspx_delta_dir_primary = Some(dd0);
+    tools.aspx_delta_dir_secondary = Some(dd1);
+    tools.aspx_framing_primary = Some(framing_ch0);
+    Ok(())
+}
+
 /// Decode the `sf_data` body for a mono, long-frame, single-window-
 /// group ASF substream. Returns the dequantised + scaled spectral
 /// coefficients for the frame.
@@ -1330,126 +1473,7 @@ pub fn parse_stereo_audio_data_outer(
             let body_ok = parse_stereo_data_body(br, tools, frame_len_base);
             if b_iframe && body_ok {
                 if let Some(cfg) = tools.aspx_config {
-                    let xover = br.read_u32(3)? as u8;
-                    tools.aspx_xover_subband_offset = Some(xover);
-                    let nats = aspx::num_aspx_timeslots(frame_len_base);
-                    let framing_ch0 = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
-                    // Per Table 52: `aspx_qmode_env[0] = aspx_qmode_env[1]
-                    // = aspx_quant_mode_env` then clamp to 0 on FIXFIX +
-                    // num_env == 1.
-                    let qmode_ch0 = if matches!(framing_ch0.int_class, aspx::AspxIntClass::FixFix)
-                        && framing_ch0.num_env == 1
-                    {
-                        aspx::AspxQuantStep::Fine
-                    } else {
-                        cfg.quant_mode_env
-                    };
-                    tools.aspx_qmode_env_primary = Some(qmode_ch0);
-                    // Table 52: aspx_balance (1 bit). If 0, aspx_framing(1)
-                    // follows for channel 1; otherwise channel 1 reuses
-                    // channel 0's framing.
-                    let balance = br.read_bit()?;
-                    tools.aspx_balance = Some(balance);
-                    let framing_ch1_ref;
-                    if !balance {
-                        let framing_ch1 = aspx::parse_aspx_framing(br, &cfg, b_iframe, nats > 8)?;
-                        // Per Table 52 the ch1 qmode is recomputed
-                        // against the ch1 framing (and re-clamped on
-                        // FIXFIX + num_env == 1).
-                        let qmode_ch1 =
-                            if matches!(framing_ch1.int_class, aspx::AspxIntClass::FixFix)
-                                && framing_ch1.num_env == 1
-                            {
-                                aspx::AspxQuantStep::Fine
-                            } else {
-                                cfg.quant_mode_env
-                            };
-                        tools.aspx_qmode_env_secondary = Some(qmode_ch1);
-                        tools.aspx_framing_secondary = Some(framing_ch1);
-                        framing_ch1_ref = tools.aspx_framing_secondary.as_ref();
-                    } else {
-                        // Shared framing; copy the ch0 qmode across.
-                        tools.aspx_qmode_env_secondary = Some(qmode_ch0);
-                        framing_ch1_ref = Some(&framing_ch0);
-                    }
-                    // aspx_delta_dir(0) then aspx_delta_dir(1) per
-                    // Table 52.
-                    let dd0 = aspx::parse_aspx_delta_dir(br, &framing_ch0)?;
-                    let f_ch1 = framing_ch1_ref.unwrap_or(&framing_ch0);
-                    let dd1 = aspx::parse_aspx_delta_dir(br, f_ch1)?;
-                    // §5.7.6.3.1 derivation feeds aspx_hfgen_iwc_2ch()
-                    // (Table 56) then four aspx_ec_data() calls
-                    // (ch0/ch1 SIGNAL, ch0/ch1 NOISE) per Table 52.
-                    if let Ok(tables) = aspx::derive_aspx_frequency_tables(&cfg, xover as u32) {
-                        let hfgen = aspx::parse_aspx_hfgen_iwc_2ch(
-                            br,
-                            balance,
-                            cfg.num_noise_sbgroups(),
-                            tables.counts.num_sbg_sig_highres,
-                            nats,
-                        )?;
-                        tools.aspx_hfgen_iwc_2ch = Some(hfgen);
-                        let qmode_ch1_effective =
-                            tools.aspx_qmode_env_secondary.unwrap_or(qmode_ch0);
-                        // ch0 SIGNAL: stereo_mode = LEVEL (Table 52).
-                        let sig0 = aspx::parse_aspx_ec_data(
-                            br,
-                            aspx::AspxDataType::Signal,
-                            framing_ch0.num_env,
-                            &framing_ch0.freq_res,
-                            qmode_ch0,
-                            aspx::AspxStereoMode::Level,
-                            &dd0.sig_delta_dir,
-                            tables.counts,
-                        )?;
-                        tools.aspx_data_sig_primary = Some(sig0);
-                        // ch1 SIGNAL: BALANCE when aspx_balance == 1
-                        // else LEVEL (Table 52).
-                        let sm_ch1 = if balance {
-                            aspx::AspxStereoMode::Balance
-                        } else {
-                            aspx::AspxStereoMode::Level
-                        };
-                        let sig1 = aspx::parse_aspx_ec_data(
-                            br,
-                            aspx::AspxDataType::Signal,
-                            f_ch1.num_env,
-                            &f_ch1.freq_res,
-                            qmode_ch1_effective,
-                            sm_ch1,
-                            &dd1.sig_delta_dir,
-                            tables.counts,
-                        )?;
-                        tools.aspx_data_sig_secondary = Some(sig1);
-                        // ch0 NOISE.
-                        let noise0 = aspx::parse_aspx_ec_data(
-                            br,
-                            aspx::AspxDataType::Noise,
-                            framing_ch0.num_noise,
-                            &[],
-                            aspx::AspxQuantStep::Fine,
-                            aspx::AspxStereoMode::Level,
-                            &dd0.noise_delta_dir,
-                            tables.counts,
-                        )?;
-                        tools.aspx_data_noise_primary = Some(noise0);
-                        // ch1 NOISE mirrors ch1 SIGNAL stereo_mode.
-                        let noise1 = aspx::parse_aspx_ec_data(
-                            br,
-                            aspx::AspxDataType::Noise,
-                            f_ch1.num_noise,
-                            &[],
-                            aspx::AspxQuantStep::Fine,
-                            sm_ch1,
-                            &dd1.noise_delta_dir,
-                            tables.counts,
-                        )?;
-                        tools.aspx_data_noise_secondary = Some(noise1);
-                        tools.aspx_frequency_tables = Some(tables);
-                    }
-                    tools.aspx_delta_dir_primary = Some(dd0);
-                    tools.aspx_delta_dir_secondary = Some(dd1);
-                    tools.aspx_framing_primary = Some(framing_ch0);
+                    parse_aspx_data_2ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
                 }
             }
         }

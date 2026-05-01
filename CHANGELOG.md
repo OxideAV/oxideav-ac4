@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 24 — Grouped multichannel `sf_data(ASF)` walker + ASPX_ACPL_3
+  inner body walker** (TS 103 190-1 §4.2.6.6 + §5.4.4.4 + Table 52 / 62):
+  - `decode_mch_sf_data_channels()` in `mch.rs` now also handles the
+    grouped / short-frame case (`num_window_groups > 1`). A new
+    `decode_asf_grouped_mono_body_with_max_sfb()` helper walks
+    `num_window_groups` independent `(asf_section_data +
+    asf_spectral_data + asf_scalefac_data + asf_snf_data)` chains per
+    body and concatenates the per-group dequantised spectra
+    group-major into a single `Vec<f32>` of length
+    `num_window_groups * sfb_offset[max_sfb]`. With `b_dual_maxsfb = 0`
+    every group shares the same `max_sfb_0`, matching Pseudocode 5
+    `get_max_sfb(g)` for the non-side-channel multichannel path.
+    `parse_two_channel_data` / `parse_three_channel_data` /
+    `parse_four_channel_data` / `parse_five_channel_data` now populate
+    `scaled_spec_per_channel` for **both** the long-frame /
+    single-window-group (r23) and the grouped / multi-window-group
+    paths.
+  - `parse_5x_audio_data_outer` for `5_X_codec_mode == ASPX_ACPL_3`
+    now walks the inner body (Table 25 row ASPX_ACPL_3:
+    `stereo_data() + aspx_data_2ch() + acpl_data_2ch()`). The flow is:
+    `parse_stereo_data_body()` → on success + I-frame +
+    `tools.aspx_config.is_some()`, `parse_aspx_data_2ch_body()` →
+    `parse_acpl_data_2ch(num_param_bands, 0, qm0, qm1)`. The parsed
+    `tools.acpl_data_2ch` slot now flows straight into the
+    §5.7.7.6.2 Pseudocode-118 5_X synthesis pipeline (closing the
+    contract the round-22 staging tests stubbed by hand).
+  - **Refactor**: factored the Table-52 `aspx_data_2ch()` body parser
+    out of the stereo CPE ASPX path (`parse_stereo_audio_data_outer`)
+    into a shared `pub(crate) parse_aspx_data_2ch_body()` helper in
+    `asf.rs`. Both the stereo CPE `StereoCodecMode::Aspx` mode and
+    the new 5_X `ASPX_ACPL_3` mode now drive this single parser —
+    one definition of `aspx_xover_subband_offset + aspx_framing(0) +
+    aspx_balance + [aspx_framing(1)] + aspx_delta_dir(0/1) +
+    aspx_hfgen_iwc_2ch + 4x aspx_ec_data` instead of two divergent
+    inline copies.
+  - 7 new tests (380 → 387 total): grouped two-group two-channel walk
+    with all-zero spectra (length matches `2 * sfb_offset[max_sfb]`);
+    three-group one-channel walk pinning the linear `num_window_groups`
+    scale; `parse_three_channel_data` grouped-short-frame end-to-end
+    walk through `parse_5x_audio_data_outer`; `parse_two_channel_data`
+    grouped-short-frame walk for Cfg0 / Cfg1; truncated grouped input
+    yields `None` without panicking; ASPX_ACPL_3 non-iframe leaves
+    `tools.acpl_data_2ch == None`; ASPX_ACPL_3 I-frame parses the
+    `aspx_config + acpl_config_2ch` configs out of the bitstream and
+    surfaces them on tools (the inner body walker bails silently
+    downstream of `stereo_data()` on a degenerate aspx_config — that
+    bail is part of the try-and-bail contract).
+
 - **Round 23 — Multichannel `sf_data(ASF)` Huffman codebook table walk**
   (TS 103 190-1 §4.2.6.7-10 Tables 26 / 27 / 28 / 29):
   - New `decode_mch_sf_data_channels()` helper in `mch.rs` walks

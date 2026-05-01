@@ -39,11 +39,25 @@ framework but usable standalone.
 > are `HCB_1`..`HCB_11` (spectral lines), `HCB_SCALEFAC` (scale-factor
 > DPCM) and `HCB_SNF` (spectral noise fill) — Annex A.1 shares the
 > codebooks across mono / stereo / multichannel; there is no separate
-> "MCH" codebook set. **380 tests**. Pending: short / grouped
-> multichannel `sf_data(ASF)` walker (`num_window_groups != 1` path)
-> + the inner `stereo_data() + aspx_data_2ch() + acpl_data_2ch()` body
-> walker that populates `tools.acpl_data_2ch` /
-> `tools.acpl_data_1ch_pair[..]` straight from the 5_X bitstream.
+> "MCH" codebook set. Round 24 closes the two r23 follow-ups: (1) the
+> grouped / short-frame multichannel `sf_data(ASF)` walker
+> (`num_window_groups > 1`) is now driven by
+> `decode_asf_grouped_mono_body_with_max_sfb()` — each per-channel
+> spectrum is the concatenation of `num_window_groups` independent
+> `(section + spectral + scalefac + snf)` chains, group-major; (2) the
+> ASPX_ACPL_3 inner body walker is now wired in
+> `parse_5x_audio_data_outer` — on an I-frame the walker chains
+> `stereo_data() + aspx_data_2ch() + acpl_data_2ch()` and the parsed
+> `tools.acpl_data_2ch` flows straight into the §5.7.7.6.2
+> Pseudocode-118 5_X synthesis pipeline. The Table-52 `aspx_data_2ch()`
+> body parser was factored out of the stereo CPE ASPX path into a
+> shared `parse_aspx_data_2ch_body()` helper — both the stereo CPE
+> mode and the 5_X ASPX_ACPL_3 mode use the same parser. **387 tests**.
+> Pending: ASPX_ACPL_1 / ASPX_ACPL_2 inner body walker for the 5_X
+> path (still relies on the future joint-MDCT residual layer + per-
+> ACplModule `acpl_data_1ch` pair extraction); 7_X-channel-element
+> walker; ASF short-frame `sf_data` walk for the mono / stereo paths
+> (the grouped walker added here covers the multichannel layouts only).
 
 ## Specs
 

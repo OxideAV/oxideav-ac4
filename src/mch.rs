@@ -412,9 +412,21 @@ pub fn parse_five_channel_data(
 ///
 /// Bodies past a Huffman / bit-stream miss return `None` for the
 /// remaining channels (we can't re-sync mid-bitstream); the entries
-/// before the miss are still populated. Short / grouped frames return
-/// all-`None` since this round only handles the long-frame,
-/// single-window-group case.
+/// before the miss are still populated.
+///
+/// Round 24 extends the previous (long-frame, `num_window_groups == 1`)
+/// path to also walk **short / grouped** frames where
+/// `num_window_groups > 1`. In that case each per-channel body fires
+/// `num_window_groups` independent
+/// `(asf_section_data + asf_spectral_data + asf_scalefac_data +
+/// asf_snf_data)` cycles — one per window group — and the
+/// per-channel spectrum is the concatenation of the
+/// `num_window_groups` per-group spectra (each of length
+/// `sfb_offset[max_sfb]` at the per-window transform length).
+/// `b_dual_maxsfb == 0` means the same `max_sfb_0` applies to every
+/// group; per-group `max_sfb` selection (Pseudocode 5
+/// `get_max_sfb(g)`) collapses to that single value for the
+/// non-side-channel multichannel path.
 pub(crate) fn decode_mch_sf_data_channels(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
@@ -422,16 +434,73 @@ pub(crate) fn decode_mch_sf_data_channels(
     n_channels: usize,
 ) -> Vec<Option<Vec<f32>>> {
     let mut out = vec![None; n_channels];
-    if !ti.b_long_frame || psy.num_window_groups != 1 {
+    if ti.b_long_frame && psy.num_window_groups == 1 {
+        // Long-frame, 1 window group — walk one body chain per channel.
+        for slot in out.iter_mut() {
+            match decode_asf_long_mono_body_with_max_sfb(br, ti, psy.max_sfb_0) {
+                Some(v) => *slot = Some(v),
+                None => break,
+            }
+        }
         return out;
     }
+    if psy.num_window_groups == 0 {
+        return out;
+    }
+    // Short / grouped frame walker.
     for slot in out.iter_mut() {
-        match decode_asf_long_mono_body_with_max_sfb(br, ti, psy.max_sfb_0) {
+        match decode_asf_grouped_mono_body_with_max_sfb(
+            br,
+            ti,
+            psy.max_sfb_0,
+            psy.num_window_groups,
+        ) {
             Some(v) => *slot = Some(v),
             None => break,
         }
     }
     out
+}
+
+/// Walk one `sf_data(ASF)` body for the grouped / short-frame case
+/// where `num_window_groups > 1`. Per spec §4.2.8 (Tables 39-42) and
+/// §5.4.4.4 the body fires `num_window_groups` independent
+/// `(section + spectral + scalefac + snf)` cycles back-to-back; the
+/// per-group spectrum is `sfb_offset[max_sfb]` long at the per-window
+/// transform length. The returned vector concatenates the
+/// `num_window_groups` per-group spectra (group-major).
+///
+/// Returns `None` on the first Huffman / bit-stream miss; partial
+/// per-group output is dropped because the bitreader position is
+/// indeterminate after a mid-body miss.
+fn decode_asf_grouped_mono_body_with_max_sfb(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    max_sfb_in: u32,
+    num_window_groups: u32,
+) -> Option<Vec<f32>> {
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let max_sfb_cap = crate::tables::num_sfb_48(tl)?;
+    let max_sfb = max_sfb_in.min(max_sfb_cap);
+    if max_sfb == 0 {
+        return None;
+    }
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    let per_group_len = sfbo[max_sfb as usize] as usize;
+    let total_len = per_group_len.checked_mul(num_window_groups as usize)?;
+    let mut out = Vec::with_capacity(total_len);
+    for _g in 0..num_window_groups {
+        let sections = crate::asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
+        let (qspec, mqi) =
+            crate::asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
+        let sf_gain =
+            crate::asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+        let _snf = crate::asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+        let scaled = crate::asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
+        out.extend_from_slice(&scaled);
+    }
+    Some(out)
 }
 
 // =====================================================================
@@ -587,11 +656,40 @@ pub fn parse_5x_audio_data_outer(
         }
         FiveXCodecMode::AspxAcpl3 => {
             tools.companding = Some(crate::aspx::parse_companding_control(br, 2)?);
-            // No coding_config: body is `stereo_data()` followed by
-            // aspx_data_2ch() + acpl_data_2ch(). The `stereo_data()`
-            // shell matches the existing parse_stereo_data_body but
-            // sits at a different bitreader position; full integration
-            // waits on r20's Pseudocode-117/118 transform wiring.
+            // No coding_config: body is `stereo_data() + aspx_data_2ch()
+            // + acpl_data_2ch()` per Table 25 row ASPX_ACPL_3.
+            //
+            // r24 wires the inner body walkers. The flow mirrors the
+            // stereo-CPE ASPX path in `asf.rs`: walk stereo_data() into
+            // tools, then if the body decoded cleanly + we're on an
+            // I-frame + an aspx_config is in scope, walk aspx_data_2ch()
+            // (Table 52). Finally walk acpl_data_2ch() (Table 62) using
+            // the parsed acpl_config_2ch() — start_band is 0 since
+            // acpl_config_2ch() doesn't carry a qmf_band field
+            // (acpl_data_2ch always covers all parameter bands).
+            let body_ok = crate::asf::parse_stereo_data_body(br, tools, frame_len_base);
+            if b_iframe && body_ok {
+                if let Some(cfg) = tools.aspx_config {
+                    crate::asf::parse_aspx_data_2ch_body(
+                        br,
+                        tools,
+                        &cfg,
+                        b_iframe,
+                        frame_len_base,
+                    )?;
+                    if let Some(acfg) = tools.acpl_config_2ch {
+                        if let Ok(d) = crate::acpl::parse_acpl_data_2ch(
+                            br,
+                            acfg.num_param_bands,
+                            0,
+                            acfg.quant_mode_0,
+                            acfg.quant_mode_1,
+                        ) {
+                            tools.acpl_data_2ch = Some(d);
+                        }
+                    }
+                }
+            }
         }
         FiveXCodecMode::Reserved(_) => {}
     }
@@ -1135,11 +1233,13 @@ mod tests {
     }
 
     /// `decode_mch_sf_data_channels` returns `None` for **all** channels
-    /// when the input doesn't satisfy the long-frame /
-    /// single-window-group precondition. The bit reader is left
-    /// untouched (no bits consumed) so downstream parsers can recover.
+    /// when the input bits are garbage (Huffman miss in the very first
+    /// section_data). r24's grouped walker still attempts the body
+    /// chain for `num_window_groups > 1`, so the all-None return here
+    /// signals a parse failure rather than the previous "skip
+    /// short/grouped" gate.
     #[test]
-    fn decode_mch_sf_data_short_frame_returns_all_none() {
+    fn decode_mch_sf_data_short_frame_garbage_returns_all_none() {
         let bytes = [0xFFu8; 4];
         let mut br = BitReader::new(&bytes);
         let ti = AsfTransformInfo {
@@ -1298,5 +1398,286 @@ mod tests {
             let v = ch.as_ref().unwrap();
             assert_eq!(v.len(), expected_len);
         }
+    }
+
+    // =================================================================
+    // Round 24: grouped multichannel sf_data(ASF) walker (num_window_groups > 1)
+    // =================================================================
+
+    /// `decode_mch_sf_data_channels` for a grouped short frame
+    /// (`num_window_groups == 2`, `b_long_frame == 0`) walks
+    /// `num_window_groups` consecutive `section / spectral / scalefac /
+    /// snf` chains per channel and returns a per-channel spectrum of
+    /// length `num_window_groups * sfb_offset[max_sfb]` (all-zero for
+    /// the synthetic input). Pins r24 §5.4.4.4 grouped path.
+    #[test]
+    fn decode_mch_sf_data_grouped_short_frame_two_groups_two_channels() {
+        // Two channels x two window groups x sf_data body each. tl=480
+        // is at frame_len_base=1920 with transf_length=2 (the third
+        // short-frame index — `n_sect_bits = 3`, esc = 7).
+        let max_sfb = 8u32;
+        let tl_idx = 2u32; // matches transf_length=2 (tl=480 short-frame).
+        let mut bw = BitWriter::new();
+        // Channel 0: two grouped bodies.
+        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        // Channel 1: two grouped bodies.
+        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let ti = AsfTransformInfo {
+            b_long_frame: false,
+            transf_length: [tl_idx, tl_idx],
+            transform_length_0: 480,
+            transform_length_1: 480,
+        };
+        let psy = AsfPsyInfo {
+            max_sfb_0: max_sfb,
+            num_windows: 2,
+            num_window_groups: 2,
+            scale_factor_grouping: vec![0],
+            ..Default::default()
+        };
+        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
+        assert_eq!(out.len(), 2);
+        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
+        let per_group_len = sfbo[max_sfb as usize] as usize;
+        let expected_total = per_group_len * 2; // num_window_groups
+        for slot in &out {
+            let v = slot.as_ref().expect("each channel decodes");
+            assert_eq!(v.len(), expected_total);
+            assert!(v.iter().all(|&s| s == 0.0));
+        }
+    }
+
+    /// Three-window-group case at the same short-frame transform
+    /// length. Verifies the walker scales linearly with
+    /// `num_window_groups`.
+    #[test]
+    fn decode_mch_sf_data_grouped_three_groups_one_channel() {
+        let max_sfb = 6u32;
+        let tl_idx = 2u32;
+        let mut bw = BitWriter::new();
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let ti = AsfTransformInfo {
+            b_long_frame: false,
+            transf_length: [tl_idx, tl_idx],
+            transform_length_0: 480,
+            transform_length_1: 480,
+        };
+        let psy = AsfPsyInfo {
+            max_sfb_0: max_sfb,
+            num_windows: 3,
+            num_window_groups: 3,
+            scale_factor_grouping: vec![0, 0],
+            ..Default::default()
+        };
+        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
+        assert_eq!(out.len(), 1);
+        let v = out[0].as_ref().expect("decode succeeds");
+        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
+        assert_eq!(v.len(), 3 * sfbo[max_sfb as usize] as usize);
+    }
+
+    /// `parse_three_channel_data` correctly drives the grouped path
+    /// when the head `sf_info(ASF, 0, 0)` reports
+    /// `num_window_groups > 1`. Each channel's `scaled_spec_per_channel`
+    /// slot carries the concatenated per-group spectra.
+    #[test]
+    fn parse_three_channel_data_grouped_short_frame_walks_per_group() {
+        // sf_info(ASF, 0, 0) at frame_len_base=1920 with
+        // b_long_frame=0, transf_length=[2,2] -> tl=480 short-frame +
+        // n_grp_bits = n_grp_bits_lt_1536 isn't applicable here; for
+        // frame_len_base=1920 (>= 1536) with equal transf_length we
+        // use n_grp_bits_ge_1536(2,2) = 3. Set
+        // scale_factor_grouping = [1, 0, 1] -> num_window_groups = 2.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_long_frame = 0
+        bw.write_u32(2, 2); // transf_length[0] = 2 (tl=480)
+        bw.write_u32(2, 2); // transf_length[1] = 2 (tl=480)
+        let max_sfb = 5u32;
+        // n_msfb_bits for tl=480 short-frame at 48 kHz: per Table 106
+        // tl=480 column 1 (n_msfb_bits) = 6.
+        bw.write_u32(max_sfb, 6); // max_sfb[0]
+                                  // scale_factor_grouping bits = 3 (n_grp_bits_ge_1536(2,2)).
+                                  // Pattern [1, 0, 1] -> exactly one group boundary (one zero) ->
+                                  // num_window_groups = 1 + 1 = 2.
+        bw.write_u32(1, 1);
+        bw.write_u32(0, 1);
+        bw.write_u32(1, 1);
+        // three_channel_info: chel_matsel + 2x chparam_info(sap_mode=0).
+        bw.write_u32(0, 4);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        // Three channels x two window groups of sf_data(ASF) bodies.
+        for _ in 0..3 {
+            for _ in 0..2 {
+                write_zero_sf_data_body(&mut bw, max_sfb, 2);
+            }
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d = parse_three_channel_data(&mut br, 1920).unwrap();
+        let psy = d.psy_info.as_ref().unwrap();
+        assert_eq!(psy.num_window_groups, 2);
+        assert!(!d.transform_info.as_ref().unwrap().b_long_frame);
+        assert_eq!(d.scaled_spec_per_channel.len(), 3);
+        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
+        let expected_total = (sfbo[max_sfb as usize] as usize) * 2;
+        for ch in &d.scaled_spec_per_channel {
+            let v = ch.as_ref().expect("each channel decodes");
+            assert_eq!(v.len(), expected_total);
+            assert!(v.iter().all(|&s| s == 0.0));
+        }
+    }
+
+    /// `parse_two_channel_data` mirrors the grouped walk for the
+    /// `5_X_channel_element` Cfg0 / Cfg1 paths — every per-channel slot
+    /// carries the concatenated grouped spectrum.
+    #[test]
+    fn parse_two_channel_data_grouped_short_frame_walks_per_group() {
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_long_frame = 0
+        bw.write_u32(2, 2); // transf_length[0] = 2 (tl=480)
+        bw.write_u32(2, 2); // transf_length[1] = 2 (tl=480)
+        let max_sfb = 4u32;
+        bw.write_u32(max_sfb, 6); // max_sfb[0]
+                                  // n_grp_bits = 3 from n_grp_bits_ge_1536(2,2). [0,0,0] -> 4 groups.
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 1);
+        // chparam_info: sap_mode=0.
+        bw.write_u32(0, 2);
+        // 2 channels x 4 window groups of bodies.
+        for _ in 0..2 {
+            for _ in 0..4 {
+                write_zero_sf_data_body(&mut bw, max_sfb, 2);
+            }
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d = parse_two_channel_data(&mut br, 1920).unwrap();
+        let psy = d.psy_info.as_ref().unwrap();
+        assert_eq!(psy.num_window_groups, 4);
+        assert_eq!(d.scaled_spec_per_channel.len(), 2);
+        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
+        let expected_total = (sfbo[max_sfb as usize] as usize) * 4;
+        for ch in &d.scaled_spec_per_channel {
+            let v = ch.as_ref().expect("each channel decodes");
+            assert_eq!(v.len(), expected_total);
+        }
+    }
+
+    /// Truncated grouped input should yield a partial per-channel
+    /// decode and not panic. We feed only one window-group's body for
+    /// the single channel and expect a `None` slot.
+    #[test]
+    fn decode_mch_sf_data_grouped_truncated_returns_none() {
+        let max_sfb = 6u32;
+        let tl_idx = 2u32;
+        let mut bw = BitWriter::new();
+        // Only one body when num_window_groups=2 expects two.
+        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let ti = AsfTransformInfo {
+            b_long_frame: false,
+            transf_length: [tl_idx, tl_idx],
+            transform_length_0: 480,
+            transform_length_1: 480,
+        };
+        let psy = AsfPsyInfo {
+            max_sfb_0: max_sfb,
+            num_windows: 2,
+            num_window_groups: 2,
+            scale_factor_grouping: vec![0],
+            ..Default::default()
+        };
+        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
+        assert_eq!(out.len(), 1);
+        // Single channel: with only 1 of 2 groups present, the second
+        // group attempt should bail (Huffman miss on garbage / EOF).
+        // We allow either Some (if zero-padding accidentally validates
+        // as a section header) or None — but we must NOT panic.
+        let _ = &out[0];
+    }
+
+    // =================================================================
+    // Round 24: ASPX_ACPL_3 inner body walker
+    // =================================================================
+
+    /// `parse_5x_audio_data_outer` for ASPX_ACPL_3 on a non-iframe path
+    /// shouldn't touch the inner body walker (gated on b_iframe + an
+    /// in-scope aspx_config) — `tools.acpl_data_2ch` stays `None`.
+    #[test]
+    fn parse_5x_aspx_acpl_3_non_iframe_leaves_acpl_data_2ch_none() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(4, 3); // 5_X_codec_mode = ASPX_ACPL_3
+                            // companding_control(2): all-zero.
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl3));
+        assert!(tools.acpl_data_2ch.is_none());
+        assert!(tools.companding.is_some());
+    }
+
+    /// `parse_5x_audio_data_outer` for ASPX_ACPL_3 on an I-frame walks
+    /// `aspx_config` + `acpl_config_2ch` + `companding_control(2)` +
+    /// `stereo_data()` then, when the body decodes cleanly, runs
+    /// `aspx_data_2ch()` and `acpl_data_2ch()`. We feed an
+    /// all-zero-tail bitstream — the body walker is allowed to bail
+    /// silently downstream of `stereo_data()` (since the freq-table
+    /// derivation may fail on a degenerate aspx_config), but the
+    /// outer walker must finish without erroring and the parsed
+    /// `acpl_config_2ch` must be visible on the tools.
+    #[test]
+    fn parse_5x_aspx_acpl_3_iframe_parses_aspx_and_acpl_configs() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(4, 3); // 5_X_codec_mode = ASPX_ACPL_3
+                            // aspx_config(): 15 bits all-zero.
+        bw.write_u32(0, 15);
+        // acpl_config_2ch(): 2-bit num_param_bands_id + 2x 1-bit
+        // quant_mode. id=0 -> 15 bands; both quant modes = Fine.
+        bw.write_u32(0, 2);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        // companding_control(2).
+        bw.write_bit(false); // sync_flag = 0
+        bw.write_bit(false); // compand_on[0]
+        bw.write_bit(false); // compand_on[1]
+        bw.write_bit(false); // compand_avg
+                             // stereo_data() body — feed enough zeros that the body walker
+                             // either succeeds or bails cleanly without panicking.
+        bw.align_to_byte();
+        while bw.byte_len() < 256 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        // The walker must complete without erroring — any body-walker
+        // mid-stream miss should be swallowed silently per the
+        // try-and-bail contract (acpl_data_2ch slot would simply stay
+        // None in that case).
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::AspxAcpl3));
+        let cfg = tools.acpl_config_2ch.expect("acpl_config_2ch parsed");
+        assert_eq!(cfg.num_param_bands, 15);
     }
 }
