@@ -21,11 +21,19 @@ framework but usable standalone.
 > outer shells plus a Table-21-correct `sf_info_lfe()` parser. Round 21
 > lands the §5.7.7.6.2 ASPX_ACPL_3 transform-matrix synthesis math
 > (Pseudocodes 118/119 — `Transform()`, `ACplModule2()`, `ACplModule3()`
-> and the full 5-channel pipeline `run_pseudocode_118_5x()`). **363
-> tests**. Pending: per-channel `sf_data(ASF)` Huffman bodies for the
-> multichannel elements (still gated on Pseudocode 178 transform-matrix
-> wiring) + ASPX_ACPL_1/2 multichannel wrappers (Pseudocode 117) +
-> 5_X-walker glue from the bitstream into the new transform synthesis.
+> and the full 5-channel pipeline `run_pseudocode_118_5x()`). Round 22
+> lands §5.7.7.6.1 ASPX_ACPL_1 / ASPX_ACPL_2 multichannel wrappers
+> (Pseudocode 117 — `run_pseudocode_117_5x()`: two parallel ACplModule's
+> with D0/D1 decorrelators) plus the 5_X-walker glue: PCM-level helpers
+> `run_acpl_5x_pair_pcm()` (ASPX_ACPL_1/2) and `run_acpl_5x_mch_pcm()`
+> (ASPX_ACPL_3) consume the parsed `acpl_config_*` + `acpl_data_*` to
+> produce 5-channel L/R/C/Ls/Rs PCM end-to-end via QMF
+> analysis → A-CPL → QMF synthesis. **374 tests**. Pending: per-channel
+> `sf_data(ASF)` Huffman bodies for the multichannel elements (still
+> gated on Pseudocode 178 transform-matrix wiring) + the inner
+> `stereo_data() + aspx_data_2ch() + acpl_data_2ch()` body walker that
+> populates `tools.acpl_data_2ch` / `tools.acpl_data_1ch_pair[..]`
+> straight from the 5_X bitstream.
 
 ## Specs
 

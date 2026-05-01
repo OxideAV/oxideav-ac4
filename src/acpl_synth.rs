@@ -49,6 +49,12 @@
 //!   plus the decorrelator + ducker state for the full
 //!   `Pseudocode 115` channel-pair synthesis path.
 //!
+//! * **§5.7.7.6.1 Multichannel `ASPX_ACPL_1` / `ASPX_ACPL_2`** —
+//!   [`run_pseudocode_117_5x`] (Pseudocode 117) wraps two parallel
+//!   [`run_pseudocode_115_pair`] passes (D0 for the L-side ACplModule,
+//!   D1 for the R-side) and forms the five 5.X output channels from
+//!   the L/R/C carriers (plus optional Ls/Rs carriers for ASPX_ACPL_1).
+//!
 //! * **§5.7.7.6.2 Multichannel `ASPX_ACPL_3`** — [`transform`]
 //!   (Pseudocode 119), [`acpl_module2`] / [`acpl_module3`] (also
 //!   Pseudocode 119) and [`run_pseudocode_118_5x`] (Pseudocode 118)
@@ -61,13 +67,10 @@
 //!
 //! What is NOT covered yet (TS 103 190-1):
 //!
-//! * §5.7.7.6.1 ASPX_ACPL_1 / ASPX_ACPL_2 multichannel wrapper
-//!   (Pseudocode 117) — uses two parallel `ACplModule`s with `y0/y1`
-//!   driven by D0/D1; the building blocks are all here, but the 5-input
-//!   wrapper still needs wiring.
 //! * Hooking the multichannel synthesis into the frame-level decoder
 //!   pipeline (the asf walker still parses `acpl_data_*` but the 5_X
-//!   walker doesn't yet drive [`run_pseudocode_118_5x`]).
+//!   walker doesn't yet drive [`run_pseudocode_118_5x`] /
+//!   [`run_pseudocode_117_5x`]).
 
 use crate::acpl::{sb_to_pb, AcplHuffParam, AcplQuantMode};
 use crate::qmf::NUM_QMF_SUBBANDS;
@@ -1660,6 +1663,215 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
 }
 
 // =====================================================================
+// §5.7.7.6.1 Pseudocode 117 — ASPX_ACPL_1 / ASPX_ACPL_2 multichannel
+// =====================================================================
+
+/// Persistent state for the §5.7.7.6.1 ASPX_ACPL_1 / ASPX_ACPL_2
+/// multichannel wrapper (Pseudocode 117): two parallel `ACplModule`s,
+/// each with its own `AcplCpeState` (D0 for the L-side ACplModule,
+/// D1 for the R-side). Carried across AC-4 frames by the decoder.
+#[derive(Debug, Clone)]
+pub struct Acpl5xPairState {
+    /// State for the first ACplModule — drives the L / Ls output pair
+    /// from the L (and optionally Ls) carrier. Decorrelator = D0.
+    pub left_pair: AcplCpeState,
+    /// State for the second ACplModule — drives the R / Rs output pair
+    /// from the R (and optionally Rs) carrier. Decorrelator = D1.
+    pub right_pair: AcplCpeState,
+    /// Differential-decode state for the first `acpl_data_1ch()` set
+    /// (alpha / beta on the L-side module).
+    pub alpha1_diff: AcplDiffState,
+    pub beta1_diff: AcplDiffState,
+    /// Differential-decode state for the second `acpl_data_1ch()` set
+    /// (alpha / beta on the R-side module).
+    pub alpha2_diff: AcplDiffState,
+    pub beta2_diff: AcplDiffState,
+}
+
+impl Acpl5xPairState {
+    pub fn new() -> Self {
+        Self {
+            left_pair: AcplCpeState::new(DecorrelatorId::D0),
+            right_pair: AcplCpeState::new(DecorrelatorId::D1),
+            alpha1_diff: AcplDiffState::new(),
+            beta1_diff: AcplDiffState::new(),
+            alpha2_diff: AcplDiffState::new(),
+            beta2_diff: AcplDiffState::new(),
+        }
+    }
+}
+
+impl Default for Acpl5xPairState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 5_X codec mode selector for [`run_pseudocode_117_5x`] — chooses
+/// between the two-carrier `ASPX_ACPL_1` (`x3`/`x4` present) and the
+/// one-carrier `ASPX_ACPL_2` (`x3`/`x4` are zero / absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acpl5xPairMode {
+    /// `5_X_codec_mode == ASPX_ACPL_1` — L/R carriers + Ls/Rs carriers
+    /// (4 driving channels into the two parallel ACplModule's).
+    AspxAcpl1,
+    /// `5_X_codec_mode == ASPX_ACPL_2` — only L/R carriers; Ls/Rs come
+    /// from each ACplModule's decorrelator-driven `y0`/`y1` term.
+    AspxAcpl2,
+}
+
+/// Inputs to one §5.7.7.6.1 Pseudocode 117 wrapper pass.
+///
+/// Carrier channel ordering follows the spec:
+///
+/// * `x0` = Left, `x1` = Right (always present)
+/// * `x2` = Centre (passthrough — copied straight to `z4`)
+/// * `x3` = Left surround, `x4` = Right surround (only used when
+///   `mode == AspxAcpl1`; `None` for `AspxAcpl2`).
+///
+/// Each ACplModule consumes its own `acpl_data_1ch()` set (the
+/// dequantised `acpl_alpha_1_dq` / `acpl_beta_1_dq` for module #1, and
+/// `acpl_alpha_2_dq` / `acpl_beta_2_dq` for module #2). `num_pset_1` /
+/// `num_pset_2` and the two framing rows can differ between modules.
+pub struct Acpl5xPairFrame<'a> {
+    pub mode: Acpl5xPairMode,
+    pub x0: &'a [[(f32, f32); NUM_QMF_SUBBANDS]],
+    pub x1: &'a [[(f32, f32); NUM_QMF_SUBBANDS]],
+    pub x2: &'a [[(f32, f32); NUM_QMF_SUBBANDS]],
+    pub x3: Option<&'a [[(f32, f32); NUM_QMF_SUBBANDS]]>,
+    pub x4: Option<&'a [[(f32, f32); NUM_QMF_SUBBANDS]]>,
+    /// `acpl_alpha_1_dq[pset][pb]` / `acpl_beta_1_dq[pset][pb]` (module
+    /// #1, drives L / Ls).
+    pub alpha_1_dq: &'a [Vec<f32>],
+    pub beta_1_dq: &'a [Vec<f32>],
+    /// `acpl_alpha_2_dq[pset][pb]` / `acpl_beta_2_dq[pset][pb]` (module
+    /// #2, drives R / Rs).
+    pub alpha_2_dq: &'a [Vec<f32>],
+    pub beta_2_dq: &'a [Vec<f32>],
+    pub num_param_bands: u32,
+    /// The multichannel paths set `acpl_qmf_band` to 0 (see
+    /// §5.7.7.6.1) — the M/S split below `acpl_qmf_band` only applies
+    /// to the channel-pair flow.
+    pub acpl_qmf_band: u32,
+    pub steep_1: bool,
+    pub steep_2: bool,
+    pub param_timeslots_1: &'a [u8],
+    pub param_timeslots_2: &'a [u8],
+}
+
+/// Output channels from [`run_pseudocode_117_5x`] — the five 5.X output
+/// QMF matrices in spec ordering (`z0`=L, `z1`=Ls, `z2`=R, `z3`=Rs,
+/// `z4`=C).
+pub struct Acpl5xPairOutput {
+    pub z0: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // L
+    pub z1: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // Ls
+    pub z2: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // R
+    pub z3: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // Rs
+    pub z4: Vec<[(f32, f32); NUM_QMF_SUBBANDS]>, // C
+}
+
+/// Run the §5.7.7.6.1 Pseudocode 117 multichannel wrapper for
+/// `5_X_codec_mode in { ASPX_ACPL_1, ASPX_ACPL_2 }`.
+///
+/// Verbatim from Pseudocode 117 (TS 103 190-1 §5.7.7.6.1):
+///
+/// ```text
+///   x0in = 2*x0;
+///   x1in = 2*x1;
+///   u0 = inputSignalModification(x0in);   // D0
+///   u1 = inputSignalModification(x1in);   // D1
+///   y0 = applyTransientDucker(u0);
+///   y1 = applyTransientDucker(u1);
+///   if (5_X_codec_mode == ASPX_ACPL_1) {
+///       x3in = 2*x3;
+///       x4in = 2*x4;
+///       (z0, z1) = ACplModule(alpha_1, beta_1, num_pset_1, x0in, x3in, y0);
+///       (z2, z3) = ACplModule(alpha_2, beta_2, num_pset_2, x1in, x4in, y1);
+///   }
+///   else if (5_X_codec_mode == ASPX_ACPL_2) {
+///       (z0, z1) = ACplModule(alpha_1, beta_1, num_pset_1, x0in, 0, y0);
+///       (z2, z3) = ACplModule(alpha_2, beta_2, num_pset_2, x1in, 0, y1);
+///   }
+///   z1 *= sqrt(2);
+///   z3 *= sqrt(2);
+///   z4 = x2;
+/// ```
+///
+/// Each `ACplModule` is invoked through [`run_pseudocode_115_pair`] so
+/// the L-side and R-side decorrelator (D0/D1) + ducker state stays
+/// chained across frames in `state.left_pair` / `state.right_pair`.
+pub fn run_pseudocode_117_5x(
+    state: &mut Acpl5xPairState,
+    frame: Acpl5xPairFrame<'_>,
+) -> Acpl5xPairOutput {
+    let num_ts = frame.x0.len();
+    debug_assert_eq!(frame.x1.len(), num_ts);
+    debug_assert_eq!(frame.x2.len(), num_ts);
+
+    // Module #1: L-side. ASPX_ACPL_1 -> x1 = x3 (Ls carrier).
+    //                   ASPX_ACPL_2 -> x1 = None.
+    let pair1_x1 = match frame.mode {
+        Acpl5xPairMode::AspxAcpl1 => frame.x3,
+        Acpl5xPairMode::AspxAcpl2 => None,
+    };
+    let pair1 = AcplCpeFrame {
+        x0: frame.x0,
+        x1: pair1_x1,
+        alpha_dq: frame.alpha_1_dq,
+        beta_dq: frame.beta_1_dq,
+        num_param_bands: frame.num_param_bands,
+        acpl_qmf_band: frame.acpl_qmf_band,
+        steep: frame.steep_1,
+        param_timeslots: frame.param_timeslots_1,
+    };
+    let out1 = run_pseudocode_115_pair(&mut state.left_pair, pair1);
+
+    // Module #2: R-side. ASPX_ACPL_1 -> x1 = x4 (Rs carrier).
+    //                   ASPX_ACPL_2 -> x1 = None.
+    let pair2_x1 = match frame.mode {
+        Acpl5xPairMode::AspxAcpl1 => frame.x4,
+        Acpl5xPairMode::AspxAcpl2 => None,
+    };
+    let pair2 = AcplCpeFrame {
+        x0: frame.x1,
+        x1: pair2_x1,
+        alpha_dq: frame.alpha_2_dq,
+        beta_dq: frame.beta_2_dq,
+        num_param_bands: frame.num_param_bands,
+        acpl_qmf_band: frame.acpl_qmf_band,
+        steep: frame.steep_2,
+        param_timeslots: frame.param_timeslots_2,
+    };
+    let out2 = run_pseudocode_115_pair(&mut state.right_pair, pair2);
+
+    // Step "z1 *= sqrt(2)", "z3 *= sqrt(2)" — the surround pair gets the
+    // sqrt(2) scale per the spec.
+    let sq2 = (2.0f32).sqrt();
+    let scale_inplace = |z: &mut [[(f32, f32); NUM_QMF_SUBBANDS]], s: f32| {
+        for col in z.iter_mut() {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                col[sb].0 *= s;
+                col[sb].1 *= s;
+            }
+        }
+    };
+    let mut z0 = out1.z0;
+    let mut z1 = out1.z1;
+    let mut z2 = out2.z0;
+    let mut z3 = out2.z1;
+    scale_inplace(&mut z1, sq2);
+    scale_inplace(&mut z3, sq2);
+
+    // Centre channel passthrough: z4 = x2 (no scale per the pseudocode).
+    let z4: Vec<[(f32, f32); NUM_QMF_SUBBANDS]> = frame.x2.to_vec();
+
+    // Borrow-checker quietener: z0/z2 are intentionally not re-scaled.
+    let _ = (&mut z0, &mut z2);
+
+    Acpl5xPairOutput { z0, z1, z2, z3, z4 }
+}
+
+// =====================================================================
 // §5.7.7 — top-level helpers wired into Ac4Decoder
 // =====================================================================
 
@@ -1824,6 +2036,372 @@ pub fn run_acpl_1ch_pcm_stereo(
         right.extend_from_slice(&syn1.process_slot(&out.z1[ts]));
     }
     Some((left, right))
+}
+
+// =====================================================================
+// §5.7.7.6 — top-level helpers wired into the 5_X channel-element
+// =====================================================================
+
+use crate::acpl::{AcplConfig2ch, AcplData1ch as AcplData1chTy, AcplData2ch};
+
+/// Five-channel PCM output bundle from the 5_X A-CPL pipelines —
+/// (L, R, C, Ls, Rs) in spec ordering.
+#[derive(Debug, Clone)]
+pub struct Acpl5xPcmOutput {
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+    pub centre: Vec<f32>,
+    pub left_surround: Vec<f32>,
+    pub right_surround: Vec<f32>,
+}
+
+/// Per-substream A-CPL state for the 5_X `ASPX_ACPL_1` /
+/// `ASPX_ACPL_2` pair pipeline (Pseudocode 117). Composed of the
+/// [`Acpl5xPairState`] plus the L/R QMF analysis + per-output QMF
+/// synthesis banks needed to round-trip PCM end-to-end.
+pub struct Acpl5xPairPcmState {
+    pub pair: Acpl5xPairState,
+    pub ana_l: QmfAnalysisBank,
+    pub ana_r: QmfAnalysisBank,
+    pub ana_c: QmfAnalysisBank,
+    pub ana_ls: QmfAnalysisBank,
+    pub ana_rs: QmfAnalysisBank,
+    pub syn_l: QmfSynthesisBank,
+    pub syn_r: QmfSynthesisBank,
+    pub syn_c: QmfSynthesisBank,
+    pub syn_ls: QmfSynthesisBank,
+    pub syn_rs: QmfSynthesisBank,
+}
+
+impl Acpl5xPairPcmState {
+    pub fn new() -> Self {
+        Self {
+            pair: Acpl5xPairState::new(),
+            ana_l: QmfAnalysisBank::new(),
+            ana_r: QmfAnalysisBank::new(),
+            ana_c: QmfAnalysisBank::new(),
+            ana_ls: QmfAnalysisBank::new(),
+            ana_rs: QmfAnalysisBank::new(),
+            syn_l: QmfSynthesisBank::new(),
+            syn_r: QmfSynthesisBank::new(),
+            syn_c: QmfSynthesisBank::new(),
+            syn_ls: QmfSynthesisBank::new(),
+            syn_rs: QmfSynthesisBank::new(),
+        }
+    }
+}
+
+impl Default for Acpl5xPairPcmState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Run the §5.7.7.6.1 Pseudocode 117 ASPX_ACPL_1 / ASPX_ACPL_2 5_X
+/// pipeline end-to-end at PCM granularity.
+///
+/// Inputs (every PCM buffer must be the same length and a multiple of
+/// 64 samples — one QMF slot per 64 samples):
+///
+/// * `pcm_l` / `pcm_r` — already-ASPX-extended carrier PCM for the
+///   primary pair. Required.
+/// * `pcm_c` — centre channel PCM (passthrough → `centre` output).
+/// * `pcm_ls` / `pcm_rs` — surround carriers for ASPX_ACPL_1 (`mode ==
+///   AspxAcpl1`); `None` for ASPX_ACPL_2.
+/// * `cfg_1` / `data_1` — `acpl_config_1ch()` + `acpl_data_1ch()` for
+///   the L-side ACplModule (alpha_1 / beta_1).
+/// * `cfg_2` / `data_2` — same, for the R-side ACplModule (alpha_2 /
+///   beta_2).
+/// * `state` — per-substream state (carries decorrelator + ducker IIR
+///   state and the ALPHA / BETA differential-decode rolling sums
+///   across frames).
+///
+/// Returns the five-channel PCM bundle, or `None` if the input shape
+/// is invalid (mismatched length / not a multiple of 64 / inconsistent
+/// surround presence vs. mode).
+#[allow(clippy::too_many_arguments)]
+pub fn run_acpl_5x_pair_pcm(
+    mode: Acpl5xPairMode,
+    pcm_l: &[f32],
+    pcm_r: &[f32],
+    pcm_c: &[f32],
+    pcm_ls: Option<&[f32]>,
+    pcm_rs: Option<&[f32]>,
+    cfg_1: &AcplConfig1ch,
+    data_1: &AcplData1chTy,
+    cfg_2: &AcplConfig1ch,
+    data_2: &AcplData1chTy,
+    state: &mut Acpl5xPairPcmState,
+) -> Option<Acpl5xPcmOutput> {
+    if pcm_l.is_empty() || pcm_l.len() % NUM_QMF_SUBBANDS != 0 {
+        return None;
+    }
+    if pcm_l.len() != pcm_r.len() || pcm_l.len() != pcm_c.len() {
+        return None;
+    }
+    let n_slots = pcm_l.len() / NUM_QMF_SUBBANDS;
+    if n_slots == 0 {
+        return None;
+    }
+    // Mode → surround carrier presence consistency check.
+    match mode {
+        Acpl5xPairMode::AspxAcpl1 => {
+            let (ls, rs) = (pcm_ls?, pcm_rs?);
+            if ls.len() != pcm_l.len() || rs.len() != pcm_l.len() {
+                return None;
+            }
+        }
+        Acpl5xPairMode::AspxAcpl2 => {
+            // Surround carriers must be absent in ASPX_ACPL_2 mode.
+            if pcm_ls.is_some() || pcm_rs.is_some() {
+                return None;
+            }
+        }
+    }
+    // QMF analysis on every active input.
+    let x0 = state.ana_l.process_block(pcm_l);
+    let x1 = state.ana_r.process_block(pcm_r);
+    let x2 = state.ana_c.process_block(pcm_c);
+    let x3_owned = pcm_ls.map(|p| state.ana_ls.process_block(p));
+    let x4_owned = pcm_rs.map(|p| state.ana_rs.process_block(p));
+
+    // Differential-decode the two acpl_data_1ch parameter sets.
+    let alpha1_q = differential_decode(
+        &data_1.alpha1,
+        cfg_1.num_param_bands,
+        &mut state.pair.alpha1_diff,
+    );
+    let beta1_q = differential_decode(
+        &data_1.beta1,
+        cfg_1.num_param_bands,
+        &mut state.pair.beta1_diff,
+    );
+    let (alpha1_dq, beta1_dq) = dequantize_alpha_beta(&alpha1_q, &beta1_q, cfg_1.quant_mode);
+    let alpha2_q = differential_decode(
+        &data_2.alpha1,
+        cfg_2.num_param_bands,
+        &mut state.pair.alpha2_diff,
+    );
+    let beta2_q = differential_decode(
+        &data_2.beta1,
+        cfg_2.num_param_bands,
+        &mut state.pair.beta2_diff,
+    );
+    let (alpha2_dq, beta2_dq) = dequantize_alpha_beta(&alpha2_q, &beta2_q, cfg_2.quant_mode);
+    if alpha1_dq.is_empty() || alpha2_dq.is_empty() {
+        return None;
+    }
+    // Pseudocode 117 wrapper over Pseudocode 115 / 116.
+    let frame = Acpl5xPairFrame {
+        mode,
+        x0: &x0,
+        x1: &x1,
+        x2: &x2,
+        x3: x3_owned.as_deref(),
+        x4: x4_owned.as_deref(),
+        alpha_1_dq: &alpha1_dq,
+        beta_1_dq: &beta1_dq,
+        alpha_2_dq: &alpha2_dq,
+        beta_2_dq: &beta2_dq,
+        num_param_bands: cfg_1.num_param_bands,
+        // 5.X multichannel paths set acpl_qmf_band = 0 per §5.7.7.6.1.
+        acpl_qmf_band: 0,
+        steep_1: matches!(
+            data_1.framing.interpolation_type,
+            AcplInterpolationType::Steep
+        ),
+        steep_2: matches!(
+            data_2.framing.interpolation_type,
+            AcplInterpolationType::Steep
+        ),
+        param_timeslots_1: &data_1.framing.param_timeslots,
+        param_timeslots_2: &data_2.framing.param_timeslots,
+    };
+    let out = run_pseudocode_117_5x(&mut state.pair, frame);
+
+    // QMF synthesis on each output channel.
+    let mut left = Vec::with_capacity(pcm_l.len());
+    let mut right = Vec::with_capacity(pcm_l.len());
+    let mut centre = Vec::with_capacity(pcm_l.len());
+    let mut left_surround = Vec::with_capacity(pcm_l.len());
+    let mut right_surround = Vec::with_capacity(pcm_l.len());
+    for ts in 0..n_slots {
+        left.extend_from_slice(&state.syn_l.process_slot(&out.z0[ts]));
+        right.extend_from_slice(&state.syn_r.process_slot(&out.z2[ts]));
+        centre.extend_from_slice(&state.syn_c.process_slot(&out.z4[ts]));
+        left_surround.extend_from_slice(&state.syn_ls.process_slot(&out.z1[ts]));
+        right_surround.extend_from_slice(&state.syn_rs.process_slot(&out.z3[ts]));
+    }
+    Some(Acpl5xPcmOutput {
+        left,
+        right,
+        centre,
+        left_surround,
+        right_surround,
+    })
+}
+
+/// Per-substream A-CPL state for the 5_X `ASPX_ACPL_3` multichannel
+/// pipeline (Pseudocode 118). Bundles the [`AcplMchState`] (D0/D1/D2 +
+/// 3x ducker + per-pset prev gammas) with the L/R QMF analysis +
+/// per-output QMF synthesis banks plus the alpha/beta/beta3/gamma
+/// differential-decode rolling state.
+pub struct Acpl5xMchPcmState {
+    pub mch: AcplMchState,
+    pub ana_l: QmfAnalysisBank,
+    pub ana_r: QmfAnalysisBank,
+    pub ana_c: QmfAnalysisBank,
+    pub syn_l: QmfSynthesisBank,
+    pub syn_r: QmfSynthesisBank,
+    pub syn_c: QmfSynthesisBank,
+    pub syn_ls: QmfSynthesisBank,
+    pub syn_rs: QmfSynthesisBank,
+    pub alpha1_diff: AcplDiffState,
+    pub alpha2_diff: AcplDiffState,
+    pub beta1_diff: AcplDiffState,
+    pub beta2_diff: AcplDiffState,
+    pub beta3_diff: AcplDiffState,
+    pub gamma_diff: [AcplDiffState; 6],
+}
+
+impl Acpl5xMchPcmState {
+    pub fn new() -> Self {
+        Self {
+            mch: AcplMchState::new(),
+            ana_l: QmfAnalysisBank::new(),
+            ana_r: QmfAnalysisBank::new(),
+            ana_c: QmfAnalysisBank::new(),
+            syn_l: QmfSynthesisBank::new(),
+            syn_r: QmfSynthesisBank::new(),
+            syn_c: QmfSynthesisBank::new(),
+            syn_ls: QmfSynthesisBank::new(),
+            syn_rs: QmfSynthesisBank::new(),
+            alpha1_diff: AcplDiffState::new(),
+            alpha2_diff: AcplDiffState::new(),
+            beta1_diff: AcplDiffState::new(),
+            beta2_diff: AcplDiffState::new(),
+            beta3_diff: AcplDiffState::new(),
+            gamma_diff: [
+                AcplDiffState::new(),
+                AcplDiffState::new(),
+                AcplDiffState::new(),
+                AcplDiffState::new(),
+                AcplDiffState::new(),
+                AcplDiffState::new(),
+            ],
+        }
+    }
+}
+
+impl Default for Acpl5xMchPcmState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Run the §5.7.7.6.2 Pseudocode 118 ASPX_ACPL_3 5_X pipeline
+/// end-to-end at PCM granularity.
+///
+/// `pcm_l` / `pcm_r` are the two A-CPL carrier streams (already
+/// ASPX-extended); `pcm_c` is the centre channel passthrough. All
+/// three buffers must share the same length, and that length must be a
+/// multiple of 64 samples.
+///
+/// `cfg` is the parsed `acpl_config_2ch()` (§4.2.13.2 Table 60); `data`
+/// is the parsed `acpl_data_2ch()` (§4.2.13.4 Table 62) which carries
+/// (alpha1, alpha2, beta1, beta2, beta3, gamma1..gamma6) Huffman
+/// parameter sets. `state` is the per-substream ACPL state (carries
+/// the D0/D1/D2 + ducker state and the differential-decode rolling
+/// sums across frames).
+pub fn run_acpl_5x_mch_pcm(
+    pcm_l: &[f32],
+    pcm_r: &[f32],
+    pcm_c: &[f32],
+    cfg: &AcplConfig2ch,
+    data: &AcplData2ch,
+    state: &mut Acpl5xMchPcmState,
+) -> Option<Acpl5xPcmOutput> {
+    if pcm_l.is_empty() || pcm_l.len() % NUM_QMF_SUBBANDS != 0 {
+        return None;
+    }
+    if pcm_l.len() != pcm_r.len() || pcm_l.len() != pcm_c.len() {
+        return None;
+    }
+    let n_slots = pcm_l.len() / NUM_QMF_SUBBANDS;
+    if n_slots == 0 {
+        return None;
+    }
+    // QMF analysis on the two carriers + the centre passthrough.
+    let x0 = state.ana_l.process_block(pcm_l);
+    let x1 = state.ana_r.process_block(pcm_r);
+    let x2 = state.ana_c.process_block(pcm_c);
+    // Differential-decode all 11 parameter sets.
+    let nb = cfg.num_param_bands;
+    let alpha1_q = differential_decode(&data.alpha1, nb, &mut state.alpha1_diff);
+    let alpha2_q = differential_decode(&data.alpha2, nb, &mut state.alpha2_diff);
+    let beta1_q = differential_decode(&data.beta1, nb, &mut state.beta1_diff);
+    let beta2_q = differential_decode(&data.beta2, nb, &mut state.beta2_diff);
+    let beta3_q = differential_decode(&data.beta3, nb, &mut state.beta3_diff);
+    let g1q = differential_decode(&data.gamma1, nb, &mut state.gamma_diff[0]);
+    let g2q = differential_decode(&data.gamma2, nb, &mut state.gamma_diff[1]);
+    let g3q = differential_decode(&data.gamma3, nb, &mut state.gamma_diff[2]);
+    let g4q = differential_decode(&data.gamma4, nb, &mut state.gamma_diff[3]);
+    let g5q = differential_decode(&data.gamma5, nb, &mut state.gamma_diff[4]);
+    let g6q = differential_decode(&data.gamma6, nb, &mut state.gamma_diff[5]);
+    let (alpha1_dq, beta1_dq) = dequantize_alpha_beta(&alpha1_q, &beta1_q, cfg.quant_mode_0);
+    let (alpha2_dq, beta2_dq) = dequantize_alpha_beta(&alpha2_q, &beta2_q, cfg.quant_mode_0);
+    let beta3_dq = dequantize_beta3(&beta3_q, cfg.quant_mode_0);
+    let g1_dq = dequantize_gamma(&g1q, cfg.quant_mode_1);
+    let g2_dq = dequantize_gamma(&g2q, cfg.quant_mode_1);
+    let g3_dq = dequantize_gamma(&g3q, cfg.quant_mode_1);
+    let g4_dq = dequantize_gamma(&g4q, cfg.quant_mode_1);
+    let g5_dq = dequantize_gamma(&g5q, cfg.quant_mode_1);
+    let g6_dq = dequantize_gamma(&g6q, cfg.quant_mode_1);
+    if alpha1_dq.is_empty() {
+        return None;
+    }
+    let frame = AcplMchFrame {
+        x0: &x0,
+        x1: &x1,
+        x2: &x2,
+        alpha_1_dq: &alpha1_dq,
+        alpha_2_dq: &alpha2_dq,
+        beta_1_dq: &beta1_dq,
+        beta_2_dq: &beta2_dq,
+        beta_3_dq: &beta3_dq,
+        g1_dq: &g1_dq,
+        g2_dq: &g2_dq,
+        g3_dq: &g3_dq,
+        g4_dq: &g4_dq,
+        g5_dq: &g5_dq,
+        g6_dq: &g6_dq,
+        num_param_bands: nb,
+        steep: matches!(
+            data.framing.interpolation_type,
+            AcplInterpolationType::Steep
+        ),
+        param_timeslots: &data.framing.param_timeslots,
+    };
+    let out = run_pseudocode_118_5x(&mut state.mch, frame);
+    let mut left = Vec::with_capacity(pcm_l.len());
+    let mut right = Vec::with_capacity(pcm_l.len());
+    let mut centre = Vec::with_capacity(pcm_l.len());
+    let mut left_surround = Vec::with_capacity(pcm_l.len());
+    let mut right_surround = Vec::with_capacity(pcm_l.len());
+    for ts in 0..n_slots {
+        left.extend_from_slice(&state.syn_l.process_slot(&out.z0[ts]));
+        right.extend_from_slice(&state.syn_r.process_slot(&out.z2[ts]));
+        centre.extend_from_slice(&state.syn_c.process_slot(&out.z4[ts]));
+        left_surround.extend_from_slice(&state.syn_ls.process_slot(&out.z1[ts]));
+        right_surround.extend_from_slice(&state.syn_rs.process_slot(&out.z3[ts]));
+    }
+    Some(Acpl5xPcmOutput {
+        left,
+        right,
+        centre,
+        left_surround,
+        right_surround,
+    })
 }
 
 // =====================================================================
@@ -2953,5 +3531,624 @@ mod tests {
         assert!(s.g3_prev_sb.iter().all(|&v| v == 0.0));
         assert!(s.g4_prev_sb.iter().all(|&v| v == 0.0));
         assert_eq!(s.g1_prev_sb.len(), NUM_QMF_SUBBANDS);
+    }
+
+    // =====================================================================
+    // §5.7.7.6.1 — ASPX_ACPL_1 / ASPX_ACPL_2 multichannel wrapper tests
+    // (Pseudocode 117)
+    // =====================================================================
+
+    /// `Acpl5xPairState::new()` should set up D0 on the L-side and D1 on
+    /// the R-side, with zero prev arrays + diff state.
+    #[test]
+    fn acpl_5x_pair_state_initial_decorrelators() {
+        let s = Acpl5xPairState::new();
+        assert!(matches!(s.left_pair.decorrelator.which, DecorrelatorId::D0));
+        assert!(matches!(
+            s.right_pair.decorrelator.which,
+            DecorrelatorId::D1
+        ));
+        assert!(s.left_pair.alpha_prev_sb.iter().all(|&v| v == 0.0));
+        assert!(s.right_pair.alpha_prev_sb.iter().all(|&v| v == 0.0));
+        assert!(s.alpha1_diff.q_prev.is_empty());
+        assert!(s.alpha2_diff.q_prev.is_empty());
+    }
+
+    /// Build a small synthetic 5_X frame with x0/x1 carrying tones and
+    /// the centre channel carrying a distinct tone. Run Pseudocode 117
+    /// in `ASPX_ACPL_2` mode (no Ls/Rs carriers) and verify that:
+    ///
+    /// 1. Five output matrices are produced, all `num_ts × 64` shaped.
+    /// 2. The centre output `z4` matches `x2` byte-for-byte (passthrough).
+    /// 3. `z1` / `z3` are scaled by sqrt(2) (the M/S split below
+    ///    `acpl_qmf_band` is `0.5*(x0±0)*sqrt(2)` for the surround pair).
+    /// 4. No NaN / Inf in any output sample.
+    #[test]
+    fn run_pseudocode_117_5x_aspx_acpl_2_passthrough_centre_and_finite() {
+        let num_ts = 16usize;
+        let num_pb = 9u32;
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x1 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x2 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            x0[ts][8] = (1.0, 0.0);
+            x1[ts][12] = (0.0, 1.0);
+            x2[ts][20] = (0.5, -0.5);
+        }
+        let alpha1 = vec![vec![0.3f32; num_pb as usize]];
+        let beta1 = vec![vec![0.2f32; num_pb as usize]];
+        let alpha2 = vec![vec![-0.4f32; num_pb as usize]];
+        let beta2 = vec![vec![0.1f32; num_pb as usize]];
+        let mut state = Acpl5xPairState::new();
+        let frame = Acpl5xPairFrame {
+            mode: Acpl5xPairMode::AspxAcpl2,
+            x0: &x0,
+            x1: &x1,
+            x2: &x2,
+            x3: None,
+            x4: None,
+            alpha_1_dq: &alpha1,
+            beta_1_dq: &beta1,
+            alpha_2_dq: &alpha2,
+            beta_2_dq: &beta2,
+            num_param_bands: num_pb,
+            acpl_qmf_band: 0,
+            steep_1: false,
+            steep_2: false,
+            param_timeslots_1: &[],
+            param_timeslots_2: &[],
+        };
+        let out = run_pseudocode_117_5x(&mut state, frame);
+        assert_eq!(out.z0.len(), num_ts);
+        assert_eq!(out.z1.len(), num_ts);
+        assert_eq!(out.z2.len(), num_ts);
+        assert_eq!(out.z3.len(), num_ts);
+        assert_eq!(out.z4.len(), num_ts);
+        // Centre passthrough z4 == x2.
+        for ts in 0..num_ts {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                assert_eq!(out.z4[ts][sb], x2[ts][sb], "z4 != x2 at ts={ts} sb={sb}");
+            }
+        }
+        // No NaN / Inf in any output sample.
+        for ts in 0..num_ts {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                for (re, im) in [
+                    out.z0[ts][sb],
+                    out.z1[ts][sb],
+                    out.z2[ts][sb],
+                    out.z3[ts][sb],
+                    out.z4[ts][sb],
+                ] {
+                    assert!(re.is_finite(), "non-finite re at ts={ts} sb={sb}");
+                    assert!(im.is_finite(), "non-finite im at ts={ts} sb={sb}");
+                }
+            }
+        }
+    }
+
+    /// In ASPX_ACPL_1 mode, the Ls / Rs carriers (`x3` / `x4`) are
+    /// expected to participate in the M/S split below `acpl_qmf_band`.
+    /// With alpha=beta=0 and `acpl_qmf_band=64` (whole-band M/S), the
+    /// pair output should reduce to `(0.5*(x0+x3)*2, 0.5*(x0-x3)*2) =
+    /// (x0+x3, x0-x3)` — note the inner `x0in = 2*x0` doubles the
+    /// inputs first. We then have `z1 *= sqrt(2)`, so the surround
+    /// channel is `(x0-x3) * sqrt(2)`.
+    #[test]
+    fn run_pseudocode_117_5x_aspx_acpl_1_low_band_ms_split() {
+        let num_ts = 4usize;
+        let num_pb = 9u32;
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x1 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x2 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x3 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x4 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        // Pick distinct tones so z0 = (x0+x3) and z1 = (x0-x3)*sqrt(2).
+        for ts in 0..num_ts {
+            x0[ts][2] = (0.7, 0.0);
+            x3[ts][2] = (0.3, 0.0);
+            x1[ts][2] = (0.5, 0.5);
+            x4[ts][2] = (0.1, -0.1);
+        }
+        let alpha1 = vec![vec![0.0f32; num_pb as usize]];
+        let beta1 = vec![vec![0.0f32; num_pb as usize]];
+        let alpha2 = vec![vec![0.0f32; num_pb as usize]];
+        let beta2 = vec![vec![0.0f32; num_pb as usize]];
+        let mut state = Acpl5xPairState::new();
+        let frame = Acpl5xPairFrame {
+            mode: Acpl5xPairMode::AspxAcpl1,
+            x0: &x0,
+            x1: &x1,
+            x2: &x2,
+            x3: Some(&x3),
+            x4: Some(&x4),
+            alpha_1_dq: &alpha1,
+            beta_1_dq: &beta1,
+            alpha_2_dq: &alpha2,
+            beta_2_dq: &beta2,
+            num_param_bands: num_pb,
+            // Whole-band M/S split: every sb < 64 takes the (x0+x1)/2
+            // and (x0-x1)/2 path inside acpl_module().
+            acpl_qmf_band: NUM_QMF_SUBBANDS as u32,
+            steep_1: false,
+            steep_2: false,
+            param_timeslots_1: &[],
+            param_timeslots_2: &[],
+        };
+        let out = run_pseudocode_117_5x(&mut state, frame);
+        let sq2 = (2.0f32).sqrt();
+        for ts in 0..num_ts {
+            // L-side: x0in = 2*x0, x3in = 2*x3 ->
+            //   z0 = 0.5 * (x0in + x3in) = x0 + x3 = (1.0, 0.0)
+            //   z1 = 0.5 * (x0in - x3in) = x0 - x3 = (0.4, 0.0); then *sqrt(2).
+            let (z0r, z0i) = out.z0[ts][2];
+            let (z1r, z1i) = out.z1[ts][2];
+            assert!((z0r - 1.0).abs() < 1e-5, "ts={ts} z0r={z0r}");
+            assert!((z0i - 0.0).abs() < 1e-5, "ts={ts} z0i={z0i}");
+            assert!(
+                (z1r - 0.4 * sq2).abs() < 1e-5,
+                "ts={ts} z1r={z1r} expected={}",
+                0.4 * sq2
+            );
+            assert!((z1i - 0.0).abs() < 1e-5, "ts={ts} z1i={z1i}");
+            // R-side: x1in = 2*x1, x4in = 2*x4 ->
+            //   z2 = 0.5 * (x1in + x4in) = x1 + x4 = (0.6, 0.4)
+            //   z3 = 0.5 * (x1in - x4in) = x1 - x4 = (0.4, 0.6); then *sqrt(2).
+            let (z2r, z2i) = out.z2[ts][2];
+            let (z3r, z3i) = out.z3[ts][2];
+            assert!((z2r - 0.6).abs() < 1e-5, "ts={ts} z2r={z2r}");
+            assert!((z2i - 0.4).abs() < 1e-5, "ts={ts} z2i={z2i}");
+            assert!(
+                (z3r - 0.4 * sq2).abs() < 1e-5,
+                "ts={ts} z3r={z3r} expected={}",
+                0.4 * sq2
+            );
+            assert!(
+                (z3i - 0.6 * sq2).abs() < 1e-5,
+                "ts={ts} z3i={z3i} expected={}",
+                0.6 * sq2
+            );
+        }
+    }
+
+    /// Both modes: Pseudocode 117 must propagate decorrelator + ducker
+    /// state across calls. After a frame, the L-side / R-side prev
+    /// arrays are populated by the inner `run_pseudocode_115_pair()` —
+    /// this test runs two frames and checks the second frame sees the
+    /// updated `alpha_prev` / `beta_prev` from the first.
+    #[test]
+    fn run_pseudocode_117_5x_state_carries_across_frames() {
+        let num_ts = 8usize;
+        let num_pb = 9u32;
+        let x0 = vec![[(1.0f32, 0.5f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x1 = vec![[(0.5f32, 1.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x2 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let alpha1 = vec![vec![0.42f32; num_pb as usize]];
+        let beta1 = vec![vec![0.13f32; num_pb as usize]];
+        let alpha2 = vec![vec![-0.11f32; num_pb as usize]];
+        let beta2 = vec![vec![0.21f32; num_pb as usize]];
+        let mut state = Acpl5xPairState::new();
+        // Pre-state: prev arrays are zeros.
+        assert!(state.left_pair.alpha_prev_sb.iter().all(|&v| v == 0.0));
+        assert!(state.right_pair.alpha_prev_sb.iter().all(|&v| v == 0.0));
+        let frame = Acpl5xPairFrame {
+            mode: Acpl5xPairMode::AspxAcpl2,
+            x0: &x0,
+            x1: &x1,
+            x2: &x2,
+            x3: None,
+            x4: None,
+            alpha_1_dq: &alpha1,
+            beta_1_dq: &beta1,
+            alpha_2_dq: &alpha2,
+            beta_2_dq: &beta2,
+            num_param_bands: num_pb,
+            acpl_qmf_band: 0,
+            steep_1: false,
+            steep_2: false,
+            param_timeslots_1: &[],
+            param_timeslots_2: &[],
+        };
+        let _out1 = run_pseudocode_117_5x(&mut state, frame);
+        // Post-state: prev arrays carry the last param-set's expanded
+        // sb rows. With a single param set of constant 0.42 / -0.11
+        // across all bands, every sb entry must equal that constant.
+        for sb in 0..NUM_QMF_SUBBANDS {
+            assert!(
+                (state.left_pair.alpha_prev_sb[sb] - 0.42).abs() < 1e-6,
+                "left alpha_prev[{sb}] = {}",
+                state.left_pair.alpha_prev_sb[sb]
+            );
+            assert!(
+                (state.right_pair.alpha_prev_sb[sb] - (-0.11)).abs() < 1e-6,
+                "right alpha_prev[{sb}] = {}",
+                state.right_pair.alpha_prev_sb[sb]
+            );
+            assert!(
+                (state.left_pair.beta_prev_sb[sb] - 0.13).abs() < 1e-6,
+                "left beta_prev[{sb}] = {}",
+                state.left_pair.beta_prev_sb[sb]
+            );
+            assert!(
+                (state.right_pair.beta_prev_sb[sb] - 0.21).abs() < 1e-6,
+                "right beta_prev[{sb}] = {}",
+                state.right_pair.beta_prev_sb[sb]
+            );
+        }
+    }
+
+    /// ASPX_ACPL_2 (no surround carriers) should compute exactly the
+    /// same per-side output as calling `run_pseudocode_115_pair()`
+    /// twice with x1 = None — Pseudocode 117 is only adding the
+    /// sqrt(2) post-scale + centre passthrough on top of two parallel
+    /// channel-pair passes.
+    #[test]
+    fn run_pseudocode_117_5x_aspx_acpl_2_matches_two_115_passes() {
+        let num_ts = 12usize;
+        let num_pb = 9u32;
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x1 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x2 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            for sb in 0..32 {
+                let phase = (ts as f32 * 0.2) + (sb as f32 * 0.1);
+                x0[ts][sb] = (0.1 * phase.cos(), 0.1 * phase.sin());
+                x1[ts][sb] = (0.05 * phase.sin(), 0.05 * phase.cos());
+            }
+        }
+        let alpha1 = vec![vec![0.3f32; num_pb as usize]];
+        let beta1 = vec![vec![0.2f32; num_pb as usize]];
+        let alpha2 = vec![vec![0.1f32; num_pb as usize]];
+        let beta2 = vec![vec![0.4f32; num_pb as usize]];
+        // Reference: run two independent channel-pair passes.
+        let mut ref_state_l = AcplCpeState::new(DecorrelatorId::D0);
+        let mut ref_state_r = AcplCpeState::new(DecorrelatorId::D1);
+        let ref_l = run_pseudocode_115_pair(
+            &mut ref_state_l,
+            AcplCpeFrame {
+                x0: &x0,
+                x1: None,
+                alpha_dq: &alpha1,
+                beta_dq: &beta1,
+                num_param_bands: num_pb,
+                acpl_qmf_band: 0,
+                steep: false,
+                param_timeslots: &[],
+            },
+        );
+        let ref_r = run_pseudocode_115_pair(
+            &mut ref_state_r,
+            AcplCpeFrame {
+                x0: &x1,
+                x1: None,
+                alpha_dq: &alpha2,
+                beta_dq: &beta2,
+                num_param_bands: num_pb,
+                acpl_qmf_band: 0,
+                steep: false,
+                param_timeslots: &[],
+            },
+        );
+        // Run Pseudocode 117 — should match the references modulo the
+        // sqrt(2) post-scale on the surround pair.
+        let mut state = Acpl5xPairState::new();
+        let frame = Acpl5xPairFrame {
+            mode: Acpl5xPairMode::AspxAcpl2,
+            x0: &x0,
+            x1: &x1,
+            x2: &x2,
+            x3: None,
+            x4: None,
+            alpha_1_dq: &alpha1,
+            beta_1_dq: &beta1,
+            alpha_2_dq: &alpha2,
+            beta_2_dq: &beta2,
+            num_param_bands: num_pb,
+            acpl_qmf_band: 0,
+            steep_1: false,
+            steep_2: false,
+            param_timeslots_1: &[],
+            param_timeslots_2: &[],
+        };
+        let out = run_pseudocode_117_5x(&mut state, frame);
+        let sq2 = (2.0f32).sqrt();
+        // Spot-check a few subbands across the time axis.
+        for ts in 0..num_ts {
+            for sb in [0usize, 5, 16, 31, 47, 63] {
+                let (a_r, a_i) = out.z0[ts][sb];
+                let (e_r, e_i) = ref_l.z0[ts][sb];
+                assert!(
+                    (a_r - e_r).abs() < 1e-5 && (a_i - e_i).abs() < 1e-5,
+                    "z0 mismatch ts={ts} sb={sb} got ({a_r},{a_i}) want ({e_r},{e_i})"
+                );
+                let (a_r, a_i) = out.z2[ts][sb];
+                let (e_r, e_i) = ref_r.z0[ts][sb];
+                assert!(
+                    (a_r - e_r).abs() < 1e-5 && (a_i - e_i).abs() < 1e-5,
+                    "z2 mismatch ts={ts} sb={sb} got ({a_r},{a_i}) want ({e_r},{e_i})"
+                );
+                let (a_r, a_i) = out.z1[ts][sb];
+                let (e_r, e_i) = (ref_l.z1[ts][sb].0 * sq2, ref_l.z1[ts][sb].1 * sq2);
+                assert!(
+                    (a_r - e_r).abs() < 1e-5 && (a_i - e_i).abs() < 1e-5,
+                    "z1 mismatch ts={ts} sb={sb} got ({a_r},{a_i}) want ({e_r},{e_i})"
+                );
+                let (a_r, a_i) = out.z3[ts][sb];
+                let (e_r, e_i) = (ref_r.z1[ts][sb].0 * sq2, ref_r.z1[ts][sb].1 * sq2);
+                assert!(
+                    (a_r - e_r).abs() < 1e-5 && (a_i - e_i).abs() < 1e-5,
+                    "z3 mismatch ts={ts} sb={sb} got ({a_r},{a_i}) want ({e_r},{e_i})"
+                );
+            }
+        }
+    }
+
+    // =====================================================================
+    // §5.7.7.6 — 5_X-walker glue: PCM-level helpers for ASPX_ACPL_{1,2,3}
+    // =====================================================================
+
+    /// `run_acpl_5x_pair_pcm` should reject inputs whose lengths don't
+    /// align (one PCM channel a multiple of 64, all channels same
+    /// length, surround presence consistent with mode).
+    #[test]
+    fn run_acpl_5x_pair_pcm_rejects_misaligned_inputs() {
+        use crate::acpl::{
+            AcplConfig1ch, AcplData1ch, AcplFramingData, AcplHuffParam, AcplInterpolationType,
+            AcplQuantMode,
+        };
+        let cfg = AcplConfig1ch {
+            num_param_bands_id: 0,
+            num_param_bands: 15,
+            quant_mode: AcplQuantMode::Fine,
+            qmf_band: 0,
+        };
+        let data = AcplData1ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![AcplHuffParam {
+                values: vec![4i32; cfg.num_param_bands as usize],
+                direction_time: false,
+            }],
+            beta1: vec![AcplHuffParam {
+                values: vec![2i32; cfg.num_param_bands as usize],
+                direction_time: false,
+            }],
+        };
+        let mut state = Acpl5xPairPcmState::new();
+        // Length not a multiple of 64 → None.
+        let pcm_short = vec![0.0f32; 65];
+        assert!(run_acpl_5x_pair_pcm(
+            Acpl5xPairMode::AspxAcpl2,
+            &pcm_short,
+            &pcm_short,
+            &pcm_short,
+            None,
+            None,
+            &cfg,
+            &data,
+            &cfg,
+            &data,
+            &mut state,
+        )
+        .is_none());
+        // Surround present in ASPX_ACPL_2 mode → None.
+        let pcm = vec![0.0f32; 64];
+        assert!(run_acpl_5x_pair_pcm(
+            Acpl5xPairMode::AspxAcpl2,
+            &pcm,
+            &pcm,
+            &pcm,
+            Some(&pcm),
+            Some(&pcm),
+            &cfg,
+            &data,
+            &cfg,
+            &data,
+            &mut state,
+        )
+        .is_none());
+        // Surround missing in ASPX_ACPL_1 mode → None.
+        assert!(run_acpl_5x_pair_pcm(
+            Acpl5xPairMode::AspxAcpl1,
+            &pcm,
+            &pcm,
+            &pcm,
+            None,
+            None,
+            &cfg,
+            &data,
+            &cfg,
+            &data,
+            &mut state,
+        )
+        .is_none());
+    }
+
+    /// End-to-end: feed three sine carriers (L/R/C) into the
+    /// `ASPX_ACPL_2` 5_X PCM pipeline. We expect five output channels
+    /// of the right length with all carrying energy and no NaN/Inf.
+    #[test]
+    fn run_acpl_5x_pair_pcm_aspx_acpl_2_emits_five_channels() {
+        use crate::acpl::{
+            AcplConfig1ch, AcplData1ch, AcplFramingData, AcplHuffParam, AcplInterpolationType,
+            AcplQuantMode,
+        };
+        let n_slots = 64usize;
+        let n = n_slots * NUM_QMF_SUBBANDS;
+        let mut pcm_l = vec![0.0f32; n];
+        let mut pcm_r = vec![0.0f32; n];
+        let mut pcm_c = vec![0.0f32; n];
+        let f_l = 440.0f32 / 48_000.0;
+        let f_r = 220.0f32 / 48_000.0;
+        let f_c = 880.0f32 / 48_000.0;
+        for i in 0..n {
+            pcm_l[i] = (2.0 * std::f32::consts::PI * f_l * i as f32).sin();
+            pcm_r[i] = 0.5 * (2.0 * std::f32::consts::PI * f_r * i as f32).sin();
+            pcm_c[i] = 0.3 * (2.0 * std::f32::consts::PI * f_c * i as f32).sin();
+        }
+        let cfg = AcplConfig1ch {
+            num_param_bands_id: 0,
+            num_param_bands: 15,
+            quant_mode: AcplQuantMode::Fine,
+            qmf_band: 0,
+        };
+        let data1 = AcplData1ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![AcplHuffParam {
+                values: vec![4i32; cfg.num_param_bands as usize],
+                direction_time: false,
+            }],
+            beta1: vec![AcplHuffParam {
+                values: vec![2i32; cfg.num_param_bands as usize],
+                direction_time: false,
+            }],
+        };
+        let data2 = AcplData1ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![AcplHuffParam {
+                values: vec![-3i32; cfg.num_param_bands as usize],
+                direction_time: false,
+            }],
+            beta1: vec![AcplHuffParam {
+                values: vec![1i32; cfg.num_param_bands as usize],
+                direction_time: false,
+            }],
+        };
+        let mut state = Acpl5xPairPcmState::new();
+        let out = run_acpl_5x_pair_pcm(
+            Acpl5xPairMode::AspxAcpl2,
+            &pcm_l,
+            &pcm_r,
+            &pcm_c,
+            None,
+            None,
+            &cfg,
+            &data1,
+            &cfg,
+            &data2,
+            &mut state,
+        )
+        .expect("synth runs");
+        assert_eq!(out.left.len(), n);
+        assert_eq!(out.right.len(), n);
+        assert_eq!(out.centre.len(), n);
+        assert_eq!(out.left_surround.len(), n);
+        assert_eq!(out.right_surround.len(), n);
+        let start = 2048usize;
+        let energy =
+            |b: &[f32]| -> f64 { b[start..].iter().map(|&s| (s as f64).powi(2)).sum::<f64>() };
+        assert!(energy(&out.left) > 1e-6, "left silent");
+        assert!(energy(&out.right) > 1e-6, "right silent");
+        assert!(energy(&out.centre) > 1e-6, "centre silent");
+        assert!(energy(&out.left_surround) > 1e-6, "Ls silent");
+        assert!(energy(&out.right_surround) > 1e-6, "Rs silent");
+        for b in [
+            &out.left,
+            &out.right,
+            &out.centre,
+            &out.left_surround,
+            &out.right_surround,
+        ] {
+            for &s in b.iter() {
+                assert!(s.is_finite(), "non-finite sample");
+            }
+        }
+    }
+
+    /// `run_acpl_5x_mch_pcm` should reject misaligned inputs and emit
+    /// five distinct PCM streams when fed a real ASPX_ACPL_3 frame.
+    #[test]
+    fn run_acpl_5x_mch_pcm_aspx_acpl_3_emits_five_channels() {
+        use crate::acpl::{
+            AcplConfig2ch, AcplData2ch, AcplFramingData, AcplHuffParam, AcplInterpolationType,
+            AcplQuantMode,
+        };
+        let n_slots = 64usize;
+        let n = n_slots * NUM_QMF_SUBBANDS;
+        let mut pcm_l = vec![0.0f32; n];
+        let mut pcm_r = vec![0.0f32; n];
+        let mut pcm_c = vec![0.0f32; n];
+        let f_l = 440.0f32 / 48_000.0;
+        let f_r = 220.0f32 / 48_000.0;
+        let f_c = 660.0f32 / 48_000.0;
+        for i in 0..n {
+            pcm_l[i] = (2.0 * std::f32::consts::PI * f_l * i as f32).sin();
+            pcm_r[i] = (2.0 * std::f32::consts::PI * f_r * i as f32).cos();
+            pcm_c[i] = 0.3 * (2.0 * std::f32::consts::PI * f_c * i as f32).sin();
+        }
+        let cfg = AcplConfig2ch {
+            num_param_bands_id: 0,
+            num_param_bands: 15,
+            quant_mode_0: AcplQuantMode::Fine,
+            quant_mode_1: AcplQuantMode::Fine,
+        };
+        let mk_huff = |seed: i32| AcplHuffParam {
+            values: vec![seed; cfg.num_param_bands as usize],
+            direction_time: false,
+        };
+        let data = AcplData2ch {
+            framing: AcplFramingData {
+                interpolation_type: AcplInterpolationType::Smooth,
+                num_param_sets_cod: 0,
+                num_param_sets: 1,
+                param_timeslots: vec![],
+            },
+            alpha1: vec![mk_huff(4)],
+            alpha2: vec![mk_huff(-3)],
+            beta1: vec![mk_huff(2)],
+            beta2: vec![mk_huff(1)],
+            beta3: vec![mk_huff(0)],
+            gamma1: vec![mk_huff(2)],
+            gamma2: vec![mk_huff(0)],
+            gamma3: vec![mk_huff(0)],
+            gamma4: vec![mk_huff(2)],
+            gamma5: vec![mk_huff(1)],
+            gamma6: vec![mk_huff(1)],
+        };
+        let mut state = Acpl5xMchPcmState::new();
+        // Reject mismatched lengths.
+        let pcm_bad = vec![0.0f32; 65];
+        assert!(
+            run_acpl_5x_mch_pcm(&pcm_bad, &pcm_bad, &pcm_bad, &cfg, &data, &mut state).is_none()
+        );
+        // Run end-to-end on the well-formed frame.
+        let out = run_acpl_5x_mch_pcm(&pcm_l, &pcm_r, &pcm_c, &cfg, &data, &mut state)
+            .expect("synth runs");
+        assert_eq!(out.left.len(), n);
+        assert_eq!(out.right.len(), n);
+        assert_eq!(out.centre.len(), n);
+        assert_eq!(out.left_surround.len(), n);
+        assert_eq!(out.right_surround.len(), n);
+        let start = 2048usize;
+        let energy =
+            |b: &[f32]| -> f64 { b[start..].iter().map(|&s| (s as f64).powi(2)).sum::<f64>() };
+        for b in [
+            &out.left,
+            &out.right,
+            &out.centre,
+            &out.left_surround,
+            &out.right_surround,
+        ] {
+            for &s in b.iter() {
+                assert!(s.is_finite(), "non-finite sample");
+            }
+        }
+        assert!(energy(&out.left) > 1e-6, "left silent");
+        assert!(energy(&out.right) > 1e-6, "right silent");
+        assert!(energy(&out.centre) > 1e-6, "centre silent");
     }
 }

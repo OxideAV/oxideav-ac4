@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 22 — ASPX_ACPL_1/2 multichannel wrapper (Pseudocode 117) +
+  5_X-walker glue**:
+  - New §5.7.7.6.1 multichannel pipeline in `acpl_synth.rs`:
+    `run_pseudocode_117_5x()` wraps two parallel
+    `run_pseudocode_115_pair()` passes (D0 decorrelator on the L-side
+    ACplModule, D1 on the R-side) and forms the five 5.X output
+    channels from the L/R/C carriers (plus optional Ls/Rs carriers in
+    `ASPX_ACPL_1` mode). Centre channel is a passthrough (`z4 = x2`);
+    surround pair (`z1`/`z3`) gets the spec's final `sqrt(2)` scale.
+  - New `Acpl5xPairState` (left/right `AcplCpeState` + alpha/beta
+    differential-decode rolling state for two `acpl_data_1ch` rows),
+    `Acpl5xPairFrame` (5 carrier slots + two `(alpha_dq, beta_dq)`
+    matrices + interpolation control), `Acpl5xPairMode` selector
+    (`AspxAcpl1` vs `AspxAcpl2`), and `Acpl5xPairOutput` (z0/z1/z2/z3/z4).
+  - PCM-level helpers wire the parsed 5_X bitstream straight through
+    QMF analysis → A-CPL → QMF synthesis:
+    - `run_acpl_5x_pair_pcm()` — drives Pseudocode 117 from
+      `(pcm_l, pcm_r, pcm_c[, pcm_ls, pcm_rs], cfg, data_1, data_2)`.
+    - `run_acpl_5x_mch_pcm()` — drives Pseudocode 118 from
+      `(pcm_l, pcm_r, pcm_c, acpl_config_2ch, acpl_data_2ch)`.
+    Both return `Acpl5xPcmOutput { left, right, centre, left_surround,
+    right_surround }` PCM buffers and bundle the QMF banks + ACPL state
+    in `Acpl5xPairPcmState` / `Acpl5xMchPcmState`.
+  - New SubstreamTools fields: `acpl_data_2ch` (parsed
+    `acpl_data_2ch()` per Table 62, for ASPX_ACPL_3) and
+    `acpl_data_1ch_pair: [Option<...>; 2]` (one `acpl_data_1ch()` per
+    parallel ACplModule, for the 5_X ASPX_ACPL_1/2 paths).
+  - 8 new lib tests + 3 new `tests/acpl_5x_pipeline.rs` integration
+    tests (363 → 374 total): D0/D1 decorrelator-id init,
+    Pseudocode 117 ASPX_ACPL_2 centre passthrough + finite-output,
+    ASPX_ACPL_1 low-band M/S split spot-check, prev-state carry across
+    frames, ASPX_ACPL_2 equivalence to two parallel
+    `run_pseudocode_115_pair()` passes, PCM-level input rejection
+    (misaligned / surround-presence vs. mode), end-to-end 5-channel
+    PCM emission for both `ASPX_ACPL_2` and `ASPX_ACPL_3`, and the
+    walker-→-synthesis glue for all three multichannel modes (the
+    walker hands back `acpl_config_*` slots, the test stages
+    `acpl_data_*` and asserts the synthesis pipeline consumes the
+    pair without further glue).
+
 - **Round 21 — ASPX_ACPL_3 transform synthesis (Pseudocodes 118/119)**:
   - New §5.7.7.6.2 multichannel pipeline in `acpl_synth.rs`:
     `transform()` (Pseudocode 119) linearly mixes the two A-CPL

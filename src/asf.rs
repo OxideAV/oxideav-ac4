@@ -654,6 +654,18 @@ pub struct SubstreamTools {
     /// Parsed `acpl_config_2ch()` (§4.2.13.2 Table 60) for `ASPX_ACPL_3`
     /// I-frame substreams. `None` for the other A-CPL paths.
     pub acpl_config_2ch: Option<crate::acpl::AcplConfig2ch>,
+    /// Parsed `acpl_data_2ch()` (§4.2.13.4 Table 62) for `ASPX_ACPL_3`
+    /// 5_X / 7_X frames. `None` for the other A-CPL paths or when the
+    /// walker bailed before reaching the ACPL trailer.
+    pub acpl_data_2ch: Option<crate::acpl::AcplData2ch>,
+    /// Parsed pair of `acpl_data_1ch()` elements for the 5_X
+    /// `ASPX_ACPL_1` / `ASPX_ACPL_2` modes (§5.7.7.6.1 Pseudocode 117).
+    /// Two parallel ACplModule's each consume one `acpl_data_1ch()` set;
+    /// `[0]` drives the L-side module (alpha_1 / beta_1), `[1]` drives
+    /// the R-side module (alpha_2 / beta_2). Either entry stays `None`
+    /// when the walker hasn't reached the ACPL trailer yet (e.g.
+    /// non-I-frame).
+    pub acpl_data_1ch_pair: [Option<crate::acpl::AcplData1ch>; 2],
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -1450,7 +1462,7 @@ pub fn parse_stereo_audio_data_outer(
 /// continue reading downstream elements like `aspx_data_2ch()`). A
 /// return of `false` means some inner Huffman-gated decode bailed; the
 /// bitreader position after the call is indeterminate.
-fn parse_stereo_data_body(
+pub(crate) fn parse_stereo_data_body(
     br: &mut BitReader<'_>,
     tools: &mut SubstreamTools,
     frame_len_base: u32,
