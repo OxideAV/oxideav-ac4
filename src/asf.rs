@@ -666,6 +666,34 @@ pub struct SubstreamTools {
     /// when the walker hasn't reached the ACPL trailer yet (e.g.
     /// non-I-frame).
     pub acpl_data_1ch_pair: [Option<crate::acpl::AcplData1ch>; 2],
+    /// `7_X_codec_mode` (§4.3.5.7 Table 98) for 7.X channel-element
+    /// substreams. Populated by [`crate::mch::parse_7x_audio_data_outer`].
+    /// Note this is a 2-bit field for 7_X (vs 3 bits for 5_X) — only
+    /// SIMPLE / ASPX / ASPX_ACPL_1 / ASPX_ACPL_2 modes exist (no
+    /// ASPX_ACPL_3 for 7_X).
+    pub seven_x_mode: Option<crate::mch::SevenXCodecMode>,
+    /// `channel_mode` of the enclosing `7_X_channel_element` — `false`
+    /// for 7.0 (no LFE), `true` for 7.1 (with LFE). Mirrors the
+    /// `b_has_lfe` plumbing of the 5_X walker.
+    pub seven_x_b_has_lfe: bool,
+    /// `coding_config` value the 7.X walker resolved (Table 33 — same
+    /// 2-bit selector as 5_X SIMPLE/ASPX path: 0/1/2/3 → Cfg0Stereo /
+    /// Cfg1ThreeStereo / Cfg2Four / Cfg3Five). `None` for non-7.X
+    /// substreams.
+    pub seven_x_coding_config: Option<crate::mch::FiveXCodingConfig>,
+    /// `b_use_sap_add_ch` flag (§4.3.5.12) read from the 7.X SIMPLE/ASPX
+    /// path before the additional `two_channel_data()`. `None` for
+    /// ASPX_ACPL_{1,2} (no additional-channel block) and for non-7.X
+    /// substreams.
+    pub seven_x_b_use_sap_add_ch: Option<bool>,
+    /// 7.X SIMPLE/ASPX additional-channel `chparam_info()` pair (Table
+    /// 33). Populated only when `b_use_sap_add_ch == 1`. Each entry
+    /// matches the standard `chparam_info()` shell.
+    pub seven_x_add_chparam_info: Option<[ChparamInfo; 2]>,
+    /// 7.X SIMPLE/ASPX trailing additional-channel `two_channel_data()`
+    /// (Table 33 — the two extra channels beyond the 5.X core). `None`
+    /// for ASPX_ACPL_{1,2} and for non-7.X substreams.
+    pub seven_x_additional_channel_data: Option<crate::mch::TwoChannelData>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -1770,7 +1798,32 @@ pub fn walk_ac4_substream(
                 frame_len_base,
             );
         }
-        // 3.0 / 7.x paths are coding-config-dependent; their
+        // 7.0 / 7.1 — drive the `7_X_channel_element` walker (round 26).
+        // The 7.X walker mirrors the 5_X SIMPLE/ASPX path's
+        // coding_config selector with a 2-bit codec_mode (no
+        // ASPX_ACPL_3) and an extra additional-channel `two_channel_data`
+        // for the front-extension / back-surround pair.
+        7 => {
+            // 7.0 — no LFE.
+            let _ = crate::mch::parse_7x_audio_data_outer(
+                &mut br,
+                &mut tools,
+                false,
+                b_iframe,
+                frame_len_base,
+            );
+        }
+        8 => {
+            // 7.1 — LFE present (channel_mode == "7.1").
+            let _ = crate::mch::parse_7x_audio_data_outer(
+                &mut br,
+                &mut tools,
+                true,
+                b_iframe,
+                frame_len_base,
+            );
+        }
+        // 3.0 paths are coding-config-dependent; their
         // outer walkers live behind the same Huffman gate as ASF's
         // spectral data. For the baseline we record the channel count
         // and bail.

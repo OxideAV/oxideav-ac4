@@ -67,9 +67,21 @@ framework but usable standalone.
 > The pair lands in `tools.acpl_data_1ch_pair[0/1]` (D0 / D1
 > ACplModule). The walker is try-and-bail: any inner Huffman / parse
 > miss leaves the already-populated `tools.*` slots intact and returns
-> silently. **395 tests**. Pending: 7_X-channel-element walker;
-> ASF short-frame `sf_data` walk for the mono / stereo paths
-> (the grouped walker added in r24 covers the multichannel layouts only).
+> silently. Round 27 lands the **7_X channel-element walker**
+> (`parse_7x_audio_data_outer`) per §4.2.6.14 Table 33 — immersive 7.0
+> and 7.1 streams now parse end-to-end. The 7.X walker mirrors the 5_X
+> SIMPLE/ASPX path's `coding_config` selector but has its own quirks:
+> 2-bit `7_X_codec_mode` (no ASPX_ACPL_3 in 7.X), `companding_control(5)`
+> only on ASPX_ACPL_{1,2}, the centre/back monos move out of the
+> coding_config switch into a single trailing `mono_data(0)` gated on
+> `coding_config in {0, 2}`, and a SIMPLE/ASPX-only additional-channel
+> block (`b_use_sap_add_ch + optional chparam_info×2 +
+> two_channel_data`) carries the front-extension / back-surround pair
+> beyond the 5.X core. `walk_ac4_substream` now dispatches
+> `channels == 7/8` (7.0/7.1) into the new walker. **416 tests** (405
+> lib + 5 + 6 integration). Pending: ASF short-frame `sf_data` walk
+> for the mono / stereo paths (the grouped walker added in r24 covers
+> the multichannel layouts only).
 
 ## Specs
 

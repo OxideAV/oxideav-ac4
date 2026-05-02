@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 27 — 7_X channel-element walker (immersive 7.0 / 7.1)**
+  (TS 103 190-1 §4.2.6.14 Table 33 + §4.3.5.7 Table 98):
+  - New `parse_7x_audio_data_outer()` walker in `mch.rs` plus a
+    `SevenXCodecMode` enum (Table 98 — 2 bits, 4 codepoints: SIMPLE /
+    ASPX / ASPX_ACPL_1 / ASPX_ACPL_2; **no** ASPX_ACPL_3 in 7.X). The
+    walker mirrors the 5_X SIMPLE/ASPX path's coding_config selector
+    but with the 7.X-specific shape:
+    - 2-bit `7_X_codec_mode` (vs 3-bit for 5_X — no Reserved values).
+    - LFE `mono_data(1)` gated on `channel_mode == "7.1"` (mapped from
+      the parent substream's channel count: 7 → 7.0, 8 → 7.1).
+    - `companding_control(5)` for ASPX_ACPL_{1,2} only — SIMPLE/ASPX in
+      7.X have no leading companding (different from 5_X where ASPX
+      gets `companding_control(5)`).
+    - Cfg0 body: `2ch_mode + two_channel_data + two_channel_data` (no
+      centre mono inside the switch).
+    - Cfg2 body: `four_channel_data` only (no surround mono inside the
+      switch). Both centre / surround monos move out to a single
+      trailing `mono_data(0)` call gated on `coding_config in {0, 2}`,
+      placed after the additional-channel block.
+    - SIMPLE/ASPX-only additional-channel block: 1-bit
+      `b_use_sap_add_ch` gating optional `chparam_info()×2`, then a
+      mandatory `two_channel_data()` for the front-extension /
+      back-surround pair beyond the 5.X core. Lands in new
+      `tools.seven_x_b_use_sap_add_ch`,
+      `tools.seven_x_add_chparam_info` and
+      `tools.seven_x_additional_channel_data` slots.
+    - ASPX_ACPL_1-only joint-MDCT residual layer (max_sfb_master +
+      chparam_info×2 + sf_data×2) — same shape as the 5_X path,
+      `n_side_bits` derived per the Table 33 NOTE from the largest
+      signalled transform length across all preceding
+      `two_channel_data` / `three_channel_data` / `four_channel_data` /
+      `five_channel_data` (including the additional-channel one when
+      it's the largest).
+    - Trailers: `aspx_data_2ch×2 + aspx_data_1ch` for any non-SIMPLE,
+      plus an extra `aspx_data_2ch` for ASPX (covering the additional
+      pair); `acpl_data_1ch×2` for ASPX_ACPL_{1,2} landing in
+      `tools.acpl_data_1ch_pair[0/1]` (shared with the 5_X
+      §5.7.7.6.1 pair walker).
+  - `walk_ac4_substream` now dispatches `channels == 7` (7.0) and
+    `channels == 8` (7.1) into the new walker. Previously these
+    channel counts fell through to the catch-all that just records
+    `channel_mode_channels` and bails — real Dolby AC-4 streams using
+    a `7_X_channel_element` now parse end-to-end without hitting the
+    catch-all.
+  - Walker is **try-and-bail** with the same contract as the 5_X
+    walker: any inner Huffman / parse miss surfaces `Ok(())` to the
+    caller, leaving already-populated `tools.*` slots intact. The
+    deeper `aspx_data` / `acpl_data` trailers are gated on
+    `b_iframe && tools.aspx_config.is_some()`.
+  - 11 new lib tests (394 → 405 total): SIMPLE Cfg3 (no SAP), 7.1
+    SIMPLE LFE walk, SIMPLE Cfg0 (two pairs + trailing centre mono),
+    SIMPLE Cfg2 (four-channel + back surround mono), SIMPLE Cfg1 (no
+    trailer), SIMPLE with `b_use_sap_add_ch == 1` (chparam pair
+    populated), ASPX_ACPL_2 non-iframe Cfg1 (no additional-channel
+    block), ASPX_ACPL_1 I-frame Cfg0 (residual layer + Cfg0 trailer),
+    ASPX_ACPL_1 zero `max_sfb_master` bails silently, truncated
+    SIMPLE five_channel_data bails silently, and
+    `SevenXCodecMode::from_u32` round-trip.
+
 - **Round 25 — ASPX_ACPL_1 / ASPX_ACPL_2 inner body walker**
   (TS 103 190-1 §4.2.6.6 Table 25 + §5.7.7.6.1 Pseudocode 117):
   - New `parse_aspx_acpl_1_2_inner_body()` helper in `mch.rs` walks the

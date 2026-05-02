@@ -884,6 +884,423 @@ fn parse_aspx_acpl_1_2_inner_body(
 }
 
 // =====================================================================
+// 7_X channel-element walker (round 27 — immersive 7.0 / 7.1)
+// =====================================================================
+
+/// `7_X_codec_mode` values per §4.3.5.7 Table 98.
+///
+/// Note this is a **2-bit** field (vs the 3-bit `5_X_codec_mode`) and
+/// has **no** `ASPX_ACPL_3` mode — only SIMPLE / ASPX / ASPX_ACPL_1 /
+/// ASPX_ACPL_2 are defined for 7.X.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SevenXCodecMode {
+    Simple,
+    Aspx,
+    AspxAcpl1,
+    AspxAcpl2,
+}
+
+impl SevenXCodecMode {
+    pub fn from_u32(v: u32) -> Self {
+        match v & 0b11 {
+            0 => Self::Simple,
+            1 => Self::Aspx,
+            2 => Self::AspxAcpl1,
+            _ => Self::AspxAcpl2,
+        }
+    }
+}
+
+/// Parse the outer layers of `7_X_channel_element(channel_mode, b_iframe)`
+/// per §4.2.6.14 Table 33.
+///
+/// `b_has_lfe == true` corresponds to `channel_mode == "7.1"` per the
+/// spec (the only differentiator between 7.0 and 7.1 inside the
+/// channel element is the leading `mono_data(1)` LFE).
+///
+/// The walker mirrors [`parse_5x_audio_data_outer`] but with the
+/// 7.X-specific shape:
+///
+/// 1. 2-bit `7_X_codec_mode` (vs 3-bit for 5_X). No `Reserved` values
+///    since all 4 codepoints are defined.
+/// 2. I-frame config block: `aspx_config()` for non-SIMPLE,
+///    `acpl_config_1ch(PARTIAL/FULL)` for ASPX_ACPL_{1,2}. There is no
+///    `acpl_config_2ch()` here — ASPX_ACPL_3 is 5.X-only.
+/// 3. LFE `mono_data(1)` when `b_has_lfe`.
+/// 4. `companding_control(5)` for ASPX_ACPL_{1,2} only — SIMPLE/ASPX in
+///    7.X have **no** leading companding (that differs from 5_X where
+///    ASPX gets `companding_control(5)`).
+/// 5. The 2-bit `coding_config` switch driving the four channel-data
+///    layouts (Cfg0 / Cfg1 / Cfg2 / Cfg3 — same selectors as the 5_X
+///    SIMPLE/ASPX path) — but with one critical difference: the Cfg0
+///    body is `2ch_mode + two_channel_data() + two_channel_data()`
+///    (no centre `mono_data(0)` here) and the Cfg2 body is just
+///    `four_channel_data()` (no trailing `mono_data(0)` here either).
+/// 6. SIMPLE/ASPX-only additional-channel block: 1-bit
+///    `b_use_sap_add_ch` then optional `chparam_info()×2` then a
+///    `two_channel_data()` carrying the additional 2 channels (the L+R
+///    surround / front-extension pair beyond the 5.X core).
+/// 7. ASPX_ACPL_1-only joint-MDCT residual layer: `max_sfb_master`
+///    (`n_side_bits` wide, derived per Table 33 NOTE) +
+///    `chparam_info()×2 + sf_data(ASF)×2`.
+/// 8. `coding_config in {0, 2}`-only trailing `mono_data(0)` — these
+///    are the centre / surround mono channels that move from inside the
+///    coding_config switch (5.X) to outside it (7.X). For 7.X this is
+///    **after** the additional-channel block.
+/// 9. ASPX trailers: `aspx_data_2ch()×2 + aspx_data_1ch()` for any
+///    non-SIMPLE mode, plus an extra `aspx_data_2ch()` for the ASPX
+///    mode (covering the additional two channels).
+/// 10. `acpl_data_1ch()×2` for ASPX_ACPL_{1,2} — same pair shape as
+///     the 5_X §5.7.7.6.1 Pseudocode 117 path.
+///
+/// Like the 5_X walker, the deeper `aspx_data` / `acpl_data` steps are
+/// gated on `b_iframe && tools.aspx_config.is_some()` so non-iframe
+/// paths consume what they can of the upstream channel data and stop.
+/// All inner Huffman / parse misses are caught try-and-bail and surface
+/// `Ok(())` to the caller — the outer walker never returns `Err` once
+/// the leading 2-bit `7_X_codec_mode` has been consumed.
+pub fn parse_7x_audio_data_outer(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    b_has_lfe: bool,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Result<()> {
+    // 7_X_codec_mode (2 bits — Table 98).
+    let mode_bits = br.read_u32(2)?;
+    let mode = SevenXCodecMode::from_u32(mode_bits);
+    tools.seven_x_mode = Some(mode);
+    tools.seven_x_b_has_lfe = b_has_lfe;
+
+    // I-frame config block.
+    if b_iframe {
+        if !matches!(mode, SevenXCodecMode::Simple) {
+            tools.aspx_config = Some(crate::aspx::parse_aspx_config(br)?);
+        }
+        match mode {
+            SevenXCodecMode::AspxAcpl1 => {
+                let cfg =
+                    crate::acpl::parse_acpl_config_1ch(br, crate::acpl::Acpl1chMode::Partial)?;
+                tools.acpl_config_1ch_partial = Some(cfg);
+            }
+            SevenXCodecMode::AspxAcpl2 => {
+                let cfg = crate::acpl::parse_acpl_config_1ch(br, crate::acpl::Acpl1chMode::Full)?;
+                tools.acpl_config_1ch_full = Some(cfg);
+            }
+            _ => {}
+        }
+    }
+
+    // LFE: mono_data(1) when channel_mode == "7.1".
+    if b_has_lfe {
+        let lfe = parse_mono_data(br, true, frame_len_base)?;
+        tools.lfe_mono_data = Some(lfe);
+    }
+
+    // companding_control(5) — ASPX_ACPL_{1,2} only.
+    // Note: SIMPLE / ASPX in 7.X do **not** carry a leading companding
+    // control (different from the 5_X walker where ASPX gets
+    // companding_control(5)).
+    if matches!(
+        mode,
+        SevenXCodecMode::AspxAcpl1 | SevenXCodecMode::AspxAcpl2
+    ) {
+        tools.companding = Some(crate::aspx::parse_companding_control(br, 5)?);
+    }
+
+    // coding_config (2 bits) — same 4-way selector as the 5.X
+    // SIMPLE/ASPX path but with different body shapes (no Cfg0 centre
+    // mono and no Cfg2 surround mono inside the switch — those move
+    // out to a single trailing `mono_data(0)` below).
+    let cc = br.read_u32(2)?;
+    let coding_cfg = match cc {
+        0 => FiveXCodingConfig::Cfg0Stereo2plusMono,
+        1 => FiveXCodingConfig::Cfg1ThreeStereo,
+        2 => FiveXCodingConfig::Cfg2FourMono,
+        _ => FiveXCodingConfig::Cfg3Five,
+    };
+    tools.seven_x_coding_config = Some(coding_cfg);
+
+    // Track the largest signalled transform length across the channel
+    // data bodies — used downstream to derive `n_side_bits` per the
+    // Table 33 NOTE for the ASPX_ACPL_1 joint-MDCT residual layer.
+    let mut largest_tl: Option<u32> = None;
+    let update_largest = |tl: u32, slot: &mut Option<u32>| {
+        *slot = Some(slot.map_or(tl, |cur| cur.max(tl)));
+    };
+
+    // Channel-data switch. Try-and-bail: any inner parser miss leaves
+    // the slot None and we still surface Ok(()).
+    let mut body_ok = true;
+    match coding_cfg {
+        FiveXCodingConfig::Cfg0Stereo2plusMono => {
+            // 7.X Cfg0 = `2ch_mode + two_channel_data + two_channel_data`
+            // (no centre mono inside this switch).
+            tools.b_2ch_mode = match br.read_bit() {
+                Ok(b) => Some(b),
+                Err(_) => {
+                    body_ok = false;
+                    None
+                }
+            };
+            tools.two_channel_data.clear();
+            if body_ok {
+                match parse_two_channel_data(br, frame_len_base) {
+                    Ok(d) => {
+                        if let Some(ti) = d.transform_info.as_ref() {
+                            update_largest(ti.transform_length_0, &mut largest_tl);
+                        }
+                        tools.two_channel_data.push(d);
+                    }
+                    Err(_) => body_ok = false,
+                }
+            }
+            if body_ok {
+                match parse_two_channel_data(br, frame_len_base) {
+                    Ok(d) => {
+                        if let Some(ti) = d.transform_info.as_ref() {
+                            update_largest(ti.transform_length_0, &mut largest_tl);
+                        }
+                        tools.two_channel_data.push(d);
+                    }
+                    Err(_) => body_ok = false,
+                }
+            }
+        }
+        FiveXCodingConfig::Cfg1ThreeStereo => {
+            // 7.X Cfg1 = `three_channel_data + two_channel_data`.
+            match parse_three_channel_data(br, frame_len_base) {
+                Ok(d) => {
+                    if let Some(ti) = d.transform_info.as_ref() {
+                        update_largest(ti.transform_length_0, &mut largest_tl);
+                    }
+                    tools.three_channel_data = Some(d);
+                }
+                Err(_) => body_ok = false,
+            }
+            if body_ok {
+                tools.two_channel_data.clear();
+                match parse_two_channel_data(br, frame_len_base) {
+                    Ok(d) => {
+                        if let Some(ti) = d.transform_info.as_ref() {
+                            update_largest(ti.transform_length_0, &mut largest_tl);
+                        }
+                        tools.two_channel_data.push(d);
+                    }
+                    Err(_) => body_ok = false,
+                }
+            }
+        }
+        FiveXCodingConfig::Cfg2FourMono => {
+            // 7.X Cfg2 = `four_channel_data` (no trailing mono inside
+            // this switch — moved to the post-additional-channel block).
+            match parse_four_channel_data(br, frame_len_base) {
+                Ok(d) => {
+                    if let Some(ti) = d.transform_info.as_ref() {
+                        update_largest(ti.transform_length_0, &mut largest_tl);
+                    }
+                    tools.four_channel_data = Some(d);
+                }
+                Err(_) => body_ok = false,
+            }
+        }
+        FiveXCodingConfig::Cfg3Five => match parse_five_channel_data(br, frame_len_base) {
+            Ok(d) => {
+                if let Some(ti) = d.transform_info.as_ref() {
+                    update_largest(ti.transform_length_0, &mut largest_tl);
+                }
+                tools.five_channel_data = Some(d);
+            }
+            Err(_) => body_ok = false,
+        },
+        FiveXCodingConfig::AcplLite2 => {
+            debug_assert!(false, "AcplLite2 unreachable from 7.X 2-bit coding_config");
+            body_ok = false;
+        }
+    }
+    if !body_ok {
+        return Ok(());
+    }
+
+    // SIMPLE / ASPX additional-channel block: optional `chparam_info()×2`
+    // gated on `b_use_sap_add_ch`, then a `two_channel_data()` carrying
+    // the extra 2 channels (the front-extension or surround-back pair).
+    if matches!(mode, SevenXCodecMode::Simple | SevenXCodecMode::Aspx) {
+        let b_use_sap_add_ch = match br.read_bit() {
+            Ok(b) => b,
+            Err(_) => return Ok(()),
+        };
+        tools.seven_x_b_use_sap_add_ch = Some(b_use_sap_add_ch);
+        if b_use_sap_add_ch {
+            // Two chparam_info() calls. Use the additional-channel
+            // two_channel_data's max_sfb when we read it below; for now
+            // pass the largest channel-data max_sfb seen so far (the
+            // chparam SAP DPCM walker is bounded by its own
+            // `max_sfb_per_group` argument).
+            let max_sfb_g = largest_tl.and_then(crate::tables::num_sfb_48).unwrap_or(63);
+            let cp0 = match parse_chparam_info(br, &[max_sfb_g]) {
+                Ok(c) => c,
+                Err(_) => return Ok(()),
+            };
+            let cp1 = match parse_chparam_info(br, &[max_sfb_g]) {
+                Ok(c) => c,
+                Err(_) => return Ok(()),
+            };
+            tools.seven_x_add_chparam_info = Some([cp0, cp1]);
+        }
+        // Additional `two_channel_data()` for the extra 2 channels.
+        match parse_two_channel_data(br, frame_len_base) {
+            Ok(d) => {
+                if let Some(ti) = d.transform_info.as_ref() {
+                    update_largest(ti.transform_length_0, &mut largest_tl);
+                }
+                tools.seven_x_additional_channel_data = Some(d);
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+
+    // ASPX_ACPL_1-only joint-MDCT residual layer (max_sfb_master +
+    // chparam_info×2 + sf_data×2). Mirrors the 5_X
+    // `parse_aspx_acpl_1_2_inner_body` ACPL_1 block — same shape, same
+    // n_side_bits derivation per Table 33 NOTE.
+    if matches!(mode, SevenXCodecMode::AspxAcpl1) {
+        let Some(tl) = largest_tl else {
+            return Ok(());
+        };
+        let Some((_n_msfb, n_side, _n_msfbl)) = tables::n_msfb_bits_48(tl) else {
+            return Ok(());
+        };
+        let Some(num_sfb_cap) = tables::num_sfb_48(tl) else {
+            return Ok(());
+        };
+        let max_sfb_master = match br.read_u32(n_side) {
+            Ok(v) => v.min(num_sfb_cap),
+            Err(_) => return Ok(()),
+        };
+        if max_sfb_master == 0 {
+            return Ok(());
+        }
+        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
+            return Ok(());
+        }
+        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
+            return Ok(());
+        }
+        let synth_ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0; 2],
+            transform_length_0: tl,
+            transform_length_1: tl,
+        };
+        let body0 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
+        let Some(_b0) = body0 else { return Ok(()) };
+        let body1 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
+        if body1.is_none() {
+            return Ok(());
+        }
+    }
+
+    // Trailing `mono_data(0)` for `coding_config in {0, 2}` — the
+    // centre (Cfg0) or surround-back (Cfg2) mono channel. In 7.X this
+    // moves out of the coding_config switch and lands after the
+    // additional-channel block / ASPX_ACPL_1 residual layer.
+    if matches!(
+        coding_cfg,
+        FiveXCodingConfig::Cfg0Stereo2plusMono | FiveXCodingConfig::Cfg2FourMono
+    ) {
+        match parse_mono_data(br, false, frame_len_base) {
+            Ok(m) => {
+                // Land in the mode-appropriate slot — Cfg0 → centre,
+                // Cfg2 → back. Reuses the existing 5_X plumbing.
+                if matches!(coding_cfg, FiveXCodingConfig::Cfg0Stereo2plusMono) {
+                    tools.cfg0_centre_mono = Some(m);
+                } else {
+                    tools.cfg2_back_mono = Some(m);
+                }
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+
+    // ASPX trailers + ACPL pair: gated on b_iframe + aspx_config in
+    // scope. Same gate as the 5_X ASPX_ACPL_{1,2,3} walkers.
+    if !b_iframe {
+        return Ok(());
+    }
+    let Some(aspx_cfg) = tools.aspx_config else {
+        return Ok(());
+    };
+
+    // `if (7_X_codec_mode != SIMPLE) { aspx_data_2ch + aspx_data_2ch
+    // + aspx_data_1ch }` — covers the L/R + Ls/Rs front pair and the
+    // additional-channel pair plus the centre mono.
+    if !matches!(mode, SevenXCodecMode::Simple) {
+        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+            .is_err()
+        {
+            return Ok(());
+        }
+    }
+    // `if (7_X_codec_mode == ASPX) { aspx_data_2ch }` — extra 2ch
+    // envelope for the additional-channel pair in pure-ASPX mode (the
+    // ASPX_ACPL_{1,2} paths fold the additional-channel ASPX into the
+    // single aspx_data_1ch above).
+    if matches!(mode, SevenXCodecMode::Aspx)
+        && crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+            .is_err()
+    {
+        return Ok(());
+    }
+
+    // ACPL pair for ASPX_ACPL_{1,2} — `acpl_data_1ch()×2`, lands in
+    // tools.acpl_data_1ch_pair[0/1] per the §5.7.7.6.1 Pseudocode 117
+    // pair walker shape (shared with the 5_X path).
+    if matches!(
+        mode,
+        SevenXCodecMode::AspxAcpl1 | SevenXCodecMode::AspxAcpl2
+    ) {
+        let acpl_cfg = match mode {
+            SevenXCodecMode::AspxAcpl1 => tools.acpl_config_1ch_partial,
+            SevenXCodecMode::AspxAcpl2 => tools.acpl_config_1ch_full,
+            _ => None,
+        };
+        let Some(acfg) = acpl_cfg else {
+            return Ok(());
+        };
+        let start_band = if acfg.qmf_band == 0 {
+            0
+        } else {
+            crate::acpl::sb_to_pb(acfg.qmf_band as u32, acfg.num_param_bands)
+        };
+        if let Ok(d0) =
+            crate::acpl::parse_acpl_data_1ch(br, acfg.num_param_bands, start_band, acfg.quant_mode)
+        {
+            tools.acpl_data_1ch_pair[0] = Some(d0);
+            if let Ok(d1) = crate::acpl::parse_acpl_data_1ch(
+                br,
+                acfg.num_param_bands,
+                start_band,
+                acfg.quant_mode,
+            ) {
+                tools.acpl_data_1ch_pair[1] = Some(d1);
+            }
+        }
+    }
+    Ok(())
+}
+
+// =====================================================================
 // Helpers
 // =====================================================================
 
@@ -2160,5 +2577,474 @@ mod tests {
         assert!(tools.three_channel_data.is_some());
         assert!(tools.acpl_data_1ch_pair[0].is_none());
         assert!(tools.acpl_data_1ch_pair[1].is_none());
+    }
+
+    // =================================================================
+    // Round 27: 7_X channel-element walker (immersive 7.0 / 7.1)
+    // =================================================================
+
+    /// Helper — write a `companding_control(5)` element with all five
+    /// channels companded on (sync_flag=true compresses the per-channel
+    /// loop to a single `compand_on=true` bit).
+    fn write_companding_5_all_on(bw: &mut oxideav_core::bits::BitWriter) {
+        bw.write_bit(true); // sync_flag
+        bw.write_bit(true); // compand_on
+    }
+
+    #[test]
+    fn seven_x_codec_mode_round_trip() {
+        assert_eq!(SevenXCodecMode::from_u32(0), SevenXCodecMode::Simple);
+        assert_eq!(SevenXCodecMode::from_u32(1), SevenXCodecMode::Aspx);
+        assert_eq!(SevenXCodecMode::from_u32(2), SevenXCodecMode::AspxAcpl1);
+        assert_eq!(SevenXCodecMode::from_u32(3), SevenXCodecMode::AspxAcpl2);
+        // Wraparound — only 2 bits are used so 4 .. 7 fold back.
+        assert_eq!(SevenXCodecMode::from_u32(4), SevenXCodecMode::Simple);
+    }
+
+    /// 7_X SIMPLE coding_config = 3 (five_channel_data) + the trailing
+    /// SIMPLE additional `two_channel_data` (no SAP). 7.0 path (no LFE).
+    #[test]
+    fn parse_7x_outer_simple_cfg3_no_sap_walks_full_body() {
+        let mut bw = BitWriter::new();
+        // 7_X_codec_mode = SIMPLE (0) -- 2 bits.
+        bw.write_u32(0, 2);
+        // No I-frame config (SIMPLE).
+        // No LFE.
+        // No companding (SIMPLE/ASPX skip companding in 7.X).
+        // coding_config = 3 -> five_channel_data.
+        bw.write_u32(3, 2);
+        // five_channel_data outer:
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(15, 6); // max_sfb[0]
+        bw.write_u32(0, 4); // chel_matsel
+        for _ in 0..5 {
+            bw.write_u32(0, 2); // chparam_info
+        }
+        for _ in 0..5 {
+            write_zero_sf_data_body(&mut bw, 15, 0);
+        }
+        // SIMPLE additional-channel block: b_use_sap_add_ch = 0.
+        bw.write_bit(false);
+        // additional two_channel_data (no SAP):
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(10, 6); // max_sfb[0]
+        bw.write_u32(0, 2); // chparam sap_mode = 0
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.seven_x_mode, Some(SevenXCodecMode::Simple));
+        assert!(!tools.seven_x_b_has_lfe);
+        assert_eq!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg3Five)
+        );
+        let five = tools.five_channel_data.as_ref().expect("5ch parsed");
+        assert_eq!(five.psy_info.as_ref().unwrap().max_sfb_0, 15);
+        assert_eq!(tools.seven_x_b_use_sap_add_ch, Some(false));
+        assert!(tools.seven_x_add_chparam_info.is_none());
+        let add = tools
+            .seven_x_additional_channel_data
+            .as_ref()
+            .expect("additional 2ch parsed");
+        assert_eq!(add.psy_info.as_ref().unwrap().max_sfb_0, 10);
+    }
+
+    /// 7.1 SIMPLE: leading `mono_data(1)` LFE then five_channel_data
+    /// then the additional `two_channel_data`.
+    #[test]
+    fn parse_7x_outer_simple_71_walks_lfe_and_five_channel() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // SIMPLE
+                            // LFE mono_data(1):
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(4, 3); // max_sfb[0] (n_msfbl_bits=3 @ tl=1920)
+                            // coding_config = 3 -> five_channel_data:
+        bw.write_u32(3, 2);
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(10, 6); // max_sfb[0]
+        bw.write_u32(0, 4);
+        for _ in 0..5 {
+            bw.write_u32(0, 2);
+        }
+        for _ in 0..5 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        // SIMPLE additional-channel block.
+        bw.write_bit(false); // b_use_sap_add_ch = 0
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(8, 6); // max_sfb[0]
+        bw.write_u32(0, 2); // chparam sap_mode = 0
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, true, true, 1920).unwrap();
+        assert!(tools.seven_x_b_has_lfe);
+        let lfe = tools.lfe_mono_data.as_ref().expect("LFE walked");
+        assert!(lfe.b_lfe);
+        assert_eq!(lfe.psy_info.as_ref().unwrap().max_sfb_0, 4);
+        assert!(tools.five_channel_data.is_some());
+        assert!(tools.seven_x_additional_channel_data.is_some());
+    }
+
+    /// 7_X SIMPLE Cfg0 — `2ch_mode + two_channel_data + two_channel_data`
+    /// (no centre mono inside the switch). The trailing centre
+    /// `mono_data(0)` lands AFTER the additional-channel block.
+    #[test]
+    fn parse_7x_outer_simple_cfg0_walks_two_pairs_then_centre_mono() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // SIMPLE
+                            // coding_config = 0:
+        bw.write_u32(0, 2);
+        // 2ch_mode (1 bit).
+        bw.write_bit(false);
+        // two_channel_data #0:
+        bw.write_bit(true);
+        bw.write_u32(12, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        // two_channel_data #1:
+        bw.write_bit(true);
+        bw.write_u32(12, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        // SIMPLE additional-channel block.
+        bw.write_bit(false); // b_use_sap_add_ch = 0
+                             // additional two_channel_data:
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        // Trailing mono_data(0) for Cfg0 (centre).
+        bw.write_bit(false); // spec_frontend = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(7, 6); // max_sfb[0]
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.seven_x_mode, Some(SevenXCodecMode::Simple));
+        assert_eq!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg0Stereo2plusMono)
+        );
+        assert_eq!(tools.b_2ch_mode, Some(false));
+        assert_eq!(tools.two_channel_data.len(), 2);
+        let centre = tools.cfg0_centre_mono.as_ref().expect("centre mono walked");
+        assert_eq!(centre.psy_info.as_ref().unwrap().max_sfb_0, 7);
+    }
+
+    /// 7_X SIMPLE Cfg2 — `four_channel_data` (no surround mono inside
+    /// switch). Trailing surround `mono_data(0)` lands AFTER the
+    /// additional-channel block.
+    #[test]
+    fn parse_7x_outer_simple_cfg2_walks_four_then_back_mono() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // SIMPLE
+                            // coding_config = 2 -> four_channel_data:
+        bw.write_u32(2, 2);
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(11, 6); // max_sfb[0]
+        for _ in 0..4 {
+            bw.write_u32(0, 2);
+        }
+        for _ in 0..4 {
+            write_zero_sf_data_body(&mut bw, 11, 0);
+        }
+        // SIMPLE additional-channel block.
+        bw.write_bit(false); // b_use_sap_add_ch = 0
+        bw.write_bit(true);
+        bw.write_u32(9, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 9, 0);
+        write_zero_sf_data_body(&mut bw, 9, 0);
+        // Trailing mono_data(0) for Cfg2 (back surround).
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(6, 6);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg2FourMono)
+        );
+        assert!(tools.four_channel_data.is_some());
+        let back = tools.cfg2_back_mono.as_ref().expect("back mono walked");
+        assert_eq!(back.psy_info.as_ref().unwrap().max_sfb_0, 6);
+    }
+
+    /// 7_X SIMPLE Cfg1 — `three_channel_data + two_channel_data` (no
+    /// trailing mono_data — coding_config in {0,2} only triggers the
+    /// trailer). The additional-channel block still fires.
+    #[test]
+    fn parse_7x_outer_simple_cfg1_no_mono_trailer() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // SIMPLE
+                            // coding_config = 1 -> three_channel_data + two_channel_data
+        bw.write_u32(1, 2);
+        // three_channel_data:
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 4); // chel_matsel
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        // two_channel_data:
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        // SIMPLE additional-channel block.
+        bw.write_bit(false); // b_use_sap_add_ch
+        bw.write_bit(true);
+        bw.write_u32(8, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg1ThreeStereo)
+        );
+        assert!(tools.three_channel_data.is_some());
+        assert_eq!(tools.two_channel_data.len(), 1);
+        // Cfg1: no trailing mono_data(0).
+        assert!(tools.cfg0_centre_mono.is_none());
+        assert!(tools.cfg2_back_mono.is_none());
+        assert!(tools.seven_x_additional_channel_data.is_some());
+    }
+
+    /// 7_X SIMPLE with `b_use_sap_add_ch = 1` — two `chparam_info()`
+    /// elements precede the additional `two_channel_data`. Validates
+    /// that `seven_x_add_chparam_info` is populated.
+    #[test]
+    fn parse_7x_outer_simple_with_sap_add_ch_populates_chparam_pair() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // SIMPLE
+        bw.write_u32(3, 2); // coding_config = 3 -> five_channel_data
+        bw.write_bit(true);
+        bw.write_u32(12, 6);
+        bw.write_u32(0, 4);
+        for _ in 0..5 {
+            bw.write_u32(0, 2);
+        }
+        for _ in 0..5 {
+            write_zero_sf_data_body(&mut bw, 12, 0);
+        }
+        // SIMPLE additional-channel block with SAP.
+        bw.write_bit(true); // b_use_sap_add_ch = 1
+        bw.write_u32(0, 2); // chparam_info #0 sap_mode = 0
+        bw.write_u32(0, 2); // chparam_info #1 sap_mode = 0
+                            // additional two_channel_data:
+        bw.write_bit(true);
+        bw.write_u32(8, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.seven_x_b_use_sap_add_ch, Some(true));
+        let pair = tools
+            .seven_x_add_chparam_info
+            .as_ref()
+            .expect("SAP chparam pair");
+        assert_eq!(pair[0].sap_mode, 0);
+        assert_eq!(pair[1].sap_mode, 0);
+    }
+
+    /// 7_X ASPX_ACPL_2 non-iframe with `coding_config = 1`
+    /// (three_channel_data branch). Walker should populate
+    /// `three_channel_data` + `two_channel_data` but the ACPL pair stays
+    /// unset (no aspx_config in scope on a non-iframe). NO additional
+    /// `two_channel_data` should be parsed (it's SIMPLE/ASPX-only).
+    #[test]
+    fn parse_7x_aspx_acpl_2_non_iframe_walks_three_channel_no_addch() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 2); // 7_X_codec_mode = ASPX_ACPL_2
+        write_companding_5_all_on(&mut bw);
+        bw.write_u32(1, 2); // coding_config = 1 -> three_channel + two_channel
+                            // three_channel_data outer:
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 4);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        // two_channel_data:
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+        assert_eq!(tools.seven_x_mode, Some(SevenXCodecMode::AspxAcpl2));
+        assert_eq!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg1ThreeStereo)
+        );
+        assert!(tools.three_channel_data.is_some());
+        assert_eq!(tools.two_channel_data.len(), 1);
+        // No additional two_channel_data — that's SIMPLE/ASPX-only.
+        assert!(tools.seven_x_additional_channel_data.is_none());
+        assert!(tools.seven_x_b_use_sap_add_ch.is_none());
+        // ACPL pair gated on b_iframe + aspx_config in scope.
+        assert!(tools.acpl_data_1ch_pair[0].is_none());
+        assert!(tools.acpl_data_1ch_pair[1].is_none());
+    }
+
+    /// 7_X ASPX_ACPL_1 I-frame with `coding_config = 0` (two_channel_data
+    /// branch). Validates the joint-MDCT residual layer + Cfg0
+    /// trailing mono_data(0) (which moves AFTER the additional-channel
+    /// block in 7.X — but ASPX_ACPL_1 has no additional-channel block,
+    /// so it's right after the residual layer).
+    #[test]
+    fn parse_7x_aspx_acpl_1_iframe_walks_residual_and_mono_trailer() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 2); // 7_X_codec_mode = ASPX_ACPL_1
+        write_zero_aspx_config(&mut bw);
+        write_acpl_config_1ch_partial(&mut bw);
+        write_companding_5_all_on(&mut bw);
+        bw.write_u32(0, 2); // coding_config = 0 -> 2ch_mode + 2x two_channel_data
+        bw.write_bit(false); // 2ch_mode
+                             // two_channel_data #0:
+        bw.write_bit(true);
+        bw.write_u32(12, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        // two_channel_data #1:
+        bw.write_bit(true);
+        bw.write_u32(12, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 0);
+        // ASPX_ACPL_1 joint-MDCT residual layer (n_side_bits=5 @ tl=1920).
+        bw.write_u32(6, 5); // max_sfb_master = 6
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 0);
+        // Cfg0 trailer: mono_data(0) for the centre.
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(7, 6);
+        // Pad for downstream try-and-bail aspx/acpl trailers.
+        bw.align_to_byte();
+        while bw.byte_len() < 256 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.seven_x_mode, Some(SevenXCodecMode::AspxAcpl1));
+        assert!(tools.aspx_config.is_some());
+        let cfg_partial = tools
+            .acpl_config_1ch_partial
+            .expect("PARTIAL config parsed");
+        assert_eq!(cfg_partial.num_param_bands, 15);
+        assert_eq!(cfg_partial.qmf_band, 1);
+        assert_eq!(tools.two_channel_data.len(), 2);
+        let centre = tools.cfg0_centre_mono.as_ref().expect("centre mono walked");
+        assert_eq!(centre.psy_info.as_ref().unwrap().max_sfb_0, 7);
+        // No additional-channel block on ASPX_ACPL_*.
+        assert!(tools.seven_x_additional_channel_data.is_none());
+        assert!(tools.seven_x_b_use_sap_add_ch.is_none());
+    }
+
+    /// 7_X ASPX_ACPL_1 zero `max_sfb_master` should bail silently —
+    /// matching the 5_X walker's bail behaviour. Subsequent aspx/acpl
+    /// trailers stay unset.
+    #[test]
+    fn parse_7x_aspx_acpl_1_iframe_zero_max_sfb_master_bails() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 2); // ASPX_ACPL_1
+        write_zero_aspx_config(&mut bw);
+        write_acpl_config_1ch_partial(&mut bw);
+        write_companding_5_all_on(&mut bw);
+        bw.write_u32(1, 2); // coding_config = 1 -> three_channel + two_channel
+                            // three_channel_data:
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 4);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
+        for _ in 0..3 {
+            write_zero_sf_data_body(&mut bw, 10, 0);
+        }
+        // two_channel_data:
+        bw.write_bit(true);
+        bw.write_u32(10, 6);
+        bw.write_u32(0, 2);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 0);
+        // max_sfb_master = 0 (n_side_bits=5).
+        bw.write_u32(0, 5);
+        bw.align_to_byte();
+        while bw.byte_len() < 64 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.seven_x_mode, Some(SevenXCodecMode::AspxAcpl1));
+        assert!(tools.three_channel_data.is_some());
+        assert!(tools.acpl_data_1ch_pair[0].is_none());
+        assert!(tools.acpl_data_1ch_pair[1].is_none());
+    }
+
+    /// Truncated input mid-`five_channel_data` for SIMPLE 7_X should
+    /// leave `five_channel_data` `None` (the channel-data parser
+    /// errored) without panicking — the outer walker still returns
+    /// Ok(()) thanks to try-and-bail.
+    #[test]
+    fn parse_7x_simple_truncated_five_channel_data_bails() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // SIMPLE
+        bw.write_u32(3, 2); // coding_config = 3
+                            // start five_channel_data but truncate:
+        bw.write_bit(true); // b_long_frame
+                            // intentionally cut here.
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_7x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+        assert_eq!(tools.seven_x_mode, Some(SevenXCodecMode::Simple));
+        assert_eq!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg3Five)
+        );
+        assert!(tools.five_channel_data.is_none());
+        assert!(tools.seven_x_additional_channel_data.is_none());
     }
 }
