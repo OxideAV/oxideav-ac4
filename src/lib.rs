@@ -338,8 +338,15 @@
 //!
 //! Known gaps (Unsupported or stubbed):
 //!
-//! * Short / grouped frames (`num_window_groups > 1`) — coefficient
-//!   path only exercises the long-frame path today.
+//! * Short / grouped frames (`num_window_groups > 1`) — round 28 lands
+//!   the mono / stereo `sf_data(ASF)` walker per Tables 39-42 (each
+//!   `asf_*_data()` body has its own outer `for (g; ...)` loop, with a
+//!   single `reference_scale_factor` and single `b_snf_data_exists` at
+//!   the head). Multichannel layouts (5.X / 7.X) still use the r24
+//!   per-group interleaved walker. MDCT synthesis for the per-group
+//!   spectra (concatenated group-major in
+//!   `tools.scaled_spec_primary` / `tools.scaled_spec_secondary`) is
+//!   not yet hooked through the decoder.
 //! * Remaining §5.7.6.4 A-SPX HF regeneration — non-FIXFIX interval
 //!   classes (FIXVAR / VARFIX / VARVAR) still fall back to the
 //!   flat-gain scaffold; the limiter (§5.7.6.4.2.2) and TNS

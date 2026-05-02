@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 28 — mono / stereo short-frame `sf_data(ASF)` walker** (TS 103
+  190-1 §4.2.8.3-6 Tables 39-42, §4.3.6.2.6 Pseudocodes 2/3/5):
+  - New spec-correct `_grouped` payload parsers in `asf_data.rs` —
+    `parse_asf_section_data_grouped()`,
+    `parse_asf_spectral_data_grouped()`,
+    `parse_asf_scalefac_data_grouped()`,
+    `parse_asf_snf_data_grouped()` — each takes per-group transform-
+    length and `max_sfb` arrays and walks the spec's outer
+    `for (g = 0; g < num_window_groups; g++)` loop. Critically:
+    `asf_scalefac_data()` consumes a *single* 8-bit
+    `reference_scale_factor` at the head with `first_scf_found` shared
+    across groups (DPCM state is continuous over the whole frame), and
+    `asf_snf_data()` consumes a *single* 1-bit `b_snf_data_exists`
+    gate at the head. This matches Tables 41 / 42 verbatim.
+  - New helpers in `asf.rs`:
+    `derive_per_group()` / `derive_per_group_with_max_sfb()` resolve
+    per-group `(transf_length_idx, transform_length, max_sfb)` from
+    `(AsfTransformInfo, AsfPsyInfo)` per Pseudocodes 2 (`get_transf_length`)
+    and 5 (`get_max_sfb`), including the `b_different_framing`
+    half-frame split (Pseudocode 3's grouping-bit shift +
+    `num_windows_0 - 1` boundary injection).
+  - New body decoders:
+    - `decode_asf_grouped_mono_body[_with_max_sfb]()` — wraps the four
+      `_grouped` payload parsers; returns the per-group dequantised
+      spectra concatenated group-major.
+    - `decode_asf_grouped_stereo_joint_body()` — joint-MDCT residual
+      layer with shared section, two independent spectral bodies (L/M
+      then R/S), shared scalefactors (band-wise max_quant_idx over
+      both channels), per-group `ms_used[g][sfb]` flag arrays, then
+      snf. Inverse M/S applied per-group: L = M+S, R = M-S for bands
+      with ms_used set.
+    - `decode_asf_mono_body_dispatch()` /
+      `decode_asf_mono_body_for_max_sfb()` — long-frame vs grouped
+      dispatch wrappers used by all per-channel call sites.
+  - Wired into the four mono / stereo call sites:
+    - `parse_mono_audio_data_outer()` — mono SIMPLE / ASPX path.
+    - `parse_aspx_acpl2_mdct_body()` — single-channel ASPX_ACPL_2
+      MDCT residual.
+    - `parse_aspx_acpl1_mdct_body()` joint + split — ASPX_ACPL_1
+      joint-MDCT residual layer (two independent mono bodies with
+      `max_sfb_0` / `max_sfb_side_0`) and the split case.
+    - `parse_stereo_data_body()` joint + split — stereo CPE body
+      with both joint MDCT (shared section + ms_used) and split MDCT
+      (two independent mono bodies).
+  - Real Dolby AC-4 mono / stereo streams that include short-frame
+    `sf_data(ASF)` (i.e. the encoder picks short-window sub-frames)
+    now decode end-to-end without bailing at the
+    `num_window_groups != 1` guard. The grouped multichannel walker
+    in `mch.rs` from r24 (per-group interleaved
+    `section + spectral + scalefac + snf`) is left untouched — its
+    pinned tests continue to pass.
+  - 9 new tests: 4 in `asf_data.rs` (grouped section / scalefac
+    reference-once / scalefac DPCM-state-carries / snf gate-once) and
+    5 in `asf.rs` (decode_asf_grouped_mono two-group + truncated;
+    parse_mono_audio_data_outer SIMPLE short-frame; parse_stereo_data_body
+    split + joint short-frame). **425 tests** (414 lib + 5 + 6
+    integration), up from 416.
+
 - **Round 27 — 7_X channel-element walker (immersive 7.0 / 7.1)**
   (TS 103 190-1 §4.2.6.14 Table 33 + §4.3.5.7 Table 98):
   - New `parse_7x_audio_data_outer()` walker in `mch.rs` plus a

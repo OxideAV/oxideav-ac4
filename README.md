@@ -78,10 +78,28 @@ framework but usable standalone.
 > block (`b_use_sap_add_ch + optional chparam_info×2 +
 > two_channel_data`) carries the front-extension / back-surround pair
 > beyond the 5.X core. `walk_ac4_substream` now dispatches
-> `channels == 7/8` (7.0/7.1) into the new walker. **416 tests** (405
-> lib + 5 + 6 integration). Pending: ASF short-frame `sf_data` walk
-> for the mono / stereo paths (the grouped walker added in r24 covers
-> the multichannel layouts only).
+> `channels == 7/8` (7.0/7.1) into the new walker. Round 28 lands the
+> mono / stereo **short-frame `sf_data(ASF)` walker** per ETSI TS 103
+> 190-1 §4.2.8.3-6 Tables 39-42: new spec-correct `_grouped` payload
+> parsers in `asf_data.rs` (each with its own outer
+> `for (g = 0; g < num_window_groups; g++)` loop, a *single* 8-bit
+> `reference_scale_factor` at the head of `asf_scalefac_data()` with
+> `first_scf_found` carrying across groups, and a *single* 1-bit
+> `b_snf_data_exists` gate at the head of `asf_snf_data()`), plus
+> `derive_per_group()` helpers that resolve per-group
+> `(transf_length_idx, transform_length, max_sfb)` from `(ti, psy)`
+> per Pseudocodes 2 / 3 / 5 (handling the `b_different_framing`
+> half-frame split). New body decoders
+> `decode_asf_grouped_mono_body[_with_max_sfb]()` and
+> `decode_asf_grouped_stereo_joint_body()` (shared section, per-group
+> `ms_used[g][sfb]`, inverse M/S) are wired into all four mono /
+> stereo call sites: `parse_mono_audio_data_outer`,
+> `parse_aspx_acpl2_mdct_body`, `parse_aspx_acpl1_mdct_body` (joint +
+> split) and `parse_stereo_data_body` (joint + split). Real Dolby
+> AC-4 mono / stereo streams using short-window sub-frames now
+> decode end-to-end without bailing at the previous
+> `num_window_groups != 1` guard. **425 tests** (414 lib + 5 + 6
+> integration).
 
 ## Specs
 

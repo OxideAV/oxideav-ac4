@@ -9,9 +9,18 @@
 //! Huffman tables live in [`crate::huffman`]; the sfb offsets live in
 //! [`crate::sfb_offset`].
 //!
-//! This is the minimum viable coefficient pipeline — single window
-//! group (`num_window_groups == 1`), long-frame case only. Short /
-//! grouped frames and HSF extension will come in follow-up commits.
+//! Both the long-frame (`num_window_groups == 1`) and the short-frame
+//! grouped (`num_window_groups > 1`) cases are supported. The
+//! grouped variants (`*_grouped`) take per-group transform-length and
+//! `max_sfb` arrays and follow Tables 39-42's outer
+//! `for (g = 0; g < num_window_groups; g++)` loops with a *single*
+//! `reference_scale_factor` (8 bits) and *single* `b_snf_data_exists`
+//! (1 bit) at the head of `asf_scalefac_data()` / `asf_snf_data()`.
+//! `first_scf_found` carries across groups so the scalefactor DPCM
+//! state is continuous over the whole frame.
+//!
+//! HSF extension (`asf_hsf_spectral_data()`, Table 42a) is still
+//! pending.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -265,6 +274,183 @@ pub fn parse_asf_snf_data(
     Ok(Some(dpcm_snf))
 }
 
+/// Parse `asf_section_data()` per Table 39 with the spec's outer
+/// `for (g = 0; g < num_window_groups; g++)` loop. Returns one
+/// [`AsfSections`] per group.
+///
+/// `transf_length_idx_per_group[g]` is the 2-bit transform-length
+/// index used for group g (drives `n_sect_bits`). `transform_length_per_group[g]`
+/// is the resolved transform length used for the `num_sfb_48` cap.
+/// `max_sfb_per_group[g]` is the per-group max_sfb from Pseudocode 5
+/// (`get_max_sfb(g)`).
+///
+/// All three slices must have length `num_window_groups`. For the
+/// equal-transform-length non-different-framing case this collapses
+/// to the same value repeated.
+pub fn parse_asf_section_data_grouped(
+    br: &mut BitReader<'_>,
+    transf_length_idx_per_group: &[u32],
+    transform_length_per_group: &[u32],
+    max_sfb_per_group: &[u32],
+) -> Result<Vec<AsfSections>> {
+    let n = transf_length_idx_per_group.len();
+    if n == 0 || transform_length_per_group.len() != n || max_sfb_per_group.len() != n {
+        return Err(Error::invalid(
+            "ac4: asf_section_data_grouped: inconsistent per-group slice lengths",
+        ));
+    }
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        out.push(parse_asf_section_data(
+            br,
+            transf_length_idx_per_group[g],
+            transform_length_per_group[g],
+            max_sfb_per_group[g],
+        )?);
+    }
+    Ok(out)
+}
+
+/// Parse `asf_spectral_data()` per Table 40 with the spec's outer
+/// `for (g = 0; g < num_window_groups; g++)` loop. Returns
+/// `(quant_spec_per_group, max_quant_idx_per_group)`.
+///
+/// `sfb_offset_per_group[g]` is the per-group `sfb_offset[]` table
+/// (Annex B at the per-group transform length). `sections_per_group`
+/// must have one entry per group; `max_sfb_per_group[g]` ditto.
+#[allow(clippy::type_complexity)]
+pub fn parse_asf_spectral_data_grouped(
+    br: &mut BitReader<'_>,
+    sections_per_group: &[AsfSections],
+    sfb_offset_per_group: &[&[u16]],
+    max_sfb_per_group: &[u32],
+) -> Result<(Vec<Vec<i32>>, Vec<Vec<u32>>)> {
+    let n = sections_per_group.len();
+    if sfb_offset_per_group.len() != n || max_sfb_per_group.len() != n {
+        return Err(Error::invalid(
+            "ac4: asf_spectral_data_grouped: inconsistent per-group slice lengths",
+        ));
+    }
+    let mut q_per_g = Vec::with_capacity(n);
+    let mut mqi_per_g = Vec::with_capacity(n);
+    for g in 0..n {
+        let (q, mqi) = parse_asf_spectral_data(
+            br,
+            &sections_per_group[g],
+            sfb_offset_per_group[g],
+            max_sfb_per_group[g],
+        )?;
+        q_per_g.push(q);
+        mqi_per_g.push(mqi);
+    }
+    Ok((q_per_g, mqi_per_g))
+}
+
+/// Parse `asf_scalefac_data()` per Table 41 with the spec's
+/// `reference_scale_factor` (8 bits) consumed *once*, then the outer
+/// `for (g = 0; g < num_window_groups; g++)` loop with `first_scf_found`
+/// shared across groups (so the DPCM state runs continuously over the
+/// whole frame). Returns one per-sfb scale-factor-gain vector per group.
+///
+/// `transform_length_per_group[g]` drives the per-group `num_sfb_48`
+/// cap on the LSF range. `max_quant_idx_per_group[g]` is the per-group
+/// per-sfb max-quant-index that `parse_asf_spectral_data_grouped`
+/// produced.
+pub fn parse_asf_scalefac_data_grouped(
+    br: &mut BitReader<'_>,
+    sections_per_group: &[AsfSections],
+    max_quant_idx_per_group: &[Vec<u32>],
+    max_sfb_per_group: &[u32],
+    transform_length_per_group: &[u32],
+) -> Result<Vec<Vec<f32>>> {
+    let n = sections_per_group.len();
+    if max_quant_idx_per_group.len() != n
+        || max_sfb_per_group.len() != n
+        || transform_length_per_group.len() != n
+    {
+        return Err(Error::invalid(
+            "ac4: asf_scalefac_data_grouped: inconsistent per-group slice lengths",
+        ));
+    }
+    let reference_scale_factor = br.read_u32(8)?;
+    let mut scale_factor: i32 = reference_scale_factor as i32;
+    let mut first_scf_found = false;
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let max_sfb = max_sfb_per_group[g];
+        let tl = transform_length_per_group[g];
+        let num_sfb_lsf = num_sfb_48(tl)
+            .ok_or_else(|| Error::invalid("ac4: scalefac_grouped: bad transform_length"))?;
+        let max_sfb_eff = max_sfb.min(num_sfb_lsf);
+        let mqi = &max_quant_idx_per_group[g];
+        let sections = &sections_per_group[g];
+        let mut sf_gain = vec![0.0_f32; max_sfb as usize];
+        for sfb in 0..max_sfb_eff as usize {
+            let cb = sections.sfb_cb[sfb];
+            if cb == 0 || mqi[sfb] == 0 {
+                continue;
+            }
+            if first_scf_found {
+                let cw_idx = huff_decode(br, HCB_SCALEFAC_LEN, HCB_SCALEFAC_CW)?;
+                scale_factor += cw_idx as i32 - 60;
+            } else {
+                first_scf_found = true;
+            }
+            let sf = scale_factor;
+            let exp = (sf as f32 - 100.0) * 0.25;
+            sf_gain[sfb] = 2.0_f32.powf(exp);
+        }
+        out.push(sf_gain);
+    }
+    Ok(out)
+}
+
+/// Parse `asf_snf_data()` per Table 42 with the spec's
+/// `b_snf_data_exists` (1 bit) consumed *once* at the head, then the
+/// outer `for (g = 0; g < num_window_groups; g++)` loop. Returns
+/// `Some(per_group_dpcm_snf)` when present, `None` when absent.
+pub fn parse_asf_snf_data_grouped(
+    br: &mut BitReader<'_>,
+    sections_per_group: &[AsfSections],
+    max_quant_idx_per_group: &[Vec<u32>],
+    max_sfb_per_group: &[u32],
+    transform_length_per_group: &[u32],
+) -> Result<Option<Vec<Vec<i32>>>> {
+    let n = sections_per_group.len();
+    if max_quant_idx_per_group.len() != n
+        || max_sfb_per_group.len() != n
+        || transform_length_per_group.len() != n
+    {
+        return Err(Error::invalid(
+            "ac4: asf_snf_data_grouped: inconsistent per-group slice lengths",
+        ));
+    }
+    let b_snf_data_exists = br.read_bit()?;
+    if !b_snf_data_exists {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(n);
+    for g in 0..n {
+        let max_sfb = max_sfb_per_group[g];
+        let tl = transform_length_per_group[g];
+        let num_sfb_lsf = num_sfb_48(tl)
+            .ok_or_else(|| Error::invalid("ac4: snf_grouped: bad transform_length"))?;
+        let max_sfb_eff = max_sfb.min(num_sfb_lsf);
+        let mqi = &max_quant_idx_per_group[g];
+        let sections = &sections_per_group[g];
+        let mut dpcm_snf = vec![0i32; max_sfb as usize];
+        for sfb in 0..max_sfb_eff as usize {
+            let cb = sections.sfb_cb[sfb];
+            if cb == 0 || mqi[sfb] == 0 {
+                let idx = huff_decode(br, HCB_SNF_LEN, HCB_SNF_CW)?;
+                dpcm_snf[sfb] = idx as i32;
+            }
+        }
+        out.push(dpcm_snf);
+    }
+    Ok(Some(out))
+}
+
 /// Apply Pseudocode 18 (dequantisation reconstruction) to the raw
 /// quantised spectral lines and scale them by `sf_gain[sfb]`.
 pub fn dequantise_and_scale(
@@ -433,5 +619,133 @@ mod tests {
         assert!((out[2] - exp_mag).abs() < 1e-4);
         assert!((out[3] + exp_mag).abs() < 1e-4);
         assert!(out[4..].iter().all(|&v| v == 0.0));
+    }
+
+    /// Grouped section_data walker: two groups, both all-zero CB-0
+    /// covering all bands. Each group emits the same 4-bit cb=0 +
+    /// n_sect_bits length-incr (no escape) chain.
+    #[test]
+    fn section_grouped_walks_two_groups_all_zero_sections() {
+        // Per group: max_sfb = 5, transf_length_idx = 0 -> n_sect_bits = 3, esc = 7.
+        // sect_cb = 0 (4 bits), sect_len_incr = 4 (3 bits, non-escape).
+        // Two groups => 2 * (4+3) = 14 bits.
+        let mut bw = BitWriter::new();
+        for _ in 0..2 {
+            bw.write_u32(0, 4); // sect_cb
+            bw.write_u32(4, 3); // sect_len_incr -> sect_len = 5
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let s = parse_asf_section_data_grouped(
+            &mut br,
+            &[0u32, 0u32],
+            &[256u32, 256u32],
+            &[5u32, 5u32],
+        )
+        .unwrap();
+        assert_eq!(s.len(), 2);
+        for sg in &s {
+            assert_eq!(sg.num_sec, 1);
+            assert_eq!(sg.sect_cb, vec![0u8]);
+            assert_eq!(sg.sect_start, vec![0u16]);
+            assert_eq!(sg.sect_end, vec![5u16]);
+        }
+    }
+
+    /// Grouped scalefac_data: ONE 8-bit reference at the head, then
+    /// per-group DPCM with shared `first_scf_found`. With all-zero
+    /// `max_quant_idx`, no DPCM codewords are emitted — only the
+    /// 8-bit reference.
+    #[test]
+    fn scalefac_grouped_consumes_single_reference_then_no_dpcm_when_mqi_all_zero() {
+        let sections = vec![
+            AsfSections {
+                sfb_cb: vec![5u8, 5u8],
+                ..AsfSections::default()
+            },
+            AsfSections {
+                sfb_cb: vec![5u8, 5u8],
+                ..AsfSections::default()
+            },
+        ];
+        let mqi_per_g = vec![vec![0u32, 0u32], vec![0u32, 0u32]];
+        let mut bw = BitWriter::new();
+        bw.write_u32(120, 8); // reference_scale_factor
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let gains_per_g = parse_asf_scalefac_data_grouped(
+            &mut br,
+            &sections,
+            &mqi_per_g,
+            &[2u32, 2u32],
+            &[256u32, 256u32],
+        )
+        .unwrap();
+        assert_eq!(gains_per_g.len(), 2);
+        for g in &gains_per_g {
+            assert_eq!(g.len(), 2);
+            assert!(g.iter().all(|&v| v == 0.0));
+        }
+    }
+
+    /// Grouped scalefac_data: `first_scf_found` carries across groups —
+    /// the second group's first active band emits a DPCM codeword
+    /// (rather than anchoring on the reference).
+    #[test]
+    fn scalefac_grouped_first_scf_found_carries_across_groups() {
+        let sections = vec![
+            AsfSections {
+                sfb_cb: vec![5u8, 5u8],
+                ..AsfSections::default()
+            },
+            AsfSections {
+                sfb_cb: vec![5u8, 5u8],
+                ..AsfSections::default()
+            },
+        ];
+        // Group 0: sfb 0 active (cb!=0, mqi>0) -> first_scf_found set,
+        //   no codeword emitted.
+        // Group 1: sfb 0 active -> DPCM codeword emitted.
+        let mqi_per_g = vec![vec![3u32, 0u32], vec![3u32, 0u32]];
+        let mut bw = BitWriter::new();
+        bw.write_u32(120, 8); // reference
+                              // One DPCM codeword for group 1's first active band: idx=60
+                              // -> delta 0 -> stays at 120.
+        bw.write_u32(
+            crate::huffman::HCB_SCALEFAC_CW[60],
+            crate::huffman::HCB_SCALEFAC_LEN[60] as u32,
+        );
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let gains_per_g = parse_asf_scalefac_data_grouped(
+            &mut br,
+            &sections,
+            &mqi_per_g,
+            &[2u32, 2u32],
+            &[256u32, 256u32],
+        )
+        .unwrap();
+        assert!((gains_per_g[0][0] - 32.0).abs() < 1e-2);
+        assert!((gains_per_g[1][0] - 32.0).abs() < 1e-2);
+    }
+
+    /// Grouped snf_data: ONE 1-bit gate at the head; when 0 returns
+    /// `None` regardless of group count.
+    #[test]
+    fn snf_grouped_single_gate_at_head_returns_none_when_absent() {
+        let sections = vec![AsfSections::default(); 3];
+        let mqi_per_g = vec![vec![0u32; 0]; 3];
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_snf_data_exists = 0
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let snf =
+            parse_asf_snf_data_grouped(&mut br, &sections, &mqi_per_g, &[0u32; 3], &[256u32; 3])
+                .unwrap();
+        assert!(snf.is_none());
     }
 }
