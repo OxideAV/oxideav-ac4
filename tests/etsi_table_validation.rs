@@ -50,10 +50,41 @@ fn etsi_tables_path() -> PathBuf {
 }
 
 /// Read the entire .c file (~80 KiB) into memory once.
-fn read_etsi_source() -> String {
+///
+/// Returns `None` (with a `cargo:warning`-style diagnostic on stderr) when
+/// the docs sibling repo isn't checked out alongside this crate — tests
+/// that rely on the file should early-return so CI in standalone-crate mode
+/// stays green. Set `OXIDEAV_AC4_REQUIRE_ETSI=1` to upgrade the skip into
+/// a hard failure (e.g. for the workspace umbrella where the docs repo is
+/// always present).
+fn read_etsi_source() -> Option<String> {
     let path = etsi_tables_path();
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e))
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            if std::env::var_os("OXIDEAV_AC4_REQUIRE_ETSI").is_some() {
+                panic!("cannot read {}: {}", path.display(), e);
+            }
+            eprintln!(
+                "etsi_table_validation: skipping (cannot read {}: {}). \
+                 Set OXIDEAV_AC4_REQUIRE_ETSI=1 to make this fatal.",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Convenience: early-return the current `#[test]` fn when the ETSI source
+/// isn't available. Used at the top of every validation test.
+macro_rules! etsi_src_or_skip {
+    () => {
+        match read_etsi_source() {
+            Some(s) => s,
+            None => return,
+        }
+    };
 }
 
 /// Strip C `/* ... */` block comments and `// ...` line comments so the
@@ -292,7 +323,7 @@ fn assert_u32_table(reference: &HashMap<String, CArray>, c_name: &str, rust: &[u
 /// CDFs etc.).
 #[test]
 fn etsi_source_parses() {
-    let src = strip_c_comments(&read_etsi_source());
+    let src = strip_c_comments(&etsi_src_or_skip!());
     let arrays = parse_c_arrays(&src);
     assert!(
         arrays.len() >= 120,
@@ -317,7 +348,7 @@ fn etsi_source_parses() {
 
 #[test]
 fn validate_asf_huffman_tables() {
-    let src = strip_c_comments(&read_etsi_source());
+    let src = strip_c_comments(&etsi_src_or_skip!());
     let r = parse_c_arrays(&src);
 
     // SCALEFAC + SNF
@@ -353,7 +384,7 @@ fn validate_asf_huffman_tables() {
 
 #[test]
 fn validate_aspx_huffman_tables() {
-    let src = strip_c_comments(&read_etsi_source());
+    let src = strip_c_comments(&etsi_src_or_skip!());
     let r = parse_c_arrays(&src);
 
     // 18 envelope/noise codebooks (Tables A.16..A.33).
@@ -534,7 +565,7 @@ fn validate_aspx_huffman_tables() {
 
 #[test]
 fn validate_acpl_huffman_tables() {
-    let src = strip_c_comments(&read_etsi_source());
+    let src = strip_c_comments(&etsi_src_or_skip!());
     let r = parse_c_arrays(&src);
 
     // 24 ACPL codebooks (Tables A.34..A.57). Names mirror C exactly.
@@ -672,7 +703,7 @@ fn validate_acpl_huffman_tables() {
 
 #[test]
 fn validate_de_huffman_tables() {
-    let src = strip_c_comments(&read_etsi_source());
+    let src = strip_c_comments(&etsi_src_or_skip!());
     let r = parse_c_arrays(&src);
 
     assert_u8_table(&r, "DE_HCB_ABS_0_LEN", DE_HCB_ABS_0_LEN);
@@ -687,7 +718,7 @@ fn validate_de_huffman_tables() {
 
 #[test]
 fn validate_drc_huffman_table() {
-    let src = strip_c_comments(&read_etsi_source());
+    let src = strip_c_comments(&etsi_src_or_skip!());
     let r = parse_c_arrays(&src);
 
     assert_u8_table(&r, "DRC_HCB_LEN", DRC_HCB_LEN);
