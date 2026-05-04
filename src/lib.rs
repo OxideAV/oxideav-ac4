@@ -336,6 +336,33 @@
 //!   [`acpl_synth::run_acpl_1ch_pcm_stereo`] (x0 = M, x1 = S into
 //!   Pseudocode 116) for the full stereo synth.
 //!
+//! * **Speech Spectral Frontend (SSF) tables + arithmetic decoder
+//!   core** — the full Annex C scalar-table inventory now lands in
+//!   [`ssf_tables`]: `POST_GAIN_LUT` (C.1), `PRED_GAIN_QUANT_TAB`
+//!   (C.3), `PRED_RFS_TABLE` / `PRED_RTS_TABLE` (C.4 / C.5), the
+//!   705-entry `CDF_TABLE` (C.7), `PREDICTOR_GAIN_CDF_LUT` (C.8),
+//!   `ENVELOPE_CDF_LUT` (C.9), the 256-entry `DITHER_TABLE` (C.10)
+//!   and `RANDOM_NOISE_TABLE` (C.11), `STEP_SIZES_Q4_15` (C.12),
+//!   `AC_COEFF_MAX_INDEX` (C.13), and the four `SLOPES_*` /
+//!   `OFFSETS_*` dB↔linear LUTs (C.14). The 37 SSF prediction-
+//!   coefficient matrices from Annex C.6 (~22 KB total) live in
+//!   [`ssf_pred_coeff`] addressable via
+//!   [`ssf_pred_coeff::ssf_pred_coeff_mat`]. Every byte in every
+//!   table is validated against the ETSI accompaniment file by the
+//!   `validate_ssf_*` integration tests. The arithmetic decoder
+//!   itself ([`ssf_ac::AcState`]) implements §5.2.8 Pseudocodes 41-47
+//!   (`AcDecoderInit` / `AcDecodeTarget` / `AcDecode` /
+//!   `AcDecodeSymbolExtCdf` / `AcDecodeFinish`) plus Pseudocode 51-53
+//!   (`Idx2Reconstruction` + `CdfEst` for the computed-CDF
+//!   transform-coefficient path) and the §5.2.8.3 random-number
+//!   generator ([`ssf_ac::SsfRandGenState`], Pseudocodes 54-57).
+//!   Wired-up convenience functions: [`ssf_ac::decode_envelope_indices`]
+//!   (Pseudocode 48), [`ssf_ac::decode_predictor_gain`] (Pseudocode 49),
+//!   [`ssf_ac::decode_coefficient_indices`] (Pseudocode 50). The
+//!   `ssf_data()` / `ssf_granule()` / `ssf_st_data()` / `ssf_ac_data()`
+//!   bitstream walkers (Tables 43-46) are the next round's scope —
+//!   the AC decoder building blocks are now in place.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — round 28 lands
@@ -368,7 +395,13 @@
 //!   Multichannel `5_X_codec_mode = ASPX_ACPL_1` / `ASPX_ACPL_2`
 //!   wrappers (Pseudocode 117) are still pending — the building blocks
 //!   are all in place but the 5-input wrapper is not wired.
-//! * Speech Spectral Frontend (SSF) arithmetic-coded path.
+//! * Speech Spectral Frontend (SSF) bitstream walker — `ssf_data()`
+//!   / `ssf_granule()` / `ssf_st_data()` / `ssf_ac_data()` (Tables
+//!   43-46). The supporting Annex C tables and the §5.2.8
+//!   arithmetic-decoder core ([`ssf_ac`]) are in place; the bitstream
+//!   parser layer that drives them is still TODO. Mono `audio_data()`
+//!   currently bails out when `spec_frontend == SSF` (see
+//!   `asf::parse_audio_data_mono`).
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
 //!   zero bands yet.
@@ -414,6 +447,9 @@ pub mod mdct;
 pub mod metadata;
 pub mod qmf;
 pub mod sfb_offset;
+pub mod ssf_ac;
+pub mod ssf_pred_coeff;
+pub mod ssf_tables;
 pub mod sync;
 pub mod tables;
 pub mod toc;

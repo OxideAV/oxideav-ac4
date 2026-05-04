@@ -38,6 +38,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 29 — Speech Spectral Frontend (SSF) tables + arithmetic
+  decoder core** (TS 103 190-1 §5.2.8 + Annex C):
+  - New `ssf_tables` module — verbatim transcription of every Annex C
+    scalar lookup table from the ETSI accompaniment file
+    `docs/audio/ac4/ts_10319001v010401p0-tables.c`:
+    `POST_GAIN_LUT` (C.1, 20 floats), `PRED_GAIN_QUANT_TAB` (C.3, 32),
+    `PRED_RFS_TABLE` (C.4, 37 u8), `PRED_RTS_TABLE` (C.5, 37 u8), the
+    full 705-entry `CDF_TABLE` (C.7), `PREDICTOR_GAIN_CDF_LUT` (C.8,
+    33), `ENVELOPE_CDF_LUT` (C.9, 33), the 256-entry `DITHER_TABLE`
+    (C.10, Q0.15) and `RANDOM_NOISE_TABLE` (C.11, float),
+    `STEP_SIZES_Q4_15` (C.12, 21), `AC_COEFF_MAX_INDEX` (C.13, 21),
+    and the four C.14 dB↔linear conversion LUTs (`SLOPES_DB_TO_LIN`,
+    `OFFSETS_DB_TO_LIN`, `SLOPES_LIN_TO_DB`, `OFFSETS_LIN_TO_DB`)
+    plus the `lin_to_db` / `db_to_lin` piecewise-linear helpers.
+  - New `ssf_pred_coeff` module — all 37 SSF prediction-coefficient
+    matrices from Annex C.6 (`SSF_PRED_COEFF_MAT0..36`, ~22 KB total
+    addressable via `ssf_pred_coeff_mat(i)` with `SSF_PRED_MAT_DIMS`
+    giving each matrix's `(rows, cols)` shape).
+  - New `ssf_ac` module — full §5.2.8 binary arithmetic decoder
+    (`AcState` from Pseudocode 42 with `init` / `decode_target` /
+    `decode` / `decode_symbol_ext_cdf` / `decode_symbol_calc_cdf` /
+    `decode_finish` mapping to Pseudocodes 43-47), the
+    `Idx2Reconstruction` + `CdfEst` computed-CDF transform-coefficient
+    path (Pseudocodes 51-53), three convenience entry points
+    `decode_envelope_indices` / `decode_predictor_gain` /
+    `decode_coefficient_indices` (Pseudocodes 48-50), and the
+    `SsfRandGenState` random-number generator (Pseudocodes 54-57)
+    backing both the dither sequence (`dither_value`) and the noise
+    sequence (`random_noise_value`).
+  - 26 new lib unit tests cover every table length + spec anchor +
+    monotonicity / range invariants, plus AC-decoder smoke tests
+    (init pulls 30 bits, renormalisation does not loop, `CdfEst` is
+    monotone, `Idx2Reconstruction` is monotone in the index, etc.).
+  - 2 new `etsi_table_validation` integration tests
+    (`validate_ssf_scalar_tables` + `validate_ssf_pred_coeff_matrices`)
+    assert byte-for-byte equality between the Rust constants and the
+    canonical C accompaniment file.
+  - The §5.2.8 SSF arithmetic-coded `ssf_ac_data()` bitstream walker
+    (Tables 43-46) is the next round's scope — all building blocks
+    are now in place.
+
 - **Round 28 — mono / stereo short-frame `sf_data(ASF)` walker** (TS 103
   190-1 §4.2.8.3-6 Tables 39-42, §4.3.6.2.6 Pseudocodes 2/3/5):
   - New spec-correct `_grouped` payload parsers in `asf_data.rs` —

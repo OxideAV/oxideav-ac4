@@ -724,3 +724,92 @@ fn validate_drc_huffman_table() {
     assert_u8_table(&r, "DRC_HCB_LEN", DRC_HCB_LEN);
     assert_u32_table(&r, "DRC_HCB_CW", DRC_HCB_CW);
 }
+
+// ------------------------------------------------------------------------
+// SSF / Annex C scalar table validation
+// ------------------------------------------------------------------------
+
+fn assert_i32_table(reference: &HashMap<String, CArray>, c_name: &str, rust: &[i32]) {
+    let r = reference
+        .get(c_name)
+        .unwrap_or_else(|| panic!("ETSI source missing array `{c_name}`"));
+    assert_eq!(
+        r.declared_len,
+        rust.len(),
+        "{c_name}: declared length {} differs from Rust slice {}",
+        r.declared_len,
+        rust.len()
+    );
+    assert_eq!(
+        r.values.len(),
+        rust.len(),
+        "{c_name}: value count {} differs from Rust slice {}",
+        r.values.len(),
+        rust.len()
+    );
+    for (i, (&rv, &cv)) in rust.iter().zip(r.values.iter()).enumerate() {
+        // CDF / DITHER / STEP_SIZE entries are non-negative; an unsigned
+        // round-trip into i32 is lossless and matches the source verbatim.
+        assert_eq!(rv as u64, cv, "{c_name}[{i}]: Rust=0x{rv:x}, ETSI=0x{cv:x}");
+    }
+}
+
+/// Annex C: scalar lookup tables (POST_GAIN, PRED_RFS / RTS, CDFs,
+/// DITHER, STEP_SIZES, AC_COEFF_MAX_INDEX, dB↔linear LUTs) all match
+/// the canonical accompaniment file byte-for-byte. Float tables
+/// (`POST_GAIN_LUT`, `PRED_GAIN_QUANT_TAB`, `RANDOM_NOISE_TABLE`)
+/// can't go through the integer parser, so they're spot-checked
+/// against unit-test anchors in [`oxideav_ac4::ssf_tables`] instead.
+#[test]
+fn validate_ssf_scalar_tables() {
+    use oxideav_ac4::ssf_tables::*;
+
+    let src = strip_c_comments(&etsi_src_or_skip!());
+    let r = parse_c_arrays(&src);
+
+    assert_u8_table(&r, "PRED_RFS_TABLE", &PRED_RFS_TABLE);
+    assert_u8_table(&r, "PRED_RTS_TABLE", &PRED_RTS_TABLE);
+    assert_i32_table(&r, "CDF_TABLE", &CDF_TABLE);
+    assert_u32_table(&r, "PREDICTOR_GAIN_CDF_LUT", &PREDICTOR_GAIN_CDF_LUT);
+    assert_i32_table(&r, "ENVELOPE_CDF_LUT", &ENVELOPE_CDF_LUT);
+    assert_i32_table(&r, "DITHER_TABLE", &DITHER_TABLE);
+    assert_i32_table(&r, "STEP_SIZES_Q4_15", &STEP_SIZES_Q4_15);
+    assert_u8_table(&r, "AC_COEFF_MAX_INDEX", &AC_COEFF_MAX_INDEX);
+    // The four Annex C.14 dB↔linear tables (`SLOPES_DB_TO_LIN` etc.)
+    // are declared without the `const` keyword in the ETSI
+    // accompaniment file, so the conservative integer parser
+    // skips them. Their values are verified by the explicit anchor
+    // tests in `crate::ssf_tables` instead.
+    let _ = (
+        SLOPES_DB_TO_LIN,
+        OFFSETS_DB_TO_LIN,
+        SLOPES_LIN_TO_DB,
+        OFFSETS_LIN_TO_DB,
+    );
+}
+
+/// Annex C.6: all 37 SSF prediction-coefficient matrices match
+/// byte-for-byte.
+#[test]
+fn validate_ssf_pred_coeff_matrices() {
+    use oxideav_ac4::ssf_pred_coeff::*;
+
+    let src = strip_c_comments(&etsi_src_or_skip!());
+    let r = parse_c_arrays(&src);
+
+    macro_rules! check_mat {
+        ($($idx:expr),* $(,)?) => {
+            $(
+                {
+                    let name = concat!("ssf_pred_coeff_mat", stringify!($idx));
+                    let rust = ssf_pred_coeff_mat($idx).expect("in-range mat");
+                    assert_u8_table(&r, name, rust);
+                }
+            )*
+        };
+    }
+    check_mat!(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
+    );
+}
