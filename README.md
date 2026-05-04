@@ -98,8 +98,34 @@ framework but usable standalone.
 > split) and `parse_stereo_data_body` (joint + split). Real Dolby
 > AC-4 mono / stereo streams using short-window sub-frames now
 > decode end-to-end without bailing at the previous
-> `num_window_groups != 1` guard. **425 tests** (414 lib + 5 + 6
-> integration).
+> `num_window_groups != 1` guard. Round 29 lands the full **§5.2.8
+> SSF arithmetic decoder + Annex C scalar inventory + 37
+> prediction-coefficient matrices** — 705-entry `CDF_TABLE`,
+> `PREDICTOR_GAIN_CDF_LUT`, `ENVELOPE_CDF_LUT`, `DITHER_TABLE` /
+> `RANDOM_NOISE_TABLE`, `STEP_SIZES_Q4_15`, `AC_COEFF_MAX_INDEX`,
+> the four C.14 dB↔linear LUTs, plus `AcState` (`init` /
+> `decode_target` / `decode_symbol_ext_cdf` /
+> `decode_symbol_calc_cdf` / `decode_finish` per Pseudocodes 41-47),
+> the `Idx2Reconstruction + CdfEst` computed-CDF path (Pseudocodes
+> 51-53), envelope / predictor-gain / coefficient convenience
+> entry points (Pseudocodes 48-50), and the `SsfRandGenState`
+> dither + noise RNG (Pseudocodes 54-57). Round 30 lands the
+> **SSF bitstream walker** (`ssf::parse_ssf_data` /
+> `parse_ssf_granule` / `parse_ssf_st_data` / `parse_ssf_ac_data`
+> per Tables 43-46), the Annex C.1 SSF-bandwidths matrix
+> (`SSF_BANDWIDTHS`, 19 bands × 8 block-length columns),
+> `SsfBinLayout::build()` (Pseudocode 7 — `start_bin[]` /
+> `end_bin[]` / `num_bins`), `SsfFrameConfig` (Tables 112-113), and
+> the `SsfChannelState` carrying RNG / `prev_pred_lag_idx` /
+> `last_num_bands` / `env_prev[]` across granules. Wired into
+> `walk_ac4_substream` for mono SIMPLE/ASPX, split-MDCT stereo, and
+> the ASPX_ACPL_1 split residual layer — `spec_frontend == SSF` no
+> longer falls through silently. The §5.2.3-5.2.7 PCM synthesis
+> chain (envelope decoder, predictor, spectrum decoder, subband
+> predictor, inverse flattening) is the next round's scope; until
+> then the decoder still emits silence for SSF substreams even
+> though the walker fully consumes the bitstream. **463 tests**
+> (450 lib + 5 + 8 integration).
 
 ## Specs
 

@@ -287,8 +287,11 @@ pub fn decode_envelope_indices(
         return Err(AcError::SymbolNotFound);
     }
     let cdf: Vec<u32> = ENVELOPE_CDF_LUT.iter().map(|&x| x as u32).collect();
+    // Pseudocode 48 picks one symbol per (idx = 1..num_bands) using a
+    // 33-entry CDF (range 0..=32). The previous range `0..=31` capped
+    // the symbol space one short.
     for slot in out.iter_mut().take(num_bands).skip(1) {
-        *slot = state.decode_symbol_ext_cdf(&cdf, 0, 31, br)?;
+        *slot = state.decode_symbol_ext_cdf(&cdf, 0, 32, br)?;
     }
     Ok(())
 }
@@ -296,9 +299,10 @@ pub fn decode_envelope_indices(
 // === Pseudocode 49: predictor-gain decoder ===================================
 
 /// Pseudocode 49: `arithmetic_decode_pred()` — decode a single
-/// predictor-gain index in `0..=31` using [`PREDICTOR_GAIN_CDF_LUT`].
+/// predictor-gain index in `0..=32` using [`PREDICTOR_GAIN_CDF_LUT`]
+/// (33 entries gives 32 symbol slots with one trailing CDF terminator).
 pub fn decode_predictor_gain(state: &mut AcState, br: &mut BitReader<'_>) -> Result<i32, AcError> {
-    state.decode_symbol_ext_cdf(&PREDICTOR_GAIN_CDF_LUT, 0, 31, br)
+    state.decode_symbol_ext_cdf(&PREDICTOR_GAIN_CDF_LUT, 0, 32, br)
 }
 
 // === Pseudocode 50: coefficient index decoder ================================

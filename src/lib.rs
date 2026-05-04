@@ -363,6 +363,28 @@
 //!   bitstream walkers (Tables 43-46) are the next round's scope —
 //!   the AC decoder building blocks are now in place.
 //!
+//! * **SSF bitstream walker** — [`ssf::parse_ssf_data`] /
+//!   [`ssf::parse_ssf_granule`] / [`ssf::parse_ssf_st_data`] /
+//!   [`ssf::parse_ssf_ac_data`] implement Tables 43-46 end-to-end. The
+//!   walker derives the SSF block layout per Table 112 (48 kHz family)
+//!   via [`ssf::SsfFrameConfig::from_frame_len_base`], builds
+//!   `start_bin[]` / `end_bin[]` / `num_bins` from the Annex C.1
+//!   bandwidths matrix ([`ssf::SSF_BANDWIDTHS`]) per §4.3.7.5
+//!   Pseudocode 7, drains the per-block predictor / static fields, and
+//!   drives the §5.2.8 arithmetic decoder ([`ssf_ac::AcState`]) for
+//!   `env_curr_ac_bits` / `env_startup_ac_bits` /
+//!   `predictor_gain_ac_bits[block]` /
+//!   `q_mdct_coefficients_ac_bits[block]`. Per-channel
+//!   [`ssf::SsfChannelState`] carries forward dither / noise RNG state
+//!   (reset per SSF-I-frame per Pseudocode 55) plus
+//!   `prev_pred_lag_idx` / `last_num_bands` / `env_prev[]`. The walker
+//!   is wired into `asf::walk_ac4_substream` for both the mono path
+//!   (`spec_frontend == SSF` no longer returns `Unsupported`) and the
+//!   split-MDCT stereo + ASPX_ACPL_1 paths (per-channel SSF/ASF
+//!   selection). Parsed payload lands on
+//!   [`asf::SubstreamTools::ssf_data_primary`] /
+//!   `ssf_data_secondary` for downstream synthesis.
+//!
 //! Known gaps (Unsupported or stubbed):
 //!
 //! * Short / grouped frames (`num_window_groups > 1`) — round 28 lands
@@ -395,13 +417,18 @@
 //!   Multichannel `5_X_codec_mode = ASPX_ACPL_1` / `ASPX_ACPL_2`
 //!   wrappers (Pseudocode 117) are still pending — the building blocks
 //!   are all in place but the 5-input wrapper is not wired.
-//! * Speech Spectral Frontend (SSF) bitstream walker — `ssf_data()`
-//!   / `ssf_granule()` / `ssf_st_data()` / `ssf_ac_data()` (Tables
-//!   43-46). The supporting Annex C tables and the §5.2.8
-//!   arithmetic-decoder core ([`ssf_ac`]) are in place; the bitstream
-//!   parser layer that drives them is still TODO. Mono `audio_data()`
-//!   currently bails out when `spec_frontend == SSF` (see
-//!   `asf::parse_audio_data_mono`).
+//! * Speech Spectral Frontend (SSF) PCM synthesis — Tables 43-46
+//!   walker landed (see `ssf::parse_ssf_data` above) so SSF
+//!   substreams parse cleanly into [`ssf::SsfData`] /
+//!   [`ssf::SsfGranule`] / [`ssf::SsfBlock`] containing the per-block
+//!   predictor flags, alloc-offset, gain bits, decoded envelope
+//!   indices, predictor-gain indices, and quantised MDCT coefficient
+//!   indices. The §5.2.3-5.2.7 synthesis chain (envelope decoder
+//!   Pseudocodes 4a-4d, predictor decoder Pseudocode 4e, spectrum
+//!   decoder Pseudocodes 26-34, subband predictor Pseudocodes 35-37,
+//!   inverse flattening Pseudocode 38) is the next round's scope.
+//!   Until then the decoder still emits silence for SSF substreams
+//!   even though the walker fully consumes the bitstream.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
 //!   zero bands yet.
@@ -447,6 +474,7 @@ pub mod mdct;
 pub mod metadata;
 pub mod qmf;
 pub mod sfb_offset;
+pub mod ssf;
 pub mod ssf_ac;
 pub mod ssf_pred_coeff;
 pub mod ssf_tables;

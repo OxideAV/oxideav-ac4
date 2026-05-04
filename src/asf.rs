@@ -694,6 +694,15 @@ pub struct SubstreamTools {
     /// (Table 33 — the two extra channels beyond the 5.X core). `None`
     /// for ASPX_ACPL_{1,2} and for non-7.X substreams.
     pub seven_x_additional_channel_data: Option<crate::mch::TwoChannelData>,
+    /// Parsed `ssf_data()` (§4.2.9 / Tables 43-46) for the primary
+    /// channel when `spec_frontend_primary == SSF`. Populated by the
+    /// mono / stereo walkers when the substream descriptor declares the
+    /// SSF spectral frontend. `None` for ASF / mode mismatches.
+    pub ssf_data_primary: Option<crate::ssf::SsfData>,
+    /// Parsed `ssf_data()` for the secondary (right / side) channel in
+    /// a stereo split-MDCT path. `None` for mono substreams or for
+    /// stereo substreams whose right channel is on ASF.
+    pub ssf_data_secondary: Option<crate::ssf::SsfData>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -853,6 +862,23 @@ pub fn parse_mono_audio_data_outer(
     if !b_iframe {
         // The transform-info for non-I-frames still runs on the first
         // I-frame's state but the syntax still reads it — keep parsing.
+    }
+    if let SpecFrontend::Ssf = frontend {
+        // §4.2.9 / Tables 43-46 — invoke the SSF bitstream walker.
+        // The SSF frame configuration is derived from `frame_len_base`
+        // assuming the 48 kHz family (the only one currently driven by
+        // the foundation TOC); 44.1 kHz support arrives with the
+        // HSF-extension wiring. A None here means the frame length
+        // doesn't map to any Annex C.1 / Table 112 row, in which case
+        // we silently skip the SSF body — the same shape the
+        // pre-round-30 walker had.
+        if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
+            let mut state = crate::ssf::SsfChannelState::new();
+            if let Ok(d) = crate::ssf::parse_ssf_data(br, b_iframe, &cfg, &mut state) {
+                tools.ssf_data_primary = Some(d);
+            }
+        }
+        return Ok(());
     }
     if let SpecFrontend::Asf = frontend {
         let ti = parse_asf_transform_info(br, frame_len_base)?;
@@ -1642,7 +1668,17 @@ fn parse_aspx_acpl1_mdct_body(
                 None => return false,
             }
         } else if matches!(m_fe, SpecFrontend::Ssf) {
-            return false;
+            // §4.2.9 SSF body for the M channel of an ASPX_ACPL_1 split
+            // residual layer.
+            if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
+                let mut state = crate::ssf::SsfChannelState::new();
+                match crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                    Ok(d) => tools.ssf_data_primary = Some(d),
+                    Err(_) => return false,
+                }
+            } else {
+                return false;
+            }
         }
         let psy_s_clone = tools.psy_info_secondary.clone();
         if let (Some(ti), Some(psy)) = (ti_s, psy_s_clone.as_ref()) {
@@ -1651,7 +1687,15 @@ fn parse_aspx_acpl1_mdct_body(
                 None => return false,
             }
         } else if matches!(s_fe, SpecFrontend::Ssf) {
-            return false;
+            if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
+                let mut state = crate::ssf::SsfChannelState::new();
+                match crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                    Ok(d) => tools.ssf_data_secondary = Some(d),
+                    Err(_) => return false,
+                }
+            } else {
+                return false;
+            }
         }
         true
     }
@@ -1968,21 +2012,48 @@ pub(crate) fn parse_stereo_data_body(
                 return false;
             }
         }
-        // Split-MDCT stereo: two independent ASF spectra. Decode each
-        // for long-frame (single window group) or short-frame /
-        // grouped (`num_window_groups > 1`). Any malformed body is
-        // surfaced as a decode miss (None) rather than a hard error.
+        // Split-MDCT stereo: two independent ASF (or SSF) spectra.
+        // Decode each for long-frame (single window group), short-frame
+        // / grouped (`num_window_groups > 1`), or — when the frontend
+        // resolved to SSF — drive the §4.2.9 SSF walker. Any malformed
+        // body is surfaced as a decode miss (None) rather than a hard
+        // error.
         let mut body_ok = true;
         if let (Some(ti), Some(psy)) = (ti_l, psy_l.as_ref()) {
             tools.scaled_spec_primary = decode_asf_mono_body_dispatch(br, &ti, psy);
             if tools.scaled_spec_primary.is_none() {
                 body_ok = false;
             }
+        } else if matches!(l, SpecFrontend::Ssf) {
+            if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
+                let mut state = crate::ssf::SsfChannelState::new();
+                // The split-MDCT stereo walker doesn't know whether the
+                // surrounding `audio_data()` came from an I-frame —
+                // assume non-I (the safe default; an I-frame body would
+                // have been gated by `b_iframe_global` upstream and
+                // pulled `b_ssf_iframe = 1` from the AC layer
+                // explicitly). We surface the parsed body when
+                // available and silently skip on parse miss.
+                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                    tools.ssf_data_primary = Some(d);
+                } else {
+                    body_ok = false;
+                }
+            }
         }
         if let (Some(ti), Some(psy)) = (ti_r, psy_r.as_ref()) {
             tools.scaled_spec_secondary = decode_asf_mono_body_dispatch(br, &ti, psy);
             if tools.scaled_spec_secondary.is_none() {
                 body_ok = false;
+            }
+        } else if matches!(r, SpecFrontend::Ssf) {
+            if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
+                let mut state = crate::ssf::SsfChannelState::new();
+                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                    tools.ssf_data_secondary = Some(d);
+                } else {
+                    body_ok = false;
+                }
             }
         }
         body_ok
@@ -3330,5 +3401,66 @@ mod tests {
         let ms = tools.ms_used.as_ref().unwrap();
         assert_eq!(ms.len(), 2 * max_sfb as usize);
         assert!(ms.iter().all(|&b| !b));
+    }
+
+    /// Mono SIMPLE substream with `spec_frontend == SSF` exercises the
+    /// round-30 wiring of the `ssf_data()` walker (Tables 43-46) into
+    /// `parse_mono_audio_data_outer`. Builds a synthetic LONG_STRIDE
+    /// I-frame `ssf_data()` body — mirrors the unit test inside
+    /// [`crate::ssf::tests`] — and verifies the parsed
+    /// `tools.ssf_data_primary` survives the trip through the
+    /// substream walker.
+    #[test]
+    fn mono_ssf_substream_walker_populates_ssf_data() {
+        let mut bw = BitWriter::new();
+        // audio_size_value = 100 (placeholder), b_more_bits = 0.
+        bw.write_u32(100, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        // mono_codec_mode = 0 (SIMPLE).
+        bw.write_u32(0, 1);
+        // mono_data(0) body:
+        //   spec_frontend = 1 (SSF).
+        bw.write_u32(1, 1);
+        // ssf_data(b_iframe=1) — frame_len_base = 960 → SsfFrameConfig
+        // resolves to (granule_length=960, num_granules=1), so only one
+        // granule is parsed (the `frame_length >= 1536` second-granule
+        // gate stays inactive).
+        //   ssf_granule(b_iframe=1):
+        bw.write_u32(0, 1); // stride_flag = LONG_STRIDE
+        bw.write_u32(0, 3); // num_bands_minus12 = 0 → num_bands = 12
+                            // Per-block predictor loop runs zero iterations (start_block ==
+                            // end_block == 0 for LONG_STRIDE I-frame).
+                            // ssf_st_data():
+        bw.write_u32(0, 5); // env_curr_band0_bits
+                            // SHORT_STRIDE-gated env_startup / gain not present.
+                            // Per-block st-data: variance_preserving (1) + alloc_offset_bits (5).
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 5);
+        // ssf_ac_data(): Init pulls 30 bits, then envelope decode etc.
+        for _ in 0..(30 + 256) {
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        // Pad to honour audio_size.
+        while bw.byte_len() < 128 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        // Walk with `frame_len_base = 960` (48 kHz / 48 fps, one
+        // granule per AC-4 frame).
+        let info = walk_ac4_substream(&bytes, 1, true, 960).unwrap();
+        assert_eq!(info.tools.mono_mode, Some(MonoCodecMode::Simple));
+        assert_eq!(info.tools.spec_frontend_primary, Some(SpecFrontend::Ssf));
+        let ssf = info
+            .tools
+            .ssf_data_primary
+            .as_ref()
+            .expect("SSF walker should have populated ssf_data_primary");
+        assert_eq!(ssf.granules.len(), 1);
+        let g = &ssf.granules[0];
+        assert_eq!(g.num_bands, 12);
+        assert_eq!(g.n_mdct, 960);
+        assert!(g.b_iframe);
     }
 }

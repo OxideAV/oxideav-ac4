@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 30 — Speech Spectral Frontend (SSF) bitstream walker** (TS 103
+  190-1 §4.2.9 / §4.3.7 + §4.3.7.5 + Tables 43-46 / 111-113):
+  - New `ssf` module with the four-table walker family:
+    `parse_ssf_data` (Table 43 — `b_ssf_iframe` gate plus 1 / 2
+    granules per `frame_length >= 1536`), `parse_ssf_granule`
+    (Table 44 — `stride_flag`, I-frame `num_bands_minus12`, per-block
+    `predictor_presence_flag` / `delta_flag` loop), `parse_ssf_st_data`
+    (Table 45 — `env_curr_band0_bits`, I-frame
+    `env_startup_band0_bits`, per-block `gain_bits` /
+    `predictor_lag(_delta)_bits` / `variance_preserving_flag` /
+    `alloc_offset_bits`), and `parse_ssf_ac_data` (Table 46 — drives
+    `decode_envelope_indices` Pseudocode 48 + `decode_predictor_gain`
+    Pseudocode 49 + `decode_coefficient_indices` Pseudocode 50, then
+    `AcDecodeFinish` Pseudocode 47 termination-bit accounting).
+  - New `SsfFrameConfig` derives `(granule_length, num_granules,
+    max_num_blocks)` per Tables 112-113 with both
+    `from_toc(fs_index, frame_rate_index, frame_length)` and a
+    `from_frame_len_base()` 48 kHz convenience overload. SHORT_STRIDE
+    is rejected when `max_num_blocks < 1`.
+  - New `SSF_BANDWIDTHS` matrix transcribes Annex C.1 verbatim
+    (19 bands × 8 block-length columns); `SsfBinLayout::build()`
+    implements §4.3.7.5 Pseudocode 7 to derive `start_bin[]` /
+    `end_bin[]` / `num_bins` from `(num_bands, n_mdct)`.
+  - New `SsfChannelState` carries forward dither / noise RNG state
+    (reset per SSF-I-frame per Pseudocode 55), `prev_pred_lag_idx`
+    (§5.2.4.0a), `last_num_bands` / `last_n_mdct` (inheritance for
+    P-frame granules), and `env_prev[]` (§5.2.3.0).
+  - Wired into `asf::walk_ac4_substream` for three call sites:
+    `parse_mono_audio_data_outer` (mono SIMPLE / ASPX path —
+    `spec_frontend == SSF` no longer returns `Unsupported`),
+    the split-MDCT stereo `parse_stereo_data_body` (per-L/R SSF
+    selection), and `parse_aspx_acpl1_mdct_body` split case (per-M/S
+    SSF selection on the ACPL_1 residual layer). Parsed payload lands
+    on `SubstreamTools::ssf_data_primary` /
+    `ssf_data_secondary` slots.
+  - **Bug fix**: `decode_envelope_indices` and `decode_predictor_gain`
+    in `ssf_ac` previously capped at symbol 31 (`AcDecodeSymbolExtCdf
+    (cdf, 0, 31)`); the spec's Pseudocodes 48 / 49 use `(cdf, 0, 32)`.
+    The 33-entry CDF tables (`ENVELOPE_CDF_LUT`,
+    `PREDICTOR_GAIN_CDF_LUT`) supply 32 symbol slots — the previous
+    cap clipped the highest-probability tail symbol.
+  - 6 new lib unit tests + 1 new integration test in `asf::tests`
+    (449 → 463 total): stride-flag block count, Annex C.1 anchors,
+    `SsfBinLayout::build` for 48 kHz / 24 fps LongStride, frame-config
+    resolution for all five Table 112-113 row classes, end-to-end
+    LongStride I-frame walk, end-to-end ShortStride I-frame walk
+    (3 live blocks, env_startup populated), and a substream-level
+    integration test (`mono_ssf_substream_walker_populates_ssf_data`)
+    that builds a synthetic SSF substream + walks it through the
+    public `walk_ac4_substream` API.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.2...v0.0.3) - 2026-05-03
 
 ### Other
