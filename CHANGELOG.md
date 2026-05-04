@@ -9,6 +9,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 31 — Speech Spectral Frontend (SSF) PCM synthesis chain** (TS
+  103 190-1 §5.2.3 / §5.2.4 / §5.2.5 / §5.2.6 / §5.2.7 +
+  §5.2.8.1 — Pseudocodes 4a / 4b / 4c / 4d / 4e / 26 / 31 / 32 / 33 /
+  34 / 35 / 36 / 37 / 38 / 39):
+  - New `ssf_synth` module turning the per-block indices on
+    `crate::ssf::SsfData` into `n_mdct` spectral lines per block.
+    Functions: `decode_envelope` (Pseudocode 4a — δ-decode chain over
+    `env_curr[]`), `interpolate_envelope` (Pseudocode 4b — SHORT_STRIDE
+    fixed-point linear interpolation between `env_prev[]` and the
+    current granule's `env[]`), `decode_gains` (Pseudocode 4c —
+    `pow(10, gain_idx * 0.1)` per block, LONG_STRIDE clamp to 1.0),
+    `refine_envelope` (Pseudocode 4d — band-≥2 gain application + the
+    `round(2 * gain_idx / 3)` allocation tweak with [-64, 63] clamp).
+  - `decode_predictor` (Pseudocode 4e) reconstructs `f_pred_gain` from
+    `PRED_GAIN_QUANT_TAB` and `f_pred_lag = 640 * 2^((idx - 509)/170)`,
+    with `i_prev_pred_lag_idx` carried forward on `SsfSynthState`.
+  - `compute_helpers` (Pseudocode 26 — `f_rfu`,
+    `i_alloc_dithering_threshold`, adaptive noise gains) +
+    `build_alloc_table` (Pseudocode 31 — no-rfu path:
+    `env_alloc_mod = env_alloc`).
+  - `inverse_quantize_block` (Pseudocode 32) implements all three
+    branches: `i_alloc == 0` noise-RNG path with the
+    variance-preserving `band > 1` branch, dithered branch via
+    `Idx2Reconstruction` + `POST_GAIN_LUT[i_alloc - 1]` + the
+    `f_post_gain_var_pres = sqrt(post_gain) * f_adaptive_noise_gain_var_pres`
+    rule, and the no-dither MMSE branch via `mmse_laplace`
+    (Pseudocode 33).
+  - `inverse_heuristic_scale` (Pseudocode 34) — currently a no-op
+    because the no-rfu path leaves `f_gain_q == 1`.
+  - `build_c_matrix` (Pseudocode 39) reconstructs the per-`tab_idx`
+    `(2*Rf+1, 65, Rt)` prediction-coefficient matrix from the
+    quantized bytes in `crate::ssf_pred_coeff` using the
+    `1.1787855 * (q - 146) / 128` reconstruction formula and the
+    spec's `s = (-1)^(k+1)` mirror rule for negative-η.
+  - `SubbandPredictorState::run` (Pseudocodes 35 / 36 / 37) maintains
+    `f_spec_buffer[NUM_SPEC_BUF=5]` + `f_env_buffer[NUM_ENV_BUF=4]`
+    histories, runs the model-based extractor (`f_period`, `k_s`,
+    `tab_idx`, `Z`-matrix even-reflection, the per-bin
+    `Σ_{ν,k} s * C[ν][f][k] * Z[bin+ν][k]` summation), then applies
+    Pseudocode 37's per-band shaper (`f_envelope * f_pred_gain`)
+    with the I-frame `integer_lag = 0` clamp.
+  - `inverse_flatten` (Pseudocode 38) sums `f_spec_res + f_spec_pred`
+    and multiplies by the per-band signal envelope.
+  - `synthesize_granule()` runs the chain across every block in one
+    granule; `synthesize_ssf_data()` runs it across both granules of
+    one frame, threading `env_prev[]` between them.
+  - `Ac4Decoder` adopts `Vec<SsfSynthState>` (one per channel) and
+    consumes `tools.ssf_data_primary` / `tools.ssf_data_secondary`
+    after the existing ASF/A-CPL pipeline: each granule's
+    `num_blocks * n_mdct` spectrum is split per-block, fed into the
+    per-channel KBD-windowed IMDCT + overlap-add, then truncated /
+    padded to the frame's sample count. SSF substreams now emit real
+    PCM instead of silence.
+  - 16 new lib unit tests (450 → 466) covering: empty/empty-tail
+    envelope decode, low-band-no-gain refinement, allocation-table
+    clamping (min + max), zero-RFU + unit-window helpers, predictor
+    presence/absence + delta-lag carry, full C-matrix dimensions
+    across all 37 `tab_idx` values, the negative-η mirror rule, the
+    subband-predictor zero-gain pass-through and finite-output smoke
+    tests, the per-band envelope-gain inverse-flattening test, and a
+    LONG_STRIDE I-granule synthesis end-to-end smoke (`synthesize_granule`
+    on a synthetic granule). Plus one decoder-level integration test
+    (`ssf_synth_long_stride_iframe_end_to_end`) that walks a synthetic
+    SSF bitstream through `parse_ssf_data` then `synthesize_ssf_data`
+    and verifies finiteness + zero-padding past `num_bins`.
+  - Note: §5.2.5.2.2 Pseudocodes 27 / 28 / 29 / 30 (full Heuristic
+    Scaling) are deferred — when `f_pred_gain == 0` the spec
+    short-circuits to `env_alloc_mod = env_alloc` + `f_gain_q = 1`,
+    which is the no-rfu path landed here. Synthesis of streams that
+    enable the predictor across many bands at once with
+    `variance_preserving == 0` will lose the heuristic envelope
+    spreading until a follow-up round.
+
 - **Round 30 — Speech Spectral Frontend (SSF) bitstream walker** (TS 103
   190-1 §4.2.9 / §4.3.7 + §4.3.7.5 + Tables 43-46 / 111-113):
   - New `ssf` module with the four-table walker family:

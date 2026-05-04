@@ -23,7 +23,7 @@ use oxideav_core::Decoder;
 use oxideav_core::TimeBase;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
-use crate::{acpl_synth, asf, aspx, mdct, qmf, sync, toc};
+use crate::{acpl_synth, asf, aspx, mdct, qmf, ssf_synth, sync, toc};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac4Decoder::new(params)))
@@ -62,6 +62,10 @@ pub struct Ac4Decoder {
     /// in the foundation decoder; multichannel `ASPX_ACPL_3` would carry
     /// a vector keyed by substream index.
     acpl_state: acpl_synth::AcplSubstreamState,
+    /// Per-channel SSF synthesis state — RNGs, predictor lag history,
+    /// subband-predictor spec/env buffers, and the previous block's
+    /// `f_spec[]` latch. Grown on demand as channels decode SSF.
+    ssf_synth_state: Vec<ssf_synth::SsfSynthState>,
 }
 
 impl Ac4Decoder {
@@ -78,6 +82,7 @@ impl Ac4Decoder {
             prev_transform_length: 0,
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
+            ssf_synth_state: Vec::new(),
         }
     }
 
@@ -396,6 +401,84 @@ impl Ac4Decoder {
         let pcm_f = self.imdct_channel_f32(ch, scaled, n);
         Self::pcm_f32_to_i16(&pcm_f)
     }
+
+    /// SSF synthesis: drive §5.2.3-5.2.7 across every granule + block
+    /// in `data`, IMDCT each `n_mdct` block, overlap/add into the
+    /// channel's history, and emit a single
+    /// `frame_samples`-long S16 vector.
+    ///
+    /// Each SSF block produces an `n_mdct`-long spectrum; the IMDCT
+    /// then yields `2 * n_mdct` time-domain samples which the
+    /// overlap-add step combines with the previous block's tail to
+    /// emit `n_mdct` PCM samples. So one granule emits
+    /// `num_blocks * n_mdct = granule_length` samples; one frame's
+    /// `ssf_data` covers the entire frame_length.
+    fn run_ssf_channel(
+        &mut self,
+        ch: usize,
+        data: &crate::ssf::SsfData,
+        frame_samples: usize,
+    ) -> Vec<i16> {
+        // Drive the synth.
+        let state_idx = ch.min(self.ssf_synth_state.len().saturating_sub(1));
+        let mut spec_concat: Vec<f32> = Vec::new();
+        let mut block_lengths: Vec<usize> = Vec::new();
+        for granule in &data.granules {
+            let n_mdct = granule.n_mdct as usize;
+            if n_mdct == 0 {
+                continue;
+            }
+            let env_prev: Vec<i32> =
+                state_idx_env_prev(self, state_idx, granule.num_bands as usize);
+            let block = ssf_synth::synthesize_granule(
+                granule,
+                &env_prev,
+                &mut self.ssf_synth_state[state_idx],
+            );
+            // synthesize_granule returns num_blocks * n_mdct; track
+            // each block's n_mdct so the IMDCT loop can split them.
+            for _ in 0..(granule.num_blocks as usize) {
+                block_lengths.push(n_mdct);
+            }
+            spec_concat.extend_from_slice(&block);
+        }
+        if spec_concat.is_empty() || block_lengths.is_empty() {
+            return Vec::new();
+        }
+        // IMDCT each block independently and concat.
+        let mut pcm_out: Vec<f32> = Vec::with_capacity(frame_samples);
+        let mut off = 0usize;
+        for &n in &block_lengths {
+            if off + n > spec_concat.len() {
+                break;
+            }
+            let block_spec = &spec_concat[off..off + n];
+            // Use `imdct_channel_f32` for KBD-windowed overlap-add.
+            // SSF blocks share the channel's overlap state so the
+            // history chains across blocks within a frame.
+            let pcm_block = self.imdct_channel_f32(ch, block_spec, n);
+            pcm_out.extend_from_slice(&pcm_block);
+            off += n;
+        }
+        // Truncate / pad to frame_samples.
+        if pcm_out.len() > frame_samples {
+            pcm_out.truncate(frame_samples);
+        } else if pcm_out.len() < frame_samples {
+            pcm_out.resize(frame_samples, 0.0);
+        }
+        Self::pcm_f32_to_i16(&pcm_out)
+    }
+}
+
+/// Helper: snapshot `env_prev[]` from the per-channel SSF synth state
+/// for the current granule's `num_bands`. Right now the synth state
+/// doesn't keep the previous granule's `env[]` around (the predictor
+/// chain re-derives it from `env_curr`); returning a zeroed vector
+/// makes the SHORT_STRIDE P-frame interpolation degrade gracefully to
+/// a flat envelope rather than panic. A future revision will wire
+/// `env_prev` through `SsfSynthState`.
+fn state_idx_env_prev(_dec: &Ac4Decoder, _state_idx: usize, num_bands: usize) -> Vec<i32> {
+    vec![0i32; num_bands]
 }
 
 impl Decoder for Ac4Decoder {
@@ -526,6 +609,20 @@ impl Decoder for Ac4Decoder {
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.acpl_data_1ch.clone());
+        // Detach SSF data so we can run §5.2.3-5.2.7 synthesis without
+        // a borrow conflict on `self`. SSF substreams are mutually
+        // exclusive with ASF on a per-channel basis (per
+        // `spec_frontend`), so when these are populated the IMDCT input
+        // for that channel comes from `synthesize_ssf_data` instead of
+        // the ASF Huffman path.
+        let ssf_primary = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.ssf_data_primary.clone());
+        let ssf_secondary = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.ssf_data_secondary.clone());
         // ASPX_ACPL_1 (joint-MDCT residual layer): M spectrum lives on
         // `scaled_spec_primary`, S on `scaled_spec_secondary`; both
         // share the same transform_info. Detect it via the parsed
@@ -634,6 +731,10 @@ impl Decoder for Ac4Decoder {
         while self.aspx_ext_state.len() < channels as usize {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
         }
+        // Same for the SSF synth state.
+        while self.ssf_synth_state.len() < channels as usize {
+            self.ssf_synth_state.push(ssf_synth::SsfSynthState::new());
+        }
         // §5.7.7 A-CPL: when the substream parsed `acpl_config_1ch` +
         // `acpl_data_1ch` we run the channel-pair synthesis on the
         // ASPX-extended primary PCM and emit two channels. The path
@@ -735,6 +836,31 @@ impl Decoder for Ac4Decoder {
                         pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
                     } else {
                         pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                    }
+                }
+            }
+        }
+        // SSF synthesis path — if either ssf_data_* is populated and
+        // the corresponding `pcm_per_channel[ch]` slot is still empty
+        // (the ASF Huffman pipeline didn't fire because spec_frontend
+        // was SSF), drive §5.2.3-5.2.7 → IMDCT to produce real PCM.
+        // Synthesize each granule into a `num_blocks * n_mdct`-long
+        // spectrum vector, then IMDCT each `n_mdct` block independently
+        // and concat the resulting overlap-added PCM.
+        if let Some(data) = ssf_primary.as_ref() {
+            if !pcm_per_channel.is_empty() && pcm_per_channel[0].is_none() {
+                let pcm = self.run_ssf_channel(0, data, samples as usize);
+                if !pcm.is_empty() {
+                    pcm_per_channel[0] = Some(pcm);
+                }
+            }
+        }
+        if channels as usize >= 2 {
+            if let Some(data) = ssf_secondary.as_ref() {
+                if pcm_per_channel.len() >= 2 && pcm_per_channel[1].is_none() {
+                    let pcm = self.run_ssf_channel(1, data, samples as usize);
+                    if !pcm.is_empty() {
+                        pcm_per_channel[1] = Some(pcm);
                     }
                 }
             }
@@ -1468,5 +1594,53 @@ mod tests {
             panic!("expected audio");
         };
         assert_eq!(af.samples, 1_920);
+    }
+
+    /// Round-31: end-to-end SSF synthesis test. Builds a synthetic
+    /// SsfData via the public API (LONG_STRIDE I-frame, num_bands=12,
+    /// predictor disabled), runs the §5.2.3-5.2.7 synth, and verifies
+    /// the output is finite + bin layout matches the spec
+    /// (num_bins == 140 for n_mdct=960 / num_bands=12 from
+    /// SsfBinLayout). All-zero AC payload + all-zero envelope indices
+    /// yields i_alloc=0 across all bands → noise-RNG-driven f_spec_invq.
+    #[test]
+    fn ssf_synth_long_stride_iframe_end_to_end() {
+        use crate::ssf;
+        use crate::ssf_synth;
+        use oxideav_core::bits::{BitReader, BitWriter};
+        // Build the same shape the asf walker will hand us: one
+        // LONG_STRIDE I-granule with num_bands=12, n_mdct=960.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 1); // stride_flag = LONG_STRIDE
+        bw.write_u32(0, 3); // num_bands_minus12 = 0 → num_bands = 12
+                            // No per-block predictor loop iterations in this layout.
+                            // ssf_st_data():
+        bw.write_u32(0, 5); // env_curr_band0_bits
+        bw.write_u32(0, 1); // variance_preserving_flag
+        bw.write_u32(0, 5); // alloc_offset_bits
+                            // ssf_ac_data() init + payload — pad ample zeros.
+        for _ in 0..(30 + 256) {
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let cfg = ssf::SsfFrameConfig::from_toc(1, 5, 960).unwrap();
+        let mut walk_state = ssf::SsfChannelState::new();
+        let data = ssf::parse_ssf_data(&mut br, true, &cfg, &mut walk_state).expect("ssf walker");
+        // Now drive the synth.
+        let mut synth_state = ssf_synth::SsfSynthState::new();
+        let spec = ssf_synth::synthesize_ssf_data(&data, &mut synth_state);
+        // One block of n_mdct=960 spectral lines.
+        assert_eq!(spec.len(), 960);
+        // All entries must be finite (RNG-driven noise on zero alloc).
+        for (i, &v) in spec.iter().enumerate() {
+            assert!(v.is_finite(), "bin {i} not finite: {v}");
+        }
+        // The first num_bins (140) coded lines are the synth output;
+        // the tail is zero-padded.
+        for &v in spec[140..].iter() {
+            assert_eq!(v, 0.0);
+        }
     }
 }

@@ -120,12 +120,23 @@ framework but usable standalone.
 > `last_num_bands` / `env_prev[]` across granules. Wired into
 > `walk_ac4_substream` for mono SIMPLE/ASPX, split-MDCT stereo, and
 > the ASPX_ACPL_1 split residual layer — `spec_frontend == SSF` no
-> longer falls through silently. The §5.2.3-5.2.7 PCM synthesis
-> chain (envelope decoder, predictor, spectrum decoder, subband
-> predictor, inverse flattening) is the next round's scope; until
-> then the decoder still emits silence for SSF substreams even
-> though the walker fully consumes the bitstream. **463 tests**
-> (450 lib + 5 + 8 integration).
+> longer falls through silently. Round 31 lands the
+> **§5.2.3-5.2.7 SSF PCM synthesis chain** in a new `ssf_synth`
+> module: envelope decoder + predictor + helpers + lossless decode +
+> inverse-quant + subband predictor + inverse-flattening
+> (Pseudocodes 4a / 4b / 4c / 4d / 4e / 26 / 31 / 32 / 33 / 34 / 35 /
+> 36 / 37 / 38) plus the C-matrix reconstruction (Pseudocode 39) for
+> all 37 `tab_idx` values. `synthesize_ssf_data()` threads
+> `env_prev[]` between granules. `Ac4Decoder` now carries a
+> per-channel `Vec<SsfSynthState>` and consumes
+> `tools.ssf_data_primary` / `tools.ssf_data_secondary` after the
+> ASF/A-CPL pipeline: each granule's `num_blocks * n_mdct` spectrum
+> is split per-block and IMDCT'd through the existing KBD
+> overlap-add path. SSF substreams now emit real PCM in place of
+> silence. §5.2.5.2.2 Heuristic Scaling (Pseudocodes 27 / 28 / 29 /
+> 30) is deferred — the spec's `f_rfu == 0` short-circuit covers any
+> block with the predictor disabled, which the current synth
+> supports. **479 tests** (466 lib + 5 + 8 integration).
 
 ## Specs
 

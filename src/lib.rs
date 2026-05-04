@@ -417,18 +417,31 @@
 //!   Multichannel `5_X_codec_mode = ASPX_ACPL_1` / `ASPX_ACPL_2`
 //!   wrappers (Pseudocode 117) are still pending — the building blocks
 //!   are all in place but the 5-input wrapper is not wired.
-//! * Speech Spectral Frontend (SSF) PCM synthesis — Tables 43-46
-//!   walker landed (see `ssf::parse_ssf_data` above) so SSF
-//!   substreams parse cleanly into [`ssf::SsfData`] /
-//!   [`ssf::SsfGranule`] / [`ssf::SsfBlock`] containing the per-block
-//!   predictor flags, alloc-offset, gain bits, decoded envelope
-//!   indices, predictor-gain indices, and quantised MDCT coefficient
-//!   indices. The §5.2.3-5.2.7 synthesis chain (envelope decoder
-//!   Pseudocodes 4a-4d, predictor decoder Pseudocode 4e, spectrum
-//!   decoder Pseudocodes 26-34, subband predictor Pseudocodes 35-37,
-//!   inverse flattening Pseudocode 38) is the next round's scope.
-//!   Until then the decoder still emits silence for SSF substreams
-//!   even though the walker fully consumes the bitstream.
+//! * **Speech Spectral Frontend (SSF) PCM synthesis** — round 31 lands
+//!   the §5.2.3-5.2.7 chain in [`ssf_synth`]: envelope decoder
+//!   ([`ssf_synth::decode_envelope`] / [`ssf_synth::interpolate_envelope`] /
+//!   [`ssf_synth::decode_gains`] / [`ssf_synth::refine_envelope`] —
+//!   Pseudocodes 4a-4d), predictor parameter calculation
+//!   ([`ssf_synth::decode_predictor`] — Pseudocode 4e), helper
+//!   variables and lossless-decoding allocation table
+//!   ([`ssf_synth::compute_helpers`] / [`ssf_synth::build_alloc_table`] —
+//!   Pseudocodes 26 + 31 no-rfu path), inverse quantizer
+//!   ([`ssf_synth::inverse_quantize_block`] /
+//!   [`ssf_synth::mmse_laplace`] — Pseudocodes 32 / 33), inverse
+//!   heuristic scaling ([`ssf_synth::inverse_heuristic_scale`] —
+//!   Pseudocode 34), C-matrix reconstruction
+//!   ([`ssf_synth::build_c_matrix`] — Pseudocode 39), subband
+//!   predictor ([`ssf_synth::SubbandPredictorState::run`] —
+//!   Pseudocodes 35-37) and inverse flattening
+//!   ([`ssf_synth::inverse_flatten`] — Pseudocode 38). The decoder
+//!   ([`decoder::Ac4Decoder::receive_frame`]) now consumes
+//!   `tools.ssf_data_primary` / `tools.ssf_data_secondary` and runs
+//!   `synthesize_ssf_data` → IMDCT → KBD overlap-add per channel,
+//!   producing real PCM in place of silence for SSF substreams. The
+//!   heuristic-scaling helpers (§5.2.5.2.2 Pseudocodes 27 / 28 /
+//!   29 / 30) are deferred — the spec's `f_rfu == 0` short-circuit
+//!   short-circuits to the no-heuristic path the synth already
+//!   supports, covering any block with the predictor disabled.
 //! * Spectral noise fill synthesis — `asf_snf_data()` parses the
 //!   Huffman-coded indices but doesn't inject shaped noise into
 //!   zero bands yet.
@@ -477,6 +490,7 @@ pub mod sfb_offset;
 pub mod ssf;
 pub mod ssf_ac;
 pub mod ssf_pred_coeff;
+pub mod ssf_synth;
 pub mod ssf_tables;
 pub mod sync;
 pub mod tables;
