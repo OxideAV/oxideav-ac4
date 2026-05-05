@@ -1874,10 +1874,7 @@ pub fn derive_fixfix_atsg(
 /// The returned vector has `num_env + 1` entries and starts at 0 and ends
 /// at `num_aspx_timeslots`. `None` is returned when the constructed
 /// borders are non-monotone or inconsistent.
-pub fn derive_fixvar_atsg(
-    num_aspx_timeslots: u32,
-    framing: &AspxFraming,
-) -> Option<Vec<u32>> {
+pub fn derive_fixvar_atsg(num_aspx_timeslots: u32, framing: &AspxFraming) -> Option<Vec<u32>> {
     let var_bord_right = framing.var_bord_right? as u32;
     let num_env = framing.num_env as usize;
     let num_rel = framing.num_rel_right as usize;
@@ -1901,7 +1898,7 @@ pub fn derive_fixvar_atsg(
     borders.push(t); // border_vector[num_env] = T
     let b_right = t - var_bord_right;
     borders.push(b_right); // border_vector[num_env - 1] = T - var_bord_right
-    // Remaining from rel_bord_right (applied right-to-left).
+                           // Remaining from rel_bord_right (applied right-to-left).
     let mut anchor = b_right;
     for &rel in framing.rel_bord_right.iter().rev() {
         let rel = rel as u32;
@@ -1912,7 +1909,7 @@ pub fn derive_fixvar_atsg(
         borders.push(anchor);
     }
     borders.reverse(); // now ascending
-    // Verify monotone strictly increasing.
+                       // Verify monotone strictly increasing.
     for w in borders.windows(2) {
         if w[0] >= w[1] {
             return None;
@@ -1930,10 +1927,7 @@ pub fn derive_fixvar_atsg(
 /// VARFIX: left border is `var_bord_left`; right border is fixed at
 /// `num_aspx_timeslots`; the relative borders `rel_bord_left` are
 /// measured from the left (each is added to the current left anchor).
-pub fn derive_varfix_atsg(
-    num_aspx_timeslots: u32,
-    framing: &AspxFraming,
-) -> Option<Vec<u32>> {
+pub fn derive_varfix_atsg(num_aspx_timeslots: u32, framing: &AspxFraming) -> Option<Vec<u32>> {
     let var_bord_left = framing.var_bord_left? as u32;
     let num_env = framing.num_env as usize;
     let num_rel = framing.num_rel_left as usize;
@@ -1978,10 +1972,7 @@ pub fn derive_varfix_atsg(
 ///
 /// VARVAR: left border is `var_bord_left`, right border is
 /// `T - var_bord_right`; relative borders fan out from each end.
-pub fn derive_varvar_atsg(
-    num_aspx_timeslots: u32,
-    framing: &AspxFraming,
-) -> Option<Vec<u32>> {
+pub fn derive_varvar_atsg(num_aspx_timeslots: u32, framing: &AspxFraming) -> Option<Vec<u32>> {
     let var_bord_left = framing.var_bord_left? as u32;
     let var_bord_right = framing.var_bord_right? as u32;
     let num_env = framing.num_env as usize;
@@ -2001,7 +1992,7 @@ pub fn derive_varvar_atsg(
         return None;
     }
     let b_right_anchor = t - var_bord_right; // T - var_bord_right
-    // Left anchors.
+                                             // Left anchors.
     let mut borders: Vec<u32> = Vec::with_capacity(num_env + 1);
     borders.push(var_bord_left);
     let mut anchor = var_bord_left;
@@ -2067,7 +2058,10 @@ pub fn derive_atsg_borders(
                 vec![0, num_aspx_timeslots]
             } else {
                 // 2 noise envelopes: split at the same junction as signal env 0.
-                let mid = sig.get(sig.len() / 2).copied().unwrap_or(num_aspx_timeslots / 2);
+                let mid = sig
+                    .get(sig.len() / 2)
+                    .copied()
+                    .unwrap_or(num_aspx_timeslots / 2);
                 vec![0, mid, num_aspx_timeslots]
             };
             Some((sig, noise))
@@ -2077,7 +2071,10 @@ pub fn derive_atsg_borders(
             let noise = if framing.num_noise == 1 {
                 vec![0, num_aspx_timeslots]
             } else {
-                let mid = sig.get(sig.len() / 2).copied().unwrap_or(num_aspx_timeslots / 2);
+                let mid = sig
+                    .get(sig.len() / 2)
+                    .copied()
+                    .unwrap_or(num_aspx_timeslots / 2);
                 vec![0, mid, num_aspx_timeslots]
             };
             Some((sig, noise))
@@ -2087,7 +2084,10 @@ pub fn derive_atsg_borders(
             let noise = if framing.num_noise == 1 {
                 vec![0, num_aspx_timeslots]
             } else {
-                let mid = sig.get(sig.len() / 2).copied().unwrap_or(num_aspx_timeslots / 2);
+                let mid = sig
+                    .get(sig.len() / 2)
+                    .copied()
+                    .unwrap_or(num_aspx_timeslots / 2);
                 vec![0, mid, num_aspx_timeslots]
             };
             Some((sig, noise))

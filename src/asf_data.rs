@@ -519,7 +519,11 @@ pub fn inject_snf_noise(
                 // 16-bit LCG: next = (69069 * state + 1) mod 2^32
                 *rng_state = rng_state.wrapping_mul(69069).wrapping_add(1);
                 // Sign from bit 15 of the state, magnitude = 1.
-                let sign: f32 = if (*rng_state >> 15) & 1 == 0 { 1.0 } else { -1.0 };
+                let sign: f32 = if (*rng_state >> 15) & 1 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 scaled[k] = sign * snf_gain;
             }
         }
@@ -843,10 +847,18 @@ mod tests {
         // RNG advanced exactly twice.
         let mut expected_rng = 0x1234_5678u32;
         expected_rng = expected_rng.wrapping_mul(69069).wrapping_add(1);
-        let sign0: f32 = if (expected_rng >> 15) & 1 == 0 { 1.0 } else { -1.0 };
+        let sign0: f32 = if (expected_rng >> 15) & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
         assert_eq!(scaled[0], sign0 * 1.0);
         expected_rng = expected_rng.wrapping_mul(69069).wrapping_add(1);
-        let sign1: f32 = if (expected_rng >> 15) & 1 == 0 { 1.0 } else { -1.0 };
+        let sign1: f32 = if (expected_rng >> 15) & 1 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
         assert_eq!(scaled[1], sign1 * 1.0);
     }
 }

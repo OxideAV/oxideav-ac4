@@ -284,9 +284,7 @@ impl Ac4Decoder {
             let num_aspx_ts = (n_slots as u32) / num_ts_in_ats.max(1);
             // §5.7.6.3.3.1 Pseudocode 76 (FIXFIX) or §5.7.6.3.3.2
             // Pseudocode 77 (FIXVAR / VARFIX / VARVAR) border derivation.
-            if let Some((atsg_sig, atsg_noise)) =
-                aspx::derive_atsg_borders(num_aspx_ts, frm)
-            {
+            if let Some((atsg_sig, atsg_noise)) = aspx::derive_atsg_borders(num_aspx_ts, frm) {
                 if sig.len() as u32 == frm.num_env {
                     let adjuster = aspx::AspxEnvelopeAdjuster::from_deltas(
                         &q,
