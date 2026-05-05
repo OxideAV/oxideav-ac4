@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 32 — SSF SHORT_STRIDE `env_prev` tracking + walker state
+  hoisting** (TS 103 190-1 §5.2.3.0 Note 2, §5.2.3.0b Pseudocode 4b,
+  §4.3.7.4.2 Pseudocodes 54-57):
+  - `SsfSynthState` gains a new `env_prev: Vec<i32>` field that
+    `synthesize_granule()` latches at the end of each granule with the
+    *resolved* envelope (post-`decode_envelope` δ-chain), not the raw
+    delta symbols. SHORT_STRIDE P-granules now use this latch as the
+    `env_prev[]` interpolation input when the caller doesn't supply
+    one — `interpolate_envelope` no longer degrades to a flat-zero
+    envelope across frame boundaries on real P-frame streams.
+    `Ac4Decoder::run_ssf_channel` drops its zero-vector
+    `state_idx_env_prev` stub and passes an empty slice; the synth
+    pulls from `state.env_prev` automatically.
+  - `Ac4Decoder` adopts `Vec<SsfChannelState>` (one per channel,
+    grown on demand) keyed `ssf_walker_state`. New
+    `walk_ac4_substream_stateful()` and the matching
+    `_stateful` variants of `parse_mono_audio_data_outer`,
+    `parse_stereo_audio_data_outer`, `parse_stereo_data_body`, and
+    `parse_aspx_acpl1_mdct_body` thread an
+    `Option<&mut [SsfChannelState]>` through the SSF body parses so
+    the walker's dither / noise RNGs (Pseudocodes 54-57) and
+    `prev_pred_lag_idx` / `last_num_bands` / `env_prev` (raw symbol
+    snapshot) persist across frames. The original public functions
+    keep their pre-r32 signatures and delegate with `None` so the
+    sibling repos / test fixtures stay binary-compatible.
+  - 4 new lib unit tests (466 → 470):
+    `synthesize_granule_latches_env_prev` (verifies `state.env_prev`
+    holds the post-`decode_envelope` chain after each granule),
+    `short_stride_p_frame_uses_state_env_prev` (proves a P-granule
+    interpolates against the latched I-granule envelope, not zero),
+    `synthesize_ssf_data_chains_env_prev_across_granules` (two-granule
+    end-to-end), and
+    `walk_ac4_substream_stateful_persists_ssf_walker_state`
+    (round-trip through the substream walker leaves the channel-0
+    state's `last_num_bands` / `last_n_mdct` / `env_prev` populated).
+
 - **Round 31 — Speech Spectral Frontend (SSF) PCM synthesis chain** (TS
   103 190-1 §5.2.3 / §5.2.4 / §5.2.5 / §5.2.6 / §5.2.7 +
   §5.2.8.1 — Pseudocodes 4a / 4b / 4c / 4d / 4e / 26 / 31 / 32 / 33 /

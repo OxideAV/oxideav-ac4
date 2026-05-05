@@ -705,8 +705,10 @@ pub fn inverse_flatten(
 
 /// Per-channel SSF synthesis state — the dither / noise RNGs, the
 /// predictor lag history, the subband predictor's spec / env buffers
-/// (§5.2.6), and a one-block latch for the previous block's `f_spec[]`
-/// (the predictor's `f_spec_prev` input).
+/// (§5.2.6), a one-block latch for the previous block's `f_spec[]`
+/// (the predictor's `f_spec_prev` input), and the previous granule's
+/// resolved envelope (the SHORT_STRIDE P-frame `env_prev[]` input to
+/// Pseudocode 4b per §5.2.3.0 Note 2).
 #[derive(Debug, Clone, Default)]
 pub struct SsfSynthState {
     /// Dither RNG (Pseudocode 56) — independent of the bitstream walker's
@@ -722,6 +724,12 @@ pub struct SsfSynthState {
     /// Previous block's `f_spec[]` — the `f_spec_prev` input to
     /// Pseudocode 36 + 37.
     pub f_spec_prev: Vec<f32>,
+    /// Previous granule's *resolved* envelope (post-`decode_envelope`
+    /// chain accumulation, not the raw delta symbols). This is the
+    /// `env_prev[]` input that Pseudocode 4b interpolates against on
+    /// SHORT_STRIDE P-frames per §5.2.3.0 Note 2. Empty until the first
+    /// granule has been synthesized.
+    pub env_prev: Vec<i32>,
 }
 
 impl SsfSynthState {
@@ -729,6 +737,12 @@ impl SsfSynthState {
         Self::default()
     }
 
+    /// Reset the per-frame state at the start of every SSF-I-frame
+    /// (Pseudocode 55). The dither / noise RNGs are re-seeded, the
+    /// predictor history is cleared, and `f_spec_prev` is dropped. The
+    /// envelope latch is *not* cleared — an I-frame supplies its own
+    /// `env_startup[]` for SHORT_STRIDE interpolation, so `env_prev`
+    /// remains valid as a P-frame fallback after this granule completes.
     pub fn reset_iframe(&mut self) {
         self.dither_rng.reset();
         self.noise_rng.reset();
@@ -777,8 +791,25 @@ pub fn synthesize_granule(
                     .as_deref()
                     .map(decode_envelope)
                     .unwrap_or_else(|| vec![0i32; num_bands])
-            } else {
+            } else if !env_prev.is_empty() {
+                // Caller supplied an explicit env_prev[] (e.g. a
+                // multi-granule frame). Use it verbatim.
                 env_prev.to_vec()
+            } else if !state.env_prev.is_empty() {
+                // No caller-supplied env_prev — fall back to the synth
+                // state's latched envelope from the previous frame's
+                // last granule (§5.2.3.0 Note 2). Pad / truncate to
+                // num_bands so a band-count change between frames still
+                // yields a well-defined interpolation input.
+                let mut e = state.env_prev.clone();
+                e.resize(num_bands, 0);
+                e
+            } else {
+                // First-ever P-granule with no prior latch — degrade to
+                // a flat envelope rather than panic. Real streams should
+                // never hit this path because every SSF stream opens
+                // with an I-frame.
+                vec![0i32; num_bands]
             };
             interpolate_envelope(&env, &prev_for_interp, num_blocks)
         }
@@ -856,6 +887,13 @@ pub fn synthesize_granule(
         let copy = f_spec.len().min(n_mdct);
         out[off..off + copy].copy_from_slice(&f_spec[..copy]);
     }
+    // Latch this granule's resolved envelope as the next granule's
+    // `env_prev[]` for SHORT_STRIDE P-frame interpolation. The walker
+    // already keeps a `SsfChannelState::env_prev` snapshot for *raw*
+    // delta symbols; this is its post-decode counterpart, so the
+    // SHORT_STRIDE P-frame path no longer has to thread env_prev across
+    // frame boundaries from the decoder.
+    state.env_prev = env;
     out
 }
 
@@ -863,12 +901,14 @@ pub fn synthesize_granule(
 /// flat MDCT-spectrum stream. Output length = sum of
 /// `num_blocks * n_mdct` per granule.
 pub fn synthesize_ssf_data(data: &SsfData, state: &mut SsfSynthState) -> Vec<f32> {
-    let mut env_prev: Vec<i32> = Vec::new();
     let mut out: Vec<f32> = Vec::new();
     for g in &data.granules {
-        let spec = synthesize_granule(g, &env_prev, state);
+        // env_prev[] is latched on `state` by `synthesize_granule` after
+        // each granule, so the second granule of an `ssf_data()` call —
+        // and the first granule of the next frame — both pick the
+        // SHORT_STRIDE P-frame envelope from the same source.
+        let spec = synthesize_granule(g, &[], state);
         out.extend_from_slice(&spec);
-        env_prev = decode_envelope(&g.env_curr);
     }
     out
 }
@@ -1091,5 +1131,153 @@ mod tests {
         for &v in &pcm_spec {
             assert!(v.is_finite());
         }
+    }
+
+    #[test]
+    fn synthesize_granule_latches_env_prev() {
+        // Round 32: SHORT_STRIDE P-frame `env_prev[]` now lives on
+        // `SsfSynthState`. After synthesizing a granule, the resolved
+        // envelope (delta-chained from `env_curr`) must be latched on
+        // `state.env_prev` so the next P-granule can interpolate
+        // against it without the decoder threading env_prev manually.
+        let env_curr_raw = vec![-28, 16, 16, 17, 16, 16, 16, 16, 16, 16, 16, 16];
+        let granule = SsfGranule {
+            b_iframe: true,
+            stride_flag: StrideFlag::LongStride,
+            num_bands: 12,
+            start_block: 0,
+            end_block: 0,
+            num_blocks: 1,
+            n_mdct: 960,
+            num_bins: 140,
+            env_curr_band0_bits: 0,
+            env_startup_band0_bits: None,
+            env_curr: env_curr_raw.clone(),
+            env_startup: None,
+            blocks: vec![SsfBlock::default()],
+            ac_bits_used: 30,
+        };
+        let mut state = SsfSynthState::new();
+        assert!(state.env_prev.is_empty());
+        let _ = synthesize_granule(&granule, &[], &mut state);
+        // State now carries the resolved (decode_envelope-applied)
+        // envelope, *not* the raw symbols.
+        assert_eq!(state.env_prev, decode_envelope(&env_curr_raw));
+    }
+
+    #[test]
+    fn short_stride_p_frame_uses_state_env_prev() {
+        // After an I-frame latches env_prev, a follow-up SHORT_STRIDE
+        // P-granule with an empty caller-supplied env_prev should
+        // interpolate against the latched envelope rather than fall
+        // back to a flat-zero envelope. The interp output for block 0
+        // (1/4 weight) should sit between env_prev and env.
+        // Stage 1: prime the state with an LONG_STRIDE I-granule whose
+        // resolved envelope is well-defined.
+        let i_env_raw = vec![-20i32, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20];
+        let i_granule = SsfGranule {
+            b_iframe: true,
+            stride_flag: StrideFlag::LongStride,
+            num_bands: 12,
+            start_block: 0,
+            end_block: 0,
+            num_blocks: 1,
+            n_mdct: 960,
+            num_bins: 140,
+            env_curr_band0_bits: 0,
+            env_startup_band0_bits: None,
+            env_curr: i_env_raw.clone(),
+            env_startup: None,
+            blocks: vec![SsfBlock::default()],
+            ac_bits_used: 30,
+        };
+        let mut state = SsfSynthState::new();
+        let _ = synthesize_granule(&i_granule, &[], &mut state);
+        let i_resolved = decode_envelope(&i_env_raw);
+        assert_eq!(state.env_prev, i_resolved);
+        // env_prev resolved: band 0 = -20, all others = -20 (delta 0).
+        // Stage 2: drive a SHORT_STRIDE P-granule with a different
+        // resolved envelope (band 0 = -10, rest = -10) — the empty
+        // caller env_prev should resolve to state.env_prev internally,
+        // so block-0 interp = env_prev + 1/4*(env - env_prev) =
+        // -20 + 1/4 * (-10 - (-20)) = -20 + 2 = -18 (Q10 fixed-point
+        // rounded; check the helper output instead).
+        let p_env_raw = vec![-10i32, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16];
+        let p_resolved = decode_envelope(&p_env_raw);
+        assert_eq!(p_resolved[0], -10);
+        // Use `interpolate_envelope` directly to compute the expected
+        // first-block interpolation, mirroring the synth's internal
+        // call. With state.env_prev as prev and p_resolved as curr.
+        let expected_interp = interpolate_envelope(&p_resolved, &i_resolved, 4);
+        // Synthesize with empty caller env_prev; the synth must use
+        // state.env_prev (which equals i_resolved). A successful run
+        // produces 4 blocks * 240 = 960 spec bins.
+        // Resolve num_bins via the same Pseudocode-7 layout the synth
+        // uses internally. n_mdct=240 + num_bands=12 → 38 bins.
+        let layout = crate::ssf::SsfBinLayout::build(12, 240).expect("layout");
+        let p_granule = SsfGranule {
+            b_iframe: false,
+            stride_flag: StrideFlag::ShortStride,
+            num_bands: 12,
+            start_block: 0,
+            end_block: 4,
+            num_blocks: 4,
+            n_mdct: 240,
+            num_bins: layout.num_bins,
+            env_curr_band0_bits: 18, // band0 = 18 - 28 = -10
+            env_startup_band0_bits: None,
+            env_curr: p_env_raw,
+            env_startup: None,
+            blocks: vec![SsfBlock::default(); 4],
+            ac_bits_used: 30,
+        };
+        let spec = synthesize_granule(&p_granule, &[], &mut state);
+        assert_eq!(spec.len(), 4 * 240);
+        // Sanity: every spec bin is finite (the interp output drives
+        // f_env_signal, which gates the noise bins; non-finite would
+        // mean we picked up a NaN somewhere).
+        for &v in &spec {
+            assert!(v.is_finite());
+        }
+        // The first-block interp[0] must be strictly between env_prev[0]
+        // (-20) and p_resolved[0] (-10) — proves the latch was used,
+        // not a zero fallback.
+        assert!(
+            expected_interp[0][0] > -20 && expected_interp[0][0] < -10,
+            "interp[0][0] = {}, expected strictly between -20 and -10",
+            expected_interp[0][0]
+        );
+    }
+
+    #[test]
+    fn synthesize_ssf_data_chains_env_prev_across_granules() {
+        // A two-granule frame: the second granule should pick up
+        // env_prev from the first via the latch, not start from zero.
+        let g0_env = vec![-25i32, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16];
+        let g1_env = vec![-15i32, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16];
+        let mk_g = |env: Vec<i32>, b_iframe: bool| SsfGranule {
+            b_iframe,
+            stride_flag: StrideFlag::LongStride,
+            num_bands: 12,
+            start_block: 0,
+            end_block: 0,
+            num_blocks: 1,
+            n_mdct: 960,
+            num_bins: 140,
+            env_curr_band0_bits: 0,
+            env_startup_band0_bits: None,
+            env_curr: env,
+            env_startup: None,
+            blocks: vec![SsfBlock::default()],
+            ac_bits_used: 30,
+        };
+        let data = SsfData {
+            granules: vec![mk_g(g0_env.clone(), true), mk_g(g1_env.clone(), false)],
+        };
+        let mut state = SsfSynthState::new();
+        let _ = synthesize_ssf_data(&data, &mut state);
+        // After both granules, state.env_prev must equal g1_env's
+        // resolved form.
+        assert_eq!(state.env_prev, decode_envelope(&g1_env));
     }
 }

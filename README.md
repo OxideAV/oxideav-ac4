@@ -136,7 +136,20 @@ framework but usable standalone.
 > silence. §5.2.5.2.2 Heuristic Scaling (Pseudocodes 27 / 28 / 29 /
 > 30) is deferred — the spec's `f_rfu == 0` short-circuit covers any
 > block with the predictor disabled, which the current synth
-> supports. **479 tests** (466 lib + 5 + 8 integration).
+> supports. Round 32 closes the SHORT_STRIDE P-frame correctness gap
+> by adding `env_prev: Vec<i32>` to `SsfSynthState`:
+> `synthesize_granule()` latches the *resolved* envelope (post-
+> `decode_envelope` δ-chain) at the end of each granule so that a
+> SHORT_STRIDE P-granule with no caller-supplied `env_prev[]`
+> interpolates against the previous frame's envelope rather than a
+> zero fallback (§5.2.3.0 Note 2). The walker side gets a parallel
+> hoist: `Ac4Decoder` now owns a `Vec<SsfChannelState>`
+> (`ssf_walker_state`) and a new `walk_ac4_substream_stateful()`
+> threads it through the SSF body parses so dither / noise RNGs
+> (Pseudocodes 54-57) and `prev_pred_lag_idx` / `last_num_bands`
+> persist across frames — pre-r32 the walker built a fresh state
+> per frame and dropped it. **483 tests** (470 lib + 5 + 8
+> integration).
 
 ## Specs
 

@@ -828,6 +828,20 @@ pub fn parse_mono_audio_data_outer(
     b_iframe: bool,
     frame_len_base: u32,
 ) -> Result<()> {
+    parse_mono_audio_data_outer_stateful(br, tools, b_iframe, frame_len_base, None)
+}
+
+/// Stateful variant of [`parse_mono_audio_data_outer`]. When
+/// `ssf_states` is `Some`, the SSF body parse uses the channel-0 state
+/// from the slice so RNG / `env_prev` continuity persists across
+/// frames. `None` falls back to a stack-local `SsfChannelState`.
+pub fn parse_mono_audio_data_outer_stateful(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    b_iframe: bool,
+    frame_len_base: u32,
+    ssf_states: Option<&mut [crate::ssf::SsfChannelState]>,
+) -> Result<()> {
     // §4.2.6.1 single_channel_element(b_iframe):
     //   mono_codec_mode; 1 bit
     //   if (b_iframe && mono_codec_mode == ASPX) { aspx_config(); }
@@ -873,8 +887,16 @@ pub fn parse_mono_audio_data_outer(
         // we silently skip the SSF body — the same shape the
         // pre-round-30 walker had.
         if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
-            let mut state = crate::ssf::SsfChannelState::new();
-            if let Ok(d) = crate::ssf::parse_ssf_data(br, b_iframe, &cfg, &mut state) {
+            // Round 32: borrow the persistent channel-0 SSF walker
+            // state from the caller when supplied so RNG / env_prev /
+            // predictor-lag history carries across frames; otherwise
+            // fall back to a stack-local one (same shape as before).
+            let mut local = crate::ssf::SsfChannelState::new();
+            let state: &mut crate::ssf::SsfChannelState = match ssf_states {
+                Some(slice) if !slice.is_empty() => &mut slice[0],
+                _ => &mut local,
+            };
+            if let Ok(d) = crate::ssf::parse_ssf_data(br, b_iframe, &cfg, state) {
                 tools.ssf_data_primary = Some(d);
             }
         }
@@ -1548,6 +1570,17 @@ fn parse_aspx_acpl1_mdct_body(
     tools: &mut SubstreamTools,
     frame_len_base: u32,
 ) -> bool {
+    parse_aspx_acpl1_mdct_body_stateful(br, tools, frame_len_base, None)
+}
+
+/// Stateful variant of [`parse_aspx_acpl1_mdct_body`]. Same SSF
+/// state-borrow semantics as [`parse_stereo_data_body_stateful`].
+fn parse_aspx_acpl1_mdct_body_stateful(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    frame_len_base: u32,
+    ssf_states: Option<&mut [crate::ssf::SsfChannelState]>,
+) -> bool {
     let b_mdct_stereo = match br.read_u32(1) {
         Ok(v) => v != 0,
         Err(_) => return false,
@@ -1661,6 +1694,22 @@ fn parse_aspx_acpl1_mdct_body(
             tools.psy_info_secondary = Some(psy);
         }
         // sf_data(M); sf_data(S). Both channels are independent.
+        // Round 32: borrow per-channel SSF walker state from the
+        // caller-supplied slice when present so dither/noise RNG +
+        // env_prev + predictor lag history persist across frames.
+        let mut local_m = crate::ssf::SsfChannelState::new();
+        let mut local_s = crate::ssf::SsfChannelState::new();
+        let (state_m_ref, state_s_ref): (
+            &mut crate::ssf::SsfChannelState,
+            &mut crate::ssf::SsfChannelState,
+        ) = match ssf_states {
+            Some(slice) if slice.len() >= 2 => {
+                let (a, rest) = slice.split_at_mut(1);
+                (&mut a[0], &mut rest[0])
+            }
+            Some(slice) if slice.len() == 1 => (&mut slice[0], &mut local_s),
+            _ => (&mut local_m, &mut local_s),
+        };
         let psy_m_clone = tools.psy_info_primary.clone();
         if let (Some(ti), Some(psy)) = (ti_m, psy_m_clone.as_ref()) {
             match decode_asf_mono_body_dispatch(br, &ti, psy) {
@@ -1671,8 +1720,7 @@ fn parse_aspx_acpl1_mdct_body(
             // §4.2.9 SSF body for the M channel of an ASPX_ACPL_1 split
             // residual layer.
             if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
-                let mut state = crate::ssf::SsfChannelState::new();
-                match crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                match crate::ssf::parse_ssf_data(br, false, &cfg, state_m_ref) {
                     Ok(d) => tools.ssf_data_primary = Some(d),
                     Err(_) => return false,
                 }
@@ -1688,8 +1736,7 @@ fn parse_aspx_acpl1_mdct_body(
             }
         } else if matches!(s_fe, SpecFrontend::Ssf) {
             if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
-                let mut state = crate::ssf::SsfChannelState::new();
-                match crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                match crate::ssf::parse_ssf_data(br, false, &cfg, state_s_ref) {
                     Ok(d) => tools.ssf_data_secondary = Some(d),
                     Err(_) => return false,
                 }
@@ -1782,6 +1829,22 @@ pub fn parse_stereo_audio_data_outer(
     b_iframe: bool,
     frame_len_base: u32,
 ) -> Result<()> {
+    parse_stereo_audio_data_outer_stateful(br, tools, b_iframe, frame_len_base, None)
+}
+
+/// Stateful variant of [`parse_stereo_audio_data_outer`]. When
+/// `ssf_states` is `Some`, the inner SSF body parses for primary /
+/// secondary channels (M / S split-MDCT or independent stereo) borrow
+/// the matching channel slot so RNG / `env_prev` continuity persists
+/// across frames. `None` falls back to stack-local `SsfChannelState`s
+/// (round 31 behavior).
+pub fn parse_stereo_audio_data_outer_stateful(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    b_iframe: bool,
+    frame_len_base: u32,
+    mut ssf_states: Option<&mut [crate::ssf::SsfChannelState]>,
+) -> Result<()> {
     // §4.2.6.3 channel_pair_element(b_iframe):
     //   stereo_codec_mode;        2 bits
     let mode_bits = br.read_u32(2)?;
@@ -1833,7 +1896,12 @@ pub fn parse_stereo_audio_data_outer(
             // (b_dual_maxsfb=1 with chparam_info() — Table 47);
             // ASPX_ACPL_2 walks a single mono MDCT residual.
             let body_ok = match mode {
-                StereoCodecMode::AspxAcpl1 => parse_aspx_acpl1_mdct_body(br, tools, frame_len_base),
+                StereoCodecMode::AspxAcpl1 => parse_aspx_acpl1_mdct_body_stateful(
+                    br,
+                    tools,
+                    frame_len_base,
+                    ssf_states.as_deref_mut(),
+                ),
                 StereoCodecMode::AspxAcpl2 => parse_aspx_acpl2_mdct_body(br, tools, frame_len_base),
                 _ => false,
             };
@@ -1874,7 +1942,12 @@ pub fn parse_stereo_audio_data_outer(
         //   * the stereo_data() body decoded cleanly (bitreader is at
         //     the right place).
         if matches!(mode, StereoCodecMode::Aspx) {
-            let body_ok = parse_stereo_data_body(br, tools, frame_len_base);
+            let body_ok = parse_stereo_data_body_stateful(
+                br,
+                tools,
+                frame_len_base,
+                ssf_states.as_deref_mut(),
+            );
             if b_iframe && body_ok {
                 if let Some(cfg) = tools.aspx_config {
                     parse_aspx_data_2ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
@@ -1885,7 +1958,7 @@ pub fn parse_stereo_audio_data_outer(
     }
 
     // SIMPLE path: just `stereo_data()`.
-    let _ = parse_stereo_data_body(br, tools, frame_len_base);
+    let _ = parse_stereo_data_body_stateful(br, tools, frame_len_base, ssf_states);
     let _ = b_iframe; // reserved for later Huffman-state keying.
     Ok(())
 }
@@ -1900,6 +1973,21 @@ pub(crate) fn parse_stereo_data_body(
     br: &mut BitReader<'_>,
     tools: &mut SubstreamTools,
     frame_len_base: u32,
+) -> bool {
+    parse_stereo_data_body_stateful(br, tools, frame_len_base, None)
+}
+
+/// Stateful variant of [`parse_stereo_data_body`]. When `ssf_states`
+/// is `Some`, split-MDCT stereo's two SSF body decodes borrow the
+/// matching channel slot from the slice (channel 0 → primary,
+/// channel 1 → secondary) so the SSF walker's RNG / `env_prev` /
+/// predictor lag history persists across frames. `None` falls back to
+/// stack-local channel state.
+pub(crate) fn parse_stereo_data_body_stateful(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    frame_len_base: u32,
+    ssf_states: Option<&mut [crate::ssf::SsfChannelState]>,
 ) -> bool {
     // stereo_data():
     //   if (b_enable_mdct_stereo_proc) {
@@ -2019,6 +2107,23 @@ pub(crate) fn parse_stereo_data_body(
         // body is surfaced as a decode miss (None) rather than a hard
         // error.
         let mut body_ok = true;
+        // Round 32: split-MDCT stereo passes ssf_states[0] to the M
+        // channel SSF walker and ssf_states[1] to the S channel SSF
+        // walker (when present). Local fallbacks keep the no-state path
+        // working unchanged.
+        let mut local_l = crate::ssf::SsfChannelState::new();
+        let mut local_r = crate::ssf::SsfChannelState::new();
+        let (state_l_ref, state_r_ref): (
+            &mut crate::ssf::SsfChannelState,
+            &mut crate::ssf::SsfChannelState,
+        ) = match ssf_states {
+            Some(slice) if slice.len() >= 2 => {
+                let (a, rest) = slice.split_at_mut(1);
+                (&mut a[0], &mut rest[0])
+            }
+            Some(slice) if slice.len() == 1 => (&mut slice[0], &mut local_r),
+            _ => (&mut local_l, &mut local_r),
+        };
         if let (Some(ti), Some(psy)) = (ti_l, psy_l.as_ref()) {
             tools.scaled_spec_primary = decode_asf_mono_body_dispatch(br, &ti, psy);
             if tools.scaled_spec_primary.is_none() {
@@ -2026,7 +2131,6 @@ pub(crate) fn parse_stereo_data_body(
             }
         } else if matches!(l, SpecFrontend::Ssf) {
             if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
-                let mut state = crate::ssf::SsfChannelState::new();
                 // The split-MDCT stereo walker doesn't know whether the
                 // surrounding `audio_data()` came from an I-frame —
                 // assume non-I (the safe default; an I-frame body would
@@ -2034,7 +2138,7 @@ pub(crate) fn parse_stereo_data_body(
                 // pulled `b_ssf_iframe = 1` from the AC layer
                 // explicitly). We surface the parsed body when
                 // available and silently skip on parse miss.
-                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, state_l_ref) {
                     tools.ssf_data_primary = Some(d);
                 } else {
                     body_ok = false;
@@ -2048,8 +2152,7 @@ pub(crate) fn parse_stereo_data_body(
             }
         } else if matches!(r, SpecFrontend::Ssf) {
             if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
-                let mut state = crate::ssf::SsfChannelState::new();
-                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, &mut state) {
+                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, state_r_ref) {
                     tools.ssf_data_secondary = Some(d);
                 } else {
                     body_ok = false;
@@ -2156,6 +2259,22 @@ pub fn walk_ac4_substream(
     b_iframe: bool,
     frame_len_base: u32,
 ) -> Result<Ac4SubstreamInfo> {
+    walk_ac4_substream_stateful(substream_bytes, channels, b_iframe, frame_len_base, None)
+}
+
+/// Stateful variant of [`walk_ac4_substream`] — accepts a `&mut`
+/// per-channel [`crate::ssf::SsfChannelState`] slice (one entry per
+/// channel) so that SSF dither / noise RNG continuity, predictor lag
+/// history, and the previous granule's `env_prev[]` snapshot persist
+/// across frame boundaries (round 32). Pass `None` to fall back to the
+/// stateless behaviour the original `walk_ac4_substream` offered.
+pub fn walk_ac4_substream_stateful(
+    substream_bytes: &[u8],
+    channels: u16,
+    b_iframe: bool,
+    frame_len_base: u32,
+    mut ssf_states: Option<&mut [crate::ssf::SsfChannelState]>,
+) -> Result<Ac4SubstreamInfo> {
     if substream_bytes.is_empty() {
         return Err(Error::invalid("ac4: empty substream"));
     }
@@ -2181,8 +2300,20 @@ pub fn walk_ac4_substream(
         ..Default::default()
     };
     match channels {
-        1 => parse_mono_audio_data_outer(&mut br, &mut tools, b_iframe, frame_len_base)?,
-        2 => parse_stereo_audio_data_outer(&mut br, &mut tools, b_iframe, frame_len_base)?,
+        1 => parse_mono_audio_data_outer_stateful(
+            &mut br,
+            &mut tools,
+            b_iframe,
+            frame_len_base,
+            ssf_states.as_deref_mut(),
+        )?,
+        2 => parse_stereo_audio_data_outer_stateful(
+            &mut br,
+            &mut tools,
+            b_iframe,
+            frame_len_base,
+            ssf_states,
+        )?,
         // 5.0 / 5.1 — drive the `5_X_channel_element` walker
         // (§4.2.6.6 Table 25). r19 lands the outer-shell parse;
         // r20 fills in Cfg0/Cfg1/Cfg2 + LFE psy_info_lfe(); inner
@@ -3462,5 +3593,45 @@ mod tests {
         assert_eq!(g.num_bands, 12);
         assert_eq!(g.n_mdct, 960);
         assert!(g.b_iframe);
+    }
+
+    /// Round 32: `walk_ac4_substream_stateful` must persist
+    /// `SsfChannelState` (the bitstream walker's RNG / `env_prev` /
+    /// `last_num_bands` carrier) into the caller-supplied slice. After
+    /// an SSF I-frame parse, `state[0].last_num_bands` reflects the
+    /// granule's num_bands and `state[0].env_prev` is non-empty.
+    #[test]
+    fn walk_ac4_substream_stateful_persists_ssf_walker_state() {
+        // Reuse the same I-frame body as the basic SSF walker test.
+        let mut bw = BitWriter::new();
+        bw.write_u32(100, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(0, 1);
+        bw.write_u32(1, 1);
+        bw.write_u32(0, 1); // stride_flag = LONG_STRIDE
+        bw.write_u32(0, 3); // num_bands_minus12 = 0 → num_bands = 12
+        bw.write_u32(0, 5); // env_curr_band0_bits
+        bw.write_u32(0, 1); // variance_preserving
+        bw.write_u32(0, 5); // alloc_offset_bits
+        for _ in 0..(30 + 256) {
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        while bw.byte_len() < 128 {
+            bw.write_u32(0, 8);
+        }
+        let bytes = bw.finish();
+        let mut state_bank = vec![crate::ssf::SsfChannelState::new()];
+        // Pre-condition: state is the default.
+        assert_eq!(state_bank[0].last_num_bands, 0);
+        assert!(state_bank[0].env_prev.is_empty());
+        let info =
+            walk_ac4_substream_stateful(&bytes, 1, true, 960, Some(&mut state_bank)).unwrap();
+        // Post-condition: walker has updated the channel-0 state.
+        assert_eq!(state_bank[0].last_num_bands, 12);
+        assert_eq!(state_bank[0].last_n_mdct, 960);
+        assert_eq!(state_bank[0].env_prev.len(), 12);
+        assert!(info.tools.ssf_data_primary.is_some());
     }
 }

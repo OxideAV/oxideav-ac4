@@ -23,7 +23,7 @@ use oxideav_core::Decoder;
 use oxideav_core::TimeBase;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
-use crate::{acpl_synth, asf, aspx, mdct, qmf, ssf_synth, sync, toc};
+use crate::{acpl_synth, asf, aspx, mdct, qmf, ssf, ssf_synth, sync, toc};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac4Decoder::new(params)))
@@ -66,6 +66,14 @@ pub struct Ac4Decoder {
     /// subband-predictor spec/env buffers, and the previous block's
     /// `f_spec[]` latch. Grown on demand as channels decode SSF.
     ssf_synth_state: Vec<ssf_synth::SsfSynthState>,
+    /// Per-channel SSF *walker* state — the bitstream-side dither /
+    /// noise RNG, `prev_pred_lag_idx`, `last_num_bands`, and the
+    /// `env_prev[]` snapshot of raw delta symbols. Hoisted onto the
+    /// decoder in round 32 so RNG continuity (Pseudocodes 54-57) is
+    /// preserved across frame boundaries; pre-r32 the walker built a
+    /// fresh per-frame state and dropped it. Grown on demand to match
+    /// the channel count seen on the latest frame.
+    ssf_walker_state: Vec<ssf::SsfChannelState>,
 }
 
 impl Ac4Decoder {
@@ -83,6 +91,7 @@ impl Ac4Decoder {
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             ssf_synth_state: Vec::new(),
+            ssf_walker_state: Vec::new(),
         }
     }
 
@@ -428,13 +437,13 @@ impl Ac4Decoder {
             if n_mdct == 0 {
                 continue;
             }
-            let env_prev: Vec<i32> =
-                state_idx_env_prev(self, state_idx, granule.num_bands as usize);
-            let block = ssf_synth::synthesize_granule(
-                granule,
-                &env_prev,
-                &mut self.ssf_synth_state[state_idx],
-            );
+            // env_prev[] for SHORT_STRIDE P-frame interpolation now
+            // lives on `SsfSynthState` and the synth latches the
+            // resolved envelope at the end of each granule, so we pass
+            // an empty slice and let the synth pull the previous
+            // granule's envelope from `state.env_prev` (§5.2.3.0 Note 2).
+            let block =
+                ssf_synth::synthesize_granule(granule, &[], &mut self.ssf_synth_state[state_idx]);
             // synthesize_granule returns num_blocks * n_mdct; track
             // each block's n_mdct so the IMDCT loop can split them.
             for _ in 0..(granule.num_blocks as usize) {
@@ -468,17 +477,6 @@ impl Ac4Decoder {
         }
         Self::pcm_f32_to_i16(&pcm_out)
     }
-}
-
-/// Helper: snapshot `env_prev[]` from the per-channel SSF synth state
-/// for the current granule's `num_bands`. Right now the synth state
-/// doesn't keep the previous granule's `env[]` around (the predictor
-/// chain re-derives it from `env_curr`); returning a zeroed vector
-/// makes the SHORT_STRIDE P-frame interpolation degrade gracefully to
-/// a flat envelope rather than panic. A future revision will wire
-/// `env_prev` through `SsfSynthState`.
-fn state_idx_env_prev(_dec: &Ac4Decoder, _state_idx: usize, num_bands: usize) -> Vec<i32> {
-    vec![0i32; num_bands]
 }
 
 impl Decoder for Ac4Decoder {
@@ -577,6 +575,12 @@ impl Decoder for Ac4Decoder {
                 Some(&raw[start..])
             }
         };
+        // Round 32: grow the per-channel SSF walker state vector to
+        // match the current frame's channel count *before* invoking the
+        // walker so the state borrow has the right shape.
+        while self.ssf_walker_state.len() < channels as usize {
+            self.ssf_walker_state.push(ssf::SsfChannelState::new());
+        }
         self.last_substream = substream_try.and_then(|sb| {
             let channels_u16 = channels;
             let b_iframe = info
@@ -584,7 +588,14 @@ impl Decoder for Ac4Decoder {
                 .first()
                 .map(|p| p.b_iframe)
                 .unwrap_or(info.b_iframe_global);
-            asf::walk_ac4_substream(sb, channels_u16, b_iframe, info.frame_length).ok()
+            asf::walk_ac4_substream_stateful(
+                sb,
+                channels_u16,
+                b_iframe,
+                info.frame_length,
+                Some(&mut self.ssf_walker_state[..channels as usize]),
+            )
+            .ok()
         });
         // If we have scaled spectra for the substream, run IMDCT + OLA
         // and produce real PCM. Per-channel PCM buffers live in
