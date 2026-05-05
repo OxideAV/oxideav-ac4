@@ -163,8 +163,24 @@ framework but usable standalone.
 > `f_rfu > 0 && !variance_preserving` the heuristic-scaling branch
 > fires and `inverse_heuristic_scale()` consumes the resulting
 > `f_gain_q[]` instead of the all-1 stub; `variance_preserving` blocks
-> correctly skip the inverse-scale call per §5.2.5.2.0 step 5.
-> **494 tests** (481 lib + 5 + 8 integration).
+> correctly skip the inverse-scale call per §5.2.5.2.0 step 5. Round 34
+> lands **FIXVAR / VARFIX / VARVAR atsg border derivation** (§5.7.6.3.3.2
+> Pseudocode 77) — new `derive_fixvar_atsg()`, `derive_varfix_atsg()`,
+> `derive_varvar_atsg()` and a unified `derive_atsg_borders()` dispatcher
+> cover all four `aspx_int_class` values; the decoder's TNS and
+> envelope-adjustment paths now route through `derive_atsg_borders`
+> instead of the FIXFIX-only path, enabling A-SPX bandwidth extension
+> for FIXVAR / VARFIX / VARVAR substreams. **§5.1.4 SNF injection**:
+> `inject_snf_noise()` fills zero-energy MDCT bins using a 16-bit LCG
+> (multiplier 69069, addend 1) and gain formula `2^((idx×1.5−84)/4)`;
+> the long-mono ASF decode path now consumes `parse_asf_snf_data()` output
+> instead of discarding it. **5_X ASPX_ACPL_3 wired in `Ac4Decoder`**:
+> two new persistent state fields (`acpl_5x_mch_state` /
+> `acpl_5x_pair_state`) are added; when `acpl_config_2ch` +
+> `acpl_data_2ch` + stereo carrier spectra are present,
+> `run_acpl_5x_mch_pcm()` (Pseudocode 118) fires and fills
+> `pcm_per_channel[0..5]` with L/R/C/Ls/Rs surround PCM.
+> **508 tests** (495 lib + 5 + 8 integration).
 
 ## Specs
 
