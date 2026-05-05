@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`register` entry point unified on `RuntimeContext`** (task #502).
+  The legacy `pub fn register(reg: &mut CodecRegistry)` is renamed to
+  `register_codecs` and a new `pub fn register(ctx: &mut
+  oxideav_core::RuntimeContext)` calls it internally. Breaking change
+  for direct callers passing a `CodecRegistry`; switch to either the
+  new `RuntimeContext` entry or the explicit `register_codecs` name.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.3...v0.0.4) - 2026-05-05
 
 ### Other

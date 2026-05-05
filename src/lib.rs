@@ -503,7 +503,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 pub const CODEC_ID_STR: &str = "ac4";
 
 /// Register the AC-4 decoder in a codec registry.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::audio("ac4_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -520,6 +520,12 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
+/// Unified registration entry point — installs AC-4 into the codec
+/// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
 }
@@ -531,18 +537,28 @@ mod tests {
     #[test]
     fn register_installs_decoder() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         assert!(reg.has_decoder(&CodecId::new(CODEC_ID_STR)));
     }
 
     #[test]
     fn iso_bmff_tag_resolves() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         let hits: Vec<_> = reg.all_tag_registrations().collect();
         assert!(hits
             .iter()
             .any(|(t, id)| matches!(t, CodecTag::Fourcc(v) if v == b"AC-4")
                 && id.as_str() == CODEC_ID_STR));
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        assert!(
+            ctx.codecs.has_decoder(&CodecId::new(CODEC_ID_STR)),
+            "decoder factory not installed via RuntimeContext"
+        );
     }
 }
