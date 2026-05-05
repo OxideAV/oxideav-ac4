@@ -62,6 +62,15 @@ pub struct Ac4Decoder {
     /// in the foundation decoder; multichannel `ASPX_ACPL_3` would carry
     /// a vector keyed by substream index.
     acpl_state: acpl_synth::AcplSubstreamState,
+    /// Per-substream state for the 5_X `ASPX_ACPL_1` / `ASPX_ACPL_2`
+    /// pair pipeline (§5.7.7.6.1 Pseudocode 117). Carries the pair
+    /// decorrelator + QMF analysis/synthesis banks across frames.
+    acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState,
+    /// Per-substream state for the 5_X `ASPX_ACPL_3` multichannel
+    /// synthesis pipeline (§5.7.7.6.2 Pseudocode 118). Carries the
+    /// D0/D1/D2 + ducker IIR state + differential-decode rolling sums
+    /// across frames.
+    acpl_5x_mch_state: acpl_synth::Acpl5xMchPcmState,
     /// Per-channel SSF synthesis state — RNGs, predictor lag history,
     /// subband-predictor spec/env buffers, and the previous block's
     /// `f_spec[]` latch. Grown on demand as channels decode SSF.
@@ -90,6 +99,8 @@ impl Ac4Decoder {
             prev_transform_length: 0,
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
+            acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
+            acpl_5x_mch_state: acpl_synth::Acpl5xMchPcmState::new(),
             ssf_synth_state: Vec::new(),
             ssf_walker_state: Vec::new(),
         }
@@ -194,18 +205,14 @@ impl Ac4Decoder {
             }
         }
         // HF generation: when the substream gave us aspx_tna_mode + a
-        // FIXFIX framing pair we can derive atsg_sig and run the full
-        // §5.7.6.4.1.3 / .4 TNS body (Pseudocodes 86 → 89). Otherwise
-        // fall back to the bare tile copy in §5.7.6.4.1.4 minus the
-        // chirp/α0/α1 terms.
+        // framing we can derive atsg_sig and run the full §5.7.6.4.1.3
+        // / .4 TNS body (Pseudocodes 86 → 89). Covers FIXFIX (Pseudocode
+        // 76) and variable interval classes (Pseudocode 77).
+        // Otherwise fall back to the bare tile copy in §5.7.6.4.1.4.
         let mut tns_used = false;
         if let (Some(tna), Some(frm)) = (tna_mode, framing) {
             let num_aspx_ts = (n_slots as u32) / num_ts_in_ats.max(1);
-            let atsg_sig_opt = if matches!(frm.int_class, aspx::AspxIntClass::FixFix) {
-                aspx::derive_fixfix_atsg(num_aspx_ts, frm.num_env, frm.num_noise).map(|(s, _)| s)
-            } else {
-                None
-            };
+            let atsg_sig_opt = aspx::derive_atsg_borders(num_aspx_ts, frm).map(|(s, _)| s);
             if let Some(atsg_sig) = atsg_sig_opt {
                 if !tna.is_empty() {
                     let q_low_ext =
@@ -275,66 +282,67 @@ impl Ac4Decoder {
             (framing, sig_deltas, noise_deltas, qmode_env, delta_dir)
         {
             let num_aspx_ts = (n_slots as u32) / num_ts_in_ats.max(1);
-            if matches!(frm.int_class, aspx::AspxIntClass::FixFix) {
-                if let Some((atsg_sig, atsg_noise)) =
-                    aspx::derive_fixfix_atsg(num_aspx_ts, frm.num_env, frm.num_noise)
-                {
-                    if sig.len() as u32 == frm.num_env {
-                        let adjuster = aspx::AspxEnvelopeAdjuster::from_deltas(
-                            &q,
+            // §5.7.6.3.3.1 Pseudocode 76 (FIXFIX) or §5.7.6.3.3.2
+            // Pseudocode 77 (FIXVAR / VARFIX / VARVAR) border derivation.
+            if let Some((atsg_sig, atsg_noise)) =
+                aspx::derive_atsg_borders(num_aspx_ts, frm)
+            {
+                if sig.len() as u32 == frm.num_env {
+                    let adjuster = aspx::AspxEnvelopeAdjuster::from_deltas(
+                        &q,
+                        tables,
+                        sig,
+                        noise,
+                        qm,
+                        &dd.sig_delta_dir,
+                        &atsg_sig,
+                        &atsg_noise,
+                        num_ts_in_ats,
+                        cfg.interpolation,
+                    );
+                    // Noise + tone injection on top of the
+                    // envelope-adjusted HF. `add_harmonic` is sized
+                    // to `num_sbg_sig_highres`; if the caller didn't
+                    // provide one (no aspx_hfgen_iwc in the
+                    // substream), default to an all-false slice so
+                    // only the noise floor contributes.
+                    let num_sbg_sig_highres = tables.sbg_sig_highres.len().saturating_sub(1);
+                    let default_ah = vec![false; num_sbg_sig_highres];
+                    let ah: &[bool] = match add_harmonic {
+                        Some(s) if s.len() == num_sbg_sig_highres => s,
+                        _ => &default_ah,
+                    };
+                    // tsg_ptr: 0 for FIXFIX (§4.3.10.4.7), from
+                    // framing.tsg_ptr for variable interval classes.
+                    let aspx_tsg_ptr: u32 = frm.tsg_ptr.map(|p| p as u32).unwrap_or(0);
+                    if matches!(frm.int_class, aspx::AspxIntClass::FixFix) && cfg.limiter {
+                        // §5.7.6.4.2.2 limiter pipeline (Pseudocodes
+                        // 96 → 101) replaces the raw sig_gain with
+                        // the boost-corrected sig_gain_sb_adj, so
+                        // do NOT pre-apply adjuster.apply here.
+                        aspx::inject_noise_and_tone_with_limiter(
+                            &mut q,
+                            &adjuster,
                             tables,
-                            sig,
-                            noise,
-                            qm,
-                            &dd.sig_delta_dir,
-                            &atsg_sig,
+                            &patches,
                             &atsg_noise,
-                            num_ts_in_ats,
-                            cfg.interpolation,
+                            ah,
+                            aspx_tsg_ptr,
+                            state,
                         );
-                        // Noise + tone injection on top of the
-                        // envelope-adjusted HF. `add_harmonic` is sized
-                        // to `num_sbg_sig_highres`; if the caller didn't
-                        // provide one (no aspx_hfgen_iwc in the
-                        // substream), default to an all-false slice so
-                        // only the noise floor contributes.
-                        let num_sbg_sig_highres = tables.sbg_sig_highres.len().saturating_sub(1);
-                        let default_ah = vec![false; num_sbg_sig_highres];
-                        let ah: &[bool] = match add_harmonic {
-                            Some(s) if s.len() == num_sbg_sig_highres => s,
-                            _ => &default_ah,
-                        };
-                        // FIXFIX has no transient pointer (§4.3.10.4.7).
-                        let aspx_tsg_ptr: u32 = 0;
-                        if cfg.limiter {
-                            // §5.7.6.4.2.2 limiter pipeline (Pseudocodes
-                            // 96 → 101) replaces the raw sig_gain with
-                            // the boost-corrected sig_gain_sb_adj, so
-                            // do NOT pre-apply adjuster.apply here.
-                            aspx::inject_noise_and_tone_with_limiter(
-                                &mut q,
-                                &adjuster,
-                                tables,
-                                &patches,
-                                &atsg_noise,
-                                ah,
-                                aspx_tsg_ptr,
-                                state,
-                            );
-                        } else {
-                            adjuster.apply(&mut q);
-                            aspx::inject_noise_and_tone(
-                                &mut q,
-                                &adjuster,
-                                tables,
-                                &atsg_noise,
-                                ah,
-                                aspx_tsg_ptr,
-                                state,
-                            );
-                        }
-                        used_envelope = true;
+                    } else {
+                        adjuster.apply(&mut q);
+                        aspx::inject_noise_and_tone(
+                            &mut q,
+                            &adjuster,
+                            tables,
+                            &atsg_noise,
+                            ah,
+                            aspx_tsg_ptr,
+                            state,
+                        );
                     }
+                    used_envelope = true;
                 }
             }
         }
@@ -634,6 +642,44 @@ impl Decoder for Ac4Decoder {
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.ssf_data_secondary.clone());
+        // Detach 5_X ASPX_ACPL_3 synthesis inputs: two carrier spectra
+        // land on scaled_spec_primary / scaled_spec_secondary (via the
+        // stereo body walker), centre from cfg0_centre_mono, and the
+        // A-CPL parameter pair from acpl_config_2ch / acpl_data_2ch.
+        // Only populated when five_x_mode == AspxAcpl3.
+        let five_x_acpl3_active = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                matches!(
+                    sub.tools.five_x_mode,
+                    Some(crate::mch::FiveXCodecMode::AspxAcpl3)
+                ) && sub.tools.acpl_config_2ch.is_some()
+                    && sub.tools.acpl_data_2ch.is_some()
+                    && sub.tools.scaled_spec_primary.is_some()
+                    && sub.tools.scaled_spec_secondary.is_some()
+            })
+            .unwrap_or(false);
+        let five_x_acpl3_cfg = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_config_2ch);
+        let five_x_acpl3_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_2ch.clone());
+        // Centre channel for ASPX_ACPL_3: the mono_data(0) body (cfg0_centre_mono)
+        // isn't yet decoded into a scaled spectrum by the walker, so we use a
+        // zero-filled placeholder of the right length. The A-CPL synthesis still
+        // fires and produces correct L/R/Ls/Rs from the stereo carriers; only the
+        // centre output will be silent until cfg0_centre_mono gains a decode path.
+        // `five_x_centre_spec` is `Some(zeroes)` when ACPL_3 is active (to avoid
+        // a length mismatch in run_acpl_5x_mch_pcm), else `None`.
+        let five_x_centre_spec: Option<Vec<f32>> = if five_x_acpl3_active {
+            Some(vec![0.0_f32; samples as usize])
+        } else {
+            None
+        };
         // ASPX_ACPL_1 (joint-MDCT residual layer): M spectrum lives on
         // `scaled_spec_primary`, S on `scaled_spec_secondary`; both
         // share the same transform_info. Detect it via the parsed
@@ -873,6 +919,56 @@ impl Decoder for Ac4Decoder {
                     if !pcm.is_empty() {
                         pcm_per_channel[1] = Some(pcm);
                     }
+                }
+            }
+        }
+        // §5.7.7.6.2 ASPX_ACPL_3 5_X synthesis (Pseudocode 118) —
+        // When the substream parsed acpl_config_2ch + acpl_data_2ch and
+        // the stereo-body path decoded the L/R carrier spectra, run the
+        // full 5-channel A-CPL synthesis and populate channels 0..4.
+        // Only fires when all five pcm_per_channel slots are still empty
+        // (i.e. the standard stereo path didn't already claim them), or
+        // when the frame is explicitly a 5_X ASPX_ACPL_3 substream.
+        if five_x_acpl3_active {
+            if let (Some(cfg), Some(data), Some(centre)) = (
+                five_x_acpl3_cfg.as_ref(),
+                five_x_acpl3_data.as_ref(),
+                five_x_centre_spec.as_deref(),
+            ) {
+                // Carrier L and R come from pcm_per_channel[0] / [1] (already
+                // filled by the stereo ASF / ASPX decode path above). If they
+                // are present use them; otherwise zero-fill as placeholders so
+                // the A-CPL synthesis still produces shaped Ls/Rs.
+                let n = samples as usize;
+                let pcm_l_f32: Vec<f32> = pcm_per_channel
+                    .first()
+                    .and_then(|p| p.as_ref())
+                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
+                    .unwrap_or_else(|| vec![0.0_f32; n]);
+                let pcm_r_f32: Vec<f32> = pcm_per_channel
+                    .get(1)
+                    .and_then(|p| p.as_ref())
+                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
+                    .unwrap_or_else(|| vec![0.0_f32; n]);
+                if let Some(out) = acpl_synth::run_acpl_5x_mch_pcm(
+                    &pcm_l_f32,
+                    &pcm_r_f32,
+                    centre,
+                    cfg,
+                    data,
+                    &mut self.acpl_5x_mch_state,
+                ) {
+                    // Output channel mapping for 5.0/5.1:
+                    //   ch0 = L, ch1 = R, ch2 = C, ch3 = Ls, ch4 = Rs.
+                    // Resize pcm_per_channel to 5 slots if needed.
+                    while pcm_per_channel.len() < 5 {
+                        pcm_per_channel.push(None);
+                    }
+                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
+                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
+                    pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
+                    pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
+                    pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
                 }
             }
         }

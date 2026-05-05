@@ -1859,6 +1859,243 @@ pub fn derive_fixfix_atsg(
 }
 
 // ---------------------------------------------------------------------
+// §5.7.6.3.3.2 FIXVAR / VARFIX / VARVAR atsg_sig / atsg_noise borders
+// (Pseudocode 77)
+// ---------------------------------------------------------------------
+
+/// Derive the `atsg_sig` border array for a FIXVAR interval per
+/// ETSI TS 103 190-1 §5.7.6.3.3.2 Pseudocode 77.
+///
+/// FIXVAR: left border is fixed at 0; right border is
+/// `num_aspx_timeslots - var_bord_right`; the relative borders
+/// `rel_bord_right[0..num_rel_right]` are measured *from the right*
+/// (each is subtracted from the current right anchor going leftwards).
+///
+/// The returned vector has `num_env + 1` entries and starts at 0 and ends
+/// at `num_aspx_timeslots`. `None` is returned when the constructed
+/// borders are non-monotone or inconsistent.
+pub fn derive_fixvar_atsg(
+    num_aspx_timeslots: u32,
+    framing: &AspxFraming,
+) -> Option<Vec<u32>> {
+    let var_bord_right = framing.var_bord_right? as u32;
+    let num_env = framing.num_env as usize;
+    let num_rel = framing.num_rel_right as usize;
+    // Consistency: num_env = num_rel_right + 1.
+    if num_env != num_rel + 1 {
+        return None;
+    }
+    // Build from right to left (right anchor first), then reverse to get
+    // ascending order.  The FIXVAR border_vector has `num_env + 1` entries:
+    //   border_vector[num_env]     = T
+    //   border_vector[num_env - 1] = T - var_bord_right
+    //   border_vector[num_env-1-i] = (previous) - rel_bord_right[i]
+    //   border_vector[0]           = the leftmost variable anchor
+    // The leading 0 is NOT part of the vector; the first border marks the
+    // start of the leftmost variable envelope.
+    let t = num_aspx_timeslots;
+    if var_bord_right > t {
+        return None;
+    }
+    let mut borders = Vec::with_capacity(num_env + 1);
+    borders.push(t); // border_vector[num_env] = T
+    let b_right = t - var_bord_right;
+    borders.push(b_right); // border_vector[num_env - 1] = T - var_bord_right
+    // Remaining from rel_bord_right (applied right-to-left).
+    let mut anchor = b_right;
+    for &rel in framing.rel_bord_right.iter().rev() {
+        let rel = rel as u32;
+        if rel > anchor {
+            return None;
+        }
+        anchor -= rel;
+        borders.push(anchor);
+    }
+    borders.reverse(); // now ascending
+    // Verify monotone strictly increasing.
+    for w in borders.windows(2) {
+        if w[0] >= w[1] {
+            return None;
+        }
+    }
+    if borders.len() != num_env + 1 {
+        return None;
+    }
+    Some(borders)
+}
+
+/// Derive the `atsg_sig` border array for a VARFIX interval per
+/// ETSI TS 103 190-1 §5.7.6.3.3.2 Pseudocode 77.
+///
+/// VARFIX: left border is `var_bord_left`; right border is fixed at
+/// `num_aspx_timeslots`; the relative borders `rel_bord_left` are
+/// measured from the left (each is added to the current left anchor).
+pub fn derive_varfix_atsg(
+    num_aspx_timeslots: u32,
+    framing: &AspxFraming,
+) -> Option<Vec<u32>> {
+    let var_bord_left = framing.var_bord_left? as u32;
+    let num_env = framing.num_env as usize;
+    let num_rel = framing.num_rel_left as usize;
+    if num_env != num_rel + 1 {
+        return None;
+    }
+    // The VARFIX border_vector has `num_env + 1` entries:
+    //   border_vector[0]       = var_bord_left (leftmost variable anchor)
+    //   border_vector[i]       = border_vector[i-1] + rel_bord_left[i-1]
+    //   border_vector[num_env] = T (rightmost = fixed end of frame)
+    // The trailing T is NOT an extra element — it is border_vector[num_env].
+    // No leading 0: the first envelope starts at var_bord_left.
+    let t = num_aspx_timeslots;
+    if var_bord_left >= t {
+        return None;
+    }
+    let mut borders = Vec::with_capacity(num_env + 1);
+    borders.push(var_bord_left); // border_vector[0]
+    let mut anchor = var_bord_left;
+    for &rel in framing.rel_bord_left.iter() {
+        let rel = rel as u32;
+        anchor += rel;
+        if anchor >= t {
+            return None;
+        }
+        borders.push(anchor);
+    }
+    borders.push(t); // border_vector[num_env] = T
+    for w in borders.windows(2) {
+        if w[0] >= w[1] {
+            return None;
+        }
+    }
+    if borders.len() != num_env + 1 {
+        return None;
+    }
+    Some(borders)
+}
+
+/// Derive the `atsg_sig` border array for a VARVAR interval per
+/// ETSI TS 103 190-1 §5.7.6.3.3.2 Pseudocode 77.
+///
+/// VARVAR: left border is `var_bord_left`, right border is
+/// `T - var_bord_right`; relative borders fan out from each end.
+pub fn derive_varvar_atsg(
+    num_aspx_timeslots: u32,
+    framing: &AspxFraming,
+) -> Option<Vec<u32>> {
+    let var_bord_left = framing.var_bord_left? as u32;
+    let var_bord_right = framing.var_bord_right? as u32;
+    let num_env = framing.num_env as usize;
+    let num_rel_left = framing.num_rel_left as usize;
+    let num_rel_right = framing.num_rel_right as usize;
+    if num_env != num_rel_left + num_rel_right + 1 {
+        return None;
+    }
+    // The VARVAR border_vector has `num_env + 1 = num_rel_left + num_rel_right + 2` entries:
+    //   Left anchors (num_rel_left + 1): [var_bord_left, +rel_l[0], ..., last_left_anchor]
+    //   Right internal anchors (num_rel_right): built right-to-left from T-var_bord_right,
+    //     then reversed to ascending (does NOT include T itself in this step)
+    //   Final T: one entry
+    // Total: (num_rel_left + 1) + num_rel_right + 1 = num_env + 1.
+    let t = num_aspx_timeslots;
+    if var_bord_left >= t || var_bord_right > t {
+        return None;
+    }
+    let b_right_anchor = t - var_bord_right; // T - var_bord_right
+    // Left anchors.
+    let mut borders: Vec<u32> = Vec::with_capacity(num_env + 1);
+    borders.push(var_bord_left);
+    let mut anchor = var_bord_left;
+    for &rel in framing.rel_bord_left.iter() {
+        anchor += rel as u32;
+        if anchor >= t {
+            return None;
+        }
+        borders.push(anchor);
+    }
+    // Right-side internal anchors: build from b_right_anchor leftwards,
+    // collect in a temp vec, then push in ascending order.
+    let mut right_internal: Vec<u32> = Vec::with_capacity(num_rel_right);
+    let mut r_anchor = b_right_anchor;
+    for &rel in framing.rel_bord_right.iter().rev() {
+        let rel = rel as u32;
+        if rel > r_anchor {
+            return None;
+        }
+        r_anchor -= rel;
+        right_internal.push(r_anchor);
+    }
+    right_internal.reverse(); // ascending order of the right-internal borders
+    for b in right_internal {
+        borders.push(b);
+    }
+    // Add T as the final border (mirrors VARFIX which ends at T).
+    borders.push(t);
+    // Verify monotone strictly increasing (no dedup needed — dedup was
+    // hiding bugs in the previous implementation).
+    for w in borders.windows(2) {
+        if w[0] >= w[1] {
+            return None;
+        }
+    }
+    if borders.len() != num_env + 1 {
+        return None;
+    }
+    Some(borders)
+}
+
+/// Derive `atsg_sig` and `atsg_noise` for any `aspx_int_class` —
+/// dispatches to FIXFIX, FIXVAR, VARFIX, or VARVAR derivation and
+/// derives the noise borders from the signal border count using
+/// `tab_border_fixfix` for FIXFIX or the one-noise-envelope rule for
+/// the variable classes.
+///
+/// Returns `None` when the border derivation fails (e.g. inconsistent
+/// num_env vs. rel_bord counts, or FIXFIX table miss).
+pub fn derive_atsg_borders(
+    num_aspx_timeslots: u32,
+    framing: &AspxFraming,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    match framing.int_class {
+        AspxIntClass::FixFix => {
+            derive_fixfix_atsg(num_aspx_timeslots, framing.num_env, framing.num_noise)
+        }
+        AspxIntClass::FixVar => {
+            let sig = derive_fixvar_atsg(num_aspx_timeslots, framing)?;
+            // Noise: num_noise is 1 when num_env == 1, else 2.
+            // For FIXVAR we use the same border structure with one noise envelope.
+            let noise = if framing.num_noise == 1 {
+                vec![0, num_aspx_timeslots]
+            } else {
+                // 2 noise envelopes: split at the same junction as signal env 0.
+                let mid = sig.get(sig.len() / 2).copied().unwrap_or(num_aspx_timeslots / 2);
+                vec![0, mid, num_aspx_timeslots]
+            };
+            Some((sig, noise))
+        }
+        AspxIntClass::VarFix => {
+            let sig = derive_varfix_atsg(num_aspx_timeslots, framing)?;
+            let noise = if framing.num_noise == 1 {
+                vec![0, num_aspx_timeslots]
+            } else {
+                let mid = sig.get(sig.len() / 2).copied().unwrap_or(num_aspx_timeslots / 2);
+                vec![0, mid, num_aspx_timeslots]
+            };
+            Some((sig, noise))
+        }
+        AspxIntClass::VarVar => {
+            let sig = derive_varvar_atsg(num_aspx_timeslots, framing)?;
+            let noise = if framing.num_noise == 1 {
+                vec![0, num_aspx_timeslots]
+            } else {
+                let mid = sig.get(sig.len() / 2).copied().unwrap_or(num_aspx_timeslots / 2);
+                vec![0, mid, num_aspx_timeslots]
+            };
+            Some((sig, noise))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // §5.7.6.3.4 Decoding A-SPX signal / noise envelopes
 // Pseudocodes 80 / 81 delta-decode, Pseudocodes 82 / 83 dequantize.
 // ---------------------------------------------------------------------
@@ -5120,5 +5357,252 @@ mod tests {
                 row[0]
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // §5.7.6.3.3.2 Pseudocode 77 — FIXVAR / VARFIX / VARVAR atsg derivation
+    // ------------------------------------------------------------------
+
+    /// Helper: build a minimal AspxFraming for FIXVAR tests.
+    #[allow(dead_code)]
+    fn fixvar_framing(_t: u32, var_bord_right: u8, rel_bord_right: &[u8]) -> AspxFraming {
+        let num_rel = rel_bord_right.len() as u8;
+        AspxFraming {
+            int_class: AspxIntClass::FixVar,
+            num_env: (num_rel + 1) as u32,
+            num_noise: 1,
+            freq_res: vec![true; (num_rel + 1) as usize],
+            var_bord_left: None,
+            var_bord_right: Some(var_bord_right),
+            num_rel_left: 0,
+            num_rel_right: num_rel,
+            rel_bord_left: vec![],
+            rel_bord_right: rel_bord_right.to_vec(),
+            tsg_ptr: None,
+        }
+    }
+
+    #[test]
+    fn derive_fixvar_atsg_two_env_no_rel() {
+        // T=16, var_bord_right=4, num_rel_right=0, num_env=1.
+        // FIXVAR border_vector: [T-var_bord_right, T] = [12, 16].
+        // The leading 0 is NOT part of the FIXVAR border_vector.
+        let frm = AspxFraming {
+            int_class: AspxIntClass::FixVar,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: vec![true],
+            var_bord_left: None,
+            var_bord_right: Some(4),
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let borders = derive_fixvar_atsg(16, &frm).unwrap();
+        assert_eq!(borders, vec![12, 16]);
+        assert_eq!(borders.len(), 2); // num_env + 1
+    }
+
+    #[test]
+    fn derive_fixvar_atsg_three_env_one_rel() {
+        // T=16, var_bord_right=2, rel_bord_right=[4], num_env=2.
+        // Build right-to-left: T=16, T-2=14, 14-4=10.
+        // Reversed ascending: [10, 14, 16].
+        let frm = AspxFraming {
+            int_class: AspxIntClass::FixVar,
+            num_env: 2,
+            num_noise: 1,
+            freq_res: vec![true; 2],
+            var_bord_left: None,
+            var_bord_right: Some(2),
+            num_rel_left: 0,
+            num_rel_right: 1,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![4],
+            tsg_ptr: None,
+        };
+        let borders = derive_fixvar_atsg(16, &frm).unwrap();
+        assert_eq!(borders, vec![10, 14, 16]);
+        assert_eq!(borders.len(), 3); // num_env+1
+    }
+
+    #[test]
+    fn derive_fixvar_atsg_rejects_inconsistent_num_env() {
+        // num_env=3 but num_rel_right=0 -> mismatch (num_env != num_rel+1)
+        let frm = AspxFraming {
+            int_class: AspxIntClass::FixVar,
+            num_env: 3,
+            num_noise: 1,
+            freq_res: vec![true; 3],
+            var_bord_left: None,
+            var_bord_right: Some(2),
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        assert!(derive_fixvar_atsg(16, &frm).is_none());
+    }
+
+    #[test]
+    fn derive_varfix_atsg_two_env_no_rel() {
+        // T=16, var_bord_left=4, num_rel_left=0, num_env=1.
+        // VARFIX border_vector: [var_bord_left, T] = [4, 16].
+        // No leading 0 (the frame starts before var_bord_left implicitly).
+        let frm = AspxFraming {
+            int_class: AspxIntClass::VarFix,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: vec![true],
+            var_bord_left: Some(4),
+            var_bord_right: None,
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let borders = derive_varfix_atsg(16, &frm).unwrap();
+        assert_eq!(borders, vec![4, 16]);
+        assert_eq!(borders.len(), 2); // num_env + 1
+    }
+
+    #[test]
+    fn derive_varfix_atsg_three_env_one_rel() {
+        // T=16, var_bord_left=3, rel_bord_left=[5], num_env=2.
+        // border_vector: [3, 3+5=8, 16] = [3, 8, 16].
+        let frm = AspxFraming {
+            int_class: AspxIntClass::VarFix,
+            num_env: 2,
+            num_noise: 1,
+            freq_res: vec![true; 2],
+            var_bord_left: Some(3),
+            var_bord_right: None,
+            num_rel_left: 1,
+            num_rel_right: 0,
+            rel_bord_left: vec![5],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let borders = derive_varfix_atsg(16, &frm).unwrap();
+        assert_eq!(borders, vec![3, 8, 16]);
+        assert_eq!(borders.len(), 3); // num_env + 1
+    }
+
+    #[test]
+    fn derive_varfix_atsg_rejects_out_of_range_var_bord() {
+        // var_bord_left >= T => reject
+        let frm = AspxFraming {
+            int_class: AspxIntClass::VarFix,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: vec![true],
+            var_bord_left: Some(16),
+            var_bord_right: None,
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        assert!(derive_varfix_atsg(16, &frm).is_none());
+    }
+
+    #[test]
+    fn derive_varvar_atsg_one_env_no_rels() {
+        // T=16, var_bord_left=4, var_bord_right=4, no rels, num_env=1.
+        // VARVAR border_vector: left=[4], right_internal=[], T=[16].
+        // Result: [4, 16].
+        // var_bord_right doesn't add an extra border when num_rel_right=0.
+        let frm = AspxFraming {
+            int_class: AspxIntClass::VarVar,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: vec![true],
+            var_bord_left: Some(4),
+            var_bord_right: Some(4),
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let borders = derive_varvar_atsg(16, &frm).unwrap();
+        assert_eq!(borders, vec![4, 16]);
+        assert_eq!(borders.len(), frm.num_env as usize + 1);
+        // Monotone.
+        for w in borders.windows(2) {
+            assert!(w[0] < w[1]);
+        }
+    }
+
+    #[test]
+    fn derive_varvar_atsg_two_env_one_right_rel() {
+        // T=16, var_bord_left=2, var_bord_right=3, rel_bord_right=[4], num_env=2.
+        // Left: [2]. Right internal (1 entry): T-var_bord_right=13, minus rel[0]=4 → 9.
+        // right_internal reversed ascending: [9]. T: [16].
+        // Result: [2, 9, 16].
+        let frm = AspxFraming {
+            int_class: AspxIntClass::VarVar,
+            num_env: 2,
+            num_noise: 1,
+            freq_res: vec![true; 2],
+            var_bord_left: Some(2),
+            var_bord_right: Some(3),
+            num_rel_left: 0,
+            num_rel_right: 1,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![4],
+            tsg_ptr: None,
+        };
+        let borders = derive_varvar_atsg(16, &frm).unwrap();
+        assert_eq!(borders, vec![2, 9, 16]);
+        assert_eq!(borders.len(), 3); // num_env + 1
+    }
+
+    #[test]
+    fn derive_atsg_borders_dispatches_fixfix() {
+        // FIXFIX with num_env=2, num_noise=1 over T=16 → same as derive_fixfix_atsg.
+        let frm = AspxFraming {
+            int_class: AspxIntClass::FixFix,
+            num_env: 2,
+            num_noise: 1,
+            freq_res: vec![true; 2],
+            var_bord_left: None,
+            var_bord_right: None,
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let (sig, noise) = derive_atsg_borders(16, &frm).unwrap();
+        assert_eq!(sig, vec![0, 8, 16]);
+        assert_eq!(noise, vec![0, 16]);
+    }
+
+    #[test]
+    fn derive_atsg_borders_fixvar_noise_one_env() {
+        // FIXVAR: sig = [12, 16] (2 entries, no leading 0).
+        // Noise always returns [0, T] for 1-envelope case.
+        let frm = AspxFraming {
+            int_class: AspxIntClass::FixVar,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: vec![true],
+            var_bord_left: None,
+            var_bord_right: Some(4),
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let (sig, noise) = derive_atsg_borders(16, &frm).unwrap();
+        assert_eq!(sig, vec![12, 16]);
+        assert_eq!(noise, vec![0, 16]); // 1 noise env => [0, T]
     }
 }

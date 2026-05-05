@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 34 — FIXVAR / VARFIX / VARVAR atsg border derivation + SNF injection + 5_X ASPX_ACPL_3 synthesis** (TS 103 190-1 §5.7.6.3.3.2 + §5.1.4 + §5.7.7.6.2):
+  - New `derive_fixvar_atsg()` (§5.7.6.3.3.2 Pseudocode 77, FIXVAR arm): builds
+    the signal-envelope border vector right-to-left from `T - var_bord_right` using
+    `rel_bord_right[]` deltas, then reverses to ascending order.
+  - New `derive_varfix_atsg()` (Pseudocode 77, VARFIX arm): builds left-to-right
+    from `var_bord_left` using `rel_bord_left[]` deltas, appends T.
+  - New `derive_varvar_atsg()` (Pseudocode 77, VARVAR arm): left-side anchors +
+    right-side internal anchors + T, totalling `num_env + 1` entries.
+  - New `derive_atsg_borders()` dispatcher: routes FIXFIX / FIXVAR / VARFIX /
+    VARVAR framing to the matching derivation and computes noise borders
+    (`[0, T]` for 1 noise envelope, `[0, mid, T]` for 2).
+  - Both the TNS path and envelope-adjustment path in `decoder.rs` now call
+    `derive_atsg_borders` instead of the FIXFIX-only `derive_fixfix_atsg`, enabling
+    A-SPX bandwidth extension for all four interval classes.
+  - New `inject_snf_noise()` in `asf_data.rs` (§5.1.4 SNF): injects
+    shaped noise (`gain = 2^((idx * 1.5 - 84) / 4)`) into zero-energy MDCT
+    bins using a 16-bit LCG (multiplier 69069, addend 1). Previously the
+    `parse_asf_snf_data()` result was discarded; now it is consumed by the
+    long-mono ASF decode path.
+  - 5_X `ASPX_ACPL_3` synthesis wired into `Ac4Decoder::receive_frame`:
+    `Ac4Decoder` gains two new persistent fields (`acpl_5x_pair_state`,
+    `acpl_5x_mch_state`); when the walker populates `acpl_config_2ch` +
+    `acpl_data_2ch` + stereo carrier spectra, `run_acpl_5x_mch_pcm`
+    (Pseudocode 118) runs and fills `pcm_per_channel[0..5]` with L/R/C/Ls/Rs.
+  - Unit tests: `derive_fixvar_atsg` (2 cases + reject), `derive_varfix_atsg`
+    (2 cases + reject), `derive_varvar_atsg` (2 cases), `derive_atsg_borders`
+    dispatch (FIXFIX + FIXVAR), `inject_snf_noise` (fill, gain formula, LCG).
+
 ### Changed
 
 - **`register` entry point unified on `RuntimeContext`** (task #502).

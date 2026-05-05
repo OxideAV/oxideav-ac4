@@ -479,6 +479,53 @@ pub fn dequantise_and_scale(
     scaled
 }
 
+/// §5.1.4 Spectral noise fill — inject shaped white noise into zero-energy
+/// spectral bins using the per-band `dpcm_snf[]` indices parsed by
+/// [`parse_asf_snf_data`].
+///
+/// The gain for band `sfb` is `2^((snf_idx * 1.5 - 84) / 4)`, which
+/// matches the `sf_gain` formula but with the SNF index substituted for
+/// the scalefactor index and a 1.5 step-size (vs 1.0 for scalefacs).
+///
+/// Noise is injected into every bin `k` in `sfb` where `scaled[k] == 0.0`
+/// (no energy from the MDCT coefficient path). The pseudo-random number
+/// sequence uses a 16-bit LCG with multiplier 69069 + addend 1 (same
+/// convention as the ASF random-sign generator in §5.1.2.3).
+///
+/// `snf_data`: per-band SNF indices from `parse_asf_snf_data` (length
+/// `max_sfb`). Bands with index 0 contribute no noise. `sfb_offset` and
+/// `max_sfb` must match the ones used to produce `scaled`. `rng_state` is
+/// updated across calls so the noise sequence continues frame-to-frame;
+/// callers should reset it on I-frames.
+pub fn inject_snf_noise(
+    scaled: &mut [f32],
+    snf_data: &[i32],
+    sfb_offset: &[u16],
+    max_sfb: u32,
+    rng_state: &mut u32,
+) {
+    for sfb in 0..max_sfb as usize {
+        let idx = match snf_data.get(sfb) {
+            Some(&v) if v > 0 => v as u32,
+            _ => continue,
+        };
+        // SNF gain: step size = 1.5 dB, base offset equivalent to sf=84.
+        // gain = 2^((idx * 1.5 - 84) / 4.0)
+        let snf_gain: f32 = 2.0_f32.powf((idx as f32 * 1.5 - 84.0) / 4.0);
+        let a = sfb_offset.get(sfb).copied().unwrap_or(0) as usize;
+        let b = sfb_offset.get(sfb + 1).copied().unwrap_or(0) as usize;
+        for k in a..b.min(scaled.len()) {
+            if scaled[k] == 0.0 {
+                // 16-bit LCG: next = (69069 * state + 1) mod 2^32
+                *rng_state = rng_state.wrapping_mul(69069).wrapping_add(1);
+                // Sign from bit 15 of the state, magnitude = 1.
+                let sign: f32 = if (*rng_state >> 15) & 1 == 0 { 1.0 } else { -1.0 };
+                scaled[k] = sign * snf_gain;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,5 +794,59 @@ mod tests {
             parse_asf_snf_data_grouped(&mut br, &sections, &mqi_per_g, &[0u32; 3], &[256u32; 3])
                 .unwrap();
         assert!(snf.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // §5.1.4 inject_snf_noise — spectral noise fill
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn inject_snf_fills_zero_bins_only() {
+        // SFB 0 spans bins [0..4], SNF idx=56 (gain > 0).
+        // bin 1 is non-zero → must not be overwritten.
+        let sfb_offset: Vec<u16> = vec![0, 4, 8];
+        let snf_data: Vec<i32> = vec![56, 0]; // sfb0 has idx, sfb1 is zero→skip
+        let mut scaled = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut rng: u32 = 1;
+        inject_snf_noise(&mut scaled, &snf_data, &sfb_offset, 2, &mut rng);
+        // bin 1 must be unchanged.
+        assert_eq!(scaled[1], 1.0);
+        // bins 0, 2, 3 must be non-zero (filled with SNF gain × ±1).
+        let snf_gain = 2.0_f32.powf((56.0 * 1.5 - 84.0) / 4.0);
+        assert!((scaled[0].abs() - snf_gain).abs() < 1e-5);
+        assert!((scaled[2].abs() - snf_gain).abs() < 1e-5);
+        assert!((scaled[3].abs() - snf_gain).abs() < 1e-5);
+        // sfb1 had idx=0 (≤0) so bins 4..8 must stay zero.
+        for &s in &scaled[4..] {
+            assert_eq!(s, 0.0, "sfb1 bins must remain zero");
+        }
+    }
+
+    #[test]
+    fn inject_snf_gain_formula_idx56() {
+        // idx=56: gain = 2^((56*1.5-84)/4) = 2^((84-84)/4) = 2^0 = 1.0
+        let snf_gain = 2.0_f32.powf((56.0_f32 * 1.5 - 84.0) / 4.0);
+        assert!((snf_gain - 1.0).abs() < 1e-5, "idx=56 gain must be 1.0");
+    }
+
+    #[test]
+    fn inject_snf_lcg_state_advances() {
+        // Each zero bin should advance the RNG and produce a deterministic result.
+        let sfb_offset: Vec<u16> = vec![0, 2];
+        let snf_data: Vec<i32> = vec![56];
+        let mut scaled = vec![0.0_f32; 2];
+        let mut rng: u32 = 0x1234_5678;
+        inject_snf_noise(&mut scaled, &snf_data, &sfb_offset, 1, &mut rng);
+        // Both bins should be ±1.0 (since idx=56 → gain=1.0).
+        assert!((scaled[0].abs() - 1.0).abs() < 1e-5);
+        assert!((scaled[1].abs() - 1.0).abs() < 1e-5);
+        // RNG advanced exactly twice.
+        let mut expected_rng = 0x1234_5678u32;
+        expected_rng = expected_rng.wrapping_mul(69069).wrapping_add(1);
+        let sign0: f32 = if (expected_rng >> 15) & 1 == 0 { 1.0 } else { -1.0 };
+        assert_eq!(scaled[0], sign0 * 1.0);
+        expected_rng = expected_rng.wrapping_mul(69069).wrapping_add(1);
+        let sign1: f32 = if (expected_rng >> 15) & 1 == 0 { 1.0 } else { -1.0 };
+        assert_eq!(scaled[1], sign1 * 1.0);
     }
 }

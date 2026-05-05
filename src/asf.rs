@@ -1470,11 +1470,17 @@ fn decode_asf_long_mono_body(
     let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
     // asf_scalefac_data.
     let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-    // asf_snf_data — consume the bits but ignore the output for now
-    // (noise fill to be added later).
-    let _snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    // asf_snf_data — §5.1.4 spectral noise fill. If present, inject
+    // shaped noise into zero-energy bins. The RNG state is initialised
+    // fresh per frame (I-frame reset per §5.1.4) — cross-frame RNG
+    // continuity is a future refinement.
+    let snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
     // Dequantise + scale.
-    let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
+    let mut scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
+    if let Some(snf_data) = snf {
+        let mut rng: u32 = 0x1234_5678; // per-frame seed
+        asf_data::inject_snf_noise(&mut scaled, &snf_data, sfbo, max_sfb, &mut rng);
+    }
     Some(scaled)
 }
 
