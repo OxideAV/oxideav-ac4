@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.3...v0.0.4) - 2026-05-05
+
+### Other
+
+- land §5.2.5.2.2 Heuristic Scaling (round 33)
+- env_prev tracking + walker state hoisting (round 32)
+- land §5.2.3-5.2.7 PCM synthesis chain (round 31)
+- land Tables 43-46 bitstream walker (round 30)
+- land Annex C tables + arithmetic decoder core (round 29)
+
 ### Added
 
 - **Round 33 — §5.2.5.2.2 Heuristic Scaling (Pseudocodes 27/28/29/30)**
