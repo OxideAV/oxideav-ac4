@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 33 — §5.2.5.2.2 Heuristic Scaling (Pseudocodes 27/28/29/30)**
+  (TS 103 190-1 §5.2.5.2.0 selector + §5.2.5.2.2):
+  - New `map_db_to_lin_q10()` (Pseudocode 29) and `map_lin_to_db_q10()`
+    (Pseudocode 30) — Q.10 fixed-point dB↔linear converters using the
+    Annex C.14 `SLOPES_DB_TO_LIN` / `OFFSETS_DB_TO_LIN` /
+    `SLOPES_LIN_TO_DB` / `OFFSETS_LIN_TO_DB` LUTs (already shipped in
+    `ssf_tables`). Out-of-range inputs clamp to the spec's `100 << 10`
+    (dB→lin) and `40 << 10` (lin→dB) ceilings.
+  - New `heuristic_scaling()` (Pseudocode 28) implements the full
+    `HeuristicScaling(iRfu, env_in, ...) -> int_weights_dB[]` chain:
+    dynamic-range compression on `env_in[]` when the spread exceeds
+    the 40 Q.10 threshold, sort-descending of `env_local[]`,
+    `Map_dB_to_Lin` per band, weighted sum scaled by `iRfu²`, reverse
+    water-filling to find `iTCurrLev`, and a final per-band
+    `Map_Lin_to_dB(iTCurrLev) - env_local[band]` weight that's clamped
+    to `[0, 15 << 10]`.
+  - New `apply_heuristic_scaling()` (Pseudocode 27) wraps Pseudocode 28
+    with the `env_in = 3 * env_alloc` pre-multiply, the LF-boost
+    threshold (`i_w_dB[0]` knocked down by 3), and the
+    `env_alloc_mod = (env_alloc - i_w_dB).clamp(ENV_MIN, ENV_MAX)` +
+    `f_gain_q = pow(10, 1.5 / 20 * f_w_dB)` post-processing. Returns
+    `(env_alloc_mod[band], f_gain_q[band])`.
+  - `synthesize_granule()` now dispatches the §5.2.5.2.0 selector:
+    when `f_rfu > 0 && !variance_preserving` AND the SSF bandwidths
+    table is available, the heuristic-scaling branch fires and
+    `inverse_heuristic_scale()` consumes the resulting `f_gain_q[]`
+    instead of the previous all-1 stub. The `variance_preserving`
+    block also correctly skips the inverse-scale call per
+    §5.2.5.2.0 step 5. Pre-r33 the synth crashed (well, silently
+    bailed) on `f_pred_gain != 0` blocks; now they decode all the way
+    through.
+  - 11 new lib unit tests (470 → 481):
+    `map_db_to_lin_zero_input` / `map_db_to_lin_out_of_range_clamps` /
+    `map_db_to_lin_monotone_within_table` /
+    `map_lin_to_db_zero_input` / `map_lin_to_db_out_of_range_clamps` /
+    `heuristic_scaling_zero_envelope_yields_zero_weights` /
+    `heuristic_scaling_clamps_to_max` /
+    `apply_heuristic_scaling_short_circuits_on_empty` /
+    `apply_heuristic_scaling_clamps_env_alloc_mod` /
+    `synthesize_granule_runs_with_heuristic_scaling_branch` /
+    `synthesize_granule_variance_preserving_skips_heuristic`.
+
 - **Round 32 — SSF SHORT_STRIDE `env_prev` tracking + walker state
   hoisting** (TS 103 190-1 §5.2.3.0 Note 2, §5.2.3.0b Pseudocode 4b,
   §4.3.7.4.2 Pseudocodes 54-57):

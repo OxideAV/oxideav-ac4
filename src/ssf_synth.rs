@@ -36,21 +36,27 @@
 //!   quantized prediction-coefficient bytes in
 //!   [`crate::ssf_pred_coeff`] ([`build_c_matrix`]).
 //!
-//! Pseudocodes 27 / 28 / 29 / 30 (Heuristic Scaling and `Map_dB_to_Lin`
-//! / `Map_Lin_to_dB`) are deferred — when `f_pred_gain == 0` the spec
-//! short-circuits to `env_alloc_mod == env_alloc` and `f_gain_q == 1`,
-//! so the no-heuristic path covers any block with the predictor turned
-//! off (the most common case in low-bitrate speech). The current SSF
-//! walker decodes the coefficient indices using a *flat* `i_alloc_table`
-//! seeded from `alloc_offset_bits` (see [`crate::ssf::parse_ssf_ac_data`]
-//! for the in-spec degenerate case) — that matches what the no-heuristic
-//! synthesis path consumes here.
+//! Pseudocodes 27 / 28 / 29 / 30 (§5.2.5.2.2 Heuristic Scaling +
+//! `Map_dB_to_Lin` / `Map_Lin_to_dB`) are landed in
+//! [`apply_heuristic_scaling`] / [`heuristic_scaling`] /
+//! [`map_db_to_lin_q10`] / [`map_lin_to_db_q10`]. The §5.2.5.2.0 selector
+//! says:
+//!
+//!   * `f_rfu == 0`           — `env_alloc_mod = env_alloc`, `f_gain_q = 1`.
+//!   * `f_rfu > 0 && var_pres` — same as above (variance-preserving path
+//!     forbids heuristic scaling).
+//!   * `f_rfu > 0 && !var_pres` — pseudocodes 27/28 produce
+//!     `(env_alloc_mod[band], f_gain_q[band])`.
+//!
+//! [`synthesize_granule`] now dispatches on this rule so every block is
+//! handled — historically only the no-rfu short-circuit was implemented.
 
 use crate::ssf::{SsfBlock, SsfData, SsfGranule, StrideFlag};
 use crate::ssf_ac::{idx_to_reconstruction, SsfRandGenState};
 use crate::ssf_pred_coeff::{ssf_pred_coeff_mat, SSF_PRED_MAT_DIMS};
 use crate::ssf_tables::{
-    POST_GAIN_LUT, PRED_GAIN_QUANT_TAB, PRED_RFS_TABLE, PRED_RTS_TABLE, STEP_SIZES_Q4_15,
+    OFFSETS_DB_TO_LIN, OFFSETS_LIN_TO_DB, POST_GAIN_LUT, PRED_GAIN_QUANT_TAB, PRED_RFS_TABLE,
+    PRED_RTS_TABLE, SLOPES_DB_TO_LIN, SLOPES_LIN_TO_DB, STEP_SIZES_Q4_15,
 };
 
 /// `NUM_SPEC_BUF` from §5.2.6 (subband predictor spectrum history depth).
@@ -288,6 +294,237 @@ pub fn compute_helpers(f_pred_gain: f32, variance_preserving: bool) -> SpectrumH
         f_adaptive_noise_gain,
         f_adaptive_noise_gain_var_pres,
     }
+}
+
+// === Pseudocode 29: Map_dB_to_Lin ===========================================
+
+/// §5.2.5.2.2 Pseudocode 29 — `Map_dB_to_Lin(iInput)`.
+///
+/// `iInput` is in `Qx.10` (10 fractional bits). Result is in `Qx.10`. The
+/// function clamps to `100 << 10` for indices outside the 10-row LUT
+/// ([`SLOPES_DB_TO_LIN`] / [`OFFSETS_DB_TO_LIN`]).
+pub fn map_db_to_lin_q10(i_input_q10: i32) -> i32 {
+    // Q.10 -> Q.4 (the LUT works with 4 fractional bits).
+    let i_input_q4 = i_input_q10 >> 6;
+    // Top bits select the LUT row: each row spans 64 Qx.4 units = 4 dB.
+    let i_index = i_input_q4 >> 6;
+    if i_index >= 0 && i_index < SLOPES_DB_TO_LIN.len() as i32 {
+        let slope = SLOPES_DB_TO_LIN[i_index as usize];
+        let mut i_res = slope * i_input_q4; // Q.8
+        i_res >>= 4; // Q.4
+        i_res += OFFSETS_DB_TO_LIN[i_index as usize]; // both in Q.4
+        i_res << 6 // back to Q.10
+    } else {
+        // Out-of-range: spec returns `100 << 10` (a constant ceiling).
+        100i32 << 10
+    }
+}
+
+// === Pseudocode 30: Map_Lin_to_dB ===========================================
+
+/// §5.2.5.2.2 Pseudocode 30 — `Map_Lin_to_dB(iInput)`.
+///
+/// Input `Qx.10`, output `Q7.10`. Uses [`SLOPES_LIN_TO_DB`] +
+/// [`OFFSETS_LIN_TO_DB`] (50 rows). Out-of-range input clamps to
+/// `40 << 10`.
+pub fn map_lin_to_db_q10(i_input_q10: i32) -> i32 {
+    // Q.10 -> Q.8 (right shift 2).
+    let i_input_q8 = i_input_q10 >> 2;
+    // The spec's `iQuantIn = iInput >> 1` is also documented as Qx.8 in
+    // the comment trail (it's quantizing in half-step increments). The
+    // index then comes from the top byte: each row spans 256 Qx.8 units
+    // (= 1.0 in Q.0 or 2.0 in Q.7 depending on interpretation; we follow
+    // the table-listed spec literally here).
+    let i_quant_in = i_input_q8 >> 1;
+    let i_index = i_quant_in >> 8;
+    let i_int = i_index << (8 + 1); // `iInt = iIndex << (8 + 1)`
+    let i_fract = i_input_q8 - i_int;
+    if i_index >= 0 && i_index < SLOPES_LIN_TO_DB.len() as i32 {
+        let slope = SLOPES_LIN_TO_DB[i_index as usize];
+        let i_tmp2_a = i_index << 1; // Qx.0
+        let i_tmp1 = slope * i_tmp2_a; // Q11.8
+        let i_tmp2_b_q16 = slope * i_fract; // Q11.16
+        let i_tmp2_b = i_tmp2_b_q16 >> 8; // Q11.8
+        let mut i_res = i_tmp1 + i_tmp2_b;
+        i_res += OFFSETS_LIN_TO_DB[i_index as usize]; // Q11.8
+        i_res << 2 // back to Q.10
+    } else {
+        40i32 << 10
+    }
+}
+
+// === Pseudocode 28: HeuristicScaling ========================================
+
+/// §5.2.5.2.2 Pseudocode 28 — `HeuristicScaling(iRfu, env_in, ...) ->
+/// int_weights_dB[]`. All quantities Q.10 unless noted.
+///
+/// `i_rfu_q10` carries `f_rfu` in `Qx.10` fixed-point (1.0 = 1024).
+/// `env_in_q0[]` is the per-band `3 * env_alloc[band]` envelope (one
+/// integer per band). `band_widths_qx0[]` is the per-band bin count.
+///
+/// Returns `int_weights_dB[band]` in `Q.10` (one entry per band).
+pub fn heuristic_scaling(
+    i_rfu_q10: i32,
+    env_in_q0: &[i32],
+    band_widths_qx0: &[i32],
+    num_bins: i32,
+) -> Vec<i32> {
+    let num_bands = env_in_q0.len();
+    if num_bands == 0 {
+        return Vec::new();
+    }
+    const I_DYN_THRESHOLD_Q10: i32 = 40 << 10; // 40.0 in Q.10
+    const I_MAXI_W_DB_Q10: i32 = 15 << 10; // 15.0 in Q.10
+    const I_INV_THREE_Q10: i32 = 341; // ~1/3 * 1024
+
+    let i_max_env: i32 = *env_in_q0.iter().max().unwrap_or(&0);
+    let i_min_env: i32 = *env_in_q0.iter().min().unwrap_or(&0);
+    let i_dyn_unscaled = i_max_env - i_min_env;
+    let i_dyn_q10 = i_dyn_unscaled << 10;
+
+    // env_local in Q.10 (after the optional compression).
+    let mut env_local_q10 = vec![0i32; num_bands];
+    if i_dyn_q10 > I_DYN_THRESHOLD_Q10 && i_dyn_unscaled > 0 {
+        // Compression: scale the (env - min) by iCmpFact = threshold/dyn_unscaled (Q.10).
+        let i_cmp_fact_q10 = I_DYN_THRESHOLD_Q10 / i_dyn_unscaled;
+        for band in 0..num_bands {
+            let v = env_in_q0[band] - i_min_env;
+            // Q.0 * Q.10 = Q.10
+            env_local_q10[band] = v * i_cmp_fact_q10;
+        }
+    } else {
+        for band in 0..num_bands {
+            let v = env_in_q0[band] - i_min_env;
+            env_local_q10[band] = v << 10;
+        }
+    }
+
+    // Sort env_local in descending order, keep the original indices so
+    // we can dereference band_widths through env_indices.
+    let mut env_indices: Vec<usize> = (0..num_bands).collect();
+    env_indices.sort_by(|&a, &b| env_local_q10[b].cmp(&env_local_q10[a]));
+    let env_local_sorted_q10: Vec<i32> = env_indices.iter().map(|&i| env_local_q10[i]).collect();
+
+    // Convert sorted envelope to linear domain via Map_dB_to_Lin.
+    let weights_lin_q10: Vec<i32> = env_local_sorted_q10
+        .iter()
+        .map(|&v| map_db_to_lin_q10(v))
+        .collect();
+
+    // iMtr = sum(weights_lin[band] * band_widths[env_indices[band]]) >> 10,
+    //        then * iRfu >> 7, then * iRfu >> 3.
+    let mut i_mtr: i64 = 0;
+    for band in 0..num_bands {
+        let bw = band_widths_qx0[env_indices[band]] as i64;
+        i_mtr += weights_lin_q10[band] as i64 * bw; // Q.10
+    }
+    i_mtr >>= 10; // Q.0
+    i_mtr *= i_rfu_q10 as i64; // Q.10
+    i_mtr >>= 7;
+    i_mtr *= i_rfu_q10 as i64;
+    i_mtr >>= 3;
+    let i_mtr = i_mtr as i32;
+
+    // Reverse water-filling — find the level that "absorbs" iMtr energy.
+    let mut i_mnt: i64 = 0;
+    let mut i_bsum: i64 = 0;
+    let mut band: usize = 0;
+    while i_mnt < i_mtr as i64 && band < num_bands - 1 {
+        let i_t_curr_lev = weights_lin_q10[band];
+        // Inner: gather all consecutive bands at the current level into iBsum.
+        while band < num_bands - 1 && weights_lin_q10[band] == i_t_curr_lev {
+            i_bsum += band_widths_qx0[env_indices[band]] as i64;
+            band += 1;
+        }
+        let i_tmp2 = (i_t_curr_lev as i64) - (weights_lin_q10[band] as i64); // Q.10
+        let contribution = i_tmp2 * i_bsum; // Q.10
+        i_mnt += contribution;
+    }
+    if i_mnt < i_mtr as i64 {
+        i_bsum = num_bins as i64;
+    }
+    if i_bsum == 0 {
+        i_bsum = 1; // defensive — without this we'd divide by zero on a degenerate input.
+    }
+    let i_tmp = (i_mnt - i_mtr as i64) << 4; // Q.14
+    let i_tmp2 = i_tmp / i_bsum; // Q.14
+    let i_tmp2 = i_tmp2 >> 4; // Q.10
+    let i_t_curr_lev_final = (weights_lin_q10[band] as i64 + i_tmp2) as i32;
+
+    // Compute int_weights_dB[band] for every band — the computation is
+    // not over the sorted order: it iterates over the *original* band
+    // indexing using env_local[band].
+    let mut int_weights_db_q10 = vec![0i32; num_bands];
+    let i_tmp2_db = map_lin_to_db_q10(i_t_curr_lev_final); // Q.10
+    for band in 0..num_bands {
+        // env_local[band] - iTmp2 (both Q.10)
+        let i_tmp = env_local_q10[band] - i_tmp2_db;
+        // * iInvThree (Q.10) → Q.20
+        let i_tmp_q20 = (i_tmp as i64) * (I_INV_THREE_Q10 as i64);
+        // >> 10 → Q.10
+        let i_tmp_q10 = ((i_tmp_q20 >> 10) as i32).clamp(0, I_MAXI_W_DB_Q10);
+        int_weights_db_q10[band] = i_tmp_q10;
+    }
+    int_weights_db_q10
+}
+
+// === Pseudocode 27: Heuristic scaling + envelope allocation modification ====
+
+/// §5.2.5.2.2 Pseudocode 27 — produce
+/// `(env_alloc_mod[band], f_gain_q[band])` from `env_alloc[band]`,
+/// `band_widths[band]`, `num_bins`, and the `f_rfu` helper.
+///
+/// Caller must have already filtered out the `f_rfu == 0 ||
+/// variance_preserving` short-circuit (those paths leave
+/// `env_alloc_mod = env_alloc` and `f_gain_q = 1.0`); this function only
+/// implements the heuristic-scaling branch.
+pub fn apply_heuristic_scaling(
+    env_alloc: &[i32],
+    band_widths: &[u8],
+    num_bins: u32,
+    f_rfu: f32,
+) -> (Vec<i32>, Vec<f32>) {
+    let num_bands = env_alloc.len();
+    if num_bands == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let env_in_q0: Vec<i32> = env_alloc.iter().map(|&v| 3 * v).collect();
+    let band_widths_qx0: Vec<i32> = band_widths
+        .iter()
+        .take(num_bands)
+        .map(|&v| i32::from(v))
+        .collect();
+    let i_rfu_q10 = (f_rfu * 1024.0).round().clamp(0.0, i32::MAX as f32) as i32;
+    let int_weights_db_q10 =
+        heuristic_scaling(i_rfu_q10, &env_in_q0, &band_widths_qx0, num_bins as i32);
+
+    // Pseudocode 27 post-processing.
+    let mut i_w_db = vec![0i32; num_bands];
+    for band in 0..num_bands {
+        // i_w_dB[band] = (int_weights_dB[band] / 2) >> 10 (Q.0)
+        i_w_db[band] = (int_weights_db_q10[band] / 2) >> 10;
+    }
+    // LF-boost.
+    const LF_BOOST_THRESHOLD: i32 = 3;
+    if i_w_db[0] > LF_BOOST_THRESHOLD {
+        i_w_db[0] -= LF_BOOST_THRESHOLD;
+    } else {
+        i_w_db[0] = 0;
+    }
+
+    let mut f_gain_q = vec![1.0_f32; num_bands];
+    let mut env_alloc_mod = vec![0i32; num_bands];
+    for band in 0..num_bands {
+        // f_w_dB = float(int_weights_dB[band]) — the spec says "conversion
+        // from Qx.10 to float" without giving a divisor; the surrounding
+        // expression `pow(10, 1.5/20 * f_w_dB)` becomes nonsensical at
+        // Q.10 magnitudes (1024 ≡ 1.0), so we treat the conversion as
+        // "scale Q.10 -> float in dB units".
+        let f_w_db = int_weights_db_q10[band] as f32 / 1024.0;
+        f_gain_q[band] = (10.0_f32).powf(1.5 / 20.0 * f_w_db);
+        env_alloc_mod[band] = (env_alloc[band] - i_w_db[band]).clamp(ENV_MIN, ENV_MAX);
+    }
+    (env_alloc_mod, f_gain_q)
 }
 
 // === Pseudocode 31: lossless decoding allocation table ======================
@@ -828,6 +1065,10 @@ pub fn synthesize_granule(
         .map(|b| (layout.start_bin[b] as usize, layout.end_bin[b] as usize))
         .collect();
 
+    // Pseudocode 28 needs the per-band bin counts from the SSF
+    // bandwidths matrix (Annex C.1) — fetch once per granule.
+    let band_widths_full = crate::ssf::ssf_band_widths_for(granule.n_mdct);
+
     let mut out = vec![0.0_f32; num_blocks * n_mdct];
     for block_idx in 0..num_blocks {
         let blk = &granule.blocks[block_idx];
@@ -842,9 +1083,21 @@ pub fn synthesize_granule(
         );
         // Pseudocode 26 — helpers.
         let helpers = compute_helpers(f_pred_gain, blk.variance_preserving);
-        // Pseudocode 31 — alloc table (no-rfu path: env_alloc_mod ==
-        // env_alloc).
-        let i_alloc_table = build_alloc_table(&env_alloc[block_idx], blk.alloc_offset_bits);
+        // Pseudocode 27/28 — heuristic scaling. The §5.2.5.2.0 selector
+        // gates the heuristic-scaling path on `f_rfu > 0 &&
+        // !variance_preserving`; otherwise env_alloc_mod = env_alloc and
+        // f_gain_q = 1.
+        let (env_alloc_mod, f_gain_q) = match band_widths_full.as_ref() {
+            Some(bw) if helpers.f_rfu > 0.0 && !blk.variance_preserving => apply_heuristic_scaling(
+                &env_alloc[block_idx],
+                &bw[..num_bands],
+                num_bins as u32,
+                helpers.f_rfu,
+            ),
+            _ => (env_alloc[block_idx].clone(), vec![1.0_f32; num_bands]),
+        };
+        // Pseudocode 31 — alloc table from env_alloc_mod.
+        let i_alloc_table = build_alloc_table(&env_alloc_mod, blk.alloc_offset_bits);
         // Pseudocode 32 — inverse quantization.
         let mut f_spec_invq = vec![0.0_f32; num_bins];
         inverse_quantize_block(
@@ -857,10 +1110,11 @@ pub fn synthesize_granule(
             &mut state.dither_rng,
             &mut f_spec_invq,
         );
-        // Pseudocode 34 — heuristic inverse scale (no-op when f_gain_q
-        // is all 1s, which it is in the no-rfu path).
-        let f_gain_q = vec![1.0_f32; num_bands];
-        inverse_heuristic_scale(&mut f_spec_invq, &bands, &f_gain_q);
+        // Pseudocode 34 — heuristic inverse scale (skipped when
+        // variance_preserving — §5.2.5.2.0 step 5).
+        if !blk.variance_preserving {
+            inverse_heuristic_scale(&mut f_spec_invq, &bands, &f_gain_q);
+        }
         let f_spec_res = f_spec_invq;
         // Pseudocode 35-37 — subband predictor. Uses f_spec_prev (the
         // previous block's *output*) — empty on the first I-block.
@@ -1279,5 +1533,189 @@ mod tests {
         // After both granules, state.env_prev must equal g1_env's
         // resolved form.
         assert_eq!(state.env_prev, decode_envelope(&g1_env));
+    }
+
+    // === Pseudocodes 27/28/29/30 ===========================================
+
+    #[test]
+    fn map_db_to_lin_zero_input() {
+        // 0 dB → SLOPES_DB_TO_LIN[0] * 0 + OFFSETS_DB_TO_LIN[0] = 16 in
+        // Q.4, then shifted left by 6 → 16 * 64 = 1024 in Q.10.
+        let r = map_db_to_lin_q10(0);
+        assert_eq!(r, 16 << 6);
+    }
+
+    #[test]
+    fn map_db_to_lin_out_of_range_clamps() {
+        // Anything above 10 LUT rows (each row covers 4 dB → 40 dB total)
+        // clamps to 100 << 10. iIndex >= 10 means iInput_q4 >= 640 i.e.
+        // iInput_q10 >= 640 << 6 = 40960. Push well past:
+        let r = map_db_to_lin_q10(40 << 10); // exactly at boundary
+        assert_eq!(r, 100i32 << 10);
+        let r = map_db_to_lin_q10(60 << 10); // far past
+        assert_eq!(r, 100i32 << 10);
+    }
+
+    #[test]
+    fn map_db_to_lin_monotone_within_table() {
+        // Within row 0, walking up should not decrease.
+        let mut prev = i32::MIN;
+        for q10 in (0i32..(4 << 10)).step_by(64) {
+            let r = map_db_to_lin_q10(q10);
+            assert!(r >= prev, "non-monotone at q10={q10}: {r} < {prev}");
+            prev = r;
+        }
+    }
+
+    #[test]
+    fn map_lin_to_db_zero_input() {
+        // iIndex = 0, iFract = 0 → iTmp1 = 0, iTmp2_b = 0,
+        // iRes = OFFSETS_LIN_TO_DB[0] = -1221, then << 2 = -4884.
+        let r = map_lin_to_db_q10(0);
+        assert_eq!(r, OFFSETS_LIN_TO_DB[0] << 2);
+    }
+
+    #[test]
+    fn map_lin_to_db_out_of_range_clamps() {
+        // iIndex >= 50 → 40 << 10 = 40960.
+        let r = map_lin_to_db_q10(i32::MAX / 4); // huge
+        assert_eq!(r, 40i32 << 10);
+    }
+
+    #[test]
+    fn heuristic_scaling_zero_envelope_yields_zero_weights() {
+        // All bands at zero → iMaxEnv == iMinEnv, iDyn == 0, env_local
+        // is all zero. Sorted is all zero. weights_lin from
+        // map_db_to_lin(0) = 1024 (Q.10). iMtr accumulates and gets
+        // multiplied by iRfu twice; with zero rfu it stays zero. Then
+        // the water-filling loop never iterates, iBsum stays 0, then is
+        // clamped to 1; iTmp = 0 / 1 = 0; iTCurrLevFinal = weights_lin[0]
+        // = 1024. Map_Lin_to_dB(1024) is some constant. Then for each
+        // band, env_local[band] - iTmp2 < 0 → clamped to 0. So all
+        // weights end up 0.
+        let env_in = vec![0i32; 12];
+        let bw = vec![15i32; 12];
+        let res = heuristic_scaling(0, &env_in, &bw, 180);
+        assert_eq!(res.len(), 12);
+        assert!(res.iter().all(|&v| v == 0), "got {res:?}");
+    }
+
+    #[test]
+    fn heuristic_scaling_clamps_to_max() {
+        // With huge envelope spread + max iRfu (1.0 in Q.10) the weights
+        // should clamp to I_MAXI_W_DB_Q10 (15 << 10 = 15360) for some bands.
+        let env_in = vec![0i32, 100, 200, 300, 400, 500];
+        let bw = vec![10i32; 6];
+        let res = heuristic_scaling(1024, &env_in, &bw, 60);
+        assert_eq!(res.len(), 6);
+        // Every weight is in [0, 15360].
+        for &v in &res {
+            assert!((0..=15360).contains(&v), "weight out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn apply_heuristic_scaling_short_circuits_on_empty() {
+        let (mod_, gq) = apply_heuristic_scaling(&[], &[], 0, 0.5);
+        assert!(mod_.is_empty());
+        assert!(gq.is_empty());
+    }
+
+    #[test]
+    fn apply_heuristic_scaling_clamps_env_alloc_mod() {
+        // env_alloc inputs near ENV_MIN/ENV_MAX should still produce
+        // env_alloc_mod within [ENV_MIN, ENV_MAX].
+        let env_alloc = vec![ENV_MAX, ENV_MIN, 0, 10, -10, 30];
+        let bw = vec![15u8; 6];
+        let (mod_, gq) = apply_heuristic_scaling(&env_alloc, &bw, 90, 0.6);
+        assert_eq!(mod_.len(), 6);
+        assert_eq!(gq.len(), 6);
+        for &v in &mod_ {
+            assert!(
+                (ENV_MIN..=ENV_MAX).contains(&v),
+                "env_alloc_mod out of range: {v}"
+            );
+        }
+        for &g in &gq {
+            assert!(g.is_finite() && g > 0.0, "f_gain_q invalid: {g}");
+        }
+    }
+
+    #[test]
+    fn synthesize_granule_runs_with_heuristic_scaling_branch() {
+        // Drive the heuristic-scaling path: f_pred_gain in (0, 2) with
+        // variance_preserving == false. Block must have predictor_presence
+        // = true, and pred_gain_idx in the middle of PRED_GAIN_QUANT_TAB
+        // (index 15 → ~0.527 → f_rfu = 0.527 > 0).
+        let blk = SsfBlock {
+            predictor_presence: true,
+            delta_flag: false,
+            predictor_lag_bits: 200,
+            pred_gain_idx: Some(15),
+            variance_preserving: false,
+            ..SsfBlock::default()
+        };
+        let env_curr = vec![-28i32, 16, 16, 17, 16, 16, 16, 16, 16, 16, 16, 16];
+        let granule = SsfGranule {
+            b_iframe: true,
+            stride_flag: StrideFlag::LongStride,
+            num_bands: 12,
+            start_block: 0,
+            end_block: 1, // predictor live in block 0
+            num_blocks: 1,
+            n_mdct: 960,
+            num_bins: 140,
+            env_curr_band0_bits: 0,
+            env_startup_band0_bits: None,
+            env_curr,
+            env_startup: None,
+            blocks: vec![blk],
+            ac_bits_used: 30,
+        };
+        let mut state = SsfSynthState::new();
+        let pcm_spec = synthesize_granule(&granule, &[], &mut state);
+        assert_eq!(pcm_spec.len(), 960);
+        for &v in &pcm_spec {
+            assert!(v.is_finite(), "non-finite output: {v}");
+        }
+    }
+
+    #[test]
+    fn synthesize_granule_variance_preserving_skips_heuristic() {
+        // With variance_preserving = true, even when f_rfu > 0 the
+        // §5.2.5.2.0 selector mandates env_alloc_mod = env_alloc and
+        // f_gain_q = 1; no heuristic-scaling pass. Just check the run
+        // completes finite.
+        let blk = SsfBlock {
+            predictor_presence: true,
+            delta_flag: false,
+            predictor_lag_bits: 200,
+            pred_gain_idx: Some(15),
+            variance_preserving: true,
+            ..SsfBlock::default()
+        };
+        let env_curr = vec![-28i32, 16, 16, 17, 16, 16, 16, 16, 16, 16, 16, 16];
+        let granule = SsfGranule {
+            b_iframe: true,
+            stride_flag: StrideFlag::LongStride,
+            num_bands: 12,
+            start_block: 0,
+            end_block: 1,
+            num_blocks: 1,
+            n_mdct: 960,
+            num_bins: 140,
+            env_curr_band0_bits: 0,
+            env_startup_band0_bits: None,
+            env_curr,
+            env_startup: None,
+            blocks: vec![blk],
+            ac_bits_used: 30,
+        };
+        let mut state = SsfSynthState::new();
+        let pcm_spec = synthesize_granule(&granule, &[], &mut state);
+        assert_eq!(pcm_spec.len(), 960);
+        for &v in &pcm_spec {
+            assert!(v.is_finite(), "non-finite output: {v}");
+        }
     }
 }

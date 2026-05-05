@@ -148,8 +148,23 @@ framework but usable standalone.
 > threads it through the SSF body parses so dither / noise RNGs
 > (Pseudocodes 54-57) and `prev_pred_lag_idx` / `last_num_bands`
 > persist across frames — pre-r32 the walker built a fresh state
-> per frame and dropped it. **483 tests** (470 lib + 5 + 8
-> integration).
+> per frame and dropped it. Round 33 lands **§5.2.5.2.2 Heuristic
+> Scaling (Pseudocodes 27/28/29/30)** — the predictor-enabled
+> spectrum-decoding branch the spec's `f_rfu == 0` short-circuit
+> previously skipped. New `map_db_to_lin_q10()` / `map_lin_to_db_q10()`
+> Q.10 fixed-point converters use the Annex C.14 LUTs;
+> `heuristic_scaling()` runs the full Pseudocode 28 chain
+> (dynamic-range compression of `env_in[]`, sorted-descending
+> `Map_dB_to_Lin`, `iRfu²`-weighted reverse water-filling,
+> `Map_Lin_to_dB`-driven per-band weight); `apply_heuristic_scaling()`
+> wraps it with the Pseudocode 27 `env_in = 3 * env_alloc` pre-multiply,
+> LF-boost, and `(env_alloc_mod, f_gain_q)` post-processing.
+> `synthesize_granule()` dispatches the §5.2.5.2.0 selector — when
+> `f_rfu > 0 && !variance_preserving` the heuristic-scaling branch
+> fires and `inverse_heuristic_scale()` consumes the resulting
+> `f_gain_q[]` instead of the all-1 stub; `variance_preserving` blocks
+> correctly skip the inverse-scale call per §5.2.5.2.0 step 5.
+> **494 tests** (481 lib + 5 + 8 integration).
 
 ## Specs
 
