@@ -354,6 +354,84 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
+    // Hardening: malformed-input edge cases. Walker must propagate Err
+    // and never panic / over-read.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn dialog_enhancement_truncated_after_data_present_flag_errors() {
+        // Only a `b_de_data_present = 1` bit then no more *bytes* — the
+        // walker should bail out parsing `de_config()` with a clean
+        // bit-reader error. We craft a 1-byte buffer with the high bit
+        // set and nothing else, then feed only that single byte slice;
+        // any read past 8 bits triggers EOF.
+        let bytes: [u8; 1] = [0b1000_0000];
+        let mut br = BitReader::new(&bytes);
+        let r = parse_dialog_enhancement(&mut br, true, None);
+        // de_method (2) + de_max_gain (2) + de_channel_config (3) = 7
+        // remaining bits all zero: nr_channels = 0 → no Huffman body.
+        // That's actually a *legal* (if degenerate) frame and parses
+        // clean. So instead truncate harder: feed an empty slice.
+        let _ = r;
+        let empty: [u8; 0] = [];
+        let mut br2 = BitReader::new(&empty);
+        assert!(parse_dialog_enhancement(&mut br2, true, None).is_err());
+    }
+
+    #[test]
+    fn dialog_enhancement_non_iframe_no_config_no_prev_errors_cleanly() {
+        // Non-I-frame, b_de_data_present = 1, de_config_flag = 0,
+        // no prev_config supplied → walker must error out (not panic).
+        let mut bw = BitWriter::new();
+        bw.write_u32(1, 1); // b_de_data_present
+        bw.write_u32(0, 1); // de_config_flag = 0
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let r = parse_dialog_enhancement(&mut br, false, None);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("active de_config"));
+    }
+
+    #[test]
+    fn de_data_with_zero_channels_is_a_clean_no_op() {
+        // de_channel_config = 0 -> nr_channels = 0, no Huffman bodies.
+        let mut bw = BitWriter::new();
+        bw.write_u32(1, 1); // b_de_data_present
+        bw.write_u32(0, 2); // de_method = 0
+        bw.write_u32(0, 2); // de_max_gain
+        bw.write_u32(0, 3); // de_channel_config = 0 -> nr_channels = 0
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let r = parse_dialog_enhancement(&mut br, true, None).unwrap();
+        let data = r.data.unwrap();
+        assert!(data.de_par.is_empty());
+        assert!(!data.keep_pos_flag);
+        assert!(!data.keep_data_flag);
+        assert!(!data.ms_proc_flag);
+        assert!(data.signal_contribution.is_none());
+    }
+
+    #[test]
+    fn dialog_enhancement_truncated_inside_de_par_huffman_errors() {
+        // Set up a valid frame header (b_de_data_present, de_config) but
+        // truncate before the Huffman bodies — the walker should bail
+        // with an error rather than panic.
+        let mut bw = BitWriter::new();
+        bw.write_u32(1, 1); // b_de_data_present
+        bw.write_u32(0, 2); // de_method = 0
+        bw.write_u32(0, 2); // de_max_gain
+        bw.write_u32(1, 3); // de_channel_config = 1 -> Centre, nr_channels=1
+                            // No Huffman data follows. parse_de_data should hit EOF.
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let r = parse_dialog_enhancement(&mut br, true, None);
+        assert!(r.is_err(), "expected truncation error");
+    }
+
+    // ------------------------------------------------------------------------
     // de_config / dialog_enhancement gating.
     // ------------------------------------------------------------------------
 

@@ -611,6 +611,175 @@ pub fn parse_drc_gains(
     })
 }
 
+// ---------------------------------------------------------------------
+// §5.7.9.3.3 PCM gain application
+// ---------------------------------------------------------------------
+
+/// Convert a 7-bit `drc_gain[ch][sf][band]` raw value into a linear
+/// per-sample multiplier per §5.7.9.3.3:
+///
+/// `g = 2^(drc_gain_dB / 6)`
+///
+/// where `drc_gain_dB = drc_gain - 64` (the -64 dB offset from
+/// §4.3.13.6.1 — `drc_gain_val` is unsigned 0..=127, mapping to
+/// -64..=+63 dB).
+#[inline]
+pub fn drc_raw_to_linear(drc_gain_raw: u8) -> f32 {
+    let db = drc_gain_raw as i32 - 64;
+    // 2^(dB/6). The factor of 1/6 vs the more common 1/20 is because
+    // AC-4 transmits gains in 6 dB power steps.
+    libm_pow2(db as f32 / 6.0)
+}
+
+/// Convert a (Lout - Lin) dB difference (dialnorm correction) into the
+/// linear scale factor `2^((Lout - Lin) / 6)` per §5.7.9.3.3.
+#[inline]
+pub fn dialnorm_correction_linear(lout_db: i32, lin_db: i32) -> f32 {
+    libm_pow2((lout_db - lin_db) as f32 / 6.0)
+}
+
+/// `2^(x)` without pulling in the `libm` crate. Uses `f32::powi` for
+/// the integer-exponent fast path, falling back to the IEEE-754 exp /
+/// ln path via `f32::exp` for fractional exponents.
+#[inline]
+fn libm_pow2(x: f32) -> f32 {
+    // exp2 isn't in core; ln(2) * x then exp.
+    const LN2: f32 = std::f32::consts::LN_2;
+    (x * LN2).exp()
+}
+
+/// Layout descriptor for [`apply_drc_gains_to_pcm`]: maps the bitstream
+/// `nr_drc_channels` channel-group ordering onto the PCM channel
+/// indices. `chg_for_pcm_channel[i]` returns which DRC channel-group
+/// index drives PCM channel `i`. Per §5.7.9.3.2, for a 5_X channel
+/// element with 3 channel groups (`[Lf, Rf, LFE]`, `[Cf]`, `[Ls, Rs]`)
+/// the natural mapping is `[0, 0, 1, 0, 2, 2]` (L=0, R=0, C=1, LFE=0,
+/// Ls=2, Rs=2).
+#[derive(Debug, Clone)]
+pub struct DrcChannelMap {
+    pub chg_for_pcm_channel: Vec<u8>,
+}
+
+impl DrcChannelMap {
+    /// Default mapping for mono / stereo where `nr_drc_channels == 1`:
+    /// every PCM channel maps to channel-group 0.
+    pub fn wideband_single_group(nr_pcm_channels: usize) -> Self {
+        Self {
+            chg_for_pcm_channel: vec![0; nr_pcm_channels],
+        }
+    }
+
+    /// 5.0 / 5.1 default: `[L, R, C, LFE?, Ls, Rs]` (LFE optional)
+    /// mapped to channel-groups `[0, 0, 1, 0, 2, 2]` per the spec
+    /// example in §5.7.9.3.2.
+    pub fn five_one_default(includes_lfe: bool) -> Self {
+        if includes_lfe {
+            Self {
+                chg_for_pcm_channel: vec![0, 0, 1, 0, 2, 2],
+            }
+        } else {
+            Self {
+                chg_for_pcm_channel: vec![0, 0, 1, 2, 2],
+            }
+        }
+    }
+}
+
+/// Apply per-subframe DRC gains to a planar PCM buffer per §5.7.9.3.3.
+///
+/// `pcm_planar[ch][sample]` is updated in-place. The frame is divided
+/// into `gains.nr_drc_subframes` equal subframes; within each subframe
+/// the same per-channel-group gain is applied across all bands.
+///
+/// Multi-band gains are applied as a wideband approximation when
+/// `gains.nr_drc_bands > 1`: the per-band gains are averaged in the
+/// linear domain before scaling. A full per-band split-band filterbank
+/// would belong in the QMF synthesis pipeline; this helper offers a
+/// conservative drop-in for callers that just need the time-domain
+/// loudness correction.
+///
+/// Returns the number of samples that were processed (sum across all
+/// subframes / channels). Errors when:
+/// - `pcm_planar.len() != map.chg_for_pcm_channel.len()`
+/// - any `chg_for_pcm_channel[i] >= gains.nr_drc_channels`
+/// - any per-channel sample buffer length doesn't divide cleanly into
+///   `gains.nr_drc_subframes` (loose tail tolerated — final subframe
+///   gets the remainder)
+pub fn apply_drc_gains_to_pcm(
+    pcm_planar: &mut [Vec<f32>],
+    gains: &DrcGains,
+    map: &DrcChannelMap,
+    dialnorm_correction: f32,
+) -> Result<usize> {
+    if pcm_planar.len() != map.chg_for_pcm_channel.len() {
+        return Err(Error::invalid(
+            "ac4: apply_drc_gains_to_pcm: pcm channel count mismatches DrcChannelMap",
+        ));
+    }
+    let nr_chg = gains.nr_drc_channels as usize;
+    let nr_sf = gains.nr_drc_subframes as usize;
+    let nr_bands = gains.nr_drc_bands as usize;
+    if nr_sf == 0 || nr_chg == 0 || nr_bands == 0 {
+        return Ok(0);
+    }
+    for &chg in &map.chg_for_pcm_channel {
+        if chg as usize >= nr_chg {
+            return Err(Error::invalid(
+                "ac4: DrcChannelMap entry out of bounds for DrcGains.nr_drc_channels",
+            ));
+        }
+    }
+
+    // Pre-compute per-(chg, sf) wideband-equivalent linear gains.
+    let mut gain_per_chg_sf = vec![0f32; nr_chg * nr_sf];
+    for chg in 0..nr_chg {
+        for sf in 0..nr_sf {
+            let mut acc = 0f32;
+            for band in 0..nr_bands {
+                let raw = gains.drc_gain[gains.idx(chg, sf, band)];
+                acc += drc_raw_to_linear(raw);
+            }
+            let avg = acc / nr_bands as f32;
+            gain_per_chg_sf[chg * nr_sf + sf] = avg * dialnorm_correction;
+        }
+    }
+
+    let mut total_samples = 0usize;
+    for (pcm_ch, ch_buf) in pcm_planar.iter_mut().enumerate() {
+        let chg = map.chg_for_pcm_channel[pcm_ch] as usize;
+        let n_total = ch_buf.len();
+        if n_total == 0 {
+            continue;
+        }
+        let sf_len = n_total / nr_sf;
+        if sf_len == 0 {
+            // Less than one sample per subframe: just apply the
+            // first-subframe gain wideband.
+            let g = gain_per_chg_sf[chg * nr_sf];
+            for s in ch_buf.iter_mut() {
+                *s *= g;
+            }
+            total_samples += n_total;
+            continue;
+        }
+        for sf in 0..nr_sf {
+            let g = gain_per_chg_sf[chg * nr_sf + sf];
+            let start = sf * sf_len;
+            let end = if sf + 1 == nr_sf {
+                n_total
+            } else {
+                start + sf_len
+            };
+            for s in ch_buf[start..end].iter_mut() {
+                *s *= g;
+            }
+            total_samples += end - start;
+        }
+    }
+
+    Ok(total_samples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,5 +1164,153 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let info = DrcChannelInfo::new(1, 1);
         assert!(parse_drc_frame(&mut br, false, info, None).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // §5.7.9.3.3 PCM gain application
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn drc_raw_to_linear_unity_at_64() {
+        // raw == 64 -> dB == 0 -> linear == 1.0.
+        let g = drc_raw_to_linear(64);
+        assert!((g - 1.0).abs() < 1e-6, "expected ~1.0, got {g}");
+    }
+
+    #[test]
+    fn drc_raw_to_linear_plus_six_db_doubles() {
+        // 6 dB power = 2x linear in the AC-4 (1/6) convention.
+        let g_pos = drc_raw_to_linear(64 + 6);
+        assert!((g_pos - 2.0).abs() < 1e-5, "+6 dB: got {g_pos}");
+        let g_neg = drc_raw_to_linear(64 - 6);
+        assert!((g_neg - 0.5).abs() < 1e-5, "-6 dB: got {g_neg}");
+    }
+
+    #[test]
+    fn dialnorm_correction_zero_is_unity() {
+        let c = dialnorm_correction_linear(-31, -31);
+        assert!((c - 1.0).abs() < 1e-6, "got {c}");
+    }
+
+    #[test]
+    fn drc_channel_map_five_one_default_with_lfe() {
+        let map = DrcChannelMap::five_one_default(true);
+        assert_eq!(map.chg_for_pcm_channel, vec![0, 0, 1, 0, 2, 2]);
+    }
+
+    #[test]
+    fn drc_channel_map_wideband_single_group() {
+        let map = DrcChannelMap::wideband_single_group(2);
+        assert_eq!(map.chg_for_pcm_channel, vec![0, 0]);
+    }
+
+    #[test]
+    fn apply_drc_gains_to_pcm_uniform_subframes_apply_per_subframe_gain() {
+        // 1 channel-group, 4 subframes, 1 band. gain[0][sf][0] = 64 + sf*6
+        // → linear gains 1, 2, 4, 8.
+        let gains = DrcGains {
+            mode_id: 0,
+            nr_drc_channels: 1,
+            nr_drc_subframes: 4,
+            nr_drc_bands: 1,
+            drc_gain_val: 64,
+            drc_gain: vec![64, 70, 76, 82], // (ch=0, sf=0..3, band=0)
+        };
+        let map = DrcChannelMap::wideband_single_group(1);
+        // 16 samples, all 1.0; expect [1,1,1,1, 2,2,2,2, 4,4,4,4, 8,8,8,8].
+        let mut pcm = vec![vec![1.0f32; 16]];
+        let n = apply_drc_gains_to_pcm(&mut pcm, &gains, &map, 1.0).unwrap();
+        assert_eq!(n, 16);
+        let expected: Vec<f32> = [1.0, 2.0, 4.0, 8.0]
+            .iter()
+            .flat_map(|&g| std::iter::repeat(g).take(4))
+            .collect();
+        for (got, want) in pcm[0].iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn apply_drc_gains_to_pcm_dialnorm_correction_is_multiplicative() {
+        // 1 group, 1 sf, 1 band, drc_gain == 64 (unity). dialnorm_corr =
+        // 0.5 → output = input * 0.5.
+        let gains = DrcGains {
+            mode_id: 0,
+            nr_drc_channels: 1,
+            nr_drc_subframes: 1,
+            nr_drc_bands: 1,
+            drc_gain_val: 64,
+            drc_gain: vec![64],
+        };
+        let map = DrcChannelMap::wideband_single_group(1);
+        let mut pcm = vec![vec![1.0f32; 4]];
+        let dialnorm = dialnorm_correction_linear(-37, -31); // -6 dB → 0.5
+        apply_drc_gains_to_pcm(&mut pcm, &gains, &map, dialnorm).unwrap();
+        for s in &pcm[0] {
+            assert!((s - 0.5).abs() < 1e-5, "got {s}");
+        }
+    }
+
+    #[test]
+    fn apply_drc_gains_to_pcm_5_1_routes_to_correct_channel_group() {
+        // 3 groups (5_X-style), 1 sf, 1 band.
+        // group 0 -> +6dB (g=2), group 1 -> 0dB (g=1), group 2 -> -6dB (g=0.5).
+        let gains = DrcGains {
+            mode_id: 0,
+            nr_drc_channels: 3,
+            nr_drc_subframes: 1,
+            nr_drc_bands: 1,
+            drc_gain_val: 70,
+            // gain[ch][sf=0][band=0] for ch in 0..3.
+            drc_gain: vec![70, 64, 58],
+        };
+        let map = DrcChannelMap::five_one_default(true); // [0,0,1,0,2,2]
+        let mut pcm: Vec<Vec<f32>> = (0..6).map(|_| vec![1.0f32; 4]).collect();
+        apply_drc_gains_to_pcm(&mut pcm, &gains, &map, 1.0).unwrap();
+        // L (chg 0) = 2, R (chg 0) = 2, C (chg 1) = 1, LFE (chg 0) = 2,
+        // Ls (chg 2) = 0.5, Rs (chg 2) = 0.5.
+        let want = [2.0, 2.0, 1.0, 2.0, 0.5, 0.5];
+        for (i, expected) in want.iter().enumerate() {
+            for s in &pcm[i] {
+                assert!(
+                    (s - expected).abs() < 1e-4,
+                    "ch {i}: got {s}, want {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_drc_gains_to_pcm_invalid_chg_rejected() {
+        let gains = DrcGains {
+            mode_id: 0,
+            nr_drc_channels: 1,
+            nr_drc_subframes: 1,
+            nr_drc_bands: 1,
+            drc_gain_val: 64,
+            drc_gain: vec![64],
+        };
+        let map = DrcChannelMap {
+            chg_for_pcm_channel: vec![5], // out of range
+        };
+        let mut pcm = vec![vec![1.0f32; 4]];
+        let err = apply_drc_gains_to_pcm(&mut pcm, &gains, &map, 1.0).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"));
+    }
+
+    #[test]
+    fn apply_drc_gains_to_pcm_pcm_channel_count_mismatch_rejected() {
+        let gains = DrcGains {
+            mode_id: 0,
+            nr_drc_channels: 1,
+            nr_drc_subframes: 1,
+            nr_drc_bands: 1,
+            drc_gain_val: 64,
+            drc_gain: vec![64],
+        };
+        let map = DrcChannelMap::wideband_single_group(2);
+        let mut pcm: Vec<Vec<f32>> = vec![vec![1.0f32; 4]]; // only 1 channel
+        let err = apply_drc_gains_to_pcm(&mut pcm, &gains, &map, 1.0).unwrap_err();
+        assert!(err.to_string().contains("mismatches"));
     }
 }

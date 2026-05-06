@@ -33,6 +33,7 @@ use crate::de::{parse_dialog_enhancement, DeConfig, DialogEnhancement};
 use crate::drc::{
     nr_drc_channels, nr_drc_subframes, parse_drc_frame, DrcChannelInfo, DrcConfig, DrcFrame,
 };
+use crate::emdf::{parse_emdf_payloads_substream, EmdfPayloadsSubstream};
 use crate::toc::variable_bits;
 
 // ---------------------------------------------------------------------
@@ -472,9 +473,14 @@ pub struct Metadata {
     pub drc: DrcFrame,
     /// Decoded `dialog_enhancement()`.
     pub dialog_enhancement: DialogEnhancement,
-    /// `b_emdf_payloads_substream` flag (the payload itself is skipped
-    /// today — full EMDF parsing is out of scope for round 15).
+    /// `b_emdf_payloads_substream` flag — true when the optional
+    /// `emdf_payloads_substream()` element is present in the bitstream.
     pub emdf_payloads_substream_present: bool,
+    /// Decoded `emdf_payloads_substream()` (Table 18) when the
+    /// `b_emdf_payloads_substream` flag was set; otherwise `None`.
+    /// Per §4.3.15.1 the terminator payload is consumed but not
+    /// surfaced as an entry.
+    pub emdf_payloads_substream: Option<EmdfPayloadsSubstream>,
     /// Number of bits left over inside the `tools_metadata_size`
     /// envelope after DRC + DE were consumed; the walker skips them
     /// to maintain bit-alignment for the next substream element.
@@ -555,14 +561,12 @@ pub fn parse_metadata(
     skip_n_bits(br, trailing)?;
 
     let emdf_payloads_substream_present = br.read_bit()?;
-    if emdf_payloads_substream_present {
-        // §4.2.4.4 emdf_payloads_substream() is gated by EMDF semantics
-        // that aren't yet implemented in this crate — return an error
-        // rather than silently mis-aligning the bitstream.
-        return Err(Error::invalid(
-            "ac4: emdf_payloads_substream() parsing is not yet implemented",
-        ));
-    }
+    let emdf_payloads_substream = if emdf_payloads_substream_present {
+        // §4.2.4.4 emdf_payloads_substream() — Table 18.
+        Some(parse_emdf_payloads_substream(br)?)
+    } else {
+        None
+    };
 
     Ok(Metadata {
         basic,
@@ -571,6 +575,7 @@ pub fn parse_metadata(
         drc,
         dialog_enhancement,
         emdf_payloads_substream_present,
+        emdf_payloads_substream,
         tools_metadata_trailing_bits: trailing,
     })
 }
@@ -1016,10 +1021,11 @@ mod tests {
     }
 
     #[test]
-    fn metadata_walker_emdf_present_errors_until_implemented() {
+    fn metadata_walker_emdf_present_terminator_only_is_ok() {
         // Same minimal payload but with b_emdf_payloads_substream = 1
-        // → walker errors with "not yet implemented" rather than
-        // mis-aligning.
+        // followed by a bare terminator (5-bit emdf_payload_id == 0)
+        // and the trailing byte_align. Walker now decodes through it
+        // and returns an empty payload list rather than erroring out.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 7); // dialnorm
         bw.write_bit(false); // more
@@ -1030,6 +1036,9 @@ mod tests {
         write_minimal_drc_absent(&mut bw);
         write_minimal_de_absent(&mut bw);
         bw.write_bit(true); // b_emdf_payloads_substream = 1
+                            // emdf_payloads_substream(): just the terminator id == 0, then
+                            // the byte_align inside parse_emdf_payloads_substream.
+        bw.write_u32(0, 5);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -1040,9 +1049,57 @@ mod tests {
             b_dialog: false,
             frame_length: 1024,
         };
-        let err = parse_metadata(&mut br, ctx, &MetadataState::default()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("emdf"), "expected EMDF error, got: {msg}");
+        let m = parse_metadata(&mut br, ctx, &MetadataState::default()).unwrap();
+        assert!(m.emdf_payloads_substream_present);
+        let sub = m
+            .emdf_payloads_substream
+            .as_ref()
+            .expect("present flag set, payload missing");
+        assert!(sub.payloads.is_empty());
+    }
+
+    #[test]
+    fn metadata_walker_emdf_present_with_one_payload_round_trips() {
+        // Same minimal frame followed by emdf_payloads_substream() with
+        // one minimal payload (id = 9, empty bytes, b_discard_unknown_payload = 1).
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 7); // dialnorm
+        bw.write_bit(false); // more
+        bw.write_bit(false); // b_channels_classifier
+        bw.write_bit(false); // b_event_probability
+        bw.write_u32(2, 7); // tools_metadata_size = 2
+        bw.write_bit(false); // b_more_bits
+        write_minimal_drc_absent(&mut bw);
+        write_minimal_de_absent(&mut bw);
+        bw.write_bit(true); // b_emdf_payloads_substream = 1
+                            // Payload 1: id=9, all-zero config gates + discard=1, size=0.
+        bw.write_u32(9, 5);
+        bw.write_bit(false); // b_smpoffst
+        bw.write_bit(false); // b_duration
+        bw.write_bit(false); // b_groupid
+        bw.write_bit(false); // b_codecdata
+        bw.write_bit(true); // b_discard_unknown_payload
+                            // emdf_payload_size = variable_bits(8) → just 8 bits of zero
+                            // and the 1-bit "more" terminator.
+        bw.write_u32(0, 8);
+        bw.write_bit(false); // more
+                             // Terminator id == 0.
+        bw.write_u32(0, 5);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let ctx = MetadataContext {
+            channel_mode: channel_mode::MONO,
+            b_iframe: true,
+            b_associated: false,
+            b_dialog: false,
+            frame_length: 1024,
+        };
+        let m = parse_metadata(&mut br, ctx, &MetadataState::default()).unwrap();
+        let sub = m.emdf_payloads_substream.as_ref().unwrap();
+        assert_eq!(sub.payloads.len(), 1);
+        assert_eq!(sub.payloads[0].emdf_payload_id, 9);
+        assert!(sub.payloads[0].payload_bytes.is_empty());
     }
 
     // ------------------------------------------------------------------

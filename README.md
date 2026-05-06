@@ -180,7 +180,33 @@ framework but usable standalone.
 > `acpl_data_2ch` + stereo carrier spectra are present,
 > `run_acpl_5x_mch_pcm()` (Pseudocode 118) fires and fills
 > `pcm_per_channel[0..5]` with L/R/C/Ls/Rs surround PCM.
-> **508 tests** (495 lib + 5 + 8 integration).
+> Round 35 lands the **§4.2.4.4 EMDF payloads substream parser**
+> (Table 18) plus the §4.2.14.14 `emdf_payload_config()` (Table 79) in a
+> new `emdf` module — `parse_emdf_payloads_substream()` walks the
+> while-loop until the `emdf_payload_id == 0` terminator, handles the
+> `id == 31 → variable_bits(5)` extension, decodes the full
+> `EmdfPayloadConfig` (sample-offset / duration / group-id / codecdata /
+> discard / frame-aligned + create-/remove-duplicate / priority /
+> proc_allowed gates per the Table 79 conditional tree), and captures
+> each payload's `emdf_payload_byte[]` verbatim. Defensive caps
+> (`MAX_EMDF_PAYLOADS = 64`, `MAX_EMDF_PAYLOAD_BYTES = 65 536`) bound
+> malformed input. The outer `metadata::parse_metadata` walker now
+> consumes the substream when `b_emdf_payloads_substream == 1` and
+> surfaces it through `Metadata::emdf_payloads_substream` instead of
+> erroring out with "not yet implemented" — real-bitstream metadata can
+> now fully round-trip through the walker. Round 35 also lands the
+> **§5.7.9.3.3 PCM gain application path**: `drc::drc_raw_to_linear()`
+> maps a 7-bit `drc_gain[ch][sf][band]` value to its linear multiplier
+> via `2^((raw-64)/6)`, `dialnorm_correction_linear()` resolves the
+> `2^((Lout-Lin)/6)` dialnorm correction, and
+> `drc::apply_drc_gains_to_pcm()` applies a parsed `DrcGains` (per
+> channel-group, per subframe — multi-band averaged in the linear
+> domain) to a planar `&mut [Vec<f32>]` PCM buffer with a
+> `DrcChannelMap` (helpers for the `[L, R, C, LFE?, Ls, Rs]` 5_X
+> layout and the wideband single-group mono/stereo case). DE walker
+> hardened with three new edge-case tests covering EOF on truncation,
+> non-I-frame without `prev_config`, and the `nr_channels == 0`
+> degenerate case. **518 tests** (505 lib + 5 + 8 integration).
 
 ## Specs
 
@@ -232,6 +258,12 @@ oxideav-ac4 = "0.0"
   downmix params) — the spec's `metadata()` tree is skipped by size,
   not parsed.
 - TS 103 190-2 IFM (immersive / object) extensions.
+- EMDF payload bodies — the outer `emdf_payloads_substream()` walker
+  (Table 18) and `emdf_payload_config()` (Table 79) are parsed but
+  the per-payload `emdf_payload_byte[]` opaque sequence is captured
+  as raw bytes; per-`emdf_payload_id` semantic interpretation lives
+  in the AC-4 EMDF datatype registry [i.14] and is out of scope for
+  the present document.
 
 ## Decode path
 
