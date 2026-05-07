@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 35 — ETSI float-table validation suite** (TS 103 190-1
+  Annex C.1, C.3, C.11 + Annex D.2, D.3):
+  - New `parse_c_float_arrays()` parser in `tests/etsi_table_validation.rs`
+    extracts every `const float` / `const float32` array (1-D and 2-D) from
+    the ETSI accompaniment file `docs/audio/ac4/ts_10319001v010401p0-tables.c`.
+    The existing integer parser (round 20) bailed on the `float` keyword, so
+    the five float-typed reference tables had been silently un-validated.
+  - New `assert_float_table()` / `assert_complex_float_table()` helpers
+    compare Rust `&[f32]` (and `&[(f32, f32)]`) constants against the
+    parsed reference under a 1 ppm absolute / 10 ppm relative epsilon —
+    tight enough to catch a single-digit transcription typo in the visible
+    decimal prefix, loose enough that f32 literal-rounding noise is
+    invisible.
+  - Four new tests:
+    - `etsi_source_parses_floats` — sanity-check that the 5 expected float
+      arrays are parsed with the right lengths (20, 32, 256, 640, 1024).
+    - `validate_ssf_float_tables` — `POST_GAIN_LUT[20]`,
+      `PRED_GAIN_QUANT_TAB[32]`, `RANDOM_NOISE_TABLE[256]` against the
+      Annex C.1 / C.3 / C.11 reference data.
+    - `validate_qmf_window` — the 640-entry Annex D.3 `QWIN` prototype
+      window against the reference.
+    - `validate_aspx_noise_table` — the Annex D.2 `ASPX_NOISE[512][2]`
+      complex-noise table against the reference (flattened row-major to
+      compare `&[(f32, f32)]` against the parsed flat `Vec<f32>`).
+  - Outcome: all 1,860 published float reference values
+    (20 + 32 + 256 + 640 + 1,024) cleared the epsilon test on first run,
+    proving the existing transcriptions in `ssf_tables.rs`, `qmf.rs`, and
+    `aspx_noise.rs` are byte-correct against the ETSI accompaniment data.
+    Future regressions caught at compile-time of the test target rather
+    than at decode-time of a fixture.
+
 - **Round 34 — FIXVAR / VARFIX / VARVAR atsg border derivation + SNF injection + 5_X ASPX_ACPL_3 synthesis** (TS 103 190-1 §5.7.6.3.3.2 + §5.1.4 + §5.7.7.6.2):
   - New `derive_fixvar_atsg()` (§5.7.6.3.3.2 Pseudocode 77, FIXVAR arm): builds
     the signal-envelope border vector right-to-left from `T - var_bord_right` using

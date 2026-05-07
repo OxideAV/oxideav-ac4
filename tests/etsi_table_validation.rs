@@ -22,6 +22,13 @@
 //!
 //! That's 60 codebooks (each is a `(LEN[], CW[])` pair, so 120 arrays
 //! validated end-to-end).
+//!
+//! Round 35 extends the suite to the float-typed accompaniment tables
+//! the integer parser used to skip (`POST_GAIN_LUT`,
+//! `PRED_GAIN_QUANT_TAB`, `RANDOM_NOISE_TABLE`, `QWIN`,
+//! `ASPX_NOISE[512][2]`) under a 1 ppm epsilon — see
+//! [`parse_c_float_arrays`] / [`validate_ssf_float_tables`] /
+//! [`validate_qmf_window`] / [`validate_aspx_noise_table`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -754,12 +761,13 @@ fn assert_i32_table(reference: &HashMap<String, CArray>, c_name: &str, rust: &[i
     }
 }
 
-/// Annex C: scalar lookup tables (POST_GAIN, PRED_RFS / RTS, CDFs,
-/// DITHER, STEP_SIZES, AC_COEFF_MAX_INDEX, dB↔linear LUTs) all match
-/// the canonical accompaniment file byte-for-byte. Float tables
-/// (`POST_GAIN_LUT`, `PRED_GAIN_QUANT_TAB`, `RANDOM_NOISE_TABLE`)
-/// can't go through the integer parser, so they're spot-checked
-/// against unit-test anchors in [`oxideav_ac4::ssf_tables`] instead.
+/// Annex C: scalar lookup tables (PRED_RFS / RTS, CDFs, DITHER,
+/// STEP_SIZES, AC_COEFF_MAX_INDEX, dB↔linear LUTs) all match the
+/// canonical accompaniment file byte-for-byte. The float-typed
+/// scalar tables (`POST_GAIN_LUT`, `PRED_GAIN_QUANT_TAB`,
+/// `RANDOM_NOISE_TABLE`) are validated against the same accompaniment
+/// file by [`validate_ssf_float_tables`] / [`parse_c_float_arrays`]
+/// (round 35) to f32 precision.
 #[test]
 fn validate_ssf_scalar_tables() {
     use oxideav_ac4::ssf_tables::*;
@@ -812,4 +820,245 @@ fn validate_ssf_pred_coeff_matrices() {
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
     );
+}
+
+// ------------------------------------------------------------------------
+// Float-table parser + assertions (round 35)
+//
+// Five float tables in the accompaniment file aren't picked up by the
+// integer parser above (it bails on the `float` / `float32` keyword):
+//
+//   const float    POST_GAIN_LUT[20]
+//   const float    PRED_GAIN_QUANT_TAB[32]
+//   const float32  RANDOM_NOISE_TABLE[256]
+//   const float    QWIN[640]
+//   const float    ASPX_NOISE[512][2]   (only 2-D float in the file)
+//
+// We give them a dedicated tokeniser. Comparison is against an `f32`
+// epsilon tight enough to catch transcription errors (one bit-flip in
+// the visible decimal prefix) but loose enough that the literal-to-f32
+// rounding inside `rustc` and the literal-to-double-then-cast path the
+// C compiler would take are both acceptable.
+// ------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct CFloatArray {
+    values: Vec<f32>,
+}
+
+/// Parse all `const float` and `const float32` arrays. Recognised forms
+/// (whitespace-tolerant):
+///
+///   const float    NAME[N]      = { v0, v1, ... };
+///   const float32  NAME[N]      = { v0, v1, ... };
+///   const float    NAME[A][B]   = { {v00, v01}, {v10, v11}, ... };
+///
+/// 2-D arrays are flattened row-major into the same `Vec<f32>` so the
+/// caller can compare them against a flat `&[f32]` (or against a
+/// `&[(f32, f32)]` after a transmute / reinterpretation). The literal
+/// suffix `f` (e.g. `0.123f`) and embedded `e+NN` exponents are both
+/// accepted.
+fn parse_c_float_arrays(src: &str) -> HashMap<String, CFloatArray> {
+    let mut out = HashMap::new();
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        if &bytes[i..i + 6] != b"const " {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 6;
+
+        // Header: read until '['.
+        let header_start = i;
+        let mut scan = i;
+        while scan < bytes.len() && bytes[scan] != b'[' {
+            if bytes[scan] == b'=' || bytes[scan] == b'{' || bytes[scan] == b';' {
+                break;
+            }
+            scan += 1;
+        }
+        if scan >= bytes.len() || bytes[scan] != b'[' {
+            i = start + 1;
+            continue;
+        }
+        let header = &src[header_start..scan];
+        if !header.contains("float") {
+            // Integer arrays handled by `parse_c_arrays`.
+            i = scan + 1;
+            continue;
+        }
+        let name = match header.split_whitespace().last() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                i = scan + 1;
+                continue;
+            }
+        };
+
+        // Skip past `[N]` or `[N][M]` to find `{`.
+        let mut p = scan;
+        while p < bytes.len() && bytes[p] != b'{' {
+            if bytes[p] == b';' {
+                break;
+            }
+            p += 1;
+        }
+        if p >= bytes.len() || bytes[p] != b'{' {
+            i = p.saturating_add(1).min(bytes.len());
+            continue;
+        }
+
+        // Collect the body until the *outermost* matching `}`.
+        let body_start = p + 1;
+        let mut q = body_start;
+        let mut depth: i32 = 1;
+        while q < bytes.len() && depth > 0 {
+            match bytes[q] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            q += 1;
+        }
+        if q >= bytes.len() {
+            i = body_start;
+            continue;
+        }
+        let body = &src[body_start..q];
+
+        // Tokenise — split on `,`, whitespace, and `{` / `}`. Each
+        // token is either a float literal (possibly with an `f`
+        // suffix and/or scientific notation) or empty.
+        let mut values = Vec::new();
+        for tok in body.split(|c: char| c == ',' || c == '{' || c == '}' || c.is_whitespace()) {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let cleaned = t.trim_end_matches('f').trim_end_matches('F');
+            match cleaned.parse::<f32>() {
+                Ok(v) => values.push(v),
+                Err(_) => {
+                    values.clear();
+                    break;
+                }
+            }
+        }
+        if !values.is_empty() {
+            out.insert(name, CFloatArray { values });
+        }
+        i = q + 1;
+    }
+    out
+}
+
+/// Compare a Rust `&[f32]` against a parsed C float array under an
+/// epsilon tolerance. The accompaniment file uses 6-7 decimal digits,
+/// so an `1e-6` absolute (or relative for big numbers) tolerance is
+/// safely below the printed precision and well above the f32 cast
+/// noise.
+fn assert_float_table(reference: &HashMap<String, CFloatArray>, c_name: &str, rust: &[f32]) {
+    let r = reference
+        .get(c_name)
+        .unwrap_or_else(|| panic!("ETSI source missing float array `{c_name}`"));
+    assert_eq!(
+        r.values.len(),
+        rust.len(),
+        "{c_name}: ETSI value count {} differs from Rust slice {}",
+        r.values.len(),
+        rust.len()
+    );
+    for (i, (&rv, &cv)) in rust.iter().zip(r.values.iter()).enumerate() {
+        let abs_tol = 1.0e-6_f32;
+        let rel_tol = 1.0e-5_f32;
+        let diff = (rv - cv).abs();
+        let allowed = abs_tol.max(rel_tol * cv.abs().max(rv.abs()));
+        assert!(
+            diff <= allowed,
+            "{c_name}[{i}]: Rust={rv:.9}, ETSI={cv:.9}, diff={diff:.3e}, allowed={allowed:.3e}"
+        );
+    }
+}
+
+/// Same as `assert_float_table` but the Rust side is a `&[(f32, f32)]`
+/// (e.g. `ASPX_NOISE_TABLE`). Pairs are flattened to (re, im, re, im, …)
+/// before comparing — matching the row-major flattening of the parser.
+fn assert_complex_float_table(
+    reference: &HashMap<String, CFloatArray>,
+    c_name: &str,
+    rust: &[(f32, f32)],
+) {
+    let flat: Vec<f32> = rust.iter().flat_map(|&(a, b)| [a, b]).collect();
+    assert_float_table(reference, c_name, &flat);
+}
+
+/// Parser sanity: the float arrays we expect must be present and have
+/// the right length.
+#[test]
+fn etsi_source_parses_floats() {
+    let src = strip_c_comments(&etsi_src_or_skip!());
+    let arrays = parse_c_float_arrays(&src);
+
+    // (name, expected length after flattening)
+    let expected: &[(&str, usize)] = &[
+        ("POST_GAIN_LUT", 20),
+        ("PRED_GAIN_QUANT_TAB", 32),
+        ("RANDOM_NOISE_TABLE", 256),
+        ("QWIN", 640),
+        ("ASPX_NOISE", 512 * 2),
+    ];
+    for (name, n) in expected {
+        let a = arrays
+            .get(*name)
+            .unwrap_or_else(|| panic!("ETSI source missing float array `{name}`"));
+        assert_eq!(
+            a.values.len(),
+            *n,
+            "{name}: parsed {} floats, expected {}",
+            a.values.len(),
+            n
+        );
+    }
+}
+
+/// Annex C.1 / C.3 / C.11 scalar float LUTs match the ETSI source
+/// to f32 precision.
+#[test]
+fn validate_ssf_float_tables() {
+    use oxideav_ac4::ssf_tables::*;
+
+    let src = strip_c_comments(&etsi_src_or_skip!());
+    let r = parse_c_float_arrays(&src);
+
+    assert_float_table(&r, "POST_GAIN_LUT", &POST_GAIN_LUT);
+    assert_float_table(&r, "PRED_GAIN_QUANT_TAB", &PRED_GAIN_QUANT_TAB);
+    assert_float_table(&r, "RANDOM_NOISE_TABLE", &RANDOM_NOISE_TABLE);
+}
+
+/// Annex D.3 QMF prototype window matches the ETSI source.
+#[test]
+fn validate_qmf_window() {
+    use oxideav_ac4::qmf::QWIN;
+
+    let src = strip_c_comments(&etsi_src_or_skip!());
+    let r = parse_c_float_arrays(&src);
+
+    assert_float_table(&r, "QWIN", &QWIN);
+}
+
+/// Annex D.2 ASPX noise table — 512 (re, im) complex pairs match the
+/// ETSI source flattened row-major.
+#[test]
+fn validate_aspx_noise_table() {
+    use oxideav_ac4::aspx_noise::ASPX_NOISE_TABLE;
+
+    let src = strip_c_comments(&etsi_src_or_skip!());
+    let r = parse_c_float_arrays(&src);
+
+    assert_complex_float_table(&r, "ASPX_NOISE", &ASPX_NOISE_TABLE);
 }
