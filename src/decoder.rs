@@ -156,6 +156,13 @@ impl Ac4Decoder {
         tna_mode: Option<&[u8]>,
         state: &mut aspx::AspxChannelExtState,
         num_ts_in_ats: u32,
+        // Round 42: §5.7.5 companding tool — applied on the QMF
+        // matrix between envelope adjustment and QMF synthesis when
+        // `b_compand_on == true` for this channel. `false` leaves
+        // the per-channel matrix untouched (the unprocessed branch
+        // of Table 116 — the b_compand_avg averaged branch is not
+        // implemented yet).
+        compand_on: bool,
     ) -> Vec<f32> {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         // Need PCM length as a multiple of 64 for whole QMF slots.
@@ -361,6 +368,16 @@ impl Ac4Decoder {
             state.sine_idx_sb_prev = None;
             state.tsg_ptr_prev = 0;
             state.num_atsg_sig_prev = 0;
+        }
+        // Round 42: §5.7.5 companding — applied per-channel on the
+        // QMF matrix when `b_compand_on == true` for this channel.
+        // The tool operates on the A-SPX-affected band [sbx, sbz)
+        // for the full A-SPX interval (all qmf timeslots in our
+        // single-frame call). Inverts the encoder-side gain
+        // attenuation, shaping the coding noise by the slot-mean
+        // signal energy.
+        if compand_on {
+            aspx::apply_companding_on_qmf(&mut q, tables.sbx, tables.sbz);
         }
         // Inverse QMF synthesis. Transpose q[sb][ts] -> slot[ts][sb] per
         // §4.4.7 inverse QMF synthesis bank.
@@ -619,6 +636,7 @@ impl Ac4Decoder {
     /// the trailer's frequency tables. `slot` indexes the per-channel
     /// `aspx_ext_state` carry-over so each output slot keeps its own
     /// noise / tone / TNS history.
+    #[allow(clippy::too_many_arguments)]
     fn aspx_extend_with_trailer(
         &mut self,
         pcm_in: &[f32],
@@ -627,6 +645,7 @@ impl Ac4Decoder {
         cfg: &aspx::AspxConfig,
         slot: usize,
         num_ts_in_ats: u32,
+        compand_on: bool,
     ) -> Vec<f32> {
         while self.aspx_ext_state.len() <= slot {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
@@ -645,7 +664,27 @@ impl Ac4Decoder {
             ch.tna_mode.as_deref(),
             state,
             num_ts_in_ats,
+            compand_on,
         )
+    }
+
+    /// Round 42: per-output-channel companding-on flag from the
+    /// captured `companding_control(num_chan)` for a 5_X frame. The
+    /// Cfg2 / Cfg0 / Cfg1 / Cfg3 paths all carry
+    /// `companding_control(5)`, indexed by the 5_X output channel
+    /// `slot` (0..4 in L/R/C/Ls/Rs order). If sync_flag == true,
+    /// `compand_on[0]` applies to all five channels (Table 116).
+    /// Returns `false` whenever the parsed flags don't reach the
+    /// requested slot — round-42 falls back to "unprocessed" rather
+    /// than implementing the b_compand_avg averaging branch.
+    fn five_x_compand_on_for_slot(cc: Option<&aspx::CompandingControl>, slot: usize) -> bool {
+        let Some(cc) = cc else {
+            return false;
+        };
+        if matches!(cc.sync_flag, Some(true)) {
+            return cc.compand_on.first().copied().unwrap_or(false);
+        }
+        cc.compand_on.get(slot).copied().unwrap_or(false)
     }
 
     /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 2`
@@ -682,6 +721,7 @@ impl Ac4Decoder {
         aspx_ls_rs: Option<&aspx::FiveXAspxTrailer>,
         aspx_centre: Option<&aspx::FiveXAspxTrailer>,
         aspx_cfg: Option<aspx::AspxConfig>,
+        companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
@@ -726,6 +766,7 @@ impl Ac4Decoder {
                     } else {
                         &trailer.primary
                     };
+                    let compand_on = Self::five_x_compand_on_for_slot(companding, slot);
                     let extended = self.aspx_extend_with_trailer(
                         &pcm_f,
                         trailer,
@@ -733,6 +774,7 @@ impl Ac4Decoder {
                         &cfg,
                         slot,
                         num_ts_in_ats,
+                        compand_on,
                     );
                     Self::pcm_f32_to_i16(&extended)
                 }
@@ -748,6 +790,7 @@ impl Ac4Decoder {
             if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
                 let pcm = match (aspx_cfg, aspx_centre) {
                     (Some(cfg), Some(trailer)) => {
+                        let compand_on = Self::five_x_compand_on_for_slot(companding, 2);
                         let extended = self.aspx_extend_with_trailer(
                             &pcm_f,
                             trailer,
@@ -755,6 +798,7 @@ impl Ac4Decoder {
                             &cfg,
                             2,
                             num_ts_in_ats,
+                            compand_on,
                         );
                         Self::pcm_f32_to_i16(&extended)
                     }
@@ -787,12 +831,19 @@ impl Ac4Decoder {
     /// are present, or when any per-channel scaled spectrum is missing
     /// (short / grouped / Huffman-miss path). Centre is silent when the
     /// trailing `mono_data` body is absent.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_5x_cfg0_simple_aspx(
         &mut self,
         tcd_a: &crate::mch::TwoChannelData,
         tcd_b: &crate::mch::TwoChannelData,
         b_2ch_mode: bool,
         centre_mono: Option<&crate::mch::MonoLfeData>,
+        aspx_lr: Option<&aspx::FiveXAspxTrailer>,
+        aspx_ls_rs: Option<&aspx::FiveXAspxTrailer>,
+        aspx_centre: Option<&aspx::FiveXAspxTrailer>,
+        aspx_cfg: Option<aspx::AspxConfig>,
+        companding: Option<&aspx::CompandingControl>,
+        num_ts_in_ats: u32,
         samples: usize,
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
     ) {
@@ -821,26 +872,121 @@ impl Ac4Decoder {
         while pcm_per_channel.len() < 5 {
             pcm_per_channel.push(None);
         }
+        // Trailer-to-output-slot mapping (independent of b_2ch_mode):
+        // ASPX is applied per output channel after channel-element
+        // decode produces PCM. Per Table 25 trailer order:
+        //   slot 0 (L)  -> aspx_lr.primary
+        //   slot 1 (R)  -> aspx_lr.secondary
+        //   slot 3 (Ls) -> aspx_ls_rs.primary
+        //   slot 4 (Rs) -> aspx_ls_rs.secondary
+        //   slot 2 (C)  -> aspx_centre.primary
         for (ch_in, &slot) in slot_map_a.iter().enumerate() {
             let Some(scaled) = tcd_a.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
-            let pcm = self.imdct_channel(slot, scaled, n_a);
+            let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
+            let pcm = self.maybe_extend_5x_slot(
+                slot,
+                pcm_f,
+                aspx_lr,
+                aspx_ls_rs,
+                aspx_centre,
+                aspx_cfg,
+                companding,
+                num_ts_in_ats,
+            );
             pcm_per_channel[slot] = Some(pcm);
         }
         for (ch_in, &slot) in slot_map_b.iter().enumerate() {
             let Some(scaled) = tcd_b.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
-            let pcm = self.imdct_channel(slot, scaled, n_b);
+            let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
+            let pcm = self.maybe_extend_5x_slot(
+                slot,
+                pcm_f,
+                aspx_lr,
+                aspx_ls_rs,
+                aspx_centre,
+                aspx_cfg,
+                companding,
+                num_ts_in_ats,
+            );
             pcm_per_channel[slot] = Some(pcm);
         }
         // Centre — slot 2. `cfg0_centre_mono` carries the trailing
         // `mono_data(0)` body when the walker decoded it.
         if let Some(mono) = centre_mono {
             if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
-                pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&pcm_f));
+                let pcm = self.maybe_extend_5x_slot(
+                    2,
+                    pcm_f,
+                    aspx_lr,
+                    aspx_ls_rs,
+                    aspx_centre,
+                    aspx_cfg,
+                    companding,
+                    num_ts_in_ats,
+                );
+                pcm_per_channel[2] = Some(pcm);
             }
+        }
+    }
+
+    /// Round 42: trailer-aware ASPX extension on one 5_X output slot
+    /// (0..=4). Used by `dispatch_5x_cfg{0,1,3}_simple_aspx` to apply
+    /// the per-channel trailer + companding pulled from the per-cfg
+    /// slots in [`crate::asf::SubstreamTools`].
+    ///
+    /// Trailer-to-slot mapping is the canonical Table-25 order
+    /// `aspx_data_2ch + aspx_data_2ch + aspx_data_1ch` translated to
+    /// 5.X output channels:
+    ///   slot 0 (L)  -> aspx_lr.primary
+    ///   slot 1 (R)  -> aspx_lr.secondary
+    ///   slot 3 (Ls) -> aspx_ls_rs.primary
+    ///   slot 4 (Rs) -> aspx_ls_rs.secondary
+    ///   slot 2 (C)  -> aspx_centre.primary
+    /// Trailers / config absent -> i16 cast of `pcm_f` only.
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_extend_5x_slot(
+        &mut self,
+        slot: usize,
+        pcm_f: Vec<f32>,
+        aspx_lr: Option<&aspx::FiveXAspxTrailer>,
+        aspx_ls_rs: Option<&aspx::FiveXAspxTrailer>,
+        aspx_centre: Option<&aspx::FiveXAspxTrailer>,
+        aspx_cfg: Option<aspx::AspxConfig>,
+        companding: Option<&aspx::CompandingControl>,
+        num_ts_in_ats: u32,
+    ) -> Vec<i16> {
+        let trailer_pair: Option<(&aspx::FiveXAspxTrailer, bool)> = match slot {
+            0 => aspx_lr.map(|t| (t, false)),
+            1 => aspx_lr.map(|t| (t, true)),
+            2 => aspx_centre.map(|t| (t, false)),
+            3 => aspx_ls_rs.map(|t| (t, false)),
+            4 => aspx_ls_rs.map(|t| (t, true)),
+            _ => None,
+        };
+        match (aspx_cfg, trailer_pair) {
+            (Some(cfg), Some((trailer, is_secondary))) => {
+                let ch = if is_secondary {
+                    trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                } else {
+                    &trailer.primary
+                };
+                let compand_on = Self::five_x_compand_on_for_slot(companding, slot);
+                let extended = self.aspx_extend_with_trailer(
+                    &pcm_f,
+                    trailer,
+                    ch,
+                    &cfg,
+                    slot,
+                    num_ts_in_ats,
+                    compand_on,
+                );
+                Self::pcm_f32_to_i16(&extended)
+            }
+            _ => Self::pcm_f32_to_i16(&pcm_f),
         }
     }
 
@@ -856,10 +1002,17 @@ impl Ac4Decoder {
     ///
     /// No-op on transform-length / sample-count mismatch, or when a
     /// per-channel scaled spectrum is absent.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_5x_cfg1_simple_aspx(
         &mut self,
         three: &crate::mch::ThreeChannelData,
         tcd: &crate::mch::TwoChannelData,
+        aspx_lr: Option<&aspx::FiveXAspxTrailer>,
+        aspx_ls_rs: Option<&aspx::FiveXAspxTrailer>,
+        aspx_centre: Option<&aspx::FiveXAspxTrailer>,
+        aspx_cfg: Option<aspx::AspxConfig>,
+        companding: Option<&aspx::CompandingControl>,
+        num_ts_in_ats: u32,
         samples: usize,
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
     ) {
@@ -888,7 +1041,17 @@ impl Ac4Decoder {
             let Some(scaled) = three.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
-            let pcm = self.imdct_channel(slot, scaled, n3);
+            let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
+            let pcm = self.maybe_extend_5x_slot(
+                slot,
+                pcm_f,
+                aspx_lr,
+                aspx_ls_rs,
+                aspx_centre,
+                aspx_cfg,
+                companding,
+                num_ts_in_ats,
+            );
             pcm_per_channel[slot] = Some(pcm);
         }
         const TWO_SLOTS: [usize; 2] = [3, 4];
@@ -896,7 +1059,17 @@ impl Ac4Decoder {
             let Some(scaled) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
-            let pcm = self.imdct_channel(slot, scaled, n2);
+            let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
+            let pcm = self.maybe_extend_5x_slot(
+                slot,
+                pcm_f,
+                aspx_lr,
+                aspx_ls_rs,
+                aspx_centre,
+                aspx_cfg,
+                companding,
+                num_ts_in_ats,
+            );
             pcm_per_channel[slot] = Some(pcm);
         }
     }
@@ -911,9 +1084,16 @@ impl Ac4Decoder {
     ///
     /// No-op on transform-length / sample-count mismatch, or when a
     /// per-channel scaled spectrum is absent.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_5x_cfg3_simple_aspx(
         &mut self,
         five: &crate::mch::FiveChannelData,
+        aspx_lr: Option<&aspx::FiveXAspxTrailer>,
+        aspx_ls_rs: Option<&aspx::FiveXAspxTrailer>,
+        aspx_centre: Option<&aspx::FiveXAspxTrailer>,
+        aspx_cfg: Option<aspx::AspxConfig>,
+        companding: Option<&aspx::CompandingControl>,
+        num_ts_in_ats: u32,
         samples: usize,
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
     ) {
@@ -935,7 +1115,17 @@ impl Ac4Decoder {
             let Some(scaled) = five.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
-            let pcm = self.imdct_channel(slot, scaled, n);
+            let pcm_f = self.imdct_channel_f32(slot, scaled, n);
+            let pcm = self.maybe_extend_5x_slot(
+                slot,
+                pcm_f,
+                aspx_lr,
+                aspx_ls_rs,
+                aspx_centre,
+                aspx_cfg,
+                companding,
+                num_ts_in_ats,
+            );
             pcm_per_channel[slot] = Some(pcm);
         }
     }
@@ -1362,10 +1552,56 @@ impl Decoder for Ac4Decoder {
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.cfg2_aspx_centre.clone());
+        // Round 42: cfg0 / cfg1 / cfg3 ASPX trailer detach.
+        let cfg0_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg0_aspx_lr.clone());
+        let cfg0_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg0_aspx_ls_rs.clone());
+        let cfg0_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg0_aspx_centre.clone());
+        let cfg1_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg1_aspx_lr.clone());
+        let cfg1_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg1_aspx_ls_rs.clone());
+        let cfg1_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg1_aspx_centre.clone());
+        let cfg3_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg3_aspx_lr.clone());
+        let cfg3_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg3_aspx_ls_rs.clone());
+        let cfg3_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg3_aspx_centre.clone());
         let five_x_aspx_config = self
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.aspx_config);
+        // Round 42: companding_control() per-channel flags. The 5_X
+        // ASPX path captures companding(3) (L/R, Ls/Rs, C) into
+        // `tools.companding`; we lift the parsed flags here so the
+        // dispatch can hand a per-channel companding-on bool to the
+        // `aspx_extend_with_trailer` wrapper.
+        let five_x_companding = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.companding.clone());
         // Cfg0 / Cfg1 / Cfg3 5_X SIMPLE/ASPX detach. Round 39: the walker
         // already populates the same `tools.three_channel_data` /
         // `four_channel_data` / `five_channel_data` / `two_channel_data`
@@ -1568,6 +1804,22 @@ impl Decoder for Ac4Decoder {
         // the IMDCT low-band PCM.
         let use_aspx_ext = aspx_tables.is_some() && aspx_cfg.is_some();
         let num_ts_in_ats = aspx::num_ts_in_ats(info.frame_length.max(1));
+        // Round 42: per-channel companding flags from the parsed
+        // `companding_control()`. For mono / stereo CPE paths the
+        // grouping is `companding_control(1)` / `companding_control(2)`
+        // — i.e. compand_on[0] is the primary channel, compand_on[1]
+        // is the secondary (or the sole entry mirrors via sync_flag).
+        let (compand_on_pri, compand_on_sec) = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                let cc = sub.tools.companding.as_ref();
+                (
+                    Self::five_x_compand_on_for_slot(cc, 0),
+                    Self::five_x_compand_on_for_slot(cc, 1),
+                )
+            })
+            .unwrap_or((false, false));
         // Make sure the per-channel A-SPX state vector is large enough.
         while self.aspx_ext_state.len() < channels as usize {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
@@ -1602,6 +1854,7 @@ impl Decoder for Ac4Decoder {
                         tna_pri.as_deref(),
                         state,
                         num_ts_in_ats,
+                        compand_on_pri,
                     );
                     if use_acpl {
                         if let (Some(cfg), Some(data)) =
@@ -1673,6 +1926,7 @@ impl Decoder for Ac4Decoder {
                             tna_sec.as_deref().or(tna_pri.as_deref()),
                             state,
                             num_ts_in_ats,
+                            compand_on_sec,
                         );
                         pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
                     } else {
@@ -1980,6 +2234,12 @@ impl Decoder for Ac4Decoder {
                         &cfg_two_channel_data[1],
                         b_2ch,
                         cfg0_centre_mono.as_ref(),
+                        cfg0_aspx_lr.as_ref(),
+                        cfg0_aspx_ls_rs.as_ref(),
+                        cfg0_aspx_centre.as_ref(),
+                        five_x_aspx_config,
+                        five_x_companding.as_ref(),
+                        num_ts_in_ats,
                         samples as usize,
                         &mut pcm_per_channel,
                     );
@@ -1992,6 +2252,12 @@ impl Decoder for Ac4Decoder {
                         self.dispatch_5x_cfg1_simple_aspx(
                             three,
                             tcd,
+                            cfg1_aspx_lr.as_ref(),
+                            cfg1_aspx_ls_rs.as_ref(),
+                            cfg1_aspx_centre.as_ref(),
+                            five_x_aspx_config,
+                            five_x_companding.as_ref(),
+                            num_ts_in_ats,
                             samples as usize,
                             &mut pcm_per_channel,
                         );
@@ -2006,6 +2272,7 @@ impl Decoder for Ac4Decoder {
                             cfg2_aspx_ls_rs.as_ref(),
                             cfg2_aspx_centre.as_ref(),
                             five_x_aspx_config,
+                            five_x_companding.as_ref(),
                             num_ts_in_ats,
                             samples as usize,
                             &mut pcm_per_channel,
@@ -2016,6 +2283,12 @@ impl Decoder for Ac4Decoder {
                     if let Some(five) = cfg_five_channel_data.as_ref() {
                         self.dispatch_5x_cfg3_simple_aspx(
                             five,
+                            cfg3_aspx_lr.as_ref(),
+                            cfg3_aspx_ls_rs.as_ref(),
+                            cfg3_aspx_centre.as_ref(),
+                            five_x_aspx_config,
+                            five_x_companding.as_ref(),
+                            num_ts_in_ats,
                             samples as usize,
                             &mut pcm_per_channel,
                         );
@@ -2702,7 +2975,7 @@ mod tests {
         let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
         let mut state = aspx::AspxChannelExtState::new();
         let out = Ac4Decoder::aspx_extend_pcm(
-            &pcm, &tables, &cfg, None, None, None, None, None, None, None, &mut state, 1,
+            &pcm, &tables, &cfg, None, None, None, None, None, None, None, &mut state, 1, false,
         );
         assert_eq!(out.len(), pcm.len());
         // Steady-state energy must be non-zero in the far tail (post
@@ -2792,6 +3065,7 @@ mod tests {
             Some(&tna_mode_heavy),
             &mut state_a,
             2,
+            false,
         );
         let mut state_b = aspx::AspxChannelExtState::new();
         let out_bare = Ac4Decoder::aspx_extend_pcm(
@@ -2807,6 +3081,7 @@ mod tests {
             Some(&tna_mode_zero),
             &mut state_b,
             2,
+            false,
         );
         assert_eq!(out_tns.len(), pcm.len());
         assert_eq!(out_bare.len(), pcm.len());
@@ -3371,6 +3646,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             1,
             n,
             &mut pcm,
@@ -3415,7 +3691,9 @@ mod tests {
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         // Request a different sample count.
-        dec.dispatch_5x_cfg2_simple_aspx(&four, None, None, None, None, None, 1, 1_920, &mut pcm);
+        dec.dispatch_5x_cfg2_simple_aspx(
+            &four, None, None, None, None, None, None, 1, 1_920, &mut pcm,
+        );
         for (slot, entry) in pcm.iter().enumerate().take(5) {
             assert!(
                 entry.is_none(),
@@ -3477,6 +3755,7 @@ mod tests {
         dec_lb.dispatch_5x_cfg2_simple_aspx(
             &four,
             Some(&back_mono),
+            None,
             None,
             None,
             None,
@@ -3548,6 +3827,7 @@ mod tests {
             Some(&trailer_2ch),
             Some(&trailer_1ch),
             Some(cfg),
+            None,
             1,
             n,
             &mut pcm_aspx,
@@ -3619,7 +3899,20 @@ mod tests {
             scaled_spec: Some(mk_ramp(0.50)),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
-        dec.dispatch_5x_cfg0_simple_aspx(&tcd_a, &tcd_b, false, Some(&centre), n, &mut pcm);
+        dec.dispatch_5x_cfg0_simple_aspx(
+            &tcd_a,
+            &tcd_b,
+            false,
+            Some(&centre),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+            n,
+            &mut pcm,
+        );
         for (slot, entry) in pcm.iter().enumerate().take(5) {
             let v = entry
                 .as_ref()
@@ -3659,7 +3952,9 @@ mod tests {
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         // No centre — slot 2 stays None.
-        dec.dispatch_5x_cfg0_simple_aspx(&tcd_a, &tcd_b, true, None, n, &mut pcm);
+        dec.dispatch_5x_cfg0_simple_aspx(
+            &tcd_a, &tcd_b, true, None, None, None, None, None, None, 1, n, &mut pcm,
+        );
         for slot in [0_usize, 1, 3, 4] {
             assert!(
                 pcm[slot].as_ref().is_some(),
@@ -3705,7 +4000,9 @@ mod tests {
             scaled_spec_per_channel: vec![Some(mk_ramp(0.40)), Some(mk_ramp(0.50))],
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
-        dec.dispatch_5x_cfg1_simple_aspx(&three, &tcd, n, &mut pcm);
+        dec.dispatch_5x_cfg1_simple_aspx(
+            &three, &tcd, None, None, None, None, None, 1, n, &mut pcm,
+        );
         for (slot, entry) in pcm.iter().enumerate().take(5) {
             let v = entry
                 .as_ref()
@@ -3744,7 +4041,7 @@ mod tests {
             ],
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
-        dec.dispatch_5x_cfg3_simple_aspx(&five, n, &mut pcm);
+        dec.dispatch_5x_cfg3_simple_aspx(&five, None, None, None, None, None, 1, n, &mut pcm);
         for (slot, entry) in pcm.iter().enumerate().take(5) {
             let v = entry
                 .as_ref()
@@ -3776,7 +4073,9 @@ mod tests {
             scaled_spec_per_channel: vec![Some(vec![0.1; 1_024]), Some(vec![0.2; 1_024])],
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
-        dec.dispatch_5x_cfg0_simple_aspx(&tcd, &tcd, false, None, 1_920, &mut pcm);
+        dec.dispatch_5x_cfg0_simple_aspx(
+            &tcd, &tcd, false, None, None, None, None, None, None, 1, 1_920, &mut pcm,
+        );
         assert!(pcm.iter().all(|p| p.is_none()), "cfg0 mismatch -> no-op");
         // cfg1
         let three = crate::mch::ThreeChannelData {
@@ -3790,7 +4089,9 @@ mod tests {
             ],
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
-        dec.dispatch_5x_cfg1_simple_aspx(&three, &tcd, 1_920, &mut pcm);
+        dec.dispatch_5x_cfg1_simple_aspx(
+            &three, &tcd, None, None, None, None, None, 1, 1_920, &mut pcm,
+        );
         assert!(pcm.iter().all(|p| p.is_none()), "cfg1 mismatch -> no-op");
         // cfg3
         let five = crate::mch::FiveChannelData {
@@ -3806,8 +4107,409 @@ mod tests {
             ],
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
-        dec.dispatch_5x_cfg3_simple_aspx(&five, 1_920, &mut pcm);
+        dec.dispatch_5x_cfg3_simple_aspx(&five, None, None, None, None, None, 1, 1_920, &mut pcm);
         assert!(pcm.iter().all(|p| p.is_none()), "cfg3 mismatch -> no-op");
+    }
+
+    /// Round 42: `dispatch_5x_cfg{0,1,3}_simple_aspx` honour captured
+    /// ASPX trailers + companding flags. With non-degenerate trailers
+    /// plus non-degenerate config, every cfg's output PCM differs
+    /// from the round-39 low-band-only path on at least one slot,
+    /// proving the trailer-aware ASPX extension fires.
+    #[test]
+    fn dispatch_5x_cfg013_with_aspx_trailers_changes_output() {
+        // Same setup shape as `dispatch_5x_cfg2_aspx_trailers_change_output_vs_low_band_only`.
+        let n_slots = 30usize;
+        let n = n_slots * 64;
+        let mk_tone = |freq_hz: f32, bias: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| bias + (2.0 * std::f32::consts::PI * freq_hz / 48_000.0 * i as f32).sin())
+                .collect()
+        };
+        let ti = crate::asf::AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0; 2],
+            transform_length_0: n as u32,
+            transform_length_1: n as u32,
+        };
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let framing = aspx::AspxFraming {
+            int_class: aspx::AspxIntClass::FixFix,
+            num_env: 1,
+            num_noise: 1,
+            freq_res: vec![true],
+            var_bord_left: None,
+            var_bord_right: None,
+            num_rel_left: 0,
+            num_rel_right: 0,
+            rel_bord_left: vec![],
+            rel_bord_right: vec![],
+            tsg_ptr: None,
+        };
+        let mk_ch = || aspx::FiveXAspxChannelTrailer {
+            framing: framing.clone(),
+            qmode_env: aspx::AspxQuantStep::Fine,
+            delta_dir: aspx::AspxDeltaDir {
+                sig_delta_dir: vec![false],
+                noise_delta_dir: vec![false],
+            },
+            data_sig: Vec::new(),
+            data_noise: Vec::new(),
+            add_harmonic: None,
+            tna_mode: None,
+        };
+        let trailer_2ch = aspx::FiveXAspxTrailer {
+            xover: 0,
+            frequency_tables: tables.clone(),
+            primary: mk_ch(),
+            secondary: Some(mk_ch()),
+        };
+        let trailer_1ch = aspx::FiveXAspxTrailer {
+            xover: 0,
+            frequency_tables: tables,
+            primary: mk_ch(),
+            secondary: None,
+        };
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+
+        // ===== cfg0 =====
+        let tcd_a = crate::mch::TwoChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            chparam: None,
+            scaled_spec_per_channel: vec![Some(mk_tone(500.0, 0.10)), Some(mk_tone(700.0, 0.20))],
+        };
+        let tcd_b = crate::mch::TwoChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            chparam: None,
+            scaled_spec_per_channel: vec![Some(mk_tone(900.0, 0.30)), Some(mk_tone(1100.0, 0.40))],
+        };
+        let centre = crate::mch::MonoLfeData {
+            b_lfe: false,
+            spec_frontend_bit: 0,
+            transform_info: Some(ti),
+            psy_info: None,
+            scaled_spec: Some(mk_tone(1300.0, 0.50)),
+        };
+        let mut dec_lb = Ac4Decoder::new(&params);
+        let mut pcm_lb: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec_lb.dispatch_5x_cfg0_simple_aspx(
+            &tcd_a,
+            &tcd_b,
+            false,
+            Some(&centre),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+            n,
+            &mut pcm_lb,
+        );
+        let mut dec_aspx = Ac4Decoder::new(&params);
+        let mut pcm_aspx: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec_aspx.dispatch_5x_cfg0_simple_aspx(
+            &tcd_a,
+            &tcd_b,
+            false,
+            Some(&centre),
+            Some(&trailer_2ch),
+            Some(&trailer_2ch),
+            Some(&trailer_1ch),
+            Some(cfg),
+            None,
+            1,
+            n,
+            &mut pcm_aspx,
+        );
+        let mut differs = 0usize;
+        for slot in 0..5 {
+            let a = pcm_lb[slot].as_ref().unwrap();
+            let b = pcm_aspx[slot].as_ref().unwrap();
+            if a != b {
+                differs += 1;
+            }
+        }
+        assert!(
+            differs > 0,
+            "cfg0 ASPX trailers must change output vs low-band-only"
+        );
+
+        // ===== cfg1 =====
+        let three = crate::mch::ThreeChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            info: None,
+            scaled_spec_per_channel: vec![
+                Some(mk_tone(500.0, 0.10)),
+                Some(mk_tone(700.0, 0.20)),
+                Some(mk_tone(900.0, 0.30)),
+            ],
+        };
+        let tcd = crate::mch::TwoChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            chparam: None,
+            scaled_spec_per_channel: vec![Some(mk_tone(1100.0, 0.40)), Some(mk_tone(1300.0, 0.50))],
+        };
+        let mut dec_lb = Ac4Decoder::new(&params);
+        let mut pcm_lb: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec_lb.dispatch_5x_cfg1_simple_aspx(
+            &three,
+            &tcd,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+            n,
+            &mut pcm_lb,
+        );
+        let mut dec_aspx = Ac4Decoder::new(&params);
+        let mut pcm_aspx: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec_aspx.dispatch_5x_cfg1_simple_aspx(
+            &three,
+            &tcd,
+            Some(&trailer_2ch),
+            Some(&trailer_2ch),
+            Some(&trailer_1ch),
+            Some(cfg),
+            None,
+            1,
+            n,
+            &mut pcm_aspx,
+        );
+        let mut differs = 0usize;
+        for slot in 0..5 {
+            let a = pcm_lb[slot].as_ref().unwrap();
+            let b = pcm_aspx[slot].as_ref().unwrap();
+            if a != b {
+                differs += 1;
+            }
+        }
+        assert!(
+            differs > 0,
+            "cfg1 ASPX trailers must change output vs low-band-only"
+        );
+
+        // ===== cfg3 =====
+        let five = crate::mch::FiveChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            info: None,
+            scaled_spec_per_channel: vec![
+                Some(mk_tone(500.0, 0.10)),
+                Some(mk_tone(700.0, 0.20)),
+                Some(mk_tone(900.0, 0.30)),
+                Some(mk_tone(1100.0, 0.40)),
+                Some(mk_tone(1300.0, 0.50)),
+            ],
+        };
+        let mut dec_lb = Ac4Decoder::new(&params);
+        let mut pcm_lb: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec_lb.dispatch_5x_cfg3_simple_aspx(&five, None, None, None, None, None, 1, n, &mut pcm_lb);
+        let mut dec_aspx = Ac4Decoder::new(&params);
+        let mut pcm_aspx: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec_aspx.dispatch_5x_cfg3_simple_aspx(
+            &five,
+            Some(&trailer_2ch),
+            Some(&trailer_2ch),
+            Some(&trailer_1ch),
+            Some(cfg),
+            None,
+            1,
+            n,
+            &mut pcm_aspx,
+        );
+        let mut differs = 0usize;
+        for slot in 0..5 {
+            let a = pcm_lb[slot].as_ref().unwrap();
+            let b = pcm_aspx[slot].as_ref().unwrap();
+            if a != b {
+                differs += 1;
+            }
+        }
+        assert!(
+            differs > 0,
+            "cfg3 ASPX trailers must change output vs low-band-only"
+        );
+    }
+
+    /// Round 42: `five_x_compand_on_for_slot` resolves per-channel
+    /// flags from `companding_control(num_chan)`. Verify the three
+    /// branches: sync_flag == None (mono), sync_flag == Some(false)
+    /// (per-channel), sync_flag == Some(true) (broadcast slot 0).
+    #[test]
+    fn five_x_compand_on_for_slot_resolves_each_branch() {
+        // No CC -> always false.
+        assert!(!Ac4Decoder::five_x_compand_on_for_slot(None, 0));
+        assert!(!Ac4Decoder::five_x_compand_on_for_slot(None, 4));
+
+        // Mono (sync_flag = None, single entry).
+        let cc_mono = aspx::CompandingControl {
+            sync_flag: None,
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        assert!(Ac4Decoder::five_x_compand_on_for_slot(Some(&cc_mono), 0));
+        // Out-of-range -> false (the unprocessed branch).
+        assert!(!Ac4Decoder::five_x_compand_on_for_slot(Some(&cc_mono), 1));
+
+        // Per-channel (sync_flag = Some(false), 5 entries for 5_X).
+        let cc_per = aspx::CompandingControl {
+            sync_flag: Some(false),
+            compand_on: vec![true, false, true, false, true],
+            compand_avg: Some(false),
+        };
+        assert!(Ac4Decoder::five_x_compand_on_for_slot(Some(&cc_per), 0));
+        assert!(!Ac4Decoder::five_x_compand_on_for_slot(Some(&cc_per), 1));
+        assert!(Ac4Decoder::five_x_compand_on_for_slot(Some(&cc_per), 2));
+        assert!(!Ac4Decoder::five_x_compand_on_for_slot(Some(&cc_per), 3));
+        assert!(Ac4Decoder::five_x_compand_on_for_slot(Some(&cc_per), 4));
+
+        // Sync (sync_flag = Some(true), single entry mirrors all
+        // channels).
+        let cc_sync_on = aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        for slot in 0..5 {
+            assert!(Ac4Decoder::five_x_compand_on_for_slot(
+                Some(&cc_sync_on),
+                slot
+            ));
+        }
+        let cc_sync_off = aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![false],
+            compand_avg: Some(false),
+        };
+        for slot in 0..5 {
+            assert!(!Ac4Decoder::five_x_compand_on_for_slot(
+                Some(&cc_sync_off),
+                slot
+            ));
+        }
+    }
+
+    /// Round 42: `aspx_extend_pcm` with `compand_on == true` produces
+    /// output that differs from the `compand_on == false` baseline.
+    /// The companding gain is `g(ts) * G` per slot, where g is a
+    /// per-slot energy power; non-trivial signal energy + non-zero
+    /// compand_on must alter the QMF synthesis output.
+    #[test]
+    fn aspx_extend_pcm_with_companding_diverges_from_baseline() {
+        let n_slots = 30usize;
+        let n = n_slots * 64;
+        let mut pcm = vec![0.0f32; n];
+        let f = 800.0_f32 / 48_000.0_f32;
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f * i as f32).sin();
+        }
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let mut state_off = aspx::AspxChannelExtState::new();
+        let out_off = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_off,
+            1,
+            false,
+        );
+        let mut state_on = aspx::AspxChannelExtState::new();
+        let out_on = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_on,
+            1,
+            true,
+        );
+        assert_eq!(out_off.len(), out_on.len());
+        let start = 1200usize;
+        let mut diffs = 0usize;
+        for (a, b) in out_off[start..].iter().zip(out_on[start..].iter()) {
+            if (a - b).abs() > 1e-6 {
+                diffs += 1;
+            }
+        }
+        assert!(
+            diffs > (out_off.len() - start) / 4,
+            "companding=on must alter the QMF-synthesis output (diffs={diffs})"
+        );
+    }
+
+    /// Round 42: `apply_companding_on_qmf` is a no-op when sbz <= sbx
+    /// (degenerate band) — it must not panic on edge cases, and must
+    /// leave the QMF matrix untouched.
+    #[test]
+    fn apply_companding_on_qmf_noop_on_empty_band() {
+        let mut q = vec![vec![(1.0_f32, 1.0_f32); 16]; 64];
+        let q_orig = q.clone();
+        // sbx == sbz: no affected band.
+        aspx::apply_companding_on_qmf(&mut q, 32, 32);
+        assert_eq!(q, q_orig);
+        // sbz < sbx: no-op.
+        aspx::apply_companding_on_qmf(&mut q, 40, 32);
+        assert_eq!(q, q_orig);
+    }
+
+    /// Round 42: `apply_companding_on_qmf` produces unit-gain output
+    /// on a pure-zero matrix (the `l == 0` early-return branch).
+    #[test]
+    fn apply_companding_on_qmf_unit_gain_on_zero_signal() {
+        let mut q = vec![vec![(0.0_f32, 0.0_f32); 16]; 64];
+        // All zeros + sbx=2, sbz=10: every slot's L_ch == 0 -> g = 1
+        // -> Q stays at zero (no NaN / inf).
+        aspx::apply_companding_on_qmf(&mut q, 2, 10);
+        for row in q.iter() {
+            for (re, im) in row.iter() {
+                assert_eq!(*re, 0.0);
+                assert_eq!(*im, 0.0);
+            }
+        }
     }
 
     /// Round 39: `dispatch_7x_additional_channel_pair` IMDCTs

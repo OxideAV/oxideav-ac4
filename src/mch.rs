@@ -736,16 +736,44 @@ pub fn parse_5x_audio_data_outer(
                     b_iframe,
                     frame_len_base,
                 );
-                if matches!(coding_cfg, FiveXCodingConfig::Cfg2FourMono) {
-                    tools.cfg2_aspx_lr = lr;
-                    tools.cfg2_aspx_ls_rs = ls_rs;
-                    tools.cfg2_aspx_centre = centre;
-                } else {
-                    // Discard captured trailers for cfg0 / cfg1 / cfg3
-                    // until the dispatch side wires them. The bits
-                    // were still consumed so the bit-pointer ends at
-                    // the right offset for any frame_data trailer.
-                    let _ = (lr, ls_rs, centre);
+                // Round 42: trailer-aware dispatch for every cfg.
+                // Per Table 25 row `case ASPX:` the trailer order is
+                // `aspx_data_2ch + aspx_data_2ch + aspx_data_1ch`
+                // regardless of `coding_config`. The 5.X output
+                // channels are L/R/C/Ls/Rs and the lone 1ch trailer
+                // names the centre — so the canonical mapping
+                // 1st-2ch -> (L,R) / 2nd-2ch -> (Ls,Rs) / 1ch -> (C)
+                // applies to every config. The cfg0 b_2ch_mode == 1
+                // inner stereo coding (L,Ls)/(R,Rs) doesn't change
+                // this — ASPX is applied per output channel after
+                // channel-element decoding completes (cfg0 b_2ch_mode
+                // mapping happens up in the dispatch itself).
+                match coding_cfg {
+                    FiveXCodingConfig::Cfg2FourMono => {
+                        tools.cfg2_aspx_lr = lr;
+                        tools.cfg2_aspx_ls_rs = ls_rs;
+                        tools.cfg2_aspx_centre = centre;
+                    }
+                    FiveXCodingConfig::Cfg0Stereo2plusMono => {
+                        tools.cfg0_aspx_lr = lr;
+                        tools.cfg0_aspx_ls_rs = ls_rs;
+                        tools.cfg0_aspx_centre = centre;
+                    }
+                    FiveXCodingConfig::Cfg1ThreeStereo => {
+                        tools.cfg1_aspx_lr = lr;
+                        tools.cfg1_aspx_ls_rs = ls_rs;
+                        tools.cfg1_aspx_centre = centre;
+                    }
+                    FiveXCodingConfig::Cfg3Five => {
+                        tools.cfg3_aspx_lr = lr;
+                        tools.cfg3_aspx_ls_rs = ls_rs;
+                        tools.cfg3_aspx_centre = centre;
+                    }
+                    FiveXCodingConfig::AcplLite2 => {
+                        // AcplLite2 is unreachable from SIMPLE/ASPX
+                        // 2-bit map (asserted above); discard captures.
+                        let _ = (lr, ls_rs, centre);
+                    }
                 }
             }
         }

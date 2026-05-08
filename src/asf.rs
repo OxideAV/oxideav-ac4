@@ -892,6 +892,37 @@ pub struct SubstreamTools {
     /// 5_X SIMPLE/ASPX cfg2 ASPX trailer for the centre channel —
     /// the `aspx_data_1ch()` after the two 2ch trailers.
     pub cfg2_aspx_centre: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg0 ASPX trailer for the front L/R pair (or
+    /// the L/Ls inner pair when `b_2ch_mode == true`). Captured from
+    /// the first `aspx_data_2ch()` after the two `two_channel_data()`
+    /// + `mono_data(0)` triple. Round 42 — mirror of `cfg2_aspx_lr`.
+    pub cfg0_aspx_lr: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg0 ASPX trailer for the surround Ls/Rs pair
+    /// (or the R/Rs inner pair when `b_2ch_mode == true`).
+    pub cfg0_aspx_ls_rs: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg0 ASPX trailer for the centre channel.
+    pub cfg0_aspx_centre: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg1 ASPX trailer for the front L/R pair —
+    /// extracted from `three_channel_data[0..1]` (channels 0 and 1
+    /// of the three_channel_data shell).
+    pub cfg1_aspx_lr: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg1 ASPX trailer for the surround Ls/Rs pair —
+    /// extracted from the `two_channel_data` that follows the
+    /// `three_channel_data` shell.
+    pub cfg1_aspx_ls_rs: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg1 ASPX trailer for the centre channel —
+    /// `three_channel_data[2]` (the third channel of the
+    /// three_channel_data shell).
+    pub cfg1_aspx_centre: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg3 ASPX trailer for the front L/R pair —
+    /// extracted from `five_channel_data[0..1]`.
+    pub cfg3_aspx_lr: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg3 ASPX trailer for the surround Ls/Rs pair —
+    /// `five_channel_data[3..4]`.
+    pub cfg3_aspx_ls_rs: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg3 ASPX trailer for the centre channel —
+    /// `five_channel_data[2]`.
+    pub cfg3_aspx_centre: Option<aspx::FiveXAspxTrailer>,
     /// Parsed `two_channel_data()` outer shells (Table 26) for the 5.X
     /// `coding_config` Cfg0 (twice: `[L/R, Ls/Rs]`) and Cfg1 (once,
     /// after `three_channel_data`). Length matches the spec's call

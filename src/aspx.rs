@@ -686,6 +686,85 @@ pub fn parse_companding_control(
     })
 }
 
+/// Apply the §5.7.5 companding tool to one channel's QMF matrix in
+/// place per ETSI TS 103 190-1 §5.7.5.2 (the decoder side runs the
+/// inverse of the encoder's gain reshaping).
+///
+/// Operates on the QMF subband range `[sbx, sbz)` (the A-SPX-affected
+/// band — for the ASPX_ACPL_1 mode the spec says start at
+/// `acpl_qmf_band` instead, but our 5_X ACPL_1 path sets the
+/// crossover to that value implicitly via the trailer xover).
+/// Operates on the full set of QMF time slots (`[0, num_slots)`) —
+/// the full §5.7.6.3.3.1 A-SPX interval.
+///
+/// `compand_on == false` leaves the channel untouched (we do not
+/// implement the b_compand_avg averaging branch yet — the trailers
+/// for absent-companding channels carry no extra data and the
+/// decoder produces non-companded but otherwise valid output, which
+/// is the unprocessed branch of Table 116).
+///
+/// The gain math follows §5.7.5.2 verbatim:
+///   * `E_ch(sb,ts) = max(|Re|,|Im|) + 0.5 * min(|Re|,|Im|)` per slot
+///   * `L_ch(ts) = 0.9105 * mean_{sb in [sbx,sbz)} E_ch(sb,ts)`
+///   * `g_ch(ts) = L_ch(ts).powf((1 - alpha) / alpha)` with
+///     `alpha = 0.65`, `G = 2.0_f32.powf(alpha)`
+///   * `Q_out(sb,ts) = g_ch(ts) * G * Q_in(sb,ts)` for sb in
+///     `[sbx, sbz)` and ts in the A-SPX interval.
+///
+/// Round 42 — implements the `sync_flag == 0`, `compand_on == true`
+/// branch only (the dominant case for 5.X SIMPLE/ASPX). The
+/// `sync_flag == 1` (per-channel-product synched gain) and
+/// `compand_avg == true` (averaged gain over the entire A-SPX
+/// interval) branches are scaffolded for a later round.
+pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
+    let sbx_u = sbx as usize;
+    let sbz_u = sbz as usize;
+    if sbz_u <= sbx_u || q.len() < sbz_u {
+        return;
+    }
+    // Use the smallest `n_slots` across the affected subbands so we
+    // never index out of range.
+    let mut n_slots = usize::MAX;
+    for row in q.iter().take(sbz_u).skip(sbx_u) {
+        if row.len() < n_slots {
+            n_slots = row.len();
+        }
+    }
+    if n_slots == usize::MAX || n_slots == 0 {
+        return;
+    }
+    let k = (sbz_u - sbx_u) as f32;
+    if k <= 0.0 {
+        return;
+    }
+    const ALPHA: f32 = 0.65;
+    let g_const = 2.0_f32.powf(ALPHA); // G in §5.7.5.2.
+    let exp_g = (1.0 - ALPHA) / ALPHA;
+    for ts in 0..n_slots {
+        // Slot mean absolute level per Pseudocode-style equation in
+        // §5.7.5.2.
+        let mut sum: f32 = 0.0;
+        for row in q.iter().take(sbz_u).skip(sbx_u) {
+            let (re, im) = row[ts];
+            let ar = re.abs();
+            let ai = im.abs();
+            // E_ch(sb,ts) = max(ar,ai) + 0.5 * min(ar,ai).
+            let e = ar.max(ai) + 0.5 * ar.min(ai);
+            sum += e;
+        }
+        let l = 0.9105 * (sum / k);
+        // Avoid 0^negative_exp = inf when l == 0; identity-gain
+        // (g = 1) on a silent slot is well-defined and avoids
+        // surprising the downstream noise / tone injection.
+        let g = if l > 0.0 { l.powf(exp_g) } else { 1.0 };
+        let scale = g * g_const;
+        for row in q.iter_mut().take(sbz_u).skip(sbx_u) {
+            let (re, im) = row[ts];
+            row[ts] = (re * scale, im * scale);
+        }
+    }
+}
+
 /// Captured bitstream state for one 5_X SIMPLE/ASPX trailer
 /// (`aspx_data_2ch()` or `aspx_data_1ch()`).
 ///

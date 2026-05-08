@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 42 — 5_X SIMPLE/ASPX cfg0/cfg1/cfg3 trailer-aware ASPX
+  dispatch + §5.7.5 companding tool** (TS 103 190-1 §4.2.6.6 / §5.7.5):
+  - `asf::SubstreamTools` gained `cfg0_aspx_{lr,ls_rs,centre}`,
+    `cfg1_aspx_{lr,ls_rs,centre}`, `cfg3_aspx_{lr,ls_rs,centre}` —
+    mirrors of the round-41 cfg2 trailer slots. The 5_X SIMPLE/ASPX
+    outer walker now stores the captured Table-25 `case ASPX:`
+    trailer triplet (`aspx_data_2ch + aspx_data_2ch + aspx_data_1ch`)
+    into the slot matching the active `coding_config` instead of
+    discarding round-41's cfg0/1/3 captures.
+  - `Ac4Decoder::dispatch_5x_cfg{0,1,3}_simple_aspx` now apply the
+    A-SPX bandwidth-extension per output channel using the captured
+    trailers, with the canonical Table-25 trailer-to-slot mapping
+    (1st-2ch -> L/R, 2nd-2ch -> Ls/Rs, 1ch -> C). Independent of
+    cfg0's `b_2ch_mode` (ASPX is applied after the channel-element
+    decode produces PCM, so the L,Ls / R,Rs inner stereo coding
+    doesn't shuffle the trailer assignment).
+  - `Ac4Decoder::maybe_extend_5x_slot` — internal helper that picks
+    the right `(trailer, primary/secondary)` for an output slot and
+    runs `aspx_extend_with_trailer` with the resolved companding-on
+    flag for that slot.
+  - `aspx::apply_companding_on_qmf(q, sbx, sbz)` — §5.7.5.2
+    companding tool decoder side, applied per-channel on the QMF
+    matrix in `[sbx, sbz)` for all timeslots. Implements the
+    `sync_flag == 0`, `b_compand_on == true` branch (the dominant
+    case): per-slot mean-absolute level `L_ch(ts)` per Pseudocode
+    equations, then `g_ch(ts) = L^((1-α)/α)` with α = 0.65 and
+    `Q_out = g * G * Q_in` with `G = 2^α`. Zero-signal slot uses
+    unit gain (avoids `0^negative_exp = inf`). The b_compand_avg
+    averaging and the `sync_flag == 1` per-channel-product synched
+    gain branches are scaffolded for a later round.
+  - `Ac4Decoder::aspx_extend_pcm` extended with a `compand_on: bool`
+    parameter — applies `apply_companding_on_qmf` between envelope
+    adjustment and inverse QMF synthesis when set. All call sites
+    updated: stereo CPE primary/secondary (uses
+    `tools.companding[0]` / `[1]`), and every 5_X cfg0/1/2/3 slot
+    (uses the `companding_control(5)` slot lookup via
+    `five_x_compand_on_for_slot`).
+  - `Ac4Decoder::five_x_compand_on_for_slot(cc, slot)` — resolves
+    `b_compand_on[slot]` from a `CompandingControl`, honouring
+    `sync_flag == true` (slot 0 broadcasts), per-channel, and absent
+    flags (returns `false`).
+  - 5 new tests cover: per-cfg trailer-aware dispatch produces
+    output that diverges from the round-39 low-band-only path;
+    companding flag resolver across mono / per-channel / sync
+    branches; `aspx_extend_pcm` with companding diverges from
+    baseline; and edge-case no-ops for `apply_companding_on_qmf`
+    (degenerate band + zero signal).
+
 - **Round 41 — 5_X SIMPLE/ASPX cfg2 ASPX bandwidth-extension trailers +
   Table 181 first-stage SAP matrix for 5_X / 7_X `ASPX_ACPL_1`** (TS
   103 190-1 §4.2.6.6 / §5.3.4.3.2):
