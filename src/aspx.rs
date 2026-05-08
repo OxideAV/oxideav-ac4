@@ -686,6 +686,60 @@ pub fn parse_companding_control(
     })
 }
 
+/// Captured bitstream state for one 5_X SIMPLE/ASPX trailer
+/// (`aspx_data_2ch()` or `aspx_data_1ch()`).
+///
+/// The 5_X SIMPLE/ASPX outer body in §4.2.6.6 / Table 25 row
+/// `case ASPX:` carries up to three ASPX trailers per substream
+/// (`aspx_data_2ch + aspx_data_2ch + aspx_data_1ch` in cfg2;
+/// the 1ch trailer alone in cfg2's centre, etc.).  Each trailer holds
+/// its own `xover` + per-channel framing/qmode/delta-dir/sig/noise
+/// envelope set + frequency tables — exactly the inputs
+/// [`AspxFrequencyTables`] + [`AspxFraming`] + envelope deltas that
+/// [`AspxChannelExtState`]-driven `aspx_extend_pcm` consumes.
+///
+/// `secondary` carries channel-1 state for a 2-channel trailer
+/// (Table 52); it stays `None` for a 1-channel trailer (Table 51).
+///
+/// Wired into [`crate::asf::SubstreamTools`] via the
+/// `cfg2_aspx_*` fields.
+#[derive(Debug, Clone)]
+pub struct FiveXAspxTrailer {
+    /// Active `aspx_xover_subband_offset` (3 bits).
+    pub xover: u8,
+    /// Frequency tables derived from `aspx_config + xover`.
+    pub frequency_tables: AspxFrequencyTables,
+    /// Per-channel ASPX state: index 0 = primary (always present),
+    /// index 1 = secondary (only set for 2ch trailers).
+    pub primary: FiveXAspxChannelTrailer,
+    /// Secondary channel — `None` for 1ch trailers.
+    pub secondary: Option<FiveXAspxChannelTrailer>,
+}
+
+/// Per-channel slice of [`FiveXAspxTrailer`] — what
+/// `aspx_extend_pcm` needs for one channel.
+#[derive(Debug, Clone)]
+pub struct FiveXAspxChannelTrailer {
+    /// `aspx_framing()` for this channel.
+    pub framing: AspxFraming,
+    /// Effective `aspx_qmode_env[ch]` after the FIXFIX + num_env == 1
+    /// clamp.
+    pub qmode_env: AspxQuantStep,
+    /// Per-envelope delta-direction bits.
+    pub delta_dir: AspxDeltaDir,
+    /// Per-envelope signal envelopes (`aspx_data_sig[ch]`).
+    pub data_sig: Vec<AspxHuffEnv>,
+    /// Per-envelope noise envelopes (`aspx_data_noise[ch]`).
+    pub data_noise: Vec<AspxHuffEnv>,
+    /// `aspx_hfgen_iwc.add_harmonic[ch]` — `Some` only when an hfgen
+    /// payload was present (it always is when there's at least one
+    /// envelope, but we keep the option for parity with the
+    /// per-substream tools).
+    pub add_harmonic: Option<Vec<bool>>,
+    /// `aspx_hfgen_iwc.tna_mode[ch]` — same as `add_harmonic`.
+    pub tna_mode: Option<Vec<u8>>,
+}
+
 /// A-SPX interval class (ETSI TS 103 190-1 §4.3.10.4.1, Table 126).
 ///
 /// Encoded on the wire as a 1/2/3-bit variable-length prefix code:

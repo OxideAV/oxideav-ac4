@@ -637,6 +637,101 @@ pub fn extract_sap_abcd(info: &ChparamInfo, max_sfb_per_group: &[u32]) -> SapCoe
     SapCoeffs { abcd }
 }
 
+/// `(L_spec, R_spec, Ls_spec, Rs_spec)` — the four preliminary
+/// spectra produced by [`apply_sap_table_181`].
+pub type SapTable181Output = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// Apply the §5.3.4.3.2 / Table 181 first-stage SAP matrix for the
+/// 5_X `ASPX_ACPL_1` mode. Mixes the two-channel preliminary spectra
+/// `(sSMP_A, sSMP_B)` with the joint-MDCT residual pair
+/// `(sSMP_3, sSMP_4)` into preliminary `(L, R, Ls, Rs)` spectra using
+/// the per-(g, sfb) `(a, b, c, d)` coefficients extracted from the two
+/// `chparam_info()` payloads following `max_sfb_master`.
+///
+/// Per Table 181 (the matrix on the right):
+///
+/// ```text
+///   [sSMP_L]    [a0  0   0   b0  0 ]   [sSMP_A]
+///   [sSMP_R]  = [0   a1  0   0   b1] * [sSMP_B]
+///   [sSMP_C]    [0   0   1   0   0 ]   [sSMP_C]
+///   [sSMP_Ls]   [c0  0   0   d0  0 ]   [sSMP_3]
+///   [sSMP_Rs]   [0   c1  0   0   d1]   [sSMP_4]
+/// ```
+///
+/// Coefficients `(a, b, c, d)` come from each `chparam_info()` SAP
+/// extraction (Pseudocode 59 / [`extract_sap_abcd`]); the SAP layer
+/// runs on a single window-group at the dominant transform length per
+/// the §4.2.6.6 NOTE, so `chparam_pair` is keyed against the joint-
+/// MDCT residual layer's `max_sfb_master` bound.
+///
+/// `tl` is the transform_length used to derive the sfb offsets; bins
+/// past the SAP-coded extent (sfb >= max_sfb) pass through (high half
+/// keeps `A`/`B`, low half is silent — same convention as the 7_X
+/// SAP application in `dispatch_7x_additional_channel_pair`).
+///
+/// All input slices must be at least `n` long where `n = tl`. Outputs
+/// are returned in `(l_spec, r_spec, ls_spec, rs_spec)` order, each
+/// length `n`. Returns `None` if `tl` has no SFB table or if any
+/// per-channel slice is shorter than `n`.
+pub fn apply_sap_table_181(
+    a_spec: &[f32],
+    b_spec: &[f32],
+    s3_spec: &[f32],
+    s4_spec: &[f32],
+    chparam_pair: &[ChparamInfo; 2],
+    max_sfb_master: u32,
+    tl: u32,
+) -> Option<SapTable181Output> {
+    let n = tl as usize;
+    if n == 0 || a_spec.len() < n || b_spec.len() < n || s3_spec.len() < n || s4_spec.len() < n {
+        return None;
+    }
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    // Joint-MDCT residual layer is single-window-group at the dominant
+    // transform length — both chparam_info() bodies use the same
+    // `max_sfb_per_group = [max_sfb_master]` bound.
+    let coeffs0 = extract_sap_abcd(&chparam_pair[0], &[max_sfb_master]);
+    let coeffs1 = extract_sap_abcd(&chparam_pair[1], &[max_sfb_master]);
+    let abcd0: &[(f32, f32, f32, f32)] = coeffs0.abcd.first().map(|v| v.as_slice()).unwrap_or(&[]);
+    let abcd1: &[(f32, f32, f32, f32)] = coeffs1.abcd.first().map(|v| v.as_slice()).unwrap_or(&[]);
+    let max_sfb = max_sfb_master as usize;
+    let mut l_spec = vec![0.0f32; n];
+    let mut r_spec = vec![0.0f32; n];
+    let mut ls_spec = vec![0.0f32; n];
+    let mut rs_spec = vec![0.0f32; n];
+    let usable0 = abcd0.len().min(max_sfb);
+    let usable1 = abcd1.len().min(max_sfb);
+    let usable = usable0.min(usable1);
+    for sfb in 0..usable {
+        let lo = sfbo[sfb] as usize;
+        let hi = sfbo[sfb + 1] as usize;
+        let hi = hi.min(n);
+        let (a0, b0, c0, d0) = abcd0[sfb];
+        let (a1, b1, c1, d1) = abcd1[sfb];
+        for k in lo..hi {
+            let a = a_spec[k];
+            let b = b_spec[k];
+            let s3 = s3_spec[k];
+            let s4 = s4_spec[k];
+            l_spec[k] = a0 * a + b0 * s3;
+            r_spec[k] = a1 * b + b1 * s4;
+            ls_spec[k] = c0 * a + d0 * s3;
+            rs_spec[k] = c1 * b + d1 * s4;
+        }
+    }
+    // Bins past the SAP-coded extent: high pair (L/R) keeps the
+    // unmodified A/B carriers (so the front pair retains its full
+    // bandwidth); low pair (Ls/Rs) stays silent (Pseudocode 117 will
+    // synthesise its own surround from the alpha/beta parameters).
+    let unmixed_start = sfbo.get(usable).copied().map(|v| v as usize).unwrap_or(n);
+    let unmixed_lo = unmixed_start.min(n);
+    if unmixed_lo < n {
+        l_spec[unmixed_lo..n].copy_from_slice(&a_spec[unmixed_lo..n]);
+        r_spec[unmixed_lo..n].copy_from_slice(&b_spec[unmixed_lo..n]);
+    }
+    Some((l_spec, r_spec, ls_spec, rs_spec))
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -786,6 +881,17 @@ pub struct SubstreamTools {
     /// 5.X Cfg2 trailing `mono_data(0)` (the surround mono after
     /// `four_channel_data`).
     pub cfg2_back_mono: Option<crate::mch::MonoLfeData>,
+    /// 5_X SIMPLE/ASPX cfg2 ASPX trailer for the front L/R pair —
+    /// the first `aspx_data_2ch()` after `four_channel_data + mono_data(0)`
+    /// (per Table 25 row `case ASPX:` cfg2). Only populated when
+    /// `5_X_codec_mode == ASPX` AND the trailer parsed cleanly.
+    pub cfg2_aspx_lr: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg2 ASPX trailer for the surround Ls/Rs pair —
+    /// the second `aspx_data_2ch()` after the L/R trailer.
+    pub cfg2_aspx_ls_rs: Option<aspx::FiveXAspxTrailer>,
+    /// 5_X SIMPLE/ASPX cfg2 ASPX trailer for the centre channel —
+    /// the `aspx_data_1ch()` after the two 2ch trailers.
+    pub cfg2_aspx_centre: Option<aspx::FiveXAspxTrailer>,
     /// Parsed `two_channel_data()` outer shells (Table 26) for the 5.X
     /// `coding_config` Cfg0 (twice: `[L/R, Ls/Rs]`) and Cfg1 (once,
     /// after `three_channel_data`). Length matches the spec's call
@@ -840,6 +946,22 @@ pub struct SubstreamTools {
     /// MDCT residual layer is single-window-grouped, per the §4.2.6.6
     /// NOTE).
     pub acpl_1_residual_pair: [Option<(u32, Vec<f32>)>; 2],
+    /// 5_X `ASPX_ACPL_1` inner walker's two `chparam_info()` payloads
+    /// (Table 25 row `case ASPX_ACPL_1:` — the two `chparam_info()` calls
+    /// after `max_sfb_master`). These drive the Pseudocode 59 SAP a/b/c/d
+    /// extraction for Table 181's first-stage matrix that mixes
+    /// (sSMP_A, sSMP_B) with (sSMP_3, sSMP_4) → preliminary
+    /// (L, R, Ls, Rs) before Pseudocode 117 runs. `[None, None]` for any
+    /// path other than 5_X ACPL_1 or when the inner walker bailed
+    /// before reaching the chparam pair.
+    pub acpl_1_residual_chparam: [Option<ChparamInfo>; 2],
+    /// `max_sfb_master` for the 5_X / 7_X `ASPX_ACPL_1` joint-MDCT
+    /// residual layer (read after `n_side_bits` per Table 25 / 33 row
+    /// `case ASPX_ACPL_1:`). Drives the per-(g, sfb) extent for
+    /// Pseudocode 59 SAP extraction in [`apply_sap_table_181`]. `None`
+    /// for any path other than 5_X / 7_X ACPL_1, or when the inner
+    /// walker bailed before reaching `max_sfb_master`.
+    pub acpl_1_residual_max_sfb_master: Option<u32>,
     /// `7_X_codec_mode` (§4.3.5.7 Table 98) for 7.X channel-element
     /// substreams. Populated by [`crate::mch::parse_7x_audio_data_outer`].
     /// Note this is a 2-bit field for 7_X (vs 3 bits for 5_X) — only
@@ -1332,6 +1454,204 @@ pub(crate) fn parse_aspx_data_2ch_body(
     tools.aspx_delta_dir_secondary = Some(dd1);
     tools.aspx_framing_primary = Some(framing_ch0);
     Ok(())
+}
+
+/// Snapshot of the per-substream ASPX-trailer slots used by the
+/// 5_X SIMPLE/ASPX trailer-capture helpers. Captures the slots
+/// before parsing a trailer so they can be restored afterwards
+/// (the cfg2 outer needs to walk three trailers in sequence — we
+/// don't want any one of them to leak its state into the
+/// "primary" view used by other paths).
+struct AspxTrailerSnapshot {
+    framing_pri: Option<aspx::AspxFraming>,
+    framing_sec: Option<aspx::AspxFraming>,
+    balance: Option<bool>,
+    xover: Option<u8>,
+    delta_dir_pri: Option<aspx::AspxDeltaDir>,
+    delta_dir_sec: Option<aspx::AspxDeltaDir>,
+    qmode_pri: Option<aspx::AspxQuantStep>,
+    qmode_sec: Option<aspx::AspxQuantStep>,
+    frequency_tables: Option<aspx::AspxFrequencyTables>,
+    hfgen_1ch: Option<aspx::AspxHfgenIwc1Ch>,
+    hfgen_2ch: Option<aspx::AspxHfgenIwc2Ch>,
+    sig_pri: Option<Vec<aspx::AspxHuffEnv>>,
+    sig_sec: Option<Vec<aspx::AspxHuffEnv>>,
+    noise_pri: Option<Vec<aspx::AspxHuffEnv>>,
+    noise_sec: Option<Vec<aspx::AspxHuffEnv>>,
+}
+
+impl AspxTrailerSnapshot {
+    fn capture(tools: &mut SubstreamTools) -> Self {
+        Self {
+            framing_pri: tools.aspx_framing_primary.take(),
+            framing_sec: tools.aspx_framing_secondary.take(),
+            balance: tools.aspx_balance.take(),
+            xover: tools.aspx_xover_subband_offset.take(),
+            delta_dir_pri: tools.aspx_delta_dir_primary.take(),
+            delta_dir_sec: tools.aspx_delta_dir_secondary.take(),
+            qmode_pri: tools.aspx_qmode_env_primary.take(),
+            qmode_sec: tools.aspx_qmode_env_secondary.take(),
+            frequency_tables: tools.aspx_frequency_tables.take(),
+            hfgen_1ch: tools.aspx_hfgen_iwc_1ch.take(),
+            hfgen_2ch: tools.aspx_hfgen_iwc_2ch.take(),
+            sig_pri: tools.aspx_data_sig_primary.take(),
+            sig_sec: tools.aspx_data_sig_secondary.take(),
+            noise_pri: tools.aspx_data_noise_primary.take(),
+            noise_sec: tools.aspx_data_noise_secondary.take(),
+        }
+    }
+
+    fn restore(self, tools: &mut SubstreamTools) {
+        tools.aspx_framing_primary = self.framing_pri;
+        tools.aspx_framing_secondary = self.framing_sec;
+        tools.aspx_balance = self.balance;
+        tools.aspx_xover_subband_offset = self.xover;
+        tools.aspx_delta_dir_primary = self.delta_dir_pri;
+        tools.aspx_delta_dir_secondary = self.delta_dir_sec;
+        tools.aspx_qmode_env_primary = self.qmode_pri;
+        tools.aspx_qmode_env_secondary = self.qmode_sec;
+        tools.aspx_frequency_tables = self.frequency_tables;
+        tools.aspx_hfgen_iwc_1ch = self.hfgen_1ch;
+        tools.aspx_hfgen_iwc_2ch = self.hfgen_2ch;
+        tools.aspx_data_sig_primary = self.sig_pri;
+        tools.aspx_data_sig_secondary = self.sig_sec;
+        tools.aspx_data_noise_primary = self.noise_pri;
+        tools.aspx_data_noise_secondary = self.noise_sec;
+    }
+}
+
+/// Walk a trailing `aspx_data_2ch()` body and capture the result as a
+/// [`aspx::FiveXAspxTrailer`]. The per-substream ASPX-trailer slots
+/// in `tools` are saved before the parse and restored afterwards, so
+/// the call leaves no residue (the captured trailer holds the parsed
+/// state).
+///
+/// Returns `None` when `parse_aspx_data_2ch_body` bails or when the
+/// frequency-table derivation didn't fire (the trailer is then
+/// considered unusable for bandwidth-extension).
+pub(crate) fn capture_aspx_data_2ch_trailer(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Option<aspx::FiveXAspxTrailer> {
+    let snap = AspxTrailerSnapshot::capture(tools);
+    let parse_ok = parse_aspx_data_2ch_body(br, tools, cfg, b_iframe, frame_len_base).is_ok();
+    let trailer = if parse_ok {
+        let xover = tools.aspx_xover_subband_offset?;
+        let frequency_tables = tools.aspx_frequency_tables.clone()?;
+        let framing_pri = tools.aspx_framing_primary.clone()?;
+        let qmode_pri = tools.aspx_qmode_env_primary?;
+        let delta_dir_pri = tools.aspx_delta_dir_primary.clone()?;
+        let sig_pri = tools.aspx_data_sig_primary.clone().unwrap_or_default();
+        let noise_pri = tools.aspx_data_noise_primary.clone().unwrap_or_default();
+        // hfgen_2ch carries per-channel `add_harmonic` + `tna_mode`
+        // arrays. When absent (xover too high to leave any sig
+        // sbgroups, etc.) we treat the channel as having no harmonic /
+        // TNS info — the extender then falls back to the noise-only
+        // path inside aspx_extend_pcm.
+        let hfgen = tools.aspx_hfgen_iwc_2ch.clone();
+        let (ah_pri, tna_pri, ah_sec, tna_sec) = if let Some(h) = hfgen.as_ref() {
+            let ah_pri = h.add_harmonic.first().cloned();
+            let ah_sec = h.add_harmonic.get(1).cloned();
+            let tna_pri = h.tna_mode.first().cloned();
+            let tna_sec = h.tna_mode.get(1).cloned();
+            (ah_pri, tna_pri, ah_sec, tna_sec)
+        } else {
+            (None, None, None, None)
+        };
+        let primary = aspx::FiveXAspxChannelTrailer {
+            framing: framing_pri.clone(),
+            qmode_env: qmode_pri,
+            delta_dir: delta_dir_pri,
+            data_sig: sig_pri,
+            data_noise: noise_pri,
+            add_harmonic: ah_pri,
+            tna_mode: tna_pri,
+        };
+        // Secondary channel: framing reuses the primary's when
+        // `aspx_balance == 1` (no aspx_framing(1) in the bitstream);
+        // delta-dir / sig / noise are always present per Table 52.
+        let framing_sec = tools
+            .aspx_framing_secondary
+            .clone()
+            .unwrap_or_else(|| framing_pri.clone());
+        let qmode_sec = tools.aspx_qmode_env_secondary.unwrap_or(qmode_pri);
+        let delta_dir_sec = tools
+            .aspx_delta_dir_secondary
+            .clone()
+            .unwrap_or_else(|| tools.aspx_delta_dir_primary.clone().unwrap_or_default());
+        let sig_sec = tools.aspx_data_sig_secondary.clone().unwrap_or_default();
+        let noise_sec = tools.aspx_data_noise_secondary.clone().unwrap_or_default();
+        let secondary = aspx::FiveXAspxChannelTrailer {
+            framing: framing_sec,
+            qmode_env: qmode_sec,
+            delta_dir: delta_dir_sec,
+            data_sig: sig_sec,
+            data_noise: noise_sec,
+            add_harmonic: ah_sec,
+            tna_mode: tna_sec,
+        };
+        Some(aspx::FiveXAspxTrailer {
+            xover,
+            frequency_tables,
+            primary,
+            secondary: Some(secondary),
+        })
+    } else {
+        None
+    };
+    snap.restore(tools);
+    trailer
+}
+
+/// Walk a trailing `aspx_data_1ch()` body and capture the result as a
+/// [`aspx::FiveXAspxTrailer`]. Mirror of
+/// [`capture_aspx_data_2ch_trailer`] for the 1-channel layout
+/// (Table 51).
+pub(crate) fn capture_aspx_data_1ch_trailer(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Option<aspx::FiveXAspxTrailer> {
+    let snap = AspxTrailerSnapshot::capture(tools);
+    let parse_ok = parse_aspx_data_1ch_body(br, tools, cfg, b_iframe, frame_len_base).is_ok();
+    let trailer = if parse_ok {
+        let xover = tools.aspx_xover_subband_offset?;
+        let frequency_tables = tools.aspx_frequency_tables.clone()?;
+        let framing = tools.aspx_framing_primary.clone()?;
+        let qmode = tools.aspx_qmode_env_primary?;
+        let delta_dir = tools.aspx_delta_dir_primary.clone()?;
+        let data_sig = tools.aspx_data_sig_primary.clone().unwrap_or_default();
+        let data_noise = tools.aspx_data_noise_primary.clone().unwrap_or_default();
+        let hfgen = tools.aspx_hfgen_iwc_1ch.clone();
+        let (add_harmonic, tna_mode) = if let Some(h) = hfgen.as_ref() {
+            (Some(h.add_harmonic.clone()), Some(h.tna_mode.clone()))
+        } else {
+            (None, None)
+        };
+        Some(aspx::FiveXAspxTrailer {
+            xover,
+            frequency_tables,
+            primary: aspx::FiveXAspxChannelTrailer {
+                framing,
+                qmode_env: qmode,
+                delta_dir,
+                data_sig,
+                data_noise,
+                add_harmonic,
+                tna_mode,
+            },
+            secondary: None,
+        })
+    } else {
+        None
+    };
+    snap.restore(tools);
+    trailer
 }
 
 /// Derive per-window-group `(transf_length_idx, transform_length, max_sfb)`
@@ -3588,6 +3908,135 @@ mod tests {
         let (a, _, c, _) = coeffs.abcd[1][0];
         assert!((a - 1.6).abs() < 1e-6);
         assert!((c - 0.4).abs() < 1e-6);
+    }
+
+    /// Round 41: Table 181 first-stage matrix with identity
+    /// chparam_info pair (sap_mode = 0, identity coefficients) leaves
+    /// the front pair (L = A, R = B) untouched and zeros the
+    /// preliminary surround pair (Ls / Rs = 0 + 1*sSMP_3,4? — actually
+    /// identity coeffs are (1, 0, 0, 1) so c = 0 and d = 1).
+    /// Concretely:
+    ///   L = 1*A + 0*sSMP_3 = A
+    ///   R = 1*B + 0*sSMP_4 = B
+    ///   Ls = 0*A + 1*sSMP_3 = sSMP_3
+    ///   Rs = 0*B + 1*sSMP_4 = sSMP_4
+    #[test]
+    fn apply_sap_table_181_identity_passthrough() {
+        // Use tl=256 -> sfb table exists per num_sfb_48. max_sfb_master
+        // chosen small (4) so the loop is bounded.
+        let tl = 256u32;
+        let n = tl as usize;
+        let max_sfb_master = 4u32;
+        let a_spec: Vec<f32> = (0..n).map(|i| 0.10 + 1e-3 * i as f32).collect();
+        let b_spec: Vec<f32> = (0..n).map(|i| 0.20 + 1e-3 * i as f32).collect();
+        let s3_spec: Vec<f32> = (0..n).map(|i| 0.30 + 1e-3 * i as f32).collect();
+        let s4_spec: Vec<f32> = (0..n).map(|i| 0.40 + 1e-3 * i as f32).collect();
+        let cp_id = ChparamInfo {
+            sap_mode: 0,
+            ms_used: vec![],
+            sap_data: None,
+        };
+        let pair = [cp_id.clone(), cp_id];
+        let (l, r, ls, rs) = apply_sap_table_181(
+            &a_spec,
+            &b_spec,
+            &s3_spec,
+            &s4_spec,
+            &pair,
+            max_sfb_master,
+            tl,
+        )
+        .expect("identity SAP must produce outputs");
+        assert_eq!(l.len(), n);
+        // Identity coefficients (1, 0, 0, 1) mean L bins are A's bins
+        // (in the SAP-coded extent) and the unmixed range still pulls
+        // from A. So L == A across the whole spectrum.
+        for k in 0..n {
+            assert!(
+                (l[k] - a_spec[k]).abs() < 1e-6,
+                "L[{k}] = {} expected {}",
+                l[k],
+                a_spec[k]
+            );
+            assert!((r[k] - b_spec[k]).abs() < 1e-6);
+        }
+        // Ls / Rs only carry sSMP_3 / sSMP_4 within the SAP-coded extent.
+        // Outside that they're silent.
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let sap_hi = sfbo[max_sfb_master as usize] as usize;
+        for k in 0..sap_hi {
+            assert!((ls[k] - s3_spec[k]).abs() < 1e-6);
+            assert!((rs[k] - s4_spec[k]).abs() < 1e-6);
+        }
+        for k in sap_hi..n {
+            assert_eq!(ls[k], 0.0);
+            assert_eq!(rs[k], 0.0);
+        }
+    }
+
+    /// Round 41: Table 181 with an `ms_used == 1` per-sfb selector mixes
+    /// (1, 1, 1, -1) over the band — L = A + sSMP_3, R = B + sSMP_4,
+    /// Ls = A + sSMP_3, Rs = B - sSMP_4.
+    #[test]
+    fn apply_sap_table_181_ms_used_mixing() {
+        let tl = 256u32;
+        let n = tl as usize;
+        let max_sfb_master = 2u32;
+        // Use constant spectra so we can check exact sums per band.
+        let a_spec = vec![1.0_f32; n];
+        let b_spec = vec![2.0_f32; n];
+        let s3_spec = vec![3.0_f32; n];
+        let s4_spec = vec![4.0_f32; n];
+        let cp = ChparamInfo {
+            sap_mode: 1,
+            ms_used: vec![vec![true, true]],
+            sap_data: None,
+        };
+        let pair = [cp.clone(), cp];
+        let (l, r, ls, rs) = apply_sap_table_181(
+            &a_spec,
+            &b_spec,
+            &s3_spec,
+            &s4_spec,
+            &pair,
+            max_sfb_master,
+            tl,
+        )
+        .unwrap();
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let sap_hi = sfbo[max_sfb_master as usize] as usize;
+        // Within SAP-coded extent: (a, b, c, d) = (1, 1, 1, -1).
+        // Per Table 181: L = a*A + b*s3; R = a*B + b*s4;
+        //                Ls = c*A + d*s3; Rs = c*B + d*s4.
+        for k in 0..sap_hi {
+            assert!((l[k] - 4.0).abs() < 1e-6); // 1*A + 1*s3 = 1 + 3
+            assert!((r[k] - 6.0).abs() < 1e-6); // 1*B + 1*s4 = 2 + 4
+            assert!((ls[k] - (-2.0)).abs() < 1e-6); // 1*A + (-1)*s3 = 1 - 3
+            assert!((rs[k] - (-2.0)).abs() < 1e-6); // 1*B + (-1)*s4 = 2 - 4
+        }
+        // Outside the SAP-coded extent: front pair pulls A/B, surround silent.
+        for k in sap_hi..n {
+            assert_eq!(l[k], 1.0);
+            assert_eq!(r[k], 2.0);
+            assert_eq!(ls[k], 0.0);
+            assert_eq!(rs[k], 0.0);
+        }
+    }
+
+    /// Round 41: missing sfb table (e.g. tl with no entry in
+    /// `num_sfb_48`) returns `None` so the dispatch can fall back to
+    /// the round-40 raw sSMP_3 / sSMP_4 path.
+    #[test]
+    fn apply_sap_table_181_missing_sfb_table_returns_none() {
+        // tl = 100 has no entry in `num_sfb_48` (only the defined
+        // transform lengths return Some).
+        let tl = 100u32;
+        let n = tl as usize;
+        let cp = ChparamInfo::default();
+        let pair = [cp.clone(), cp];
+        let zero = vec![0.0f32; n];
+        let out = apply_sap_table_181(&zero, &zero, &zero, &zero, &pair, 1, tl);
+        assert!(out.is_none());
     }
 
     /// `SapCoeffs::identity` produces an all-ones-diagonal matrix.

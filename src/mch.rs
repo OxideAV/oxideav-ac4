@@ -695,10 +695,59 @@ pub fn parse_5x_audio_data_outer(
                     );
                 }
             }
-            // ASPX trailers (aspx_data_2ch + aspx_data_2ch +
-            // aspx_data_1ch) deferred — they follow the same Table 51 /
-            // 52 layout as stereo ASPX but consume per-substream
-            // I-frame state we haven't propagated up here yet.
+            // §4.2.6.6 Table 25 row `case ASPX:` — when the 5_X codec
+            // mode is ASPX (not SIMPLE) the body trails three ASPX
+            // payloads regardless of coding_config:
+            //
+            //   aspx_data_2ch();   // first stereo pair
+            //   aspx_data_2ch();   // second stereo pair
+            //   aspx_data_1ch();   // mono (centre)
+            //
+            // Captured into per-coding-config trailer slots so the
+            // decoder can run `aspx_extend_pcm` per channel without
+            // overwriting the stereo-CPE primary/secondary slots.
+            //
+            // Round 41: cfg2 wired (the four-channel + back-mono
+            // layout). cfg0 / cfg1 / cfg3 land in the same trailers
+            // but with different channel-to-trailer mappings; the
+            // dispatch side currently consumes only the cfg2 mapping
+            // so the cfg0 / cfg1 / cfg3 trailer fields capture data
+            // for a future round to wire.
+            if matches!(mode, FiveXCodecMode::Aspx) && b_iframe && tools.aspx_config.is_some() {
+                let aspx_cfg = tools.aspx_config.unwrap();
+                let lr = crate::asf::capture_aspx_data_2ch_trailer(
+                    br,
+                    tools,
+                    &aspx_cfg,
+                    b_iframe,
+                    frame_len_base,
+                );
+                let ls_rs = crate::asf::capture_aspx_data_2ch_trailer(
+                    br,
+                    tools,
+                    &aspx_cfg,
+                    b_iframe,
+                    frame_len_base,
+                );
+                let centre = crate::asf::capture_aspx_data_1ch_trailer(
+                    br,
+                    tools,
+                    &aspx_cfg,
+                    b_iframe,
+                    frame_len_base,
+                );
+                if matches!(coding_cfg, FiveXCodingConfig::Cfg2FourMono) {
+                    tools.cfg2_aspx_lr = lr;
+                    tools.cfg2_aspx_ls_rs = ls_rs;
+                    tools.cfg2_aspx_centre = centre;
+                } else {
+                    // Discard captured trailers for cfg0 / cfg1 / cfg3
+                    // until the dispatch side wires them. The bits
+                    // were still consumed so the bit-pointer ends at
+                    // the right offset for any frame_data trailer.
+                    let _ = (lr, ls_rs, centre);
+                }
+            }
         }
         FiveXCodecMode::AspxAcpl1 | FiveXCodecMode::AspxAcpl2 => {
             tools.companding = Some(crate::aspx::parse_companding_control(br, 3)?);
@@ -863,12 +912,14 @@ fn parse_aspx_acpl_1_2_inner_body(
         // Per Pseudocode 5 / §4.2.10 the per-group max_sfb here is just
         // max_sfb_master (joint-MDCT residual layer is a single window
         // group at the dominant transform length).
-        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
-            return Ok(());
-        }
-        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
-            return Ok(());
-        }
+        let cp0 = match parse_chparam_info(br, &[max_sfb_master]) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let cp1 = match parse_chparam_info(br, &[max_sfb_master]) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
         // Two sf_data(ASF) bodies — pair the channels' residual MDCT
         // spectra. We reuse the ASF long-frame body decoder with the
         // explicit max_sfb_master bound. We synthesise the
@@ -889,8 +940,15 @@ fn parse_aspx_acpl_1_2_inner_body(
         // Table 181) so the ASPX_ACPL_1 dispatch can IMDCT them into
         // Ls / Rs surround PCM carriers (round 40 — replaces the
         // round-37 silence placeholder for the surround-driven path).
+        // Round 41 also persists the matching `chparam_info()` pair so
+        // the dispatch can apply Table 181's SAP a/b/c/d first-stage
+        // matrix between (sSMP_A, sSMP_B) and (sSMP_3, sSMP_4) before
+        // Pseudocode 117 runs.
         tools.acpl_1_residual_pair[0] = Some((tl, b0));
         tools.acpl_1_residual_pair[1] = Some((tl, b1));
+        tools.acpl_1_residual_chparam[0] = Some(cp0);
+        tools.acpl_1_residual_chparam[1] = Some(cp1);
+        tools.acpl_1_residual_max_sfb_master = Some(max_sfb_master);
     }
 
     // 3) Cfg0 only: mono_data(0) — centre / surround mono.
@@ -1245,12 +1303,14 @@ pub fn parse_7x_audio_data_outer(
         if max_sfb_master == 0 {
             return Ok(());
         }
-        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
-            return Ok(());
-        }
-        if parse_chparam_info(br, &[max_sfb_master]).is_err() {
-            return Ok(());
-        }
+        let cp0 = match parse_chparam_info(br, &[max_sfb_master]) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let cp1 = match parse_chparam_info(br, &[max_sfb_master]) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
         let synth_ti = AsfTransformInfo {
             b_long_frame: true,
             transf_length: [0; 2],
@@ -1263,9 +1323,13 @@ pub fn parse_7x_audio_data_outer(
         let Some(b1) = body1 else { return Ok(()) };
         // Persist the 7_X ASPX_ACPL_1 joint-MDCT residual pair too —
         // shape mirrors the 5_X path; the dispatch can use the same
-        // tools slot for both 5_X and 7_X surround-driven render.
+        // tools slot for both 5_X and 7_X surround-driven render. Same
+        // `chparam_info()` pair persisted for Table 181 SAP application.
         tools.acpl_1_residual_pair[0] = Some((tl, b0));
         tools.acpl_1_residual_pair[1] = Some((tl, b1));
+        tools.acpl_1_residual_chparam[0] = Some(cp0);
+        tools.acpl_1_residual_chparam[1] = Some(cp1);
+        tools.acpl_1_residual_max_sfb_master = Some(max_sfb_master);
     }
 
     // Trailing `mono_data(0)` for `coding_config in {0, 2}` — the

@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 41 — 5_X SIMPLE/ASPX cfg2 ASPX bandwidth-extension trailers +
+  Table 181 first-stage SAP matrix for 5_X / 7_X `ASPX_ACPL_1`** (TS
+  103 190-1 §4.2.6.6 / §5.3.4.3.2):
+  - `aspx::FiveXAspxTrailer` + `aspx::FiveXAspxChannelTrailer` —
+    captured per-trailer bitstream state (xover, frequency tables,
+    framing, qmode, delta-dir, sig/noise envelopes, hfgen
+    add_harmonic / tna_mode) for one `aspx_data_2ch()` or
+    `aspx_data_1ch()` payload. Wraps everything `aspx_extend_pcm`
+    needs for one or two channels.
+  - `asf::capture_aspx_data_2ch_trailer` /
+    `asf::capture_aspx_data_1ch_trailer` — wrap `parse_aspx_data_*_body`
+    with snapshot/restore over the per-substream ASPX-trailer slots
+    so multiple sequential trailers can be parsed without corrupting
+    each other's state.
+  - `parse_5x_audio_data_outer` SIMPLE/ASPX branch now walks the
+    Table 25 row `case ASPX:` trailer triplet (`aspx_data_2ch +
+    aspx_data_2ch + aspx_data_1ch`) and stores the captured trailers
+    on `tools.cfg2_aspx_lr / cfg2_aspx_ls_rs / cfg2_aspx_centre`.
+    Cfg0/Cfg1/Cfg3 still parse the bits (so the bitreader lands at
+    the right offset) but don't yet wire to dispatch.
+  - `Ac4Decoder::dispatch_5x_cfg2_simple_aspx` extended to apply
+    A-SPX bandwidth-extension per-channel: L/R use `aspx_lr` (primary
+    / secondary); Ls/Rs use `aspx_ls_rs`; centre uses `aspx_centre`.
+    SIMPLE-mode (no trailers) and trailer-parse-miss paths fall
+    through to round-38 low-band-only PCM.
+  - `asf::apply_sap_table_181(a, b, s3, s4, chparam_pair, max_sfb,
+    tl) -> (l, r, ls, rs)` — Table 181 first-stage matrix for
+    `5_X_codec_mode == ASPX_ACPL_1`. Mixes (sSMP_A, sSMP_B) with
+    (sSMP_3, sSMP_4) per-sfb using the (a, b, c, d) coefficients
+    extracted from each `chparam_info()` payload (Pseudocode 59) into
+    preliminary (L, R, Ls, Rs) spectra. Bands past `max_sfb_master`
+    pull L/R from A/B and zero Ls/Rs.
+  - `parse_aspx_acpl_1_2_inner_body` (5_X) +
+    `parse_7x_audio_data_outer` (7_X ASPX_ACPL_1 branch) now persist
+    the parsed `chparam_info()` pair on
+    `tools.acpl_1_residual_chparam` plus `max_sfb_master` on
+    `tools.acpl_1_residual_max_sfb_master` — round 40 already
+    persisted the residual spectra; round 41 closes the loop with
+    the SAP coefficients + bound.
+  - `Ac4Decoder::receive_frame` 5_X ACPL_1 dispatch now applies
+    Table 181's SAP matrix in the spectral domain when all four
+    inputs (sSMP_A, sSMP_B, sSMP_3, sSMP_4 + chparam pair +
+    max_sfb_master) are available, IMDCTs the resulting (L, R, Ls,
+    Rs) preliminary spectra, and feeds them into Pseudocode 117
+    (`run_acpl_5x_pair_pcm`) as the already-mixed PCM inputs the
+    spec expects. ACPL_2 mode (no residual pair) falls through to
+    round-40 silence placeholders.
+
 - **Round 40 — SAP a/b/c/d coefficient extraction (Pseudocode 59) +
   Table 183 7_X SIMPLE/ASPX final channel mapping + standalone Ls/Rs
   surround mono walker for ACPL_1 Mode 1** (TS 103 190-1 §5.3.2 /
