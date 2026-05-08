@@ -612,6 +612,65 @@ impl Ac4Decoder {
             pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
         }
     }
+
+    /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 2`
+    /// dispatch: the parsed `four_channel_data` carries L/R/Ls/Rs in
+    /// `scaled_spec_per_channel[0..4]` and the trailing
+    /// `cfg2_back_mono.scaled_spec` carries the centre. Channel mapping
+    /// per Table 180:
+    ///
+    /// ```text
+    ///     four_channel_data[0] -> slot 0 (L)
+    ///     four_channel_data[1] -> slot 1 (R)
+    ///     four_channel_data[2] -> slot 3 (Ls)
+    ///     four_channel_data[3] -> slot 4 (Rs)
+    ///     mono_data           -> slot 2 (C)
+    /// ```
+    ///
+    /// Round 38 wires this end-to-end. ASPX bandwidth-extension /
+    /// companding for the four channels is deferred — only the ASF body
+    /// IMDCT lands here. The function is a no-op when any of the four
+    /// per-channel scaled spectra are absent (short / grouped frame
+    /// or Huffman miss).
+    fn dispatch_5x_cfg2_simple_aspx(
+        &mut self,
+        four: &crate::mch::FourChannelData,
+        back_mono: Option<&crate::mch::MonoLfeData>,
+        samples: usize,
+        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+    ) {
+        let Some(ti) = four.transform_info.as_ref() else {
+            return;
+        };
+        let n = ti.transform_length_0 as usize;
+        if n == 0 || n != samples {
+            return;
+        }
+        if four.scaled_spec_per_channel.len() < 4 {
+            return;
+        }
+        // Channel mapping: ch_in -> slot_out per Table 180 cfg2 column.
+        const SLOT_MAP: [usize; 4] = [0, 1, 3, 4];
+        // Need at least 5 output slots (L/R/C/Ls/Rs). Resize on demand.
+        while pcm_per_channel.len() < 5 {
+            pcm_per_channel.push(None);
+        }
+        for (ch_in, &slot) in SLOT_MAP.iter().enumerate() {
+            let Some(scaled) = four.scaled_spec_per_channel[ch_in].as_ref() else {
+                continue;
+            };
+            let pcm = self.imdct_channel(slot, scaled, n);
+            pcm_per_channel[slot] = Some(pcm);
+        }
+        // Centre — slot 2. `cfg2_back_mono` may carry a body when the
+        // walker decoded the trailing `mono_data(0)`; otherwise the
+        // centre stays silent.
+        if let Some(mono) = back_mono {
+            if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
+                pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&pcm_f));
+            }
+        }
+    }
 }
 
 impl Decoder for Ac4Decoder {
@@ -849,6 +908,36 @@ impl Decoder for Ac4Decoder {
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.cfg0_centre_mono.clone());
+        // Round 38: detach the 5_X SIMPLE/ASPX `coding_config == 2`
+        // payloads so we can drive an end-to-end multichannel decode.
+        // The walker populates `four_channel_data.scaled_spec_per_channel`
+        // (4 entries — L, R, Ls, Rs per Table 180) and `cfg2_back_mono`
+        // (the trailing `mono_data(0)` — slot 2, the C centre channel
+        // for 5.X). Active only when `five_x_mode in {Simple, Aspx}` and
+        // `five_x_coding_config == Cfg2FourMono`. Cfg0/Cfg1/Cfg3 each
+        // need their own dispatch helpers and are deferred.
+        let five_x_cfg2_active = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                matches!(
+                    sub.tools.five_x_mode,
+                    Some(crate::mch::FiveXCodecMode::Simple)
+                        | Some(crate::mch::FiveXCodecMode::Aspx)
+                ) && matches!(
+                    sub.tools.five_x_coding_config,
+                    Some(crate::mch::FiveXCodingConfig::Cfg2FourMono)
+                ) && sub.tools.four_channel_data.is_some()
+            })
+            .unwrap_or(false);
+        let cfg2_four_channel_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.four_channel_data.clone());
+        let cfg2_back_mono = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg2_back_mono.clone());
         // Round 37: 7_X ASPX_ACPL_1 / ASPX_ACPL_2 pair dispatch state
         // (mirrors the 5_X detach above). Both modes carry the same
         // shape of `acpl_config_1ch_*` + `acpl_data_1ch_pair`. The 7_X
@@ -890,15 +979,20 @@ impl Decoder for Ac4Decoder {
             && seven_x_pair_cfg.is_some()
             && seven_x_pair_data_1.is_some()
             && seven_x_pair_data_2.is_some();
-        // Centre channel for ASPX_ACPL_3: the mono_data(0) body (cfg0_centre_mono)
-        // isn't yet decoded into a scaled spectrum by the walker, so we use a
-        // zero-filled placeholder of the right length. The A-CPL synthesis still
-        // fires and produces correct L/R/Ls/Rs from the stereo carriers; only the
-        // centre output will be silent until cfg0_centre_mono gains a decode path.
-        // `five_x_centre_spec` is `Some(zeroes)` when ACPL_3 is active (to avoid
-        // a length mismatch in run_acpl_5x_mch_pcm), else `None`.
+        // Centre channel for ASPX_ACPL_3: round 38 wires the parsed
+        // `cfg0_centre_mono.scaled_spec` (when present) through IMDCT +
+        // overlap-add for slot 2 (centre). This replaces the round-37
+        // silence placeholder used while the body decoder was deferred.
+        // Falls back to a zero-filled placeholder when the centre body
+        // isn't decoded (LFE / SSF / Huffman miss / ACPL_3 walker
+        // doesn't populate cfg0_centre_mono on every frame) so the
+        // length-checked run_acpl_5x_mch_pcm still fires and emits
+        // shaped Ls/Rs from the L/R carriers.
         let five_x_centre_spec: Option<Vec<f32>> = if five_x_acpl3_active {
-            Some(vec![0.0_f32; samples as usize])
+            let centre_pcm = cfg0_centre_mono
+                .as_ref()
+                .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
+            Some(centre_pcm.unwrap_or_else(|| vec![0.0_f32; samples as usize]))
         } else {
             None
         };
@@ -1270,6 +1364,23 @@ impl Decoder for Ac4Decoder {
                     centre_pcm.as_deref(),
                     None,
                     None,
+                    &mut pcm_per_channel,
+                );
+            }
+        }
+        // Round 38: §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX
+        // `coding_config == 2` end-to-end decode. Walks the parsed
+        // `four_channel_data` (L/R/Ls/Rs per Table 180) + trailing
+        // `cfg2_back_mono` (C) into per-channel PCM. Mutually exclusive
+        // with the ACPL_3 / pair paths above (they own different
+        // `five_x_mode` enums or `coding_config` values), so this only
+        // fires when the SIMPLE/ASPX pure-MDCT cfg2 walker is in scope.
+        if five_x_cfg2_active && !five_x_acpl3_active && !five_x_pair_active {
+            if let Some(four) = cfg2_four_channel_data.as_ref() {
+                self.dispatch_5x_cfg2_simple_aspx(
+                    four,
+                    cfg2_back_mono.as_ref(),
+                    samples as usize,
                     &mut pcm_per_channel,
                 );
             }
@@ -2435,5 +2546,96 @@ mod tests {
         assert_eq!(pcm.len(), 1_920);
         // All-zero spectrum + zero history -> all-zero PCM.
         assert!(pcm.iter().all(|&s| s == 0.0));
+    }
+
+    /// Round 38: `dispatch_5x_cfg2_simple_aspx` IMDCTs the parsed
+    /// `four_channel_data.scaled_spec_per_channel[0..4]` into PCM slots
+    /// 0/1/3/4 (L/R/Ls/Rs per Table 180) and the trailing
+    /// `cfg2_back_mono` into slot 2 (C). With non-zero ramp spectra in
+    /// slots 0/1/3/4 and slot 2, every channel must carry energy after
+    /// IMDCT + overlap-add (the windowed first-frame output isn't
+    /// pure silence even though the prior overlap history was zero).
+    #[test]
+    fn dispatch_5x_cfg2_populates_l_r_c_ls_rs() {
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let n: usize = 1_920;
+        let ti = crate::asf::AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0; 2],
+            transform_length_0: n as u32,
+            transform_length_1: n as u32,
+        };
+        // Build per-channel "ramp" spectra so every output carries energy.
+        // The amplitude is small enough that i16 quantisation doesn't
+        // squash everything to zero after IMDCT + windowing.
+        let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
+        let four = crate::mch::FourChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            info: None,
+            scaled_spec_per_channel: vec![
+                Some(mk_ramp(0.10)),
+                Some(mk_ramp(0.20)),
+                Some(mk_ramp(0.30)),
+                Some(mk_ramp(0.40)),
+            ],
+        };
+        let back_mono = crate::mch::MonoLfeData {
+            b_lfe: false,
+            spec_frontend_bit: 0,
+            transform_info: Some(ti),
+            psy_info: None,
+            scaled_spec: Some(mk_ramp(0.50)),
+        };
+        let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec.dispatch_5x_cfg2_simple_aspx(&four, Some(&back_mono), n, &mut pcm);
+        // Every L/R/C/Ls/Rs slot must be populated and carry energy.
+        for (slot, entry) in pcm.iter().enumerate().take(5) {
+            let v = entry
+                .as_ref()
+                .unwrap_or_else(|| panic!("slot {slot} populated"));
+            assert_eq!(v.len(), n);
+            let energy: u64 = v.iter().map(|&s| s.unsigned_abs() as u64).sum();
+            assert!(
+                energy > 0,
+                "slot {slot} must carry energy from per-channel ramp"
+            );
+        }
+    }
+
+    /// Round 38: `dispatch_5x_cfg2_simple_aspx` is a no-op when the
+    /// `four_channel_data.transform_info` carrier-length differs from
+    /// the requested `samples` count — leaves all output slots unchanged.
+    #[test]
+    fn dispatch_5x_cfg2_noop_on_length_mismatch() {
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let ti = crate::asf::AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0; 2],
+            transform_length_0: 1_024,
+            transform_length_1: 1_024,
+        };
+        let four = crate::mch::FourChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            info: None,
+            scaled_spec_per_channel: vec![
+                Some(vec![0.1_f32; 1_024]),
+                Some(vec![0.2_f32; 1_024]),
+                Some(vec![0.3_f32; 1_024]),
+                Some(vec![0.4_f32; 1_024]),
+            ],
+        };
+        let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
+        // Request a different sample count.
+        dec.dispatch_5x_cfg2_simple_aspx(&four, None, 1_920, &mut pcm);
+        for (slot, entry) in pcm.iter().enumerate().take(5) {
+            assert!(
+                entry.is_none(),
+                "slot {slot} should be untouched on length mismatch"
+            );
+        }
     }
 }

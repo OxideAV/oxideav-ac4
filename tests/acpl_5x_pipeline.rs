@@ -632,3 +632,87 @@ fn seven_x_aspx_acpl_2_walker_to_synthesis_glue() {
         assert!(s.is_finite(), "non-finite sample in 7.X output");
     }
 }
+
+/// Round 38: 5_X SIMPLE/ASPX `coding_config == 2` walker → tools layout
+/// glue. After `parse_5x_audio_data_outer` walks a Cfg2 frame the parsed
+/// `four_channel_data.scaled_spec_per_channel[0..4]` carries L/R/Ls/Rs
+/// (per Table 180) and `cfg2_back_mono` carries the centre. This test
+/// verifies the walker hands back the right slots — the downstream
+/// IMDCT dispatch (`Ac4Decoder::dispatch_5x_cfg2_simple_aspx`) is
+/// covered by the unit tests in `decoder.rs`.
+#[test]
+fn five_x_simple_cfg2_walker_populates_four_plus_back_mono() {
+    use oxideav_ac4::asf::SubstreamTools;
+    use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode, FiveXCodingConfig};
+
+    // 5_X_codec_mode = SIMPLE (3 bits, value 0). No LFE.
+    // coding_config = 2 (Cfg2FourMono).
+    // four_channel_data: long-frame, max_sfb=20, 4x chparam_info + 4x
+    // all-zero sf_data bodies.
+    // mono_data(0): spec_frontend=ASF, long-frame, max_sfb=8, all-zero
+    // sf_data body.
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
+    bw.write_u32(2, 2); // coding_config = 2
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(20, 6); // max_sfb[0]
+    for _ in 0..4 {
+        bw.write_u32(0, 2); // chparam_info #i
+    }
+    // 4x sf_data(ASF) all-zero bodies.
+    let write_zero = |bw: &mut BitWriter, max_sfb: u32| {
+        // sect_cb=0 (4 bits), sect_len_incr accumulating to max_sfb-1
+        // (3-bit slots with 7-escape).
+        bw.write_u32(0, 4);
+        let mut remaining = max_sfb.saturating_sub(1);
+        while remaining >= 7 {
+            bw.write_u32(7, 3);
+            remaining -= 7;
+        }
+        bw.write_u32(remaining, 3);
+        bw.write_u32(120, 8); // scalefac reference
+        bw.write_bit(false); // b_snf_data_exists=0
+    };
+    for _ in 0..4 {
+        write_zero(&mut bw, 20);
+    }
+    // Trailing mono_data(0) for the centre.
+    bw.write_bit(false); // spec_frontend = ASF
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(8, 6); // max_sfb[0]
+    write_zero(&mut bw, 8);
+    bw.align_to_byte();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    let mut tools = SubstreamTools::default();
+    parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+    assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::Simple));
+    assert_eq!(
+        tools.five_x_coding_config,
+        Some(FiveXCodingConfig::Cfg2FourMono)
+    );
+    let four = tools
+        .four_channel_data
+        .as_ref()
+        .expect("four_channel_data populated");
+    // All four per-channel scaled spectra must be present and length-
+    // matched to sfb_offset[max_sfb=20] for tl=1920.
+    assert_eq!(four.scaled_spec_per_channel.len(), 4);
+    for (i, ch) in four.scaled_spec_per_channel.iter().enumerate() {
+        assert!(
+            ch.is_some(),
+            "four_channel_data slot {i} must carry scaled_spec"
+        );
+    }
+    let back = tools
+        .cfg2_back_mono
+        .as_ref()
+        .expect("cfg2_back_mono populated");
+    assert!(!back.b_lfe);
+    assert_eq!(back.psy_info.as_ref().unwrap().max_sfb_0, 8);
+    // Round 38: trailing mono_data body now decodes into scaled_spec.
+    assert!(
+        back.scaled_spec.is_some(),
+        "round 38: cfg2 back mono body walks into scaled_spec"
+    );
+}

@@ -1823,6 +1823,35 @@ pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
     Some(scaled)
 }
 
+/// LFE flavour of [`decode_asf_long_mono_body_with_max_sfb`] — Table 35
+/// `sf_info_lfe()` always forces `b_long_frame == 1` and reads `max_sfb[0]`
+/// with the `n_msfbl_bits` width (Table 106 column 4) instead of the
+/// regular `n_msfb_bits`. The `sf_data(ASF)` body for an LFE channel is
+/// then the same shape as for any other long-frame ASF channel — a single
+/// `asf_section_data + asf_spectral_data + asf_scalefac_data + asf_snf_data`
+/// quartet over `[0, max_sfb)`. The narrower bit-width for `max_sfb` is
+/// the only LFE-specific bit-stream difference; the body decoder itself
+/// matches `decode_asf_long_mono_body_with_max_sfb` exactly.
+///
+/// Round 38 surfaces this as a separate entry point so the LFE path in
+/// [`crate::mch::parse_mono_data`] can call it explicitly (and so callers
+/// reading the call site know they're decoding an LFE body, not a
+/// standard mono body that just happens to have a small `max_sfb`).
+pub(crate) fn decode_asf_long_lfe_body_with_max_sfb_lfe(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    max_sfb_lfe: u32,
+) -> Option<Vec<f32>> {
+    // Per Table 35: `sf_info_lfe()` only runs in the long-frame path. If
+    // the caller hands us a non-long-frame transform info we bail rather
+    // than trying to walk a grouped body — the LFE body shape is
+    // explicitly long-frame only per spec (`b_long_frame = 1`).
+    if !ti.b_long_frame {
+        return None;
+    }
+    decode_asf_long_mono_body_with_max_sfb(br, ti, max_sfb_lfe)
+}
+
 /// Parse the outer layers of a stereo `audio_data()` element
 /// (channel_pair_element / stereo_data).
 ///

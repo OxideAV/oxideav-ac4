@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 38 — LFE body decoder + cfg2_back_mono end-to-end decode +
+  ACPL_3 centre channel via IMDCT** (TS 103 190-1 §4.2.7.2 / §4.2.6.6
+  Cfg2 / §5.7.7.6.2):
+  - `parse_mono_data(b_lfe=true)` now walks the trailing `sf_data(ASF)`
+    body via the new `decode_asf_long_lfe_body_with_max_sfb_lfe`
+    helper. `sf_info_lfe()` (Table 35) forces long-frame / single
+    window group, so the LFE body shape is the regular ASF long-frame
+    quartet (`asf_section_data + asf_spectral_data + asf_scalefac_data
+    + asf_snf_data`) — only the `max_sfb[0]` bit-width changes
+    (`n_msfbl_bits` from Table 106 column 4 instead of `n_msfb_bits`).
+    The dequantised + scaled spectrum lands on `MonoLfeData::scaled_spec`,
+    matching the round-37 non-LFE behaviour.
+  - `Ac4Decoder::dispatch_5x_cfg2_simple_aspx` — new helper that runs
+    end-to-end IMDCT + overlap-add for the 5_X SIMPLE/ASPX
+    `coding_config == 2` channel layout. Walks the parsed
+    `four_channel_data.scaled_spec_per_channel[0..4]` into output
+    slots 0/1/3/4 (L/R/Ls/Rs per Table 180) and the trailing
+    `cfg2_back_mono.scaled_spec` into slot 2 (C). Fires when
+    `five_x_mode in {Simple, Aspx}` and `five_x_coding_config ==
+    Cfg2FourMono`. Cfg0 / Cfg1 / Cfg3 dispatch helpers remain deferred.
+  - `Ac4Decoder::receive_frame` ACPL_3 path: replaces the round-37
+    silence-placeholder for the centre carrier with an IMDCT of
+    `cfg0_centre_mono.scaled_spec` via `imdct_mono_lfe_data_f32`. The
+    Pseudocode 118 multichannel synthesis now emits a non-silent
+    centre when the trailing `mono_data(0)` body decoded successfully;
+    falls back to silence when the centre body is absent (LFE / SSF /
+    Huffman miss / non-Cfg0 frame).
+  - New unit + integration tests:
+    - `parse_mono_data_lfe_walks_sf_data_body` — replaces the round-37
+      "LFE body deferred" test; verifies the LFE body now decodes into
+      `scaled_spec` for an all-zero stream.
+    - `dispatch_5x_cfg2_populates_l_r_c_ls_rs` — cfg2 dispatch IMDCTs
+      every channel into the right output slot with non-zero energy
+      from per-channel ramp spectra.
+    - `dispatch_5x_cfg2_noop_on_length_mismatch` — cfg2 dispatch
+      leaves output slots untouched when the carrier transform length
+      differs from the requested sample count.
+    - `five_x_simple_cfg2_walker_populates_four_plus_back_mono` —
+      integration test threading `parse_5x_audio_data_outer` → cfg2
+      tools layout, asserting the four per-channel scaled spectra +
+      back-mono body all populate cleanly.
 - **Round 37 — 7_X ASPX_ACPL_1 / ASPX_ACPL_2 dispatch + cfg0 centre
   end-to-end decode** (TS 103 190-1 §5.7.7.6.3 Pseudocode 120 +
   §5.7.7.6.1 Pseudocode 117 cfg0 centre-channel wiring):

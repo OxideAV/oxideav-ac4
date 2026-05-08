@@ -54,9 +54,9 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
 
 use crate::asf::{
-    decode_asf_long_mono_body_with_max_sfb, parse_asf_psy_info, parse_asf_psy_info_lfe,
-    parse_asf_transform_info, parse_chparam_info, AsfPsyInfo, AsfTransformInfo, ChparamInfo,
-    SubstreamTools,
+    decode_asf_long_lfe_body_with_max_sfb_lfe, decode_asf_long_mono_body_with_max_sfb,
+    parse_asf_psy_info, parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info,
+    AsfPsyInfo, AsfTransformInfo, ChparamInfo, SubstreamTools,
 };
 use crate::tables;
 
@@ -293,6 +293,13 @@ pub fn parse_mono_data(
     // returns `Ok(...)`. SSF-frontend (`spec_frontend_bit == 1`) is
     // deferred — the SSF body lives elsewhere in the substream and is
     // not co-located with `mono_data()`.
+    //
+    // Round 38: extend the body walk to LFE channels via
+    // `decode_asf_long_lfe_body_with_max_sfb_lfe`. Per `sf_info_lfe()`
+    // (Table 35) the LFE channel is always long-frame, single window
+    // group, ASF-frontend — so the same long-frame mono body decoder
+    // applies, just with `max_sfb_0` already capped by the
+    // `n_msfbl_bits` bit-width.
     if !b_lfe && out.spec_frontend_bit == 0 {
         if ti.b_long_frame && psy.num_window_groups == 1 {
             if let Some(scaled) = decode_asf_long_mono_body_with_max_sfb(br, &ti, psy.max_sfb_0) {
@@ -307,6 +314,13 @@ pub fn parse_mono_data(
             ) {
                 out.scaled_spec = Some(scaled);
             }
+        }
+    } else if b_lfe {
+        // LFE: `sf_info_lfe()` forces long-frame, single window group;
+        // walk the LFE body via the dedicated decoder. Try-and-bail
+        // identical to the non-LFE path.
+        if let Some(scaled) = decode_asf_long_lfe_body_with_max_sfb_lfe(br, &ti, psy.max_sfb_0) {
+            out.scaled_spec = Some(scaled);
         }
     }
     out.psy_info = Some(psy);
@@ -1507,24 +1521,36 @@ mod tests {
         );
     }
 
-    /// Round 37: `parse_mono_data(b_lfe=true)` does NOT walk a body —
-    /// the LFE path stays outer-shell-only since the LFE body decoder
-    /// is reserved for a future round. `scaled_spec` must be `None` and
-    /// the bit cursor must end exactly after `sf_info_lfe()`.
+    /// Round 38: `parse_mono_data(b_lfe=true)` walks the trailing
+    /// `sf_data(ASF)` body via `decode_asf_long_lfe_body_with_max_sfb_lfe`.
+    /// LFE channels are always long-frame / single window group per
+    /// Table 35 (`sf_info_lfe`), so an all-zero body decodes to a length-
+    /// matched all-zero spectrum, identical in shape to the non-LFE long
+    /// path but with `max_sfb` constrained by the `n_msfbl_bits` width.
     #[test]
-    fn parse_mono_data_lfe_skips_body_walk() {
+    fn parse_mono_data_lfe_walks_sf_data_body() {
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_long_frame
         bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 @ tl=1920
+        write_zero_sf_data_body(&mut bw, 5, 0);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
         let lfe = parse_mono_data(&mut br, true, 1920).unwrap();
         assert!(lfe.b_lfe);
+        let scaled = lfe
+            .scaled_spec
+            .as_ref()
+            .expect("LFE body walked into scaled_spec");
+        assert!(!scaled.is_empty(), "LFE scaled spectrum must be non-empty");
+        // All-zero body: every bin should be exactly 0.0.
         assert!(
-            lfe.scaled_spec.is_none(),
-            "LFE body decoder is deferred — scaled_spec must stay None"
+            scaled.iter().all(|&v| v == 0.0),
+            "all-zero LFE sf_data body must dequantise to all zeros"
         );
+        // Length matches `sfb_offset[max_sfb]` for tl=1920, max_sfb=5 —
+        // not pinned exactly, just bounded above by the transform length.
+        assert!(scaled.len() <= 1920);
     }
 
     /// Round 37: SSF-frontend (`spec_frontend_bit == 1`) mono channels
@@ -1691,13 +1717,16 @@ mod tests {
         // 5_X_codec_mode = SIMPLE, b_has_lfe = 1.
         // mono_data(1): asf_transform_info long-frame at 1920 +
         // sf_info_lfe with n_msfbl_bits=3 -> value 4.
+        // Round 38: LFE body now decoded — append an all-zero sf_data
+        // body at max_sfb=4 (n_sect_bits=3 since transf_length_idx=0).
         // Then coding_config=3 + five_channel_data shell + 5x sf_data.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
                             // LFE mono_data(1):
         bw.write_bit(true); // b_long_frame
         bw.write_u32(4, 3); // max_sfb[0] -- n_msfbl_bits = 3 for tl=1920
-                            // coding_config = 3, then five_channel_data:
+        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+                                                // coding_config = 3, then five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true);
         bw.write_u32(10, 6);
@@ -1717,6 +1746,11 @@ mod tests {
         let lfe = tools.lfe_mono_data.as_ref().unwrap();
         assert!(lfe.b_lfe);
         assert_eq!(lfe.psy_info.as_ref().unwrap().max_sfb_0, 4);
+        // Round 38: LFE body is now decoded; scaled_spec must be Some.
+        assert!(
+            lfe.scaled_spec.is_some(),
+            "round 38: LFE body walks into scaled_spec"
+        );
         let d = tools.five_channel_data.as_ref().unwrap();
         assert_eq!(d.psy_info.as_ref().unwrap().max_sfb_0, 10);
     }
@@ -2784,7 +2818,8 @@ mod tests {
                             // LFE mono_data(1):
         bw.write_bit(true); // b_long_frame
         bw.write_u32(4, 3); // max_sfb[0] (n_msfbl_bits=3 @ tl=1920)
-                            // coding_config = 3 -> five_channel_data:
+        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+                                                // coding_config = 3 -> five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
