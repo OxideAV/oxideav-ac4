@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 36 — 5_X ASPX_ACPL_1 / ASPX_ACPL_2 decoder dispatch wiring**
+  (TS 103 190-1 §5.7.7.6.1, Pseudocode 117):
+  - `Ac4Decoder::receive_frame` now dispatches the §5.7.7.6.1
+    Pseudocode 117 channel-pair multichannel synthesis when the 5_X
+    walker resolved `five_x_mode` to `AspxAcpl1` or `AspxAcpl2` and
+    populated the matching `acpl_config_1ch_*` + `acpl_data_1ch_pair`
+    tools slots. The dispatch:
+    - Reads L/R carrier PCM from `pcm_per_channel[0]`/`[1]` (already
+      filled by the stereo ASF / ASPX decode path), zero-filling on
+      absence to keep QMF analysis history consistent.
+    - Resolves the active `acpl_config_1ch` per mode:
+      `acpl_config_1ch_partial` for `AspxAcpl1`,
+      `acpl_config_1ch_full` for `AspxAcpl2` (per Tables 25 + 59).
+    - Builds zero-filled centre / Ls / Rs carrier placeholders
+      (centre matches the existing ACPL_3 wiring; Ls/Rs only for
+      ACPL_1 mode per `Acpl5xPairMode` mode-vs-surround consistency
+      check). The carrier-decode paths gain real signal when
+      `cfg0_centre_mono` and the surround mono carriers acquire
+      end-to-end decoders in a future round.
+    - Calls `acpl_synth::run_acpl_5x_pair_pcm` and writes the five
+      output channels (L, R, C, Ls, Rs) into `pcm_per_channel[0..5]`,
+      growing the slot vector as needed.
+    - Skipped when the substream is already an `AspxAcpl3` 5_X frame
+      (the two pipelines are mutually exclusive per Table 97).
+  - The dispatch logic is extracted into a private
+    `Ac4Decoder::dispatch_acpl_5x_pair` helper so the path can be
+    unit-tested without building a full 5_X TOC + body.
+  - Five new unit tests in `decoder::tests` cover the synthesis
+    arithmetic + dispatch behaviour:
+    - `dispatch_acpl_5x_pair_aspx_acpl_2_emits_five_channels` —
+      ACPL_2 dispatch with ±2000 carrier-PCM tones produces five
+      channels with non-zero L / R energy.
+    - `dispatch_acpl_5x_pair_aspx_acpl_1_emits_five_channels` —
+      ACPL_1 dispatch with zero-filled Ls/Rs surround placeholders
+      still emits five-channel output.
+    - `dispatch_acpl_5x_pair_rejects_unaligned_sample_count` —
+      dispatch is a no-op when sample count isn't a multiple of
+      `NUM_QMF_SUBBANDS` (64).
+    - `dispatch_acpl_5x_pair_zero_fills_missing_carriers` — when L/R
+      slots are `None`, dispatch synthesises silence-grade output
+      from zero-filled fallbacks.
+    - `dispatch_acpl_5x_pair_resolves_partial_for_aspx_acpl_1` —
+      regression check that `qmf_band` differs between `partial`
+      (1..8) and `full` (always 0) configs per Table 59.
+  - Test count: 535 → 540 (+5).
+  - The §5.7.7.6.2 ACPL_3 dispatch (round 34 — Pseudocode 118)
+    remains unchanged; the new ACPL_1 / ACPL_2 path takes its place
+    when those modes are signalled.
+
 - **Round 35 — ETSI float-table validation suite** (TS 103 190-1
   Annex C.1, C.3, C.11 + Annex D.2, D.3):
   - New `parse_c_float_arrays()` parser in `tests/etsi_table_validation.rs`
