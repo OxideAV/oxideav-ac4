@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 39 — 5_X SIMPLE/ASPX cfg0/cfg1/cfg3 dispatch helpers +
+  7_X SIMPLE/ASPX additional-channel pair render** (TS 103 190-1
+  §5.3.4.3.1 / Table 180 columns 0/1/3 + §5.3.4.4.1 / Table 182):
+  - `Ac4Decoder::dispatch_5x_cfg0_simple_aspx` — IMDCTs each
+    `two_channel_data.scaled_spec_per_channel[0..2]` into PCM slots
+    per the 1-bit `b_2ch_mode`: `false` -> tcd_a→[0,1] (L,R) /
+    tcd_b→[3,4] (Ls,Rs); `true` -> tcd_a→[0,3] (L,Ls) /
+    tcd_b→[1,4] (R,Rs). `cfg0_centre_mono.scaled_spec` (the trailing
+    `mono_data(0)`) lands on slot 2 (C).
+  - `Ac4Decoder::dispatch_5x_cfg1_simple_aspx` — IMDCTs
+    `three_channel_data[0..3]` into slots 0/1/2 (L/R/C) and
+    `two_channel_data[0..2]` into slots 3/4 (Ls/Rs).
+  - `Ac4Decoder::dispatch_5x_cfg3_simple_aspx` — IMDCTs
+    `five_channel_data[0..5]` straight into slots 0..4 (L/R/C/Ls/Rs).
+  - `Ac4Decoder::dispatch_7x_additional_channel_pair` — IMDCTs the
+    `seven_x_additional_channel_data.scaled_spec_per_channel[0..2]`
+    into PCM slots 5 / 6 (the F / G preliminary outputs in Table 182).
+    SAP companding (Table 183 a,b,c,d) is the identity for now —
+    `b_use_sap_add_ch == false` collapses the matrix; the explicit
+    SAP coefficient extraction lands in a future round.
+  - `Ac4Decoder::receive_frame` switch: round 38's cfg2-only branch
+    now selects across `Cfg0/Cfg1/Cfg2/Cfg3` based on the parsed
+    `five_x_coding_config`. Mutually exclusive with the ACPL_3 / pair
+    paths via the existing `five_x_simple_aspx_active` gate. The
+    7_X SIMPLE/ASPX path additionally runs the additional-channel
+    pair dispatch on top of the core 5-channel mapping.
+  - New tests (+9): `dispatch_5x_cfg0_populates_l_r_c_ls_rs_default_2ch_mode`,
+    `dispatch_5x_cfg0_alternate_2ch_mode_maps_to_l_ls_r_rs`,
+    `dispatch_5x_cfg1_populates_l_r_c_ls_rs`,
+    `dispatch_5x_cfg3_populates_l_r_c_ls_rs`,
+    `dispatch_5x_cfg013_noop_on_length_mismatch`,
+    `dispatch_7x_additional_pair_populates_slots_5_and_6`,
+    `dispatch_7x_additional_pair_noop_on_length_mismatch`,
+    plus integration tests
+    `five_x_simple_cfg0_walker_populates_two_two_plus_centre`,
+    `five_x_simple_cfg3_walker_populates_five_channel_data`. Total:
+    551 -> 560.
+
 - **Round 38 — LFE body decoder + cfg2_back_mono end-to-end decode +
   ACPL_3 centre channel via IMDCT** (TS 103 190-1 §4.2.7.2 / §4.2.6.6
   Cfg2 / §5.7.7.6.2):

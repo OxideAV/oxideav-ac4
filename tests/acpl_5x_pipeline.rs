@@ -716,3 +716,124 @@ fn five_x_simple_cfg2_walker_populates_four_plus_back_mono() {
         "round 38: cfg2 back mono body walks into scaled_spec"
     );
 }
+
+/// Round 39: 5_X SIMPLE/ASPX `coding_config == 0` walker → tools layout
+/// glue. After `parse_5x_audio_data_outer` walks a Cfg0 frame the parsed
+/// `two_channel_data[0/1].scaled_spec_per_channel[0..2]` carries the
+/// L/R + Ls/Rs (2ch_mode == 0) or L/Ls + R/Rs (2ch_mode == 1) pairs
+/// per Table 180, and `cfg0_centre_mono` carries the centre channel.
+#[test]
+fn five_x_simple_cfg0_walker_populates_two_two_plus_centre() {
+    use oxideav_ac4::asf::SubstreamTools;
+    use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode, FiveXCodingConfig};
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
+    bw.write_u32(0, 2); // coding_config = 0 (Cfg0Stereo2plusMono)
+    bw.write_bit(false); // b_2ch_mode = 0
+                         // 2x two_channel_data: long-frame max_sfb=20, chparam_info, 2x sf_data
+    let write_zero = |bw: &mut BitWriter, max_sfb: u32| {
+        bw.write_u32(0, 4);
+        let mut remaining = max_sfb.saturating_sub(1);
+        while remaining >= 7 {
+            bw.write_u32(7, 3);
+            remaining -= 7;
+        }
+        bw.write_u32(remaining, 3);
+        bw.write_u32(120, 8);
+        bw.write_bit(false);
+    };
+    for _ in 0..2 {
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(20, 6); // max_sfb[0]
+        bw.write_u32(0, 2); // chparam_info
+        for _ in 0..2 {
+            write_zero(&mut bw, 20);
+        }
+    }
+    // mono_data(0) for centre — spec_frontend = ASF, long-frame, max_sfb=8.
+    bw.write_bit(false); // spec_frontend = ASF
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(8, 6); // max_sfb[0]
+    write_zero(&mut bw, 8);
+    bw.align_to_byte();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    let mut tools = SubstreamTools::default();
+    parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+    assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::Simple));
+    assert_eq!(
+        tools.five_x_coding_config,
+        Some(FiveXCodingConfig::Cfg0Stereo2plusMono)
+    );
+    assert_eq!(tools.b_2ch_mode, Some(false));
+    assert_eq!(tools.two_channel_data.len(), 2);
+    for (idx, tcd) in tools.two_channel_data.iter().enumerate() {
+        assert_eq!(tcd.scaled_spec_per_channel.len(), 2);
+        for (ch, slot) in tcd.scaled_spec_per_channel.iter().enumerate() {
+            assert!(
+                slot.is_some(),
+                "cfg0 two_channel_data[{idx}] slot {ch} must carry scaled_spec"
+            );
+        }
+    }
+    let centre = tools
+        .cfg0_centre_mono
+        .as_ref()
+        .expect("cfg0_centre_mono populated");
+    assert!(centre.scaled_spec.is_some());
+}
+
+/// Round 39: 5_X SIMPLE/ASPX `coding_config == 3` walker → tools layout
+/// glue. After `parse_5x_audio_data_outer` walks a Cfg3 frame the parsed
+/// `five_channel_data.scaled_spec_per_channel[0..5]` carries L/R/C/Ls/Rs.
+#[test]
+fn five_x_simple_cfg3_walker_populates_five_channel_data() {
+    use oxideav_ac4::asf::SubstreamTools;
+    use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode, FiveXCodingConfig};
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
+    bw.write_u32(3, 2); // coding_config = 3 (Cfg3Five)
+                        // five_channel_data: long-frame max_sfb=20, chel_matsel(4) +
+                        // 5x chparam_info + 5x sf_data(ASF)
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(20, 6); // max_sfb[0]
+    bw.write_u32(0, 4); // chel_matsel
+    for _ in 0..5 {
+        bw.write_u32(0, 2); // chparam_info
+    }
+    let write_zero = |bw: &mut BitWriter, max_sfb: u32| {
+        bw.write_u32(0, 4);
+        let mut remaining = max_sfb.saturating_sub(1);
+        while remaining >= 7 {
+            bw.write_u32(7, 3);
+            remaining -= 7;
+        }
+        bw.write_u32(remaining, 3);
+        bw.write_u32(120, 8);
+        bw.write_bit(false);
+    };
+    for _ in 0..5 {
+        write_zero(&mut bw, 20);
+    }
+    bw.align_to_byte();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    let mut tools = SubstreamTools::default();
+    parse_5x_audio_data_outer(&mut br, &mut tools, false, true, 1920).unwrap();
+    assert_eq!(tools.five_x_mode, Some(FiveXCodecMode::Simple));
+    assert_eq!(
+        tools.five_x_coding_config,
+        Some(FiveXCodingConfig::Cfg3Five)
+    );
+    let five = tools
+        .five_channel_data
+        .as_ref()
+        .expect("five_channel_data populated");
+    assert_eq!(five.scaled_spec_per_channel.len(), 5);
+    for (i, ch) in five.scaled_spec_per_channel.iter().enumerate() {
+        assert!(
+            ch.is_some(),
+            "five_channel_data slot {i} must carry scaled_spec"
+        );
+    }
+}
