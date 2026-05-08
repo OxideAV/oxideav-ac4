@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 43 — companding `b_compand_avg` + `sync_flag == 1` branches +
+  ASPX_ACPL_1 sb0 = `acpl_qmf_band` hookup** (TS 103 190-1 §5.7.5.2 +
+  Pseudocode 121):
+  - `aspx::CompandingMode` enum captures the (`sync_flag`,
+    `b_compand_on[ch]`, `b_compand_avg`) product per Pseudocode 121:
+    `Off`, `PerSlot`, `Averaged`, `SyncPerSlot`, `SyncAveraged`.
+  - `aspx::CompandingMode::from_control(cc, slot)` resolves the
+    active branch for a single channel from a parsed
+    `CompandingControl`, honouring `sync_flag == true` (slot 0
+    broadcasts) and the b_compand_avg presence-rule.
+  - `aspx::apply_companding_on_qmf_with_mode(q, sb0, sb1, mode)`
+    extends the round-42 single-channel path to all four active
+    sub-branches: `PerSlot` / `SyncPerSlot` apply `g_ch(ts) * G`
+    per timeslot; `Averaged` / `SyncAveraged` average `L_ch(ts)`
+    over the full A-SPX interval, derive a single constant
+    `g_avg,ch * G` and broadcast it across all timeslots. (`Off`
+    is a strict no-op.) `apply_companding_on_qmf` retained as a
+    `PerSlot` thin wrapper for backward compatibility.
+  - `Ac4Decoder::aspx_extend_pcm` signature now takes
+    `(compand_mode: CompandingMode, compand_sb0_override: Option<u32>)`
+    instead of a raw `compand_on: bool`. The override implements
+    §5.7.5.2's sb0 selection rule: for the `ASPX_ACPL_1` codec mode
+    sb0 = `acpl_qmf_band` (from `acpl_config_1ch_partial.qmf_band`);
+    otherwise sb0 falls back to `tables.sbx` (= `aspx_xover_band`).
+  - Stereo CPE path (`receive_frame`) lifts the override from
+    `tools.acpl_config_1ch_partial.qmf_band` whenever the active
+    stereo or 5_X mode is `AspxAcpl1`. Cfg0/Cfg1/Cfg2/Cfg3 SIMPLE/ASPX
+    dispatchers pass `None` (those paths never run on ACPL_1).
+  - `Ac4Decoder::five_x_compand_mode_for_slot` resolves a
+    `CompandingMode` per output slot for the 5_X dispatchers; the
+    legacy `five_x_compand_on_for_slot` is retained as a thin
+    `mode != Off` wrapper for round-42 unit-test compatibility.
+  - sync_flag == 1 cross-channel synchronisation: the per-channel
+    pipeline computes `g_ch(ts)` per channel; for `M = 1` (the
+    dominant case in our pipeline) the geometric mean across
+    channels reduces to the local gain (exact). For `M > 1` channels
+    processed independently the synchronisation is approximated —
+    documented as a known limitation in
+    `apply_companding_on_qmf_with_mode`.
+  - 5_X ACPL_3 path companding wiring: already in place from round
+    42 via the stereo CPE path's `compand_mode_pri` /
+    `compand_mode_sec` (the ACPL_3 walker populates `tools.companding`
+    from `companding_control(2)`; the L/R carriers go through the
+    standard stereo CPE primary/secondary path which now lifts
+    `CompandingMode` and applies it before the §5.7.7.6.2
+    Pseudocode 118 multichannel synthesis).
+  - 7 new tests cover: `CompandingMode::from_control` resolves all
+    six sync/on/avg product states; `apply_companding_on_qmf_with_mode`
+    `Off` strict no-op + `Averaged`/`SyncAveraged` constant-scale
+    invariant + sb0-override band shift; `five_x_compand_mode_for_slot`
+    branch resolution; `aspx_extend_pcm` with sb0 override + with
+    `Averaged` mode diverges from baseline.
+
 - **Round 42 — 5_X SIMPLE/ASPX cfg0/cfg1/cfg3 trailer-aware ASPX
   dispatch + §5.7.5 companding tool** (TS 103 190-1 §4.2.6.6 / §5.7.5):
   - `asf::SubstreamTools` gained `cfg0_aspx_{lr,ls_rs,centre}`,

@@ -686,46 +686,127 @@ pub fn parse_companding_control(
     })
 }
 
+/// Selector for the §5.7.5.2 companding sub-branch to apply per channel.
+///
+/// Captures the (`sync_flag`, `b_compand_on[ch]`, `b_compand_avg`)
+/// product per ETSI TS 103 190-1 Pseudocode 121:
+///
+/// ```text
+///   sync_flag == 0:
+///     b_compand_on[ch] == TRUE   -> PerSlot       (apply g_ch(ts))
+///     b_compand_on[ch] == FALSE && b_compand_avg == TRUE
+///                                 -> Averaged     (apply g_avg,ch)
+///     b_compand_on[ch] == FALSE && b_compand_avg == FALSE
+///                                 -> Off          (no-op)
+///   sync_flag == 1:
+///     b_compand_on[0] == TRUE   -> SyncPerSlot    (apply g_synch(ts))
+///     b_compand_on[0] == FALSE && b_compand_avg == TRUE
+///                                 -> SyncAveraged (apply g_avg,synch)
+///     b_compand_on[0] == FALSE && b_compand_avg == FALSE
+///                                 -> Off          (no-op)
+/// ```
+///
+/// In the current per-channel decode pipeline the sync branches are
+/// approximated by the per-channel branches (geometric mean across
+/// `M = 1` channels reduces to the single channel's gain). Multi-channel
+/// synchronisation is documented as a known limitation; the per-channel
+/// gain shape is still applied so the decoder still inverts the
+/// encoder's gain reshaping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompandingMode {
+    /// `b_compand_on[ch] == FALSE && (b_compand_avg == FALSE || not signalled)`.
+    Off,
+    /// `sync_flag == 0 && b_compand_on[ch] == TRUE`.
+    PerSlot,
+    /// `sync_flag == 0 && b_compand_on[ch] == FALSE && b_compand_avg == TRUE`.
+    Averaged,
+    /// `sync_flag == 1 && b_compand_on[0] == TRUE`. In a single-channel
+    /// pipeline this collapses onto the per-slot gain (`M = 1` case).
+    SyncPerSlot,
+    /// `sync_flag == 1 && b_compand_on[0] == FALSE && b_compand_avg == TRUE`.
+    /// Averaged, single-channel approximation as above.
+    SyncAveraged,
+}
+
+impl CompandingMode {
+    /// Resolve the mode for one channel from a parsed [`CompandingControl`]
+    /// and the channel's index into `compand_on`.
+    ///
+    /// `slot` is the per-channel offset into `cc.compand_on` (0..M-1)
+    /// when `sync_flag == 0`. With `sync_flag == 1` the spec says
+    /// `compand_on[0]` applies to all channels (Table 116) so `slot`
+    /// is ignored on that branch.
+    pub fn from_control(cc: &CompandingControl, slot: usize) -> Self {
+        let sync = matches!(cc.sync_flag, Some(true));
+        let on = if sync {
+            cc.compand_on.first().copied().unwrap_or(false)
+        } else {
+            cc.compand_on.get(slot).copied().unwrap_or(false)
+        };
+        let avg = cc.compand_avg.unwrap_or(false);
+        match (sync, on, avg) {
+            (false, true, _) => Self::PerSlot,
+            (false, false, true) => Self::Averaged,
+            (false, false, false) => Self::Off,
+            (true, true, _) => Self::SyncPerSlot,
+            (true, false, true) => Self::SyncAveraged,
+            (true, false, false) => Self::Off,
+        }
+    }
+}
+
 /// Apply the §5.7.5 companding tool to one channel's QMF matrix in
 /// place per ETSI TS 103 190-1 §5.7.5.2 (the decoder side runs the
 /// inverse of the encoder's gain reshaping).
 ///
-/// Operates on the QMF subband range `[sbx, sbz)` (the A-SPX-affected
-/// band — for the ASPX_ACPL_1 mode the spec says start at
-/// `acpl_qmf_band` instead, but our 5_X ACPL_1 path sets the
-/// crossover to that value implicitly via the trailer xover).
+/// This is the single-channel entry-point used by the per-channel
+/// trailer dispatch in [`crate::decoder::Ac4Decoder`]. Operates on the
+/// QMF subband range `[sb0, sb1)`, where:
+///
+///   * `sb0 == aspx_xover_band[ch]` for ASPX / SIMPLE codec modes
+///     (i.e. `tables.sbx`).
+///   * `sb0 == acpl_qmf_band` for the `ASPX_ACPL_1` mode (taken from
+///     `acpl_config_1ch_partial.qmf_band`); the wrapper at
+///     [`Ac4Decoder::aspx_extend_with_trailer`] hands the right value.
+///
 /// Operates on the full set of QMF time slots (`[0, num_slots)`) —
 /// the full §5.7.6.3.3.1 A-SPX interval.
 ///
-/// `compand_on == false` leaves the channel untouched (we do not
-/// implement the b_compand_avg averaging branch yet — the trailers
-/// for absent-companding channels carry no extra data and the
-/// decoder produces non-companded but otherwise valid output, which
-/// is the unprocessed branch of Table 116).
-///
 /// The gain math follows §5.7.5.2 verbatim:
 ///   * `E_ch(sb,ts) = max(|Re|,|Im|) + 0.5 * min(|Re|,|Im|)` per slot
-///   * `L_ch(ts) = 0.9105 * mean_{sb in [sbx,sbz)} E_ch(sb,ts)`
+///   * `L_ch(ts) = 0.9105 * mean_{sb in [sb0,sb1)} E_ch(sb,ts)`
 ///   * `g_ch(ts) = L_ch(ts).powf((1 - alpha) / alpha)` with
 ///     `alpha = 0.65`, `G = 2.0_f32.powf(alpha)`
 ///   * `Q_out(sb,ts) = g_ch(ts) * G * Q_in(sb,ts)` for sb in
-///     `[sbx, sbz)` and ts in the A-SPX interval.
+///     `[sb0, sb1)` and ts in the A-SPX interval.
 ///
-/// Round 42 — implements the `sync_flag == 0`, `compand_on == true`
-/// branch only (the dominant case for 5.X SIMPLE/ASPX). The
-/// `sync_flag == 1` (per-channel-product synched gain) and
-/// `compand_avg == true` (averaged gain over the entire A-SPX
-/// interval) branches are scaffolded for a later round.
-pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
-    let sbx_u = sbx as usize;
-    let sbz_u = sbz as usize;
-    if sbz_u <= sbx_u || q.len() < sbz_u {
+/// Branch behaviour per [`CompandingMode`]:
+///   * `Off` — no-op (channel passes through untouched).
+///   * `PerSlot` / `SyncPerSlot` — apply g(ts) per timeslot. (For
+///     `SyncPerSlot` with `M > 1` the spec averages g_ch across
+///     channels via geometric mean; the per-channel pipeline can't see
+///     other channels' gains so we apply the local gain — exact for
+///     `M == 1`.)
+///   * `Averaged` / `SyncAveraged` — average L_ch(ts) over the entire
+///     A-SPX interval, derive a single constant gain, apply it.
+pub fn apply_companding_on_qmf_with_mode(
+    q: &mut [Vec<(f32, f32)>],
+    sb0: u32,
+    sb1: u32,
+    mode: CompandingMode,
+) {
+    if matches!(mode, CompandingMode::Off) {
+        return;
+    }
+    let sb0_u = sb0 as usize;
+    let sb1_u = sb1 as usize;
+    if sb1_u <= sb0_u || q.len() < sb1_u {
         return;
     }
     // Use the smallest `n_slots` across the affected subbands so we
     // never index out of range.
     let mut n_slots = usize::MAX;
-    for row in q.iter().take(sbz_u).skip(sbx_u) {
+    for row in q.iter().take(sb1_u).skip(sb0_u) {
         if row.len() < n_slots {
             n_slots = row.len();
         }
@@ -733,18 +814,18 @@ pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
     if n_slots == usize::MAX || n_slots == 0 {
         return;
     }
-    let k = (sbz_u - sbx_u) as f32;
+    let k = (sb1_u - sb0_u) as f32;
     if k <= 0.0 {
         return;
     }
     const ALPHA: f32 = 0.65;
     let g_const = 2.0_f32.powf(ALPHA); // G in §5.7.5.2.
     let exp_g = (1.0 - ALPHA) / ALPHA;
+    // Per-slot absolute level L_ch(ts).
+    let mut levels = Vec::with_capacity(n_slots);
     for ts in 0..n_slots {
-        // Slot mean absolute level per Pseudocode-style equation in
-        // §5.7.5.2.
         let mut sum: f32 = 0.0;
-        for row in q.iter().take(sbz_u).skip(sbx_u) {
+        for row in q.iter().take(sb1_u).skip(sb0_u) {
             let (re, im) = row[ts];
             let ar = re.abs();
             let ai = im.abs();
@@ -752,17 +833,55 @@ pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
             let e = ar.max(ai) + 0.5 * ar.min(ai);
             sum += e;
         }
-        let l = 0.9105 * (sum / k);
+        levels.push(0.9105 * (sum / k));
+    }
+    let pow_or_one = |l: f32| -> f32 {
         // Avoid 0^negative_exp = inf when l == 0; identity-gain
         // (g = 1) on a silent slot is well-defined and avoids
         // surprising the downstream noise / tone injection.
-        let g = if l > 0.0 { l.powf(exp_g) } else { 1.0 };
-        let scale = g * g_const;
-        for row in q.iter_mut().take(sbz_u).skip(sbx_u) {
+        if l > 0.0 {
+            l.powf(exp_g)
+        } else {
+            1.0
+        }
+    };
+    let scales: Vec<f32> = match mode {
+        CompandingMode::PerSlot | CompandingMode::SyncPerSlot => {
+            levels.iter().map(|&l| pow_or_one(l) * g_const).collect()
+        }
+        CompandingMode::Averaged | CompandingMode::SyncAveraged => {
+            // L_avg,ch = (1/num_slots) * sum_{ts} L_ch(ts).
+            let l_avg = if levels.is_empty() {
+                0.0
+            } else {
+                levels.iter().sum::<f32>() / (levels.len() as f32)
+            };
+            // g_avg,ch = L_avg,ch ^ ((1-alpha)/alpha). Constant across
+            // the whole A-SPX interval — broadcast over n_slots.
+            let constant = pow_or_one(l_avg) * g_const;
+            vec![constant; n_slots]
+        }
+        CompandingMode::Off => unreachable!("early-returned above"),
+    };
+    for ts in 0..n_slots {
+        let scale = scales[ts];
+        for row in q.iter_mut().take(sb1_u).skip(sb0_u) {
             let (re, im) = row[ts];
             row[ts] = (re * scale, im * scale);
         }
     }
+}
+
+/// Round-42 backward-compatible single-channel companding entry-point.
+///
+/// Equivalent to `apply_companding_on_qmf_with_mode(q, sbx, sbz, PerSlot)`
+/// — the `sync_flag == 0`, `b_compand_on[ch] == TRUE` branch of
+/// Pseudocode 121. New call-sites should prefer
+/// [`apply_companding_on_qmf_with_mode`] so the
+/// `b_compand_avg == TRUE` and `sync_flag == 1` branches are wired
+/// through.
+pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
+    apply_companding_on_qmf_with_mode(q, sbx, sbz, CompandingMode::PerSlot);
 }
 
 /// Captured bitstream state for one 5_X SIMPLE/ASPX trailer
@@ -3306,6 +3425,232 @@ mod tests {
         assert_eq!(cc.sync_flag, Some(false));
         assert_eq!(cc.compand_on, vec![true, true, false, true, true]);
         assert_eq!(cc.compand_avg, Some(false));
+    }
+
+    /// Round 43: `CompandingMode::from_control` covers the six product
+    /// states of (sync_flag, compand_on, compand_avg) per Pseudocode 121.
+    #[test]
+    fn companding_mode_from_control_resolves_all_branches() {
+        // sync_flag = None (mono), compand_on=true → PerSlot.
+        let cc = CompandingControl {
+            sync_flag: None,
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        assert_eq!(
+            CompandingMode::from_control(&cc, 0),
+            CompandingMode::PerSlot
+        );
+
+        // sync_flag = Some(false), compand_on[slot]=true → PerSlot.
+        let cc = CompandingControl {
+            sync_flag: Some(false),
+            compand_on: vec![true, true, false, true, true],
+            compand_avg: Some(false),
+        };
+        assert_eq!(
+            CompandingMode::from_control(&cc, 0),
+            CompandingMode::PerSlot
+        );
+        assert_eq!(
+            CompandingMode::from_control(&cc, 1),
+            CompandingMode::PerSlot
+        );
+
+        // sync_flag = Some(false), compand_on[slot]=false, avg=false → Off.
+        assert_eq!(CompandingMode::from_control(&cc, 2), CompandingMode::Off);
+
+        // sync_flag = Some(false), compand_on[slot]=false, avg=true → Averaged.
+        let cc_avg = CompandingControl {
+            sync_flag: Some(false),
+            compand_on: vec![true, false, true, true, true],
+            compand_avg: Some(true),
+        };
+        assert_eq!(
+            CompandingMode::from_control(&cc_avg, 0),
+            CompandingMode::PerSlot
+        );
+        assert_eq!(
+            CompandingMode::from_control(&cc_avg, 1),
+            CompandingMode::Averaged
+        );
+
+        // sync_flag = Some(true), compand_on[0]=true → SyncPerSlot for any slot.
+        let cc_sync_on = CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        for s in 0..5 {
+            assert_eq!(
+                CompandingMode::from_control(&cc_sync_on, s),
+                CompandingMode::SyncPerSlot
+            );
+        }
+
+        // sync_flag = Some(true), compand_on[0]=false, avg=true → SyncAveraged.
+        let cc_sync_off_avg = CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![false],
+            compand_avg: Some(true),
+        };
+        for s in 0..5 {
+            assert_eq!(
+                CompandingMode::from_control(&cc_sync_off_avg, s),
+                CompandingMode::SyncAveraged
+            );
+        }
+
+        // sync_flag = Some(true), compand_on[0]=false, avg=false → Off
+        // (degenerate: spec only signals avg when at least one chan is
+        // off, but the parser still surfaces avg=false when no channels
+        // need averaging — guard against the lookup here).
+        let cc_sync_off_no_avg = CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![false],
+            compand_avg: Some(false),
+        };
+        assert_eq!(
+            CompandingMode::from_control(&cc_sync_off_no_avg, 0),
+            CompandingMode::Off
+        );
+
+        // Slot index out of range falls back to Off (no panic).
+        let cc_short = CompandingControl {
+            sync_flag: Some(false),
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        assert_eq!(
+            CompandingMode::from_control(&cc_short, 99),
+            CompandingMode::Off
+        );
+    }
+
+    /// Round 43: `apply_companding_on_qmf_with_mode` Off branch is a
+    /// strict no-op even on a non-empty band — the channel passes
+    /// through untouched.
+    #[test]
+    fn apply_companding_on_qmf_with_mode_off_is_strict_noop() {
+        let mut q = vec![vec![(0.7_f32, 0.3_f32); 16]; 64];
+        let q_orig = q.clone();
+        apply_companding_on_qmf_with_mode(&mut q, 4, 32, CompandingMode::Off);
+        assert_eq!(q, q_orig);
+    }
+
+    /// Round 43: `Averaged` / `SyncAveraged` apply a constant scale
+    /// across timeslots — the per-slot variation in PerSlot is
+    /// suppressed. Build a Q matrix whose energy varies dramatically
+    /// per slot; under PerSlot the scale tracks each slot's level
+    /// (varying scales), under Averaged a single L_avg-derived scale
+    /// is applied (constant across slots).
+    #[test]
+    fn apply_companding_averaged_uses_constant_gain_across_slots() {
+        let n_slots = 8usize;
+        let n_sb = 16usize;
+        let sb0 = 4u32;
+        let sb1 = 12u32;
+        // Slot t has level proportional to (t+1): re=t+1, im=0.
+        let make_q = || -> Vec<Vec<(f32, f32)>> {
+            let mut q = vec![vec![(0.0_f32, 0.0_f32); n_slots]; n_sb];
+            for ts in 0..n_slots {
+                let v = (ts + 1) as f32;
+                for row in q.iter_mut().take(sb1 as usize).skip(sb0 as usize) {
+                    row[ts] = (v, 0.0);
+                }
+            }
+            q
+        };
+        // Run PerSlot.
+        let mut q_per = make_q();
+        apply_companding_on_qmf_with_mode(&mut q_per, sb0, sb1, CompandingMode::PerSlot);
+        // The output magnitudes (sb in band) should NOT all scale by
+        // the same factor — different slots get different gains.
+        let m_per: Vec<f32> = (0..n_slots).map(|ts| q_per[sb0 as usize][ts].0).collect();
+        // Slots have differing input magnitudes (1..=8), and the
+        // PerSlot gain is monotone-decreasing in input level (exponent
+        // is negative), so at least two ratios should differ.
+        let r1 = m_per[0] / 1.0;
+        let r7 = m_per[7] / 8.0;
+        assert!(
+            (r1 - r7).abs() > 1e-3,
+            "PerSlot must produce slot-varying scales (r1={r1}, r7={r7})"
+        );
+
+        // Run Averaged.
+        let mut q_avg = make_q();
+        apply_companding_on_qmf_with_mode(&mut q_avg, sb0, sb1, CompandingMode::Averaged);
+        // The Averaged gain is constant — scale = output/input must
+        // match across all slots.
+        let scales: Vec<f32> = (0..n_slots)
+            .map(|ts| q_avg[sb0 as usize][ts].0 / ((ts + 1) as f32))
+            .collect();
+        let s0 = scales[0];
+        for &s in &scales[1..] {
+            assert!(
+                (s - s0).abs() < 1e-4,
+                "Averaged must apply a constant scale (s0={s0}, s={s})"
+            );
+        }
+        // SyncAveraged collapses onto Averaged for M=1.
+        let mut q_sync_avg = make_q();
+        apply_companding_on_qmf_with_mode(&mut q_sync_avg, sb0, sb1, CompandingMode::SyncAveraged);
+        for sb in (sb0 as usize)..(sb1 as usize) {
+            for ts in 0..n_slots {
+                let a = q_avg[sb][ts];
+                let b = q_sync_avg[sb][ts];
+                assert!(
+                    (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6,
+                    "Averaged and SyncAveraged must coincide for M=1 channel"
+                );
+            }
+        }
+    }
+
+    /// Round 43: `apply_companding_on_qmf_with_mode` honours the
+    /// `sb0` argument — passing a different sb0 (matching the
+    /// ASPX_ACPL_1 `acpl_qmf_band` override) shifts the band that
+    /// gets companded and changes the output relative to the
+    /// `sbx`-default call.
+    #[test]
+    fn apply_companding_with_mode_sb0_override_shifts_band() {
+        let n_slots = 8usize;
+        let n_sb = 16usize;
+        // Inject distinct levels in two regions so the two sb0 values
+        // see different K * sum_E inputs.
+        let make_q = || -> Vec<Vec<(f32, f32)>> {
+            let mut q = vec![vec![(0.0_f32, 0.0_f32); n_slots]; n_sb];
+            for row in q.iter_mut().take(6).skip(4) {
+                for cell in row.iter_mut().take(n_slots) {
+                    *cell = (1.0, 0.0);
+                }
+            }
+            for row in q.iter_mut().take(12).skip(8) {
+                for cell in row.iter_mut().take(n_slots) {
+                    *cell = (3.0, 0.0);
+                }
+            }
+            q
+        };
+        // sb0=4 (default aspx_xover) vs sb0=8 (acpl_qmf_band override).
+        let mut q_a = make_q();
+        apply_companding_on_qmf_with_mode(&mut q_a, 4, 12, CompandingMode::PerSlot);
+        let mut q_b = make_q();
+        apply_companding_on_qmf_with_mode(&mut q_b, 8, 12, CompandingMode::PerSlot);
+        // q_a touches sb=4..12 (incl. low-energy 4..6); q_b touches
+        // sb=8..12 (only high-energy region) — q_a leaves sb=4..6
+        // scaled by some factor; q_b leaves sb=4..6 untouched.
+        for sb in 4..6 {
+            for ts in 0..n_slots {
+                let a = q_a[sb][ts].0;
+                let b = q_b[sb][ts].0;
+                assert!(
+                    (b - 1.0).abs() < 1e-6,
+                    "sb0=8 must leave sb={sb} untouched (b={b})"
+                );
+                assert!((a - 1.0).abs() > 1e-3, "sb0=4 must scale sb={sb} (a={a})");
+            }
+        }
     }
 
     // --- aspx_framing tests ------------------------------------------

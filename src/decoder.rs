@@ -156,13 +156,16 @@ impl Ac4Decoder {
         tna_mode: Option<&[u8]>,
         state: &mut aspx::AspxChannelExtState,
         num_ts_in_ats: u32,
-        // Round 42: §5.7.5 companding tool — applied on the QMF
-        // matrix between envelope adjustment and QMF synthesis when
-        // `b_compand_on == true` for this channel. `false` leaves
-        // the per-channel matrix untouched (the unprocessed branch
-        // of Table 116 — the b_compand_avg averaged branch is not
-        // implemented yet).
-        compand_on: bool,
+        // Round 43: §5.7.5 companding tool — applied on the QMF matrix
+        // between envelope adjustment and QMF synthesis. `mode` selects
+        // the Pseudocode 121 sub-branch (`Off` / `PerSlot` / `Averaged`
+        // / `SyncPerSlot` / `SyncAveraged`). `sb0_override == Some(b)`
+        // overrides the lower band edge with `acpl_qmf_band` for the
+        // ASPX_ACPL_1 codec mode (per §5.7.5.2 sb0 selection); `None`
+        // falls back to `tables.sbx` (the A-SPX crossover, default
+        // for ASPX / SIMPLE).
+        compand_mode: aspx::CompandingMode,
+        compand_sb0_override: Option<u32>,
     ) -> Vec<f32> {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         // Need PCM length as a multiple of 64 for whole QMF slots.
@@ -369,16 +372,16 @@ impl Ac4Decoder {
             state.tsg_ptr_prev = 0;
             state.num_atsg_sig_prev = 0;
         }
-        // Round 42: §5.7.5 companding — applied per-channel on the
-        // QMF matrix when `b_compand_on == true` for this channel.
-        // The tool operates on the A-SPX-affected band [sbx, sbz)
-        // for the full A-SPX interval (all qmf timeslots in our
-        // single-frame call). Inverts the encoder-side gain
-        // attenuation, shaping the coding noise by the slot-mean
-        // signal energy.
-        if compand_on {
-            aspx::apply_companding_on_qmf(&mut q, tables.sbx, tables.sbz);
-        }
+        // Round 43: §5.7.5 companding — applied per-channel on the
+        // QMF matrix per Pseudocode 121's chosen branch. The tool
+        // operates on `[sb0, sbz)` for the full A-SPX interval (all
+        // qmf timeslots in our single-frame call). Inverts the
+        // encoder-side gain reshaping, shaping the coding noise by
+        // the slot-mean signal energy. `sb0` is normally `tables.sbx`
+        // (aspx_xover_band); for the ASPX_ACPL_1 codec mode it's
+        // `acpl_qmf_band` per §5.7.5.2's sb0 selection rule.
+        let compand_sb0 = compand_sb0_override.unwrap_or(tables.sbx);
+        aspx::apply_companding_on_qmf_with_mode(&mut q, compand_sb0, tables.sbz, compand_mode);
         // Inverse QMF synthesis. Transpose q[sb][ts] -> slot[ts][sb] per
         // §4.4.7 inverse QMF synthesis bank.
         let mut syn = qmf::QmfSynthesisBank::new();
@@ -645,7 +648,8 @@ impl Ac4Decoder {
         cfg: &aspx::AspxConfig,
         slot: usize,
         num_ts_in_ats: u32,
-        compand_on: bool,
+        compand_mode: aspx::CompandingMode,
+        compand_sb0_override: Option<u32>,
     ) -> Vec<f32> {
         while self.aspx_ext_state.len() <= slot {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
@@ -664,27 +668,42 @@ impl Ac4Decoder {
             ch.tna_mode.as_deref(),
             state,
             num_ts_in_ats,
-            compand_on,
+            compand_mode,
+            compand_sb0_override,
         )
     }
 
-    /// Round 42: per-output-channel companding-on flag from the
-    /// captured `companding_control(num_chan)` for a 5_X frame. The
-    /// Cfg2 / Cfg0 / Cfg1 / Cfg3 paths all carry
-    /// `companding_control(5)`, indexed by the 5_X output channel
-    /// `slot` (0..4 in L/R/C/Ls/Rs order). If sync_flag == true,
-    /// `compand_on[0]` applies to all five channels (Table 116).
-    /// Returns `false` whenever the parsed flags don't reach the
-    /// requested slot — round-42 falls back to "unprocessed" rather
-    /// than implementing the b_compand_avg averaging branch.
-    fn five_x_compand_on_for_slot(cc: Option<&aspx::CompandingControl>, slot: usize) -> bool {
-        let Some(cc) = cc else {
-            return false;
-        };
-        if matches!(cc.sync_flag, Some(true)) {
-            return cc.compand_on.first().copied().unwrap_or(false);
+    /// Round 43: per-output-channel companding mode from the captured
+    /// `companding_control(num_chan)` for a 5_X frame. The Cfg2 / Cfg0 /
+    /// Cfg1 / Cfg3 paths all carry `companding_control(5)`, indexed by
+    /// the 5_X output channel `slot` (0..4 in L/R/C/Ls/Rs order). If
+    /// `sync_flag == true`, `compand_on[0]` applies to all five
+    /// channels (Table 116).
+    ///
+    /// Returns `CompandingMode::Off` whenever the parsed flags don't
+    /// reach the requested slot, otherwise resolves to one of the four
+    /// active sub-branches of Pseudocode 121
+    /// (`PerSlot` / `Averaged` / `SyncPerSlot` / `SyncAveraged`) per
+    /// [`aspx::CompandingMode::from_control`].
+    fn five_x_compand_mode_for_slot(
+        cc: Option<&aspx::CompandingControl>,
+        slot: usize,
+    ) -> aspx::CompandingMode {
+        match cc {
+            Some(cc) => aspx::CompandingMode::from_control(cc, slot),
+            None => aspx::CompandingMode::Off,
         }
-        cc.compand_on.get(slot).copied().unwrap_or(false)
+    }
+
+    /// Backward-compat helper kept for round-42 unit tests — returns
+    /// the boolean "is companding active on this slot" derived from
+    /// the resolved [`aspx::CompandingMode`]. New code should call
+    /// [`Self::five_x_compand_mode_for_slot`] directly.
+    fn five_x_compand_on_for_slot(cc: Option<&aspx::CompandingControl>, slot: usize) -> bool {
+        !matches!(
+            Self::five_x_compand_mode_for_slot(cc, slot),
+            aspx::CompandingMode::Off
+        )
     }
 
     /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 2`
@@ -766,7 +785,7 @@ impl Ac4Decoder {
                     } else {
                         &trailer.primary
                     };
-                    let compand_on = Self::five_x_compand_on_for_slot(companding, slot);
+                    let compand_mode = Self::five_x_compand_mode_for_slot(companding, slot);
                     let extended = self.aspx_extend_with_trailer(
                         &pcm_f,
                         trailer,
@@ -774,7 +793,11 @@ impl Ac4Decoder {
                         &cfg,
                         slot,
                         num_ts_in_ats,
-                        compand_on,
+                        compand_mode,
+                        // SIMPLE/ASPX cfg2 is not ASPX_ACPL_1, so sb0 ==
+                        // aspx_xover_band (the trailer's tables.sbx);
+                        // pass `None` to use the default.
+                        None,
                     );
                     Self::pcm_f32_to_i16(&extended)
                 }
@@ -790,7 +813,7 @@ impl Ac4Decoder {
             if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
                 let pcm = match (aspx_cfg, aspx_centre) {
                     (Some(cfg), Some(trailer)) => {
-                        let compand_on = Self::five_x_compand_on_for_slot(companding, 2);
+                        let compand_mode = Self::five_x_compand_mode_for_slot(companding, 2);
                         let extended = self.aspx_extend_with_trailer(
                             &pcm_f,
                             trailer,
@@ -798,7 +821,8 @@ impl Ac4Decoder {
                             &cfg,
                             2,
                             num_ts_in_ats,
-                            compand_on,
+                            compand_mode,
+                            None,
                         );
                         Self::pcm_f32_to_i16(&extended)
                     }
@@ -974,7 +998,7 @@ impl Ac4Decoder {
                 } else {
                     &trailer.primary
                 };
-                let compand_on = Self::five_x_compand_on_for_slot(companding, slot);
+                let compand_mode = Self::five_x_compand_mode_for_slot(companding, slot);
                 let extended = self.aspx_extend_with_trailer(
                     &pcm_f,
                     trailer,
@@ -982,7 +1006,10 @@ impl Ac4Decoder {
                     &cfg,
                     slot,
                     num_ts_in_ats,
-                    compand_on,
+                    compand_mode,
+                    // SIMPLE/ASPX cfg{0,1,3} dispatchers never run on
+                    // ASPX_ACPL_1, so sb0 stays at aspx_xover_band.
+                    None,
                 );
                 Self::pcm_f32_to_i16(&extended)
             }
@@ -1804,22 +1831,44 @@ impl Decoder for Ac4Decoder {
         // the IMDCT low-band PCM.
         let use_aspx_ext = aspx_tables.is_some() && aspx_cfg.is_some();
         let num_ts_in_ats = aspx::num_ts_in_ats(info.frame_length.max(1));
-        // Round 42: per-channel companding flags from the parsed
+        // Round 43: per-channel companding mode from the parsed
         // `companding_control()`. For mono / stereo CPE paths the
         // grouping is `companding_control(1)` / `companding_control(2)`
         // — i.e. compand_on[0] is the primary channel, compand_on[1]
         // is the secondary (or the sole entry mirrors via sync_flag).
-        let (compand_on_pri, compand_on_sec) = self
+        let (compand_mode_pri, compand_mode_sec) = self
             .last_substream
             .as_ref()
             .map(|sub| {
                 let cc = sub.tools.companding.as_ref();
                 (
-                    Self::five_x_compand_on_for_slot(cc, 0),
-                    Self::five_x_compand_on_for_slot(cc, 1),
+                    Self::five_x_compand_mode_for_slot(cc, 0),
+                    Self::five_x_compand_mode_for_slot(cc, 1),
                 )
             })
-            .unwrap_or((false, false));
+            .unwrap_or((aspx::CompandingMode::Off, aspx::CompandingMode::Off));
+        // Round 43: §5.7.5.2 sb0 selection — for the ASPX_ACPL_1 codec
+        // mode the companding tool starts at `acpl_qmf_band` instead of
+        // `aspx_xover_band`. Both the stereo CPE ASPX_ACPL_1 path and
+        // the 5_X ASPX_ACPL_1 path read this from
+        // `acpl_config_1ch_partial.qmf_band`. `None` for any other
+        // codec mode → falls back to `tables.sbx`.
+        let compand_sb0_override: Option<u32> = self.last_substream.as_ref().and_then(|sub| {
+            let stereo_acpl1 =
+                matches!(sub.tools.stereo_mode, Some(asf::StereoCodecMode::AspxAcpl1));
+            let five_x_acpl1 = matches!(
+                sub.tools.five_x_mode,
+                Some(crate::mch::FiveXCodecMode::AspxAcpl1)
+            );
+            if stereo_acpl1 || five_x_acpl1 {
+                sub.tools
+                    .acpl_config_1ch_partial
+                    .as_ref()
+                    .map(|c| c.qmf_band as u32)
+            } else {
+                None
+            }
+        });
         // Make sure the per-channel A-SPX state vector is large enough.
         while self.aspx_ext_state.len() < channels as usize {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
@@ -1854,7 +1903,8 @@ impl Decoder for Ac4Decoder {
                         tna_pri.as_deref(),
                         state,
                         num_ts_in_ats,
-                        compand_on_pri,
+                        compand_mode_pri,
+                        compand_sb0_override,
                     );
                     if use_acpl {
                         if let (Some(cfg), Some(data)) =
@@ -1926,7 +1976,8 @@ impl Decoder for Ac4Decoder {
                             tna_sec.as_deref().or(tna_pri.as_deref()),
                             state,
                             num_ts_in_ats,
-                            compand_on_sec,
+                            compand_mode_sec,
+                            compand_sb0_override,
                         );
                         pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
                     } else {
@@ -2975,7 +3026,20 @@ mod tests {
         let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
         let mut state = aspx::AspxChannelExtState::new();
         let out = Ac4Decoder::aspx_extend_pcm(
-            &pcm, &tables, &cfg, None, None, None, None, None, None, None, &mut state, 1, false,
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state,
+            1,
+            aspx::CompandingMode::Off,
+            None,
         );
         assert_eq!(out.len(), pcm.len());
         // Steady-state energy must be non-zero in the far tail (post
@@ -3065,7 +3129,8 @@ mod tests {
             Some(&tna_mode_heavy),
             &mut state_a,
             2,
-            false,
+            aspx::CompandingMode::Off,
+            None,
         );
         let mut state_b = aspx::AspxChannelExtState::new();
         let out_bare = Ac4Decoder::aspx_extend_pcm(
@@ -3081,7 +3146,8 @@ mod tests {
             Some(&tna_mode_zero),
             &mut state_b,
             2,
-            false,
+            aspx::CompandingMode::Off,
+            None,
         );
         assert_eq!(out_tns.len(), pcm.len());
         assert_eq!(out_bare.len(), pcm.len());
@@ -4449,7 +4515,8 @@ mod tests {
             None,
             &mut state_off,
             1,
-            false,
+            aspx::CompandingMode::Off,
+            None,
         );
         let mut state_on = aspx::AspxChannelExtState::new();
         let out_on = Ac4Decoder::aspx_extend_pcm(
@@ -4465,7 +4532,8 @@ mod tests {
             None,
             &mut state_on,
             1,
-            true,
+            aspx::CompandingMode::PerSlot,
+            None,
         );
         assert_eq!(out_off.len(), out_on.len());
         let start = 1200usize;
@@ -4639,5 +4707,250 @@ mod tests {
             let energy: u64 = v.iter().map(|&s| s.unsigned_abs() as u64).sum();
             assert!(energy > 0, "add slot {slot} must carry F/G energy");
         }
+    }
+
+    /// Round 43: `five_x_compand_mode_for_slot` resolves the active
+    /// branch of Pseudocode 121 per output channel. Verify each of
+    /// the (sync, on, avg) combinations the spec admits.
+    #[test]
+    fn five_x_compand_mode_for_slot_resolves_each_branch() {
+        // None CC -> Off everywhere.
+        for slot in 0..5 {
+            assert_eq!(
+                Ac4Decoder::five_x_compand_mode_for_slot(None, slot),
+                aspx::CompandingMode::Off
+            );
+        }
+        // Per-channel mix: ch0 on, ch1 off+avg, ch2 off (no avg).
+        let cc_per = aspx::CompandingControl {
+            sync_flag: Some(false),
+            compand_on: vec![true, false, false, true, true],
+            compand_avg: Some(true),
+        };
+        assert_eq!(
+            Ac4Decoder::five_x_compand_mode_for_slot(Some(&cc_per), 0),
+            aspx::CompandingMode::PerSlot
+        );
+        assert_eq!(
+            Ac4Decoder::five_x_compand_mode_for_slot(Some(&cc_per), 1),
+            aspx::CompandingMode::Averaged
+        );
+        // Sync per-slot.
+        let cc_sync_on = aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        for slot in 0..5 {
+            assert_eq!(
+                Ac4Decoder::five_x_compand_mode_for_slot(Some(&cc_sync_on), slot),
+                aspx::CompandingMode::SyncPerSlot
+            );
+        }
+        // Sync averaged.
+        let cc_sync_avg = aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![false],
+            compand_avg: Some(true),
+        };
+        for slot in 0..5 {
+            assert_eq!(
+                Ac4Decoder::five_x_compand_mode_for_slot(Some(&cc_sync_avg), slot),
+                aspx::CompandingMode::SyncAveraged
+            );
+        }
+    }
+
+    /// Round 43: `aspx_extend_pcm` honours the sb0 override — passing
+    /// a non-default sb0 (the ASPX_ACPL_1 `acpl_qmf_band` rule)
+    /// produces output that differs from the default `tables.sbx`
+    /// baseline.
+    #[test]
+    fn aspx_extend_pcm_with_sb0_override_changes_output() {
+        let n_slots = 30usize;
+        let n = n_slots * 64;
+        let mut pcm = vec![0.0f32; n];
+        let f = 1200.0_f32 / 48_000.0_f32;
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f * i as f32).sin();
+        }
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        // Default sb0 (== tables.sbx).
+        let mut state_a = aspx::AspxChannelExtState::new();
+        let out_default = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_a,
+            1,
+            aspx::CompandingMode::PerSlot,
+            None,
+        );
+        // Override sb0 to a different value strictly less than sbx (or
+        // strictly between sbx and sbz) — it must change the affected
+        // band and thus the output post-QMF synthesis.
+        let alt_sb0 = if tables.sbx > 1 {
+            tables.sbx - 1
+        } else {
+            tables.sbx + 1
+        };
+        let mut state_b = aspx::AspxChannelExtState::new();
+        let out_override = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_b,
+            1,
+            aspx::CompandingMode::PerSlot,
+            Some(alt_sb0),
+        );
+        assert_eq!(out_default.len(), out_override.len());
+        let start = 1200usize;
+        let mut diffs = 0usize;
+        for (a, b) in out_default[start..]
+            .iter()
+            .zip(out_override[start..].iter())
+        {
+            if (a - b).abs() > 1e-6 {
+                diffs += 1;
+            }
+        }
+        assert!(
+            diffs > 0,
+            "sb0 override must alter the QMF-synthesis output (diffs={diffs})"
+        );
+    }
+
+    /// Round 43: `aspx_extend_pcm` with `CompandingMode::Averaged`
+    /// produces output that diverges from the `Off` baseline AND
+    /// from the `PerSlot` branch — averaging collapses per-slot
+    /// variation into a constant gain.
+    #[test]
+    fn aspx_extend_pcm_averaged_branch_diverges_from_per_slot() {
+        let n_slots = 30usize;
+        let n = n_slots * 64;
+        let mut pcm = vec![0.0f32; n];
+        // Mix two tones so the per-slot energy actually varies.
+        let f1 = 600.0_f32 / 48_000.0_f32;
+        let f2 = 1900.0_f32 / 48_000.0_f32;
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * f1 * i as f32).sin()
+                + 0.4 * (2.0 * std::f32::consts::PI * f2 * i as f32).sin();
+        }
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let mut state_off = aspx::AspxChannelExtState::new();
+        let out_off = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_off,
+            1,
+            aspx::CompandingMode::Off,
+            None,
+        );
+        let mut state_per = aspx::AspxChannelExtState::new();
+        let out_per = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_per,
+            1,
+            aspx::CompandingMode::PerSlot,
+            None,
+        );
+        let mut state_avg = aspx::AspxChannelExtState::new();
+        let out_avg = Ac4Decoder::aspx_extend_pcm(
+            &pcm,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_avg,
+            1,
+            aspx::CompandingMode::Averaged,
+            None,
+        );
+        assert_eq!(out_off.len(), out_avg.len());
+        assert_eq!(out_per.len(), out_avg.len());
+        let start = 1200usize;
+        // Averaged differs from Off (companding actually fired).
+        let mut diffs_off_avg = 0usize;
+        for (a, b) in out_off[start..].iter().zip(out_avg[start..].iter()) {
+            if (a - b).abs() > 1e-6 {
+                diffs_off_avg += 1;
+            }
+        }
+        assert!(
+            diffs_off_avg > 0,
+            "Averaged must diverge from Off baseline (diffs={diffs_off_avg})"
+        );
+        // Averaged differs from PerSlot (constant scale vs per-slot scale).
+        let mut diffs_per_avg = 0usize;
+        for (a, b) in out_per[start..].iter().zip(out_avg[start..].iter()) {
+            if (a - b).abs() > 1e-6 {
+                diffs_per_avg += 1;
+            }
+        }
+        assert!(
+            diffs_per_avg > 0,
+            "Averaged must diverge from PerSlot (diffs={diffs_per_avg})"
+        );
     }
 }
