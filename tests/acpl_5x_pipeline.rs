@@ -548,3 +548,87 @@ fn five_x_aspx_acpl_1_walker_inner_body_populates_two_channel_and_centre() {
         assert!(s.is_finite());
     }
 }
+
+/// Round 37: 7_X ASPX_ACPL_2 walker → Pseudocode 120 pipeline glue.
+///
+/// Walks a non-iframe 7_X ASPX_ACPL_2 outer header (so we can skip the
+/// I-frame `aspx_config()` blob), then drives the same Pseudocode 117
+/// `run_acpl_5x_pair_pcm` core that Pseudocode 120 reuses. For
+/// `ASPX_ACPL_{1,2}` the additional 2 channels (z6/z7 in Pseudocode
+/// 120) live outside the A-CPL pair so this glue test only checks the
+/// 5-channel core (L/R/C/Ls/Rs) — same as the 5_X path.
+#[test]
+fn seven_x_aspx_acpl_2_walker_to_synthesis_glue() {
+    use oxideav_ac4::mch::{parse_7x_audio_data_outer, SevenXCodecMode};
+    // 7_X_codec_mode = ASPX_ACPL_2 (2 bits, value 3).
+    let mut bw = BitWriter::new();
+    bw.write_u32(3, 2); // 7_X_codec_mode = ASPX_ACPL_2
+                        // No b_iframe path -> no aspx_config / acpl_config_1ch in the
+                        // bitstream. companding_control(5) for ACPL_{1,2}:
+                        //   sync_flag=1 -> single b_compand_on bit (5 channels share).
+    bw.write_bit(true); // sync_flag
+    bw.write_bit(true); // compand_on (sync=1 → 1 channel-bit)
+                        // coding_config = 0 (Cfg0Stereo2plusMono). Body bails
+                        // before the inner 2ch_mode bit due to non-iframe gate
+                        // on aspx_data trailers — that's fine; we exit cleanly
+                        // and verify the seven_x_mode resolves correctly.
+    bw.write_u32(0, 2); // coding_config = 0
+    bw.align_to_byte();
+    let bytes = bw.finish();
+    let mut br = BitReader::new(&bytes);
+    let mut tools = SubstreamTools::default();
+    parse_7x_audio_data_outer(&mut br, &mut tools, false, false, 1920).unwrap();
+    assert_eq!(tools.seven_x_mode, Some(SevenXCodecMode::AspxAcpl2));
+    // Stage acpl_config_1ch_full + the two acpl_data_1ch parameter
+    // sets (one per parallel ACplModule). This is what a future
+    // I-frame body walker / state-replay path will populate.
+    let cfg = AcplConfig1ch {
+        num_param_bands_id: 0,
+        num_param_bands: 15,
+        quant_mode: AcplQuantMode::Fine,
+        qmf_band: 0,
+    };
+    tools.acpl_config_1ch_full = Some(cfg);
+    let data_1 = stub_data_1ch(2, 1, cfg.num_param_bands);
+    let data_2 = stub_data_1ch(-1, 2, cfg.num_param_bands);
+    tools.acpl_data_1ch_pair[0] = Some(data_1.clone());
+    tools.acpl_data_1ch_pair[1] = Some(data_2.clone());
+
+    // Drive the same Pseudocode 117 pipeline (which Pseudocode 120
+    // wraps for 7_X) on synthetic L/R/C carrier PCM.
+    let n_slots = 64usize;
+    let n = n_slots * NUM_QMF_SUBBANDS;
+    let pcm_l = sine_pcm(n, 440.0, 1.0);
+    let pcm_r = sine_pcm(n, 220.0, 0.7);
+    let pcm_c = sine_pcm(n, 660.0, 0.3);
+    let mut state = Acpl5xPairPcmState::new();
+    let out = run_acpl_5x_pair_pcm(
+        Acpl5xPairMode::AspxAcpl2,
+        &pcm_l,
+        &pcm_r,
+        &pcm_c,
+        None,
+        None,
+        &cfg,
+        &data_1,
+        &cfg,
+        &data_2,
+        &mut state,
+    )
+    .expect("synth runs");
+    assert_eq!(out.left.len(), n);
+    assert_eq!(out.right.len(), n);
+    assert_eq!(out.centre.len(), n);
+    assert_eq!(out.left_surround.len(), n);
+    assert_eq!(out.right_surround.len(), n);
+    for s in out
+        .left
+        .iter()
+        .chain(&out.right)
+        .chain(&out.centre)
+        .chain(&out.left_surround)
+        .chain(&out.right_surround)
+    {
+        assert!(s.is_finite(), "non-finite sample in 7.X output");
+    }
+}

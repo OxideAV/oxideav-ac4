@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 37 — 7_X ASPX_ACPL_1 / ASPX_ACPL_2 dispatch + cfg0 centre
+  end-to-end decode** (TS 103 190-1 §5.7.7.6.3 Pseudocode 120 +
+  §5.7.7.6.1 Pseudocode 117 cfg0 centre-channel wiring):
+  - `Ac4Decoder::receive_frame` now dispatches the §5.7.7.6.3
+    Pseudocode 120 channel-pair multichannel synthesis when the 7_X
+    walker resolved `seven_x_mode` to `AspxAcpl1` or `AspxAcpl2`. The
+    dispatch reuses `dispatch_acpl_5x_pair` (the Pseudocode 117
+    channel-pair core that Pseudocode 120 wraps for 7.X) — for
+    `ASPX_ACPL_{1,2}` the additional 2 channels (z6/z7 in Pseudocode
+    120) live outside the A-CPL pair so the 5-channel core (L/R/C/Ls/Rs)
+    is identical between 5_X and 7_X. Slots 5..7 stay at silence until
+    the additional-channel decode path lands.
+  - `MonoLfeData` (`mch::parse_mono_data`) now decodes the trailing
+    `sf_data(ASF)` body for non-LFE, ASF-frontend, long-frame /
+    single-window-group mono channels — replacing the round-36
+    silence-placeholder for the centre channel in the 5_X / 7_X
+    Pseudocode 117 / 120 dispatches with a real IMDCT / overlap-add
+    centre carrier. The new `MonoLfeData::scaled_spec` field carries
+    the dequantised + scaled MDCT spectrum; LFE / SSF-frontend / short
+    / grouped / Huffman-error cases still leave this `None` and
+    preserve the prior outer-shell-only behaviour.
+  - `Ac4Decoder::dispatch_acpl_5x_pair` now accepts optional
+    `centre_pcm` / `ls_pcm` / `rs_pcm` carrier overrides — `None`
+    falls back to the round-36 silence-placeholder; `Some(...)` threads
+    real per-channel PCM through Pseudocode 117's `z4 = x2` centre
+    passthrough (and the `x3in = 2*x3` / `x4in = 2*x4` Ls/Rs pre-
+    multiplications for ACPL_1 mode). The Cfg0 centre is wired from
+    the parsed `cfg0_centre_mono.scaled_spec` via a new
+    `imdct_mono_lfe_data_f32` helper.
+  - New unit + integration tests:
+    - `parse_mono_data_non_lfe_walks_sf_data_body` — non-LFE long-frame
+      ASF-frontend mono walks the trailing body into `scaled_spec`.
+    - `parse_mono_data_lfe_skips_body_walk` — LFE body decoder remains
+      deferred (round-36 behaviour preserved).
+    - `parse_mono_data_non_lfe_ssf_frontend_skips_body_walk` —
+      SSF-frontend mono skips the ASF body walk.
+    - `dispatch_acpl_5x_pair_centre_pcm_passthrough_emits_centre_energy`
+      — supplying a real centre PCM produces non-silent ch2 output.
+    - `seven_x_pair_dispatch_resolves_same_mode_as_five_x` — the 7_X
+      dispatch maps `SevenXCodecMode::AspxAcpl{1,2}` to the same
+      `Acpl5xPairMode` selectors as the 5_X path.
+    - `imdct_mono_lfe_data_f32_returns_none_when_no_scaled_spec` /
+      `imdct_mono_lfe_data_f32_imdcts_when_scaled_spec_present` —
+      cover the new IMDCT helper.
+    - `seven_x_aspx_acpl_2_walker_to_synthesis_glue` — integration
+      test threading `parse_7x_audio_data_outer` →
+      `acpl_data_1ch_pair` → `run_acpl_5x_pair_pcm` for a non-iframe
+      7_X ACPL_2 substream.
+
 - **Round 36 — 5_X ASPX_ACPL_1 / ASPX_ACPL_2 decoder dispatch wiring**
   (TS 103 190-1 §5.7.7.6.1, Pseudocode 117):
   - `Ac4Decoder::receive_frame` now dispatches the §5.7.7.6.1

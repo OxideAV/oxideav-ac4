@@ -110,11 +110,19 @@ pub enum FiveXCodingConfig {
     AcplLite2,
 }
 
-/// Parsed `mono_data(b_lfe)` per Table 21 — outer shell only.
+/// Parsed `mono_data(b_lfe)` per Table 21 — outer shell + body.
 ///
 /// `b_lfe == 1` switches `sf_info(...)` to `sf_info_lfe()` per §4.2.8 /
 /// §4.3.6.2.1 (the `max_sfb[0]` field uses `n_msfbl_bits` from Table
 /// 106 instead of `n_msfb_bits`).
+///
+/// Round 37: extended with `scaled_spec` — the dequantised + scaled
+/// MDCT spectrum from the trailing `sf_data(ASF)` body (long-frame,
+/// single window group case only). For LFE, for the SSF frontend
+/// (`spec_frontend_bit == 1`), or for any short / grouped / Huffman-error
+/// case, this stays `None` and only the outer shell is filled. This
+/// matches the per-channel `scaled_spec_per_channel` slot pattern in
+/// [`TwoChannelData`] / [`ThreeChannelData`] etc.
 #[derive(Debug, Clone, Default)]
 pub struct MonoLfeData {
     /// `b_lfe` flag the walker was invoked with.
@@ -128,6 +136,13 @@ pub struct MonoLfeData {
     /// `sf_info_lfe()` flavour with `max_sfb` capped to
     /// `num_sfb_lfe()` and bit-width `n_msfbl_bits`.
     pub psy_info: Option<AsfPsyInfo>,
+    /// Dequantised + scaled MDCT spectrum from the trailing `sf_data(ASF)`
+    /// body. Populated for the non-LFE, ASF-frontend, long-frame,
+    /// single-window-group case. Length is `sfb_offset[max_sfb]` at the
+    /// signalled transform length. `None` for LFE (the LFE body decoder
+    /// is reserved for a future round), for SSF-frontend mono channels,
+    /// or for any short / grouped / Huffman-error case.
+    pub scaled_spec: Option<Vec<f32>>,
 }
 
 /// Parsed `three_channel_info()` per Table 30: 4-bit `chel_matsel` +
@@ -233,8 +248,15 @@ pub struct FiveChannelData {
 /// `sf_info_lfe()` runs in place of `sf_info()` — `max_sfb[0]` is
 /// `n_msfbl_bits` wide and clamped to the LFE band table.
 ///
-/// We currently parse the outer-shell (transform_info + psy_info). The
-/// `sf_data` body is left for the caller / a future round.
+/// Round 37: when the channel is non-LFE, ASF-frontend
+/// (`spec_frontend_bit == 0`), and long-frame / single-window-group, the
+/// trailing `sf_data(ASF)` body is also walked into `scaled_spec`
+/// (matching the multichannel `decode_mch_sf_data_channels` pattern).
+/// Walker is **try-and-bail** for the body so a Huffman miss leaves the
+/// outer shell intact and the caller still gets `Ok(...)`. The SSF
+/// frontend and LFE body paths remain deferred — those slots stay
+/// `None` and the bitreader cursor is left where the outer shell
+/// finished (consistent with prior behaviour).
 pub fn parse_mono_data(
     br: &mut BitReader<'_>,
     b_lfe: bool,
@@ -263,6 +285,30 @@ pub fn parse_mono_data(
     } else {
         parse_asf_psy_info(br, &ti, frame_len_base, false, false)?
     };
+
+    // Round 37: trailing `sf_data(ASF)` body for non-LFE ASF-frontend
+    // mono channels. This mirrors the per-channel body walk inside
+    // `decode_mch_sf_data_channels` for a single channel. Try-and-bail:
+    // any Huffman / bit-stream miss leaves `scaled_spec` as `None` and
+    // returns `Ok(...)`. SSF-frontend (`spec_frontend_bit == 1`) is
+    // deferred — the SSF body lives elsewhere in the substream and is
+    // not co-located with `mono_data()`.
+    if !b_lfe && out.spec_frontend_bit == 0 {
+        if ti.b_long_frame && psy.num_window_groups == 1 {
+            if let Some(scaled) = decode_asf_long_mono_body_with_max_sfb(br, &ti, psy.max_sfb_0) {
+                out.scaled_spec = Some(scaled);
+            }
+        } else if psy.num_window_groups > 0 {
+            if let Some(scaled) = decode_asf_grouped_mono_body_with_max_sfb(
+                br,
+                &ti,
+                psy.max_sfb_0,
+                psy.num_window_groups,
+            ) {
+                out.scaled_spec = Some(scaled);
+            }
+        }
+    }
     out.psy_info = Some(psy);
     Ok(out)
 }
@@ -1424,6 +1470,82 @@ mod tests {
         assert!(
             msg.contains("LFE") || msg.contains("transform_length"),
             "expected LFE-rejection error, got: {msg}"
+        );
+    }
+
+    /// Round 37: `parse_mono_data(b_lfe=false)` walks the trailing
+    /// `sf_data(ASF)` body for the long-frame, ASF-frontend, single
+    /// window group case and lands a dequantised + scaled spectrum on
+    /// `scaled_spec`. The all-zero body decodes to a zero-length-matched
+    /// spectrum (no Huffman codepoints fired).
+    #[test]
+    fn parse_mono_data_non_lfe_walks_sf_data_body() {
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // spec_frontend = ASF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(8, 6); // max_sfb[0]
+        write_zero_sf_data_body(&mut bw, 8, 0);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mono = parse_mono_data(&mut br, false, 1920).unwrap();
+        assert!(!mono.b_lfe);
+        assert_eq!(mono.spec_frontend_bit, 0);
+        let scaled = mono
+            .scaled_spec
+            .as_ref()
+            .expect("body walked into scaled_spec");
+        // Spectrum length is `sfb_offset[max_sfb]` — Table 110 row for
+        // tl=1920 / max_sfb=8 puts that just below 256 bins; we don't
+        // hard-pin the exact value but the body must be non-empty.
+        assert!(!scaled.is_empty(), "scaled spectrum must be non-empty");
+        // All-zero body: every bin should be exactly 0.0 (dequantise of
+        // q == 0 + any scalefac is 0.0).
+        assert!(
+            scaled.iter().all(|&v| v == 0.0),
+            "all-zero sf_data body must dequantise to all zeros"
+        );
+    }
+
+    /// Round 37: `parse_mono_data(b_lfe=true)` does NOT walk a body —
+    /// the LFE path stays outer-shell-only since the LFE body decoder
+    /// is reserved for a future round. `scaled_spec` must be `None` and
+    /// the bit cursor must end exactly after `sf_info_lfe()`.
+    #[test]
+    fn parse_mono_data_lfe_skips_body_walk() {
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 @ tl=1920
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let lfe = parse_mono_data(&mut br, true, 1920).unwrap();
+        assert!(lfe.b_lfe);
+        assert!(
+            lfe.scaled_spec.is_none(),
+            "LFE body decoder is deferred — scaled_spec must stay None"
+        );
+    }
+
+    /// Round 37: SSF-frontend (`spec_frontend_bit == 1`) mono channels
+    /// don't have a co-located body; the walker stops after the outer
+    /// shell and `scaled_spec` stays `None`. The bit cursor advances
+    /// past the leading 1-bit selector + `asf_transform_info` +
+    /// `asf_psy_info` only.
+    #[test]
+    fn parse_mono_data_non_lfe_ssf_frontend_skips_body_walk() {
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // spec_frontend = SSF
+        bw.write_bit(true); // b_long_frame
+        bw.write_u32(8, 6); // max_sfb[0]
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let mono = parse_mono_data(&mut br, false, 1920).unwrap();
+        assert_eq!(mono.spec_frontend_bit, 1);
+        assert!(
+            mono.scaled_spec.is_none(),
+            "SSF-frontend mono must skip the ASF body walk"
         );
     }
 
