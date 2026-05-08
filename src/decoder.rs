@@ -847,27 +847,46 @@ impl Ac4Decoder {
         }
     }
 
-    /// §5.3.4.4.1 / Table 182 — 7_X SIMPLE/ASPX additional-channel
-    /// pair dispatch. The `seven_x_additional_channel_data` shell
-    /// carries two `sf_data(ASF)` bodies for the F / G preliminary
-    /// output channels (Table 182). With `b_use_sap_add_ch == false`
-    /// (or absent), Table 183's SAP matrix collapses to identity and
-    /// F / G land directly on slots 5 / 6 (Lb,Rb / Lw,Rw / Tfl,Tfr per
-    /// `channel_mode` — slot ordering is the bitstream-order pair, the
-    /// container's channel layout decides the symbolic name).
+    /// §5.3.4.4.1 / Table 182 / Table 183 — 7_X SIMPLE/ASPX additional-
+    /// channel pair dispatch. The `seven_x_additional_channel_data` shell
+    /// carries two `sf_data(ASF)` bodies for the F / G preliminary output
+    /// channels (Table 182). The optional `partner_pair_spectra` carry the
+    /// 5.X-core counterparts D/E (or A/B per `channel_mode`) that pair
+    /// with F/G in the Table 183 SAP matrix.
     ///
-    /// SAP companding (a,b,c,d coefficients from `seven_x_add_chparam_info`)
-    /// is deferred — round-39 lands the identity pass-through. When
-    /// `b_use_sap_add_ch == true`, the dispatch still emits F/G into
-    /// slots 5/6; the SAP matrix multiplication folds in once the
-    /// coefficient extraction pipeline lands.
+    /// With `b_use_sap_add_ch == false` (or absent), Table 183's SAP
+    /// matrix collapses to identity — F / G land directly on slots 5 / 6
+    /// and the partner spectra are untouched (their independent IMDCT
+    /// path produces the unmodified slots 3 / 4 elsewhere in the
+    /// pipeline).
     ///
-    /// No-op on transform-length / sample-count mismatch, or when
-    /// either per-channel scaled spectrum is absent (short / grouped
-    /// frame / Huffman miss).
+    /// With `b_use_sap_add_ch == true`, the per-sfb (a, b, c, d)
+    /// coefficients are extracted from each `chparam_info` (Pseudocode 59
+    /// via [`crate::asf::extract_sap_abcd`]) and applied to the spectral
+    /// pair (P, F) → (slot_partner, slot_F+1) and (Q, G) → (slot_partner+1,
+    /// slot_F+2) per the Table 183 row for the active channel_mode:
+    ///
+    /// ```text
+    ///     [out_high]   [a  b]   [partner]
+    ///     [        ] = [    ] · [        ]
+    ///     [out_low ]   [c  d]   [add_ch ]
+    /// ```
+    ///
+    /// where `out_high` lands on the partner's existing slot (overwriting
+    /// the unmixed PCM at that slot) and `out_low` lands on the
+    /// additional-pair slot. When partner spectra are absent or the
+    /// transform lengths don't match, falls back to identity render
+    /// (slots 5 / 6 from F / G unmodified).
+    ///
+    /// No-op on transform-length / sample-count mismatch, or when either
+    /// per-channel scaled spectrum is absent (short / grouped frame /
+    /// Huffman miss).
     fn dispatch_7x_additional_channel_pair(
         &mut self,
         add: &crate::mch::TwoChannelData,
+        partner_pair_spectra: Option<[&[f32]; 2]>,
+        partner_slots: [usize; 2],
+        chparam: Option<&[asf::ChparamInfo; 2]>,
         samples: usize,
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
     ) {
@@ -882,16 +901,89 @@ impl Ac4Decoder {
             return;
         }
         // Slots 5 / 6 are the additional-pair output channels (F, G).
+        let pair_out_slots: [usize; 2] = [5, 6];
         while pcm_per_channel.len() < 7 {
             pcm_per_channel.push(None);
         }
-        const SLOT_MAP: [usize; 2] = [5, 6];
-        for (ch_in, &slot) in SLOT_MAP.iter().enumerate() {
-            let Some(scaled) = add.scaled_spec_per_channel[ch_in].as_ref() else {
+        // Resize so partner slots are addressable too.
+        for &slot in partner_slots.iter() {
+            while pcm_per_channel.len() <= slot {
+                pcm_per_channel.push(None);
+            }
+        }
+        // Per-pair SAP application: for each i in 0..2, mix
+        // `partner_pair_spectra[i]` (P or Q) with `add[i]` (F or G).
+        // When partner is absent or chparam is None, falls through to
+        // identity (only the additional-pair F/G is rendered).
+        let tl = ti.transform_length_0;
+        let max_sfb_cap = crate::tables::num_sfb_48(tl).unwrap_or(0);
+        for ch_in in 0..2 {
+            let Some(scaled_add) = add.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
-            let pcm = self.imdct_channel(slot, scaled, n);
-            pcm_per_channel[slot] = Some(pcm);
+            // Build SAP coefficients for this pair if requested.
+            let abcd: Option<Vec<(f32, f32, f32, f32)>> = match (chparam, partner_pair_spectra) {
+                (Some(cps), Some(partners))
+                    if max_sfb_cap > 0 && partners[ch_in].len() == n && scaled_add.len() == n =>
+                {
+                    let coeffs = asf::extract_sap_abcd(&cps[ch_in], &[max_sfb_cap]);
+                    coeffs.abcd.into_iter().next()
+                }
+                _ => None,
+            };
+            if let (Some(abcd_row), Some(partners)) = (abcd.as_ref(), partner_pair_spectra) {
+                // Spectral SAP per-sfb. Mix (P, F) -> (out_high, out_low).
+                let partner = partners[ch_in];
+                let sfbo = match crate::sfb_offset::sfb_offset_48(tl) {
+                    Some(s) => s,
+                    None => {
+                        // SFB table missing — fall through to identity.
+                        let pcm = self.imdct_channel(pair_out_slots[ch_in], scaled_add, n);
+                        pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm);
+                        continue;
+                    }
+                };
+                let mut out_high = vec![0.0f32; n];
+                let mut out_low = vec![0.0f32; n];
+                let usable_sfb = abcd_row.len().min(max_sfb_cap as usize);
+                for sfb in 0..usable_sfb {
+                    let lo = sfbo[sfb] as usize;
+                    let hi = sfbo[sfb + 1] as usize;
+                    let hi = hi.min(n).min(partner.len()).min(scaled_add.len());
+                    let (a, b, c, d) = abcd_row[sfb];
+                    for k in lo..hi {
+                        let p = partner[k];
+                        let f = scaled_add[k];
+                        out_high[k] = a * p + b * f;
+                        out_low[k] = c * p + d * f;
+                    }
+                }
+                // Copy untouched bands (sfb >= usable_sfb) from the
+                // partner / add spectra so the high half retains
+                // the partner's bandwidth and the low half is silent
+                // outside the SAP-coded range.
+                let unmixed_start = sfbo
+                    .get(usable_sfb)
+                    .copied()
+                    .map(|v| v as usize)
+                    .unwrap_or(n);
+                let unmixed_lo = unmixed_start.min(n);
+                let unmixed_hi = n.min(partner.len());
+                if unmixed_lo < unmixed_hi {
+                    out_high[unmixed_lo..unmixed_hi]
+                        .copy_from_slice(&partner[unmixed_lo..unmixed_hi]);
+                }
+                let pcm_high = self.imdct_channel(partner_slots[ch_in], &out_high, n);
+                pcm_per_channel[partner_slots[ch_in]] = Some(pcm_high);
+                let pcm_low = self.imdct_channel(pair_out_slots[ch_in], &out_low, n);
+                pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm_low);
+            } else {
+                // Identity passthrough — only render the additional pair
+                // (slots 5/6). Partner slots untouched (their independent
+                // 5_X-core IMDCT runs separately).
+                let pcm = self.imdct_channel(pair_out_slots[ch_in], scaled_add, n);
+                pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm);
+            }
         }
     }
 }
@@ -1582,6 +1674,35 @@ impl Decoder for Ac4Decoder {
                 let centre_pcm = cfg0_centre_mono
                     .as_ref()
                     .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
+                // Round 40: standalone Ls/Rs surround mono walker for
+                // ACPL_1's Mode 1 surround-driven path. The 5_X
+                // ASPX_ACPL_1 inner walker now persists the joint-MDCT
+                // residual pair (sSMP,3 / sSMP,4 per Table 181) on
+                // `tools.acpl_1_residual_pair`; we IMDCT them here into
+                // Ls/Rs PCM carriers and feed them as the `x3` / `x4`
+                // inputs of Pseudocode 117. ACPL_2 mode never emits a
+                // residual pair (no max_sfb_master in the walker), so
+                // the detach is `None` for that path → silence — same
+                // as the round-37 placeholder.
+                let acpl_1_residual_pair = self
+                    .last_substream
+                    .as_ref()
+                    .map(|sub| sub.tools.acpl_1_residual_pair.clone())
+                    .unwrap_or([None, None]);
+                let ls_pcm = acpl_1_residual_pair[0].as_ref().and_then(|(tl, scaled)| {
+                    if *tl as usize == samples as usize {
+                        Some(self.imdct_channel_f32(3, scaled, samples as usize))
+                    } else {
+                        None
+                    }
+                });
+                let rs_pcm = acpl_1_residual_pair[1].as_ref().and_then(|(tl, scaled)| {
+                    if *tl as usize == samples as usize {
+                        Some(self.imdct_channel_f32(4, scaled, samples as usize))
+                    } else {
+                        None
+                    }
+                });
                 self.dispatch_acpl_5x_pair(
                     mode,
                     cfg,
@@ -1589,8 +1710,8 @@ impl Decoder for Ac4Decoder {
                     data_2,
                     samples as usize,
                     centre_pcm.as_deref(),
-                    None,
-                    None,
+                    ls_pcm.as_deref(),
+                    rs_pcm.as_deref(),
                     &mut pcm_per_channel,
                 );
             }
@@ -1618,6 +1739,29 @@ impl Decoder for Ac4Decoder {
                 let centre_pcm = cfg0_centre_mono
                     .as_ref()
                     .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
+                // Round 40: same standalone Ls/Rs surround mono walker
+                // as the 5_X path — the 7_X ASPX_ACPL_1 walker writes
+                // to the same `acpl_1_residual_pair` slot. ACPL_2 path
+                // detaches `None` (no residual pair).
+                let acpl_1_residual_pair = self
+                    .last_substream
+                    .as_ref()
+                    .map(|sub| sub.tools.acpl_1_residual_pair.clone())
+                    .unwrap_or([None, None]);
+                let ls_pcm = acpl_1_residual_pair[0].as_ref().and_then(|(tl, scaled)| {
+                    if *tl as usize == samples as usize {
+                        Some(self.imdct_channel_f32(3, scaled, samples as usize))
+                    } else {
+                        None
+                    }
+                });
+                let rs_pcm = acpl_1_residual_pair[1].as_ref().and_then(|(tl, scaled)| {
+                    if *tl as usize == samples as usize {
+                        Some(self.imdct_channel_f32(4, scaled, samples as usize))
+                    } else {
+                        None
+                    }
+                });
                 self.dispatch_acpl_5x_pair(
                     mode,
                     cfg,
@@ -1625,8 +1769,8 @@ impl Decoder for Ac4Decoder {
                     data_2,
                     samples as usize,
                     centre_pcm.as_deref(),
-                    None,
-                    None,
+                    ls_pcm.as_deref(),
+                    rs_pcm.as_deref(),
                     &mut pcm_per_channel,
                 );
             }
@@ -1686,21 +1830,92 @@ impl Decoder for Ac4Decoder {
                 _ => {}
             }
         }
-        // Round 39: §5.3.4.4.1 / Table 182 — 7_X SIMPLE/ASPX additional
-        // channel pair render. The walker populates
+        // Round 39 / 40: §5.3.4.4.1 / Table 182 + Table 183 — 7_X
+        // SIMPLE/ASPX additional-channel pair render. The walker populates
         // `seven_x_additional_channel_data` (two sf_data(ASF) bodies)
         // when `7_X_codec_mode in {SIMPLE, ASPX}`. Slots 5 / 6 (the F/G
         // preliminary outputs in Table 182) get the IMDCT'd low-band PCM.
-        // SAP companding (a,b,c,d coefficients from
-        // `seven_x_add_chparam_info`) is deferred — identity matrix is
-        // applied implicitly when `b_use_sap_add_ch == false`. The 7_X
-        // ACPL_1/_2 walker has its own additional-channel handling per
-        // §5.3.4.4.2/.3 (z6/z7 in Pseudocode 120) — this branch is gated
-        // on the SIMPLE/ASPX active-flag so they don't collide.
+        //
+        // Round 40 wires the SAP a/b/c/d coefficient extraction
+        // (`extract_sap_abcd` per Pseudocode 59) through Table 183's
+        // 2-pair joint-stereo matrix when `b_use_sap_add_ch == true` AND
+        // partner spectra (D, E for `coding_config in {0, 2, 3}` —
+        // 3/4/0.x channel_mode) are present. The dispatch walks
+        // (P, F) → (slot_high, slot_low) and (Q, G) → (slot_high+1,
+        // slot_low+1) per-sfb in the spectral domain. With identity SAP
+        // (`b_use_sap_add_ch == false`), the partner spectra are left
+        // untouched at their 5.X-core slots and only F/G land at slots
+        // 5/6 — matching the round-39 behaviour.
+        //
+        // The 7_X ACPL_1/_2 walker has its own additional-channel
+        // handling per §5.3.4.4.2/.3 (z6/z7 in Pseudocode 120) — this
+        // branch is gated on the SIMPLE/ASPX active-flag.
         if seven_x_simple_aspx_active {
             if let Some(add) = seven_x_additional_channel_data.as_ref() {
+                // Resolve partner spectra + slots based on the active
+                // 7_X coding_config. Per Table 183 row "3/4/0.x" (the
+                // standard 7.0/7.1 layout that our 7_X walker handles)
+                // the partner pair is (Ls, Rs) — slot 3 / slot 4 in our
+                // 5.X-core dispatch; F/G lift to (Lb, Rb) on slot 5/6.
+                let partner_slots: [usize; 2] = [3, 4];
+                let (partner_d, partner_e): (Option<Vec<f32>>, Option<Vec<f32>>) =
+                    match five_x_coding_cfg {
+                        Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
+                            // 5_X cfg2 four_channel_data carries [L, R, Ls, Rs]
+                            // in indices [0, 1, 2, 3] per Table 180. The
+                            // surround pair lives at four[2]/four[3].
+                            let (d, e) = match cfg2_four_channel_data.as_ref() {
+                                Some(four) => (
+                                    four.scaled_spec_per_channel.get(2).cloned().flatten(),
+                                    four.scaled_spec_per_channel.get(3).cloned().flatten(),
+                                ),
+                                None => (None, None),
+                            };
+                            (d, e)
+                        }
+                        Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
+                            // 5_X cfg3 five_channel_data lays out [L, R, C,
+                            // Ls, Rs] per Table 180. Surround pair lives at
+                            // five[3]/five[4].
+                            let (d, e) = match cfg_five_channel_data.as_ref() {
+                                Some(five) => (
+                                    five.scaled_spec_per_channel.get(3).cloned().flatten(),
+                                    five.scaled_spec_per_channel.get(4).cloned().flatten(),
+                                ),
+                                None => (None, None),
+                            };
+                            (d, e)
+                        }
+                        Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
+                            // 5_X cfg1 three_channel_data + two_channel_data:
+                            // surround pair lives at the trailing
+                            // two_channel_data[0]/[1] (slots 3/4 in our
+                            // dispatch). Use the parsed scaled_spec.
+                            let (d, e) = match cfg_two_channel_data.first() {
+                                Some(tcd) => (
+                                    tcd.scaled_spec_per_channel.first().cloned().flatten(),
+                                    tcd.scaled_spec_per_channel.get(1).cloned().flatten(),
+                                ),
+                                None => (None, None),
+                            };
+                            (d, e)
+                        }
+                        _ => (None, None),
+                    };
+                let chparam_pair = self
+                    .last_substream
+                    .as_ref()
+                    .and_then(|sub| sub.tools.seven_x_add_chparam_info.as_ref().cloned());
+                let partner_pair: Option<[&[f32]; 2]> =
+                    match (partner_d.as_ref(), partner_e.as_ref()) {
+                        (Some(d), Some(e)) => Some([d.as_slice(), e.as_slice()]),
+                        _ => None,
+                    };
                 self.dispatch_7x_additional_channel_pair(
                     add,
+                    partner_pair,
+                    partner_slots,
+                    chparam_pair.as_ref(),
                     samples as usize,
                     &mut pcm_per_channel,
                 );
@@ -2630,6 +2845,48 @@ mod tests {
         }
     }
 
+    /// Round 40: standalone Ls/Rs surround mono walker — when the
+    /// `acpl_1_residual_pair` is populated and we feed the IMDCT'd PCM
+    /// as `ls_pcm` / `rs_pcm` to `dispatch_acpl_5x_pair`, the output
+    /// surround channels (slots 3 / 4) must reflect non-zero energy
+    /// from the residual carriers (replacing the round-37 silence
+    /// placeholder).
+    #[test]
+    fn dispatch_acpl_5x_pair_with_real_ls_rs_carriers_emits_surround_energy() {
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let n = 1_920usize;
+        let carrier_l: Vec<i16> = (0..n).map(|i| (i % 200) as i16 * 30).collect();
+        let carrier_r: Vec<i16> = (0..n).map(|i| ((i + 50) % 200) as i16 * 30).collect();
+        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let cfg = dispatch_stub_cfg(12);
+        let data_1 = dispatch_stub_data_1ch(2, 1, cfg.num_param_bands);
+        let data_2 = dispatch_stub_data_1ch(-3, 2, cfg.num_param_bands);
+        // Feed real Ls/Rs PCM (mimicking what the round-40 walker does:
+        // IMDCT the parsed `acpl_1_residual_pair` spectra and pass the
+        // PCM as the `x3` / `x4` inputs to Pseudocode 117).
+        let ls_pcm: Vec<f32> = (0..n).map(|i| 0.05 * (i as f32 / n as f32)).collect();
+        let rs_pcm: Vec<f32> = (0..n).map(|i| -0.05 * (i as f32 / n as f32)).collect();
+
+        dec.dispatch_acpl_5x_pair(
+            Acpl5xPairMode::AspxAcpl1,
+            &cfg,
+            &data_1,
+            &data_2,
+            n,
+            None,
+            Some(&ls_pcm),
+            Some(&rs_pcm),
+            &mut pcm_per_channel,
+        );
+
+        assert!(pcm_per_channel.len() >= 5);
+        for (slot, entry) in pcm_per_channel.iter().enumerate().take(5) {
+            assert!(entry.is_some(), "slot {slot} populated by dispatch");
+            assert_eq!(entry.as_ref().unwrap().len(), n);
+        }
+    }
+
     /// `dispatch_acpl_5x_pair` must early-return when the sample count
     /// isn't a multiple of NUM_QMF_SUBBANDS (64), leaving
     /// `pcm_per_channel` unchanged.
@@ -3218,7 +3475,7 @@ mod tests {
             scaled_spec_per_channel: vec![Some(mk_ramp(0.30)), Some(mk_ramp(0.40))],
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
-        dec.dispatch_7x_additional_channel_pair(&add, n, &mut pcm);
+        dec.dispatch_7x_additional_channel_pair(&add, None, [3, 4], None, n, &mut pcm);
         // Slots 0..4 untouched, slots 5/6 populated.
         for (slot, entry) in pcm.iter().enumerate().take(5) {
             assert!(entry.is_none(), "slot {slot} stays untouched");
@@ -3253,12 +3510,74 @@ mod tests {
             scaled_spec_per_channel: vec![Some(vec![0.1; 1_024]), Some(vec![0.2; 1_024])],
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 7];
-        dec.dispatch_7x_additional_channel_pair(&add, 1_920, &mut pcm);
+        dec.dispatch_7x_additional_channel_pair(&add, None, [3, 4], None, 1_920, &mut pcm);
         for (slot, entry) in pcm.iter().enumerate() {
             assert!(
                 entry.is_none(),
                 "slot {slot} should be untouched on length mismatch"
             );
+        }
+    }
+
+    /// Round 40: with SAP `b_use_sap_add_ch == true` and identity
+    /// chparam_info coefficients (sap_mode = 0 -> a=d=1, b=c=0), the
+    /// dispatch should emit the partner spectrum on the partner slot
+    /// and zero on the additional pair slot (since c=0, d=1 means
+    /// `out_low = 0*P + 1*F = F`; identity passes F through to slot 5/6
+    /// and P unchanged to partner slot — equivalent to the no-SAP path
+    /// but with the partner slot also explicitly populated from the
+    /// shared spectrum).
+    #[test]
+    fn dispatch_7x_additional_pair_sap_identity_routes_partner_and_additional() {
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let n: usize = 1_920;
+        let ti = crate::asf::AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0; 2],
+            transform_length_0: n as u32,
+            transform_length_1: n as u32,
+        };
+        let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
+        let add = crate::mch::TwoChannelData {
+            transform_info: Some(ti),
+            psy_info: None,
+            chparam: None,
+            scaled_spec_per_channel: vec![Some(mk_ramp(0.30)), Some(mk_ramp(0.40))],
+        };
+        let partner_d = mk_ramp(0.10);
+        let partner_e = mk_ramp(0.20);
+        let chparam = [
+            crate::asf::ChparamInfo::default(),
+            crate::asf::ChparamInfo::default(),
+        ];
+        let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
+        dec.dispatch_7x_additional_channel_pair(
+            &add,
+            Some([partner_d.as_slice(), partner_e.as_slice()]),
+            [3, 4],
+            Some(&chparam),
+            n,
+            &mut pcm,
+        );
+        assert!(pcm.len() >= 7);
+        // Partner slots 3/4 should now carry P (from the IMDCT of
+        // partner_d / partner_e) — non-zero energy.
+        for slot in [3_usize, 4] {
+            let v = pcm[slot]
+                .as_ref()
+                .unwrap_or_else(|| panic!("partner slot {slot} populated"));
+            assert_eq!(v.len(), n);
+        }
+        // Additional pair slots 5/6 carry F/G via the identity SAP
+        // (out_low = 0*P + 1*F = F).
+        for slot in [5_usize, 6] {
+            let v = pcm[slot]
+                .as_ref()
+                .unwrap_or_else(|| panic!("add slot {slot} populated"));
+            assert_eq!(v.len(), n);
+            let energy: u64 = v.iter().map(|&s| s.unsigned_abs() as u64).sum();
+            assert!(energy > 0, "add slot {slot} must carry F/G energy");
         }
     }
 }

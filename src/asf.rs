@@ -487,6 +487,156 @@ pub fn parse_sap_data(br: &mut BitReader<'_>, max_sfb_per_group: &[u32]) -> Resu
     })
 }
 
+/// Per-(group, sfb) SAP coefficients (a, b, c, d) extracted from a
+/// `chparam_info()` element per Pseudocode 59 (§5.3.2). Each row is a
+/// window-group; each entry is the SAP 2x2 mixing matrix coefficient
+/// quartet for that scale-factor band — i.e.
+///
+/// ```text
+///     [O_0]   [a  b] [I_0]
+///     [   ] = [    ] [   ]
+///     [O_1]   [c  d] [I_1]
+/// ```
+///
+/// applied per-sfb to a stereo pair (the joint-MDCT / SAP companding
+/// matrix). The four extraction modes are:
+///
+/// * `sap_mode == 0` — identity: `a = d = 1, b = c = 0`.
+/// * `sap_mode == 1, ms_used == 0` — identity (same as mode 0).
+/// * `sap_mode == 1, ms_used == 1` — M/S inverse: `a = b = c = 1, d = -1`.
+/// * `sap_mode == 2` — *reserved* (treated as identity here for safety).
+/// * `sap_mode == 3, sap_used` — alpha-driven SAP: with
+///   `sap_gain = alpha_q * 0.1`,
+///   `a = 1 + sap_gain, b = 1, c = 1 - sap_gain, d = -1`.
+/// * `sap_mode == 3, !sap_used` — passthrough: `a = 1, b = 0, c = 0, d = 1`.
+///
+/// `alpha_q[g][sfb]` is differential-decoded across pair-major sfb (sfb,
+/// sfb+1 share a flag — odd sfbs inherit the even sfb's alpha_q). Cross-
+/// group time-deltas (`delta_code_time`) require that group g and g-1
+/// share the same `max_sfb_g` (Pseudocode 59 forces `code_delta = 0`
+/// otherwise).
+#[derive(Debug, Clone, Default)]
+pub struct SapCoeffs {
+    /// `[g][sfb] -> (a, b, c, d)` — outer length is `num_window_groups`,
+    /// inner length is `max_sfb_per_group[g]`. All values in `f32`.
+    pub abcd: Vec<Vec<(f32, f32, f32, f32)>>,
+}
+
+impl SapCoeffs {
+    /// Identity (passthrough) coefficients for an empty `chparam_info()`
+    /// or when `sap_mode == 0` is signalled with no follow-up payload.
+    pub fn identity(max_sfb_per_group: &[u32]) -> Self {
+        let abcd = max_sfb_per_group
+            .iter()
+            .map(|&m| vec![(1.0, 0.0, 0.0, 1.0); m as usize])
+            .collect();
+        Self { abcd }
+    }
+}
+
+/// Extract per-(g, sfb) SAP coefficients (a, b, c, d) from a parsed
+/// `chparam_info()` per Pseudocode 59 (§5.3.2). `max_sfb_per_group[g]`
+/// must match the bound used to walk the `chparam_info` body.
+///
+/// Pseudocode 59 derives `alpha_q[g][sfb]` from `dpcm_alpha_q[g][sfb]`
+/// via DPCM (sfb-major delta against `alpha_q[g][sfb-2]` for even sfbs;
+/// odd sfbs inherit the even pair-mate; cross-group `delta_code_time`
+/// folds in when supported). Then `sap_gain = alpha_q * 0.1` drives
+/// `(a, b, c, d) = (1 + sap_gain, 1, 1 - sap_gain, -1)` for SAP-coded
+/// bands and `(1, 0, 0, 1)` for skipped bands.
+pub fn extract_sap_abcd(info: &ChparamInfo, max_sfb_per_group: &[u32]) -> SapCoeffs {
+    let mode = info.mode();
+    let mut abcd: Vec<Vec<(f32, f32, f32, f32)>> = max_sfb_per_group
+        .iter()
+        .map(|&m| vec![(1.0, 0.0, 0.0, 1.0); m as usize])
+        .collect();
+    match mode {
+        SapMode::None | SapMode::Reserved => {
+            // Identity already populated above.
+        }
+        SapMode::MsUsed => {
+            // Per-sfb selector — when ms_used == 1, swap the row to the
+            // M/S inverse matrix. Pseudocode 59 column:
+            //   a = b = c = 1, d = -1.
+            for (g, &m) in max_sfb_per_group.iter().enumerate() {
+                let row = info.ms_used.get(g);
+                for (sfb, slot) in abcd[g].iter_mut().enumerate().take(m as usize) {
+                    let used = row.and_then(|r| r.get(sfb).copied()).unwrap_or(false);
+                    if used {
+                        *slot = (1.0, 1.0, 1.0, -1.0);
+                    }
+                }
+            }
+        }
+        SapMode::SapData => {
+            let Some(sd) = info.sap_data.as_ref() else {
+                return SapCoeffs { abcd };
+            };
+            // Pair-major DPCM differential decode of dpcm_alpha_q ->
+            // alpha_q[g][sfb]. For odd sfbs inherit alpha_q[g][sfb-1].
+            // For even sfbs: delta = dpcm_alpha_q[g][sfb] (Huffman path
+            // already subtracted the DC offset of 60 in our parser);
+            // start of group: alpha = delta when `sfb == 0` and not
+            // cross-group time-coding; otherwise alpha[g][sfb] =
+            // alpha[g][sfb-2] + delta. With cross-group time-coding
+            // (`delta_code_time == 1` and `max_sfb_g == max_sfb_prev`),
+            // alpha[g][sfb] = alpha[g-1][sfb] + delta.
+            let num_groups = max_sfb_per_group.len();
+            let mut alpha_q: Vec<Vec<i32>> = max_sfb_per_group
+                .iter()
+                .map(|&m| vec![0i32; m as usize])
+                .collect();
+            let mut max_sfb_prev = max_sfb_per_group.first().copied().unwrap_or(0);
+            for g in 0..num_groups {
+                let m = max_sfb_per_group[g] as usize;
+                let dp = sd.dpcm_alpha_q.get(g);
+                let used_row = sd.sap_coeff_used.get(g);
+                let mut sfb = 0usize;
+                while sfb < m {
+                    let used = used_row.and_then(|r| r.get(sfb).copied()).unwrap_or(false);
+                    if used {
+                        if sfb % 2 == 1 {
+                            // Odd sfb inherits the pair's even partner.
+                            alpha_q[g][sfb] =
+                                alpha_q[g].get(sfb.saturating_sub(1)).copied().unwrap_or(0);
+                        } else {
+                            // Even sfb: differential decode against the
+                            // previous even sfb (or the same sfb in group
+                            // g-1 when `delta_code_time` is on and the
+                            // group-bounds match — Pseudocode 59 forces
+                            // `code_delta = 0` if `max_sfb_g != max_sfb_prev`
+                            // or `g == 0`).
+                            let delta = dp.and_then(|r| r.get(sfb).copied()).unwrap_or(0);
+                            let code_delta = g != 0
+                                && max_sfb_per_group[g] == max_sfb_prev
+                                && sd.delta_code_time;
+                            let prev = if code_delta {
+                                alpha_q
+                                    .get(g.wrapping_sub(1))
+                                    .and_then(|r| r.get(sfb).copied())
+                                    .unwrap_or(0)
+                            } else if sfb == 0 {
+                                0
+                            } else {
+                                alpha_q[g].get(sfb - 2).copied().unwrap_or(0)
+                            };
+                            alpha_q[g][sfb] = prev + delta;
+                        }
+                        let sap_gain = alpha_q[g][sfb] as f32 * 0.1;
+                        abcd[g][sfb] = (1.0 + sap_gain, 1.0, 1.0 - sap_gain, -1.0);
+                    } else {
+                        // Skipped band: passthrough identity.
+                        abcd[g][sfb] = (1.0, 0.0, 0.0, 1.0);
+                    }
+                    sfb += 1;
+                }
+                max_sfb_prev = max_sfb_per_group[g];
+            }
+        }
+    }
+    SapCoeffs { abcd }
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -666,6 +816,30 @@ pub struct SubstreamTools {
     /// when the walker hasn't reached the ACPL trailer yet (e.g.
     /// non-I-frame).
     pub acpl_data_1ch_pair: [Option<crate::acpl::AcplData1ch>; 2],
+    /// 5.X `ASPX_ACPL_1` joint-MDCT residual-layer scaled spectra for the
+    /// two `sf_data(ASF)` bodies that follow the chparam_info pair. Per
+    /// Table 181, these are `sSMP,3` and `sSMP,4` — the surround-driving
+    /// inputs that mix with the preliminary outputs (A/B from the
+    /// `two_channel_data` or three_channel_data) via the chparam SAP
+    /// matrix to produce the final L/R/Ls/Rs output channels.
+    ///
+    /// Round 40 wires this for the standalone Ls/Rs surround mono
+    /// walker — round-39 dropped the parsed bodies on the floor (the
+    /// walker still ran them through `decode_asf_long_mono_body_with_max_sfb`
+    /// for try-and-bail correctness but didn't persist them). With the
+    /// pair populated, the 5_X `ASPX_ACPL_1` dispatch can IMDCT the
+    /// residual MDCT spectra and feed them as `ls_pcm` / `rs_pcm`
+    /// carriers into [`crate::acpl_synth::run_acpl_5x_pair_pcm`] (the
+    /// `x3` / `x4` inputs of Pseudocode 117). When `None`, the
+    /// dispatch falls back to the round-37 silence placeholder for
+    /// the surround carriers.
+    ///
+    /// Each entry is the (transform_length, scaled_spec) bundle — the
+    /// transform_length matches the upstream channel-data's largest
+    /// signalled length (the dominant transform on which the joint-
+    /// MDCT residual layer is single-window-grouped, per the §4.2.6.6
+    /// NOTE).
+    pub acpl_1_residual_pair: [Option<(u32, Vec<f32>)>; 2],
     /// `7_X_codec_mode` (§4.3.5.7 Table 98) for 7.X channel-element
     /// substreams. Populated by [`crate::mch::parse_7x_audio_data_outer`].
     /// Note this is a 2-bit field for 7_X (vs 3 bits for 5_X) — only
@@ -3302,6 +3476,130 @@ mod tests {
         assert_eq!(sd.dpcm_alpha_q.len(), 2);
         assert_eq!(sd.dpcm_alpha_q[0], vec![0, 0]);
         assert_eq!(sd.dpcm_alpha_q[1], vec![0, 0]);
+    }
+
+    // ---------------- extract_sap_abcd / Pseudocode 59 ----------------
+
+    /// `sap_mode == 0` -> identity matrix on every band.
+    #[test]
+    fn extract_sap_abcd_mode_zero_returns_identity() {
+        let cp = ChparamInfo {
+            sap_mode: 0,
+            ..ChparamInfo::default()
+        };
+        let coeffs = extract_sap_abcd(&cp, &[4]);
+        assert_eq!(coeffs.abcd.len(), 1);
+        for q in &coeffs.abcd[0] {
+            assert_eq!(*q, (1.0, 0.0, 0.0, 1.0));
+        }
+    }
+
+    /// `sap_mode == 1` -> per-sfb selector. ms_used == 1 -> M/S inverse
+    /// (`a=b=c=1, d=-1`); ms_used == 0 -> identity.
+    #[test]
+    fn extract_sap_abcd_mode_one_swaps_per_sfb_on_ms_used() {
+        let cp = ChparamInfo {
+            sap_mode: 1,
+            ms_used: vec![vec![true, false, true, false]],
+            sap_data: None,
+        };
+        let coeffs = extract_sap_abcd(&cp, &[4]);
+        assert_eq!(coeffs.abcd[0][0], (1.0, 1.0, 1.0, -1.0));
+        assert_eq!(coeffs.abcd[0][1], (1.0, 0.0, 0.0, 1.0));
+        assert_eq!(coeffs.abcd[0][2], (1.0, 1.0, 1.0, -1.0));
+        assert_eq!(coeffs.abcd[0][3], (1.0, 0.0, 0.0, 1.0));
+    }
+
+    /// `sap_mode == 3, sap_used` -> alpha-driven SAP. Pair-major DPCM:
+    /// odd sfbs inherit the even pair-mate's alpha_q. Even sfbs accumulate
+    /// the dpcm delta against the previous even sfb in the same group
+    /// (or alpha == delta when `sfb == 0`).
+    #[test]
+    fn extract_sap_abcd_mode_three_pair_dpcm_decode() {
+        // Single group, max_sfb = 4. All pair flags set. dpcm row =
+        // [delta(sfb=0), 0, delta(sfb=2), 0]. alpha_q[0] = delta_0 = 5;
+        // alpha_q[1] = alpha_q[0] = 5 (pair inherit); alpha_q[2] =
+        // alpha_q[0] + delta_2 = 5 + 3 = 8; alpha_q[3] = alpha_q[2] = 8.
+        let cp = ChparamInfo {
+            sap_mode: 3,
+            ms_used: vec![],
+            sap_data: Some(SapData {
+                sap_coeff_all: true,
+                sap_coeff_used: vec![vec![true, true, true, true]],
+                delta_code_time: false,
+                dpcm_alpha_q: vec![vec![5, 0, 3, 0]],
+            }),
+        };
+        let coeffs = extract_sap_abcd(&cp, &[4]);
+        let row = &coeffs.abcd[0];
+        // sfb 0: alpha_q = 5 -> sap_gain = 0.5 -> (1.5, 1, 0.5, -1).
+        let (a, b, c, d) = row[0];
+        assert!((a - 1.5).abs() < 1e-6);
+        assert_eq!(b, 1.0);
+        assert!((c - 0.5).abs() < 1e-6);
+        assert_eq!(d, -1.0);
+        // sfb 1 inherits sfb 0.
+        assert_eq!(row[1], row[0]);
+        // sfb 2: alpha_q = 8 -> sap_gain = 0.8 -> (1.8, 1, 0.2, -1).
+        let (a2, _b2, c2, _d2) = row[2];
+        assert!((a2 - 1.8).abs() < 1e-6);
+        assert!((c2 - 0.2).abs() < 1e-6);
+        assert_eq!(row[3], row[2]);
+    }
+
+    /// `sap_mode == 3, !sap_used` -> band passthrough (a=1,b=0,c=0,d=1).
+    #[test]
+    fn extract_sap_abcd_mode_three_unused_bands_pass_through() {
+        let cp = ChparamInfo {
+            sap_mode: 3,
+            ms_used: vec![],
+            sap_data: Some(SapData {
+                sap_coeff_all: false,
+                sap_coeff_used: vec![vec![false, false]],
+                delta_code_time: false,
+                dpcm_alpha_q: vec![vec![10, 0]],
+            }),
+        };
+        let coeffs = extract_sap_abcd(&cp, &[2]);
+        assert_eq!(coeffs.abcd[0][0], (1.0, 0.0, 0.0, 1.0));
+        assert_eq!(coeffs.abcd[0][1], (1.0, 0.0, 0.0, 1.0));
+    }
+
+    /// Cross-group `delta_code_time` only fires when groups share their
+    /// `max_sfb_g` (Pseudocode 59 forces `code_delta = 0` otherwise).
+    #[test]
+    fn extract_sap_abcd_mode_three_delta_code_time_cross_group() {
+        // Two groups, both max_sfb = 2. delta_code_time = 1.
+        // Group 0 dpcm = [4, 0] -> alpha[0] = [4, 4].
+        // Group 1 dpcm = [2, 0] -> alpha[1][0] = alpha[0][0] + 2 = 6;
+        //                          alpha[1][1] = alpha[1][0] = 6.
+        let cp = ChparamInfo {
+            sap_mode: 3,
+            ms_used: vec![],
+            sap_data: Some(SapData {
+                sap_coeff_all: true,
+                sap_coeff_used: vec![vec![true, true], vec![true, true]],
+                delta_code_time: true,
+                dpcm_alpha_q: vec![vec![4, 0], vec![2, 0]],
+            }),
+        };
+        let coeffs = extract_sap_abcd(&cp, &[2, 2]);
+        // Group 1 sfb 0: sap_gain = 0.6 -> a = 1.6.
+        let (a, _, c, _) = coeffs.abcd[1][0];
+        assert!((a - 1.6).abs() < 1e-6);
+        assert!((c - 0.4).abs() < 1e-6);
+    }
+
+    /// `SapCoeffs::identity` produces an all-ones-diagonal matrix.
+    #[test]
+    fn sap_coeffs_identity_helper() {
+        let coeffs = SapCoeffs::identity(&[3, 2]);
+        assert_eq!(coeffs.abcd.len(), 2);
+        for row in &coeffs.abcd {
+            for q in row {
+                assert_eq!(*q, (1.0, 0.0, 0.0, 1.0));
+            }
+        }
     }
 
     // =================================================================

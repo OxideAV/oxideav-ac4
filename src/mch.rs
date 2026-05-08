@@ -882,11 +882,15 @@ fn parse_aspx_acpl_1_2_inner_body(
             transform_length_1: tl,
         };
         let body0 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
-        let Some(_b0) = body0 else { return Ok(()) };
+        let Some(b0) = body0 else { return Ok(()) };
         let body1 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
-        if body1.is_none() {
-            return Ok(());
-        }
+        let Some(b1) = body1 else { return Ok(()) };
+        // Persist the joint-MDCT residual pair (sSMP,3 / sSMP,4 per
+        // Table 181) so the ASPX_ACPL_1 dispatch can IMDCT them into
+        // Ls / Rs surround PCM carriers (round 40 — replaces the
+        // round-37 silence placeholder for the surround-driven path).
+        tools.acpl_1_residual_pair[0] = Some((tl, b0));
+        tools.acpl_1_residual_pair[1] = Some((tl, b1));
     }
 
     // 3) Cfg0 only: mono_data(0) — centre / surround mono.
@@ -1254,11 +1258,14 @@ pub fn parse_7x_audio_data_outer(
             transform_length_1: tl,
         };
         let body0 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
-        let Some(_b0) = body0 else { return Ok(()) };
+        let Some(b0) = body0 else { return Ok(()) };
         let body1 = decode_asf_long_mono_body_with_max_sfb(br, &synth_ti, max_sfb_master);
-        if body1.is_none() {
-            return Ok(());
-        }
+        let Some(b1) = body1 else { return Ok(()) };
+        // Persist the 7_X ASPX_ACPL_1 joint-MDCT residual pair too —
+        // shape mirrors the 5_X path; the dispatch can use the same
+        // tools slot for both 5_X and 7_X surround-driven render.
+        tools.acpl_1_residual_pair[0] = Some((tl, b0));
+        tools.acpl_1_residual_pair[1] = Some((tl, b1));
     }
 
     // Trailing `mono_data(0)` for `coding_config in {0, 2}` — the
@@ -2558,6 +2565,18 @@ mod tests {
         // stays None (no aspx_config in scope).
         assert!(tools.acpl_data_1ch_pair[0].is_none());
         assert!(tools.acpl_data_1ch_pair[1].is_none());
+        // Round 40: the residual pair (sSMP,3 / sSMP,4 spectra per
+        // Table 181) is now persisted on `tools.acpl_1_residual_pair`
+        // so the dispatch can IMDCT it into Ls/Rs PCM carriers. The
+        // sf_data bodies above are all-zero, so the resulting spectra
+        // are all-zero — the slot is `Some` regardless.
+        assert!(tools.acpl_1_residual_pair[0].is_some(), "sSMP,3 persisted");
+        assert!(tools.acpl_1_residual_pair[1].is_some(), "sSMP,4 persisted");
+        let (tl0, spec0) = tools.acpl_1_residual_pair[0].as_ref().unwrap();
+        assert_eq!(*tl0, 1920);
+        // sfb_offset[8] for tl=1920 — caller-provided max_sfb_master = 8.
+        // Length is the number of MDCT bins covered by 8 sfbs at tl=1920.
+        assert!(!spec0.is_empty(), "sSMP,3 spectrum is non-empty");
     }
 
     /// ASPX_ACPL_2 I-frame with `coding_config = 1`

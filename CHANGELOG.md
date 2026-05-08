@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 40 — SAP a/b/c/d coefficient extraction (Pseudocode 59) +
+  Table 183 7_X SIMPLE/ASPX final channel mapping + standalone Ls/Rs
+  surround mono walker for ACPL_1 Mode 1** (TS 103 190-1 §5.3.2 /
+  §5.3.4.4.1 / §5.7.7.6.1):
+  - `asf::SapCoeffs` + `asf::extract_sap_abcd(info, max_sfb_per_group)`
+    — Pseudocode 59 implementation. Walks `chparam_info.sap_mode` ∈
+    {0, 1, 3} and emits per-(g, sfb) `(a, b, c, d)` quartets:
+    * `sap_mode == 0` → identity (a=d=1, b=c=0).
+    * `sap_mode == 1, ms_used` → M/S inverse (a=b=c=1, d=-1) per-sfb;
+      identity where ms_used == false.
+    * `sap_mode == 3` → alpha-driven SAP. Pair-major DPCM differential
+      decode of `dpcm_alpha_q` → `alpha_q[g][sfb]` (odd sfbs inherit
+      the even pair-mate; cross-group `delta_code_time` folds in when
+      `g != 0` and `max_sfb_g == max_sfb_prev`). `sap_gain = alpha_q
+      * 0.1` drives `(a, b, c, d) = (1 + sap_gain, 1, 1 - sap_gain, -1)`
+      for SAP-coded bands; `(1, 0, 0, 1)` for skipped bands.
+  - `Ac4Decoder::dispatch_7x_additional_channel_pair` extended:
+    accepts `partner_pair_spectra` + `partner_slots` + `chparam`. With
+    `b_use_sap_add_ch == true` AND partner spectra of matching
+    transform length, applies Table 183's SAP matrix per-sfb in the
+    spectral domain — `[out_high; out_low] = [a b; c d] · [partner;
+    add_ch]` — then IMDCTs both halves independently. With identity
+    SAP the partner slot is left untouched (its independent 5_X-core
+    IMDCT renders elsewhere) and only F/G land at slots 5/6 per Table
+    182 — round-39 behaviour preserved.
+  - `Ac4Decoder::receive_frame` 7_X branch resolves the partner pair
+    from the active `five_x_coding_config`: cfg2 picks
+    `four_channel_data[2,3]` (Ls/Rs); cfg3 picks
+    `five_channel_data[3,4]`; cfg1 picks the trailing
+    `two_channel_data[0,1]`. cfg0 has no natural surround partner
+    inside the 5_X core — falls through to identity passthrough.
+  - **Standalone Ls/Rs surround mono walker for ACPL_1's Mode 1
+    surround-driven path**: `parse_aspx_acpl_1_2_inner_body` (5_X)
+    and `parse_7x_audio_data_outer` (7_X) now persist the joint-MDCT
+    residual pair (sSMP,3 / sSMP,4 per Table 181) on
+    `tools.acpl_1_residual_pair: [Option<(u32, Vec<f32>)>; 2]`. The
+    decoder's 5_X / 7_X ACPL_1 dispatch IMDCTs them into Ls / Rs PCM
+    carriers and feeds them as the `x3` / `x4` inputs of Pseudocode
+    117 — replacing the round-37 silence placeholder for slots 3 / 4.
+    ASPX_ACPL_2 mode never emits a residual pair (no max_sfb_master
+    in its walker), so the detach is `None` and surround stays at
+    silence as before.
+  - New tests (+8): `extract_sap_abcd_mode_zero_returns_identity`,
+    `extract_sap_abcd_mode_one_swaps_per_sfb_on_ms_used`,
+    `extract_sap_abcd_mode_three_pair_dpcm_decode`,
+    `extract_sap_abcd_mode_three_unused_bands_pass_through`,
+    `extract_sap_abcd_mode_three_delta_code_time_cross_group`,
+    `sap_coeffs_identity_helper`,
+    `dispatch_7x_additional_pair_sap_identity_routes_partner_and_additional`,
+    `dispatch_acpl_5x_pair_with_real_ls_rs_carriers_emits_surround_energy`.
+    The existing
+    `parse_5x_aspx_acpl_1_non_iframe_walks_three_channel_data` grew an
+    assertion that `tools.acpl_1_residual_pair[0/1].is_some()` after
+    the inner walker runs. 568 tests total (was 560).
+
 - **Round 39 — 5_X SIMPLE/ASPX cfg0/cfg1/cfg3 dispatch helpers +
   7_X SIMPLE/ASPX additional-channel pair render** (TS 103 190-1
   §5.3.4.3.1 / Table 180 columns 0/1/3 + §5.3.4.4.1 / Table 182):
