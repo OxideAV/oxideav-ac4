@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 46 — AC-4 IMS encoder scaffold + ACPL_1 surround Ls/Rs
+  ASPX-extension spec audit** (TS 103 190-2 §6.2.1.1 / §6.3.2.5,
+  TS 103 190-1 §4.2.6.6 Table 25):
+  - `encoder_ims::Ac4ImsEncoder` — Auditor-mode AC-4 IMS encoder
+    skeleton. Emits a structurally-valid `raw_ac4_frame()` payload
+    with the IMS-flavoured `ac4_toc()` (`bitstream_version = 2` +
+    `ac4_presentation_v1_info()` + `ac4_substream_group_info()`) per
+    TS 103 190-2 §6.2.1.1. Public API: `Ac4ImsEncoder::new()` (defaults
+    to mono 48 kHz 24 fps single-presentation single-substream-group
+    iframe), `with_v0()` / `with_stereo()` / `with_5_1()` builders,
+    `encode_frame(body_padding_bytes)` (bumps the 10-bit
+    sequence_counter modulo 1024), and `encode_frame_v0(...)` that
+    forces the TS 103 190-1 v0 layout for round-trip-with-decoder
+    tests. Audio body is zero-byte placeholder bits — full encoder
+    pipeline (MDCT analysis, scalefactor selection, entropy coding,
+    A-SPX envelope coding, A-CPL parameter extraction) deferred to
+    future rounds. Eight new unit tests cover sequence_counter wrap,
+    `parse_ac4_toc` round-trip for mono / stereo / 5.1, full
+    `Ac4Decoder` round-trip emitting silent audio, and the leading
+    `bitstream_version` bit-pattern invariant for both v0 (`0b00`)
+    and v2 (`0b10`) frames.
+  - `decoder.rs::dispatch_acpl_5x_pair`-driving block: spec-confirms
+    NOT-ASPX finding for the ACPL_1 surround Ls/Rs carriers per ETSI
+    TS 103 190-1 §4.2.6.6 Table 25 row `case ASPX_ACPL_1:`. The
+    trailer order is `aspx_data_2ch()` (L/R primary pair) +
+    `aspx_data_1ch()` (centre mono) + two `acpl_data_1ch()` parameter
+    sets — there is NO third ASPX trailer for the surround pair. The
+    Ls/Rs sSMP,3 / sSMP,4 carriers are joint-MDCT residuals that feed
+    Pseudocode 117 raw, with the post-Pseudocode-117 surround-output
+    bandwidth shape coming from the L/R-carrier ACPL synthesis
+    (alpha/beta/decorrelator), not from independent surround-pair
+    extension. Same finding for the M=2 surround-pair synced
+    companding cohort: with no surround carriers, no companding to
+    sync. The existing raw-PCM dispatch path is correct per spec —
+    no behavioural change in this round, only a documentation note
+    closing out the round-45 follow-up flagged in `dispatch_acpl_5x_pair`.
+
 - **Round 44 — companding `sync_flag == 1` cross-channel synchronisation
   (Pseudocode 121's exact `g_synch(ts) = (∏ g_ch)^(1/M)`)** (TS 103
   190-1 §5.7.5.2 + Pseudocode 121):

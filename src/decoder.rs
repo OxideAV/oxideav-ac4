@@ -2600,6 +2600,31 @@ impl Decoder for Ac4Decoder {
                 // residual pair (no max_sfb_master in the walker), so
                 // the detach is `None` for that path → silence — same
                 // as the round-37 placeholder.
+                //
+                // Round 46 — ACPL_1 surround Ls/Rs ASPX extension:
+                // SPEC-CONFIRMS-NOT-ASPX. Per ETSI TS 103 190-1 §4.2.6.6
+                // Table 25 row `case ASPX_ACPL_1:` (the `5_X_codec_mode
+                // == ASPX_ACPL_1` body parsed by
+                // `parse_aspx_acpl_1_2_inner_body` in `mch.rs`) the
+                // trailer order is `aspx_data_2ch()` (L/R primary
+                // carriers) + `aspx_data_1ch()` (centre mono) + two
+                // `acpl_data_1ch()` parameter sets — there is NO third
+                // ASPX trailer for the surround Ls/Rs pair. The Ls/Rs
+                // carriers are the joint-MDCT residual sSMP,3 / sSMP,4
+                // straight out of the inner sf_data×2 walker; per
+                // §5.7.5.2 / §5.7.6 ASPX BWE applies to the
+                // M-channel-side carriers only (acpl_qmf_band-rooted
+                // sb0 on the L/R primary pair + centre mono, never on
+                // the residual surround pair). Feeding them raw into
+                // Pseudocode 117 as `x3` / `x4` matches the spec — the
+                // post-Pseudocode-117 surround output gets its
+                // synthesis-bandwidth shape from the L/R carriers via
+                // alpha/beta/decorrelator, not from independent
+                // surround-pair extension. Same finding for the
+                // matching M=2 surround-pair synced companding cohort:
+                // no carriers means no companding to sync. Round-46
+                // therefore wires no new surround-pair ASPX/companding
+                // path here; the existing raw-PCM path is correct.
                 let acpl_1_residual_pair = self
                     .last_substream
                     .as_ref()

@@ -482,6 +482,7 @@ pub mod decoder;
 pub mod drc;
 pub mod drc_huffman;
 pub mod emdf;
+pub mod encoder_ims;
 pub mod huffman;
 pub mod mch;
 pub mod mdct;
