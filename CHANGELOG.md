@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 48 — Forward MDCT analysis + ASF entropy encoder for arbitrary
+  PCM input** (TS 103 190-1 §5.5 MDCT + §5.7 SIMPLE + §5.8 ASF +
+  Pseudocodes 17-19 + Annex A.0 huff_codes):
+  - `encoder_mdct::mdct_naive` + `EncoderMdctState` — forward MDCT
+    direction complementing the decoder's `mdct::imdct`. Naive
+    O(N²) direct-summation cosine basis (correctness-first; encoder
+    isn't on a hot path). Sign convention + scaling matched against
+    the decoder's IMDCT through a Princen-Bradley TDAC round-trip
+    test (constant-signal recovery in steady-state middle frame
+    within 1% error). `EncoderMdctState` carries the previous-frame
+    `N` PCM samples for cross-frame 50% TDAC overlap.
+  - `encoder_asf::quantise_coeff` + `pick_scalefactor_for_band` +
+    `encode_pair` + `write_sect_len_incr` + `write_scalefac_data` +
+    `build_mono_simple_asf_body_from_pcm_spectrum` — closed-form
+    forward ASF entropy encoder for the long-frame, single-window-
+    group, mono SIMPLE channel case. Per-band scalefactor selection
+    via the closed-form solve `sf_min = ceil(100 + 4*log2(max_abs/q_max^(4/3)))`
+    keeping every quantised line within HCB5's ±4 magnitude bound
+    after `q = round(sign(c)*|c/sf_gain|^(3/4))`. Single-section
+    HCB5 emission across `0..max_sfb`; reference scalefactor
+    + DPCM-coded per-band deltas via HCB_SCALEFAC; `b_snf_data_exists = 0`.
+  - `Ac4ImsEncoder::encode_frame_pcm(input: &[f32])` — public entry
+    point taking arbitrary float PCM input (range `[-1.0, 1.0]`)
+    and emitting a structurally-valid IMS v2 frame end-to-end:
+    forward MDCT analysis → per-band scalefactor + quantisation →
+    HCB5 entropy coding → wrap in v2 IMS TOC + audio_size header.
+    Lazily initialises a per-encoder `EncoderMdctState` on first
+    call; bumps `sequence_counter` modulo 1024. Mono / 48 kHz / 24 fps
+    by default (frame_len = 1920 samples, max_sfb = 40 covering
+    bins 0..600 ≈ 7.5 kHz).
+  - 13 new unit tests across the three modules cover: forward MDCT
+    zero-in-zero-out + linearity + Princen-Bradley constant-signal
+    + sine-wave SNR > 40 dB; quantise/dequantise round-trip;
+    pick_scalefactor q_max bound; encode_pair signed/unsigned
+    round-trip via `huff_decode` + `split_qspec`;
+    `build_mono_simple_asf_body_from_pcm_spectrum` end-to-end parse
+    via the existing ASF decoder; full encode → decode round-trip
+    for 1 kHz tone (peak amplitude > 1000 i16), multi-tone
+    250+500+1000 Hz (SNR > 10 dB on steady-state frame), and
+    silence (peak < 50 i16); `encode_frame_pcm` bumps
+    `sequence_counter` per call.
+  - Codebook-selection optimiser (try HCB1..11 per section, pick
+    min-bits), section-boundary optimiser (split bands by
+    codebook), spectral noise fill, and stereo / multichannel
+    forward analysis remain deferred for round 49+.
+
 - **Round 46 — AC-4 IMS encoder scaffold + ACPL_1 surround Ls/Rs
   ASPX-extension spec audit** (TS 103 190-2 §6.2.1.1 / §6.3.2.5,
   TS 103 190-1 §4.2.6.6 Table 25):

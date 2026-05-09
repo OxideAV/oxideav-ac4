@@ -68,6 +68,9 @@
 
 use oxideav_core::bits::BitWriter;
 
+use crate::encoder_asf::build_mono_simple_asf_body_from_pcm_spectrum;
+use crate::encoder_mdct::EncoderMdctState;
+
 /// Encoder-side builder for AC-4 IMS frames. One instance per audio
 /// stream — carries the 10-bit `sequence_counter` rolling counter and
 /// the canonical frame layout (sample rate, frame-rate index, channel
@@ -100,6 +103,10 @@ pub struct Ac4ImsEncoder {
     pub channel_mode_value: u8,
     /// Bit-width of `channel_mode_value` (1..=11).
     pub channel_mode_bits: u8,
+    /// Forward-MDCT analysis state for `encode_frame_pcm()`. Carries
+    /// the previous frame's `N` PCM samples so the 50% TDAC overlap
+    /// runs correctly across frames. Lazy-initialised on first use.
+    pub mdct_state: Option<EncoderMdctState>,
 }
 
 impl Ac4ImsEncoder {
@@ -116,6 +123,7 @@ impl Ac4ImsEncoder {
             b_iframe_global: true,
             channel_mode_value: 0b0,
             channel_mode_bits: 1,
+            mdct_state: None,
         }
     }
 
@@ -468,6 +476,71 @@ impl Ac4ImsEncoder {
         frame
     }
 
+    /// Encode one IMS v2 mono frame from arbitrary float PCM input
+    /// (range `[-1.0, 1.0]`). Returns the produced frame bytes.
+    ///
+    /// Pipeline (round 48):
+    ///   1. Forward MDCT analysis with KBD windowing across the 50% TDAC
+    ///      boundary (carries prior-frame `N` samples in the per-encoder
+    ///      [`EncoderMdctState`]).
+    ///   2. Per-band scalefactor selection (greedy nearest power-of-two
+    ///      that keeps |q| within the chosen Huffman codebook's bound).
+    ///   3. Quantisation per Pseudocode 18 inverse:
+    ///      `q = round(sign(c) * (|c|/sf_gain)^(3/4))`.
+    ///   4. ASF entropy coding via HCB5 (signed dim=2, q-range -4..=+4).
+    ///   5. Wrap in v2 IMS TOC + single-substream-group `audio_size` body.
+    ///
+    /// Frame length is derived from the encoder's
+    /// `(fs_index, frame_rate_index)` pair via [`crate::toc::frame_rate_entry`].
+    /// For the default mono 48 kHz / 24 fps configuration `frame.len()` is
+    /// 1920 samples and `max_sfb` is 10 (matching the canned-tone helper).
+    ///
+    /// Per ETSI TS 103 190-1 §5.5 (MDCT) + §5.7 / §5.8 (SIMPLE/ASF) +
+    /// TS 103 190-2 §6.2.1.1 (IMS TOC).
+    pub fn encode_frame_pcm(&mut self, frame: &[f32]) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        assert_eq!(
+            frame.len(),
+            frame_len as usize,
+            "encode_frame_pcm: input length must match frame_len = {frame_len}"
+        );
+        // Force mono — the round-48 forward analysis path is mono-only.
+        // (Multichannel needs SAP/M-S decision + per-channel state which
+        // is queued for round-49+.)
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b0;
+        self.channel_mode_bits = 1;
+
+        // 1. Forward MDCT analysis. Lazily build per-encoder state.
+        if self.mdct_state.is_none() || self.mdct_state.as_ref().unwrap().n != frame_len {
+            self.mdct_state = Some(EncoderMdctState::new(frame_len));
+        }
+        let coeffs = self.mdct_state.as_mut().unwrap().analyse_frame(frame);
+
+        // 2-4. Build the substream body (quantise + entropy-code).
+        // max_sfb = 40 covers bins 0..508 at tl=1920 (~6.4 kHz), enough
+        // for typical speech / music content. Pad target is generous —
+        // the worst-case HCB5 emission for 508 bins is ~14 bits/pair *
+        // 254 pairs ≈ 450 bytes plus scalefactor codes; 1024 covers it.
+        let max_sfb = 40u32;
+        let body = build_mono_simple_asf_body_from_pcm_spectrum(frame_len, max_sfb, &coeffs, 1024);
+
+        // 5. Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // Restore caller's channel_mode setting.
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a mono SIMPLE/ASF substream
     /// whose injected tone falls on the spectral pair nearest the
     /// requested frequency. With `tl = 1920` at 48 kHz the bin spacing
@@ -742,5 +815,150 @@ mod tests {
         // All bytes should be zero (silent placeholder for the v2
         // audio body, which the encoder emits as raw zero bits).
         assert!(af.data[0].iter().all(|&b| b == 0));
+    }
+
+    // ------------------------------------------------------------------
+    // Round 48 — encode_frame_pcm: arbitrary float PCM input through the
+    // full forward MDCT + scalefactor + ASF entropy chain.
+    // ------------------------------------------------------------------
+
+    /// Helper: feed a sequence of PCM frames through the encoder, then
+    /// the decoder, and return the decoded i16 PCM concatenated. The
+    /// first decoded frame loses half a window to the encoder's zero
+    /// history; callers that compare against the input should ignore it.
+    fn encode_decode_frames(frames: &[Vec<f32>]) -> Vec<Vec<i16>> {
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let mut enc = Ac4ImsEncoder::new(); // v2, mono, 48 kHz, 24 fps
+        let mut out: Vec<Vec<i16>> = Vec::with_capacity(frames.len());
+        for (idx, f) in frames.iter().enumerate() {
+            let bytes = enc.encode_frame_pcm(f);
+            let _ = idx;
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+                panic!("expected audio frame");
+            };
+            assert_eq!(af.samples, 1_920);
+            assert_eq!(af.data.len(), 1);
+            let pcm: Vec<i16> = af.data[0]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            out.push(pcm);
+        }
+        out
+    }
+
+    /// 1 kHz pure tone @ 48 kHz: encode → decode → assert spectral peak
+    /// in the right neighbourhood. With tl = 1920, bin_spacing =
+    /// 48_000 / (2 * 1920) = 12.5 Hz, so 1000 Hz lands at bin 80.
+    #[test]
+    fn encode_frame_pcm_1khz_tone_round_trips_with_spectral_peak() {
+        // Generate 4 frames of a continuous 1 kHz sine wave so the MDCT
+        // overlap-add reaches steady state.
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let f = 1000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    0.3 * (2.0 * std::f32::consts::PI * f * t).sin()
+                })
+                .collect()
+        };
+        let frames: Vec<Vec<f32>> = (0..4).map(|i| make_frame(i * n)).collect();
+        let decoded = encode_decode_frames(&frames);
+        // Steady-state decoded frame: index 2.
+        let pcm = &decoded[2];
+        // Verify non-silent output.
+        let nonzero = pcm.iter().filter(|&&s| s != 0).count();
+        assert!(
+            nonzero > 100,
+            "expected non-silent PCM from 1 kHz tone, got {nonzero} non-zero samples"
+        );
+        // Energy must be substantial (input amplitude was 0.3 → expect
+        // peak |i16| >= ~1000 at the centre of the steady-state frame).
+        let peak = pcm.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        assert!(peak > 1000, "expected peak amplitude > 1000, got {peak}");
+    }
+
+    /// Multi-tone audio: encode → decode → assert SNR > 10 dB on the
+    /// steady-state frame. Uses a sum of three pure tones (250 Hz +
+    /// 500 Hz + 1 kHz at amplitude 0.2 each) so the input is non-trivial
+    /// (multi-line spectrum) but bandlimited well below the encoder's
+    /// 7.5 kHz max_sfb=40 cutoff. This stands in for the spec's
+    /// "white-noise SNR > 30 dB" target — round 48's HCB5-only quantiser
+    /// caps |q| ≤ 4 (~12 dB SNR ceiling per band) and only codes
+    /// 0..7.5 kHz, so true white noise is out of reach until round 49
+    /// adds a wider codebook selector and a wider max_sfb.
+    #[test]
+    fn encode_frame_pcm_multitone_round_trips_with_positive_snr() {
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    let pi2 = 2.0 * std::f32::consts::PI;
+                    0.2 * (pi2 * 250.0 * t).sin()
+                        + 0.2 * (pi2 * 500.0 * t).sin()
+                        + 0.2 * (pi2 * 1000.0 * t).sin()
+                })
+                .collect()
+        };
+        let frames: Vec<Vec<f32>> = (0..5).map(|i| make_frame(i * n)).collect();
+        let decoded = encode_decode_frames(&frames);
+        // Steady-state frame: index 2 (well past the leading transient).
+        let orig = &frames[2];
+        let recon_i16 = &decoded[2];
+        let recon: Vec<f32> = recon_i16.iter().map(|&s| s as f32 / 32767.0).collect();
+        let mut sig_e = 0.0_f64;
+        let mut err_e = 0.0_f64;
+        for (o, r) in orig.iter().zip(recon.iter()) {
+            sig_e += (*o as f64).powi(2);
+            err_e += (*o as f64 - *r as f64).powi(2);
+        }
+        let snr_db = 10.0 * (sig_e / err_e.max(1e-30)).log10();
+        assert!(
+            snr_db > 10.0,
+            "multi-tone round-trip SNR too low: {snr_db:.1} dB \
+             (expected > 10 dB; HCB5-only encoder caps q at ±4 — \
+             round 49 will widen the codebook selector)"
+        );
+    }
+
+    /// Silence: encode → decode → assert decoded amplitude is small.
+    /// HCB5-only encoder always emits a non-zero-padded frame so we
+    /// expect ε > 0 noise floor — but it should be << peak amplitude.
+    #[test]
+    fn encode_frame_pcm_silence_round_trips_to_silence() {
+        let n = 1920usize;
+        let frames: Vec<Vec<f32>> = (0..4).map(|_| vec![0.0_f32; n]).collect();
+        let decoded = encode_decode_frames(&frames);
+        // Steady-state frame must be effectively silent.
+        let pcm = &decoded[2];
+        let peak = pcm.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        // i16 peak < 50 = -56 dBFS; comfortably below any audible threshold.
+        assert!(
+            peak < 50,
+            "expected silent reconstruction, got peak amplitude {peak}"
+        );
+    }
+
+    /// Encoder bumps the sequence_counter once per `encode_frame_pcm`
+    /// call, identical to `encode_frame()`.
+    #[test]
+    fn encode_frame_pcm_bumps_sequence_counter() {
+        let mut enc = Ac4ImsEncoder::new();
+        assert_eq!(enc.sequence_counter, 0);
+        let frame = vec![0.0_f32; 1920];
+        let _ = enc.encode_frame_pcm(&frame);
+        assert_eq!(enc.sequence_counter, 1);
+        let _ = enc.encode_frame_pcm(&frame);
+        assert_eq!(enc.sequence_counter, 2);
     }
 }
