@@ -3015,8 +3015,10 @@ mod tests {
         // claiming 48 kHz, 24 fps, stereo (channel_mode prefix '10'),
         // b_iframe = 1.
         let mut bw = BitWriter::new();
-        // bitstream_version = 2 (2 bits).
-        bw.write_u32(2, 2);
+        // bitstream_version = 0 (2 bits) — TS 103 190-1 v0 syntax body
+        // follows. The parser dispatches `ac4_presentation_info()` only
+        // when bitstream_version <= 1.
+        bw.write_u32(0, 2);
         // sequence_counter = 7 (10 bits).
         bw.write_u32(7, 10);
         // b_wait_frames = 0.
@@ -3102,7 +3104,7 @@ mod tests {
         // Single-presentation, single-substream AC-4 TOC claiming
         // 48 kHz, 24 fps, mono (channel_mode prefix '0'), b_iframe = 1.
         let mut bw = BitWriter::new();
-        bw.write_u32(2, 2); // bitstream_version = 2
+        bw.write_u32(0, 2); // bitstream_version = 0 (TS 103 190-1 v0 syntax body follows)
         bw.write_u32(7, 10); // sequence_counter
         bw.write_u32(0, 1); // b_wait_frames
         bw.write_u32(1, 1); // fs_index = 1 (48 kHz)

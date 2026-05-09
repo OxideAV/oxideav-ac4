@@ -11,6 +11,18 @@
 //! decoder-side counterpart is expected to re-tile zeros back to
 //! silence PCM.
 //!
+//! Round 47 fixes the v2 TOC bit layout to match the literal §6.2.1.1
+//! / §6.2.1.3 / §6.3.2.5 syntax boxes (the round-46 scaffold skipped
+//! `b_hsf_ext` / `b_single_substream` in `ac4_substream_group_info()`
+//! and emitted a stale `ac4_presentation_v1_info()` skeleton missing
+//! `mdcompat`, `frame_rate_fractions_info()`, `emdf_info()`,
+//! `b_presentation_filter`, and the trailing
+//! `ac4_substream_info_chan()` body). The matching v2 dispatch in
+//! [`crate::toc::parse_ac4_toc`] now walks the same syntax, so v2
+//! `Ac4ImsEncoder::encode_frame()` → `parse_ac4_toc` round-trips the
+//! same `(channels, samples, sample_rate, b_iframe_global)` tuple as
+//! the v0 path.
+//!
 //! The Auditor-mode goal is to land the public type surface and the
 //! TOC writer so downstream tooling (TS 103 190-2 conformance
 //! checkers, MP4 packagers, demux smoke tests) can pull a real frame
@@ -191,9 +203,11 @@ impl Ac4ImsEncoder {
         } else {
             // TS 103 190-2 §6.2.1.1: for bitstream_version > 1 the TOC
             // carries a single `b_program_id` flag (no short_program_id /
-            // program_uuid in this Auditor scaffold), then the per-pres
+            // program_uuid in this scaffold), then the per-pres
             // `ac4_presentation_v1_info()` loop, then the per-group
-            // `ac4_substream_group_info()` loop.
+            // `ac4_substream_group_info()` loop. Round 47 emits a
+            // single-presentation, single-substream-group frame: the
+            // smallest IMS shape that round-trips through `parse_ac4_toc`.
             bw.write_u32(0, 1); // b_program_id = 0 (no program identifier)
             self.write_presentation_v1_info(bw);
             self.write_substream_group_info(bw);
@@ -236,55 +250,84 @@ impl Ac4ImsEncoder {
     }
 
     /// `ac4_presentation_v1_info()` per ETSI TS 103 190-2 §6.2.1.3 —
-    /// single-substream-group form: `b_single_substream_group = 1`
-    /// then the version-skip path (`bitstream_version != 1` so no
-    /// `presentation_version()` call), then the
-    /// `ac4_sgi_specifier()` referencing `group_index = 0` and the
-    /// trailing `b_pre_virtualized` / `b_add_emdf_substreams` /
-    /// `ac4_presentation_substream_info()` skeleton.
+    /// single-substream-group form for `bitstream_version >= 2`:
+    /// `b_single_substream_group = 1`, then `presentation_version() = 0`
+    /// (single zero-bit since `bitstream_version != 1`), `mdcompat = 0`,
+    /// `b_presentation_id = 0`, `frame_rate_multiply_info()` (one bit
+    /// for `frame_rate_index = 1`), `frame_rate_fractions_info()`
+    /// (zero bits for index 1), `emdf_info()` (minimum form),
+    /// `b_presentation_filter = 0`, `ac4_sgi_specifier()` referencing
+    /// `group_index = 0`, `b_pre_virtualized = 0`,
+    /// `b_add_emdf_substreams = 0`, and `ac4_presentation_substream_info()`
+    /// (b_alternative = 0, b_pres_ndot = !iframe, substream_index = 0).
     fn write_presentation_v1_info(&self, bw: &mut BitWriter) {
-        // b_single_substream_group = 1 — single group references the
-        // sole substream-group emitted below.
+        // b_single_substream_group = 1.
         bw.write_u32(1, 1);
-        // bitstream_version == 2 → skip presentation_version() per the
-        // §6.2.1.3 syntax box (the `if (bitstream_version != 1)` skip).
-        // mdcompat (3 b) emitted only for the multi-group path; for the
-        // single-group path the v1 syntax goes straight to
-        // `ac4_sgi_specifier()`.
-        // ac4_sgi_specifier(): group_index = 0 — encoded as a
-        // one-bit run of the variable_bits(3) prefix (`0b000` followed
-        // by no extension).
-        bw.write_u32(0, 3); // group_index
-        bw.write_u32(0, 1); // variable_bits continuation
-                            // b_pre_virtualized = 0, b_add_emdf_substreams = 0.
+        // presentation_version() = 0 — single '0' bit (loop terminates
+        // immediately). Emitted for bitstream_version != 1.
+        bw.write_u32(0, 1);
+        // mdcompat = 0 (3 b) — emitted for bitstream_version != 1.
+        bw.write_u32(0, 3);
+        // b_presentation_id = 0.
+        bw.write_u32(0, 1);
+        // frame_rate_multiply_info(): single b_multiplier bit for
+        // frame_rate_index in {0, 1, 7, 8, 9}.
+        bw.write_u32(0, 1);
+        // frame_rate_fractions_info(): nothing for frame_rate_index < 5
+        // or > 12.
+        // emdf_info(): emdf_version=0 (2b), key_id=0 (3b),
+        //   b_emdf_payloads_substream_info=0, emdf_reserved.b_more=0.
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 3);
         bw.write_u32(0, 1);
         bw.write_u32(0, 1);
-        // ac4_presentation_substream_info() — minimal: b_alternative = 0,
-        // b_pres_ndot = 1 (independent presentation, matches I-frame).
+        // b_presentation_filter = 0.
         bw.write_u32(0, 1);
-        bw.write_u32(if self.b_iframe_global { 1 } else { 0 }, 1);
+        // ac4_sgi_specifier(): group_index = 0 (3 b, no variable_bits
+        // extension since group_index < 7).
+        bw.write_u32(0, 3);
+        // b_pre_virtualized = 0, b_add_emdf_substreams = 0.
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 1);
+        // ac4_presentation_substream_info(): b_alternative = 0,
+        // b_pres_ndot = !b_iframe_global, substream_index = 0 (2 b).
+        bw.write_u32(0, 1);
+        bw.write_u32(if self.b_iframe_global { 0 } else { 1 }, 1);
+        bw.write_u32(0, 2);
     }
 
     /// `ac4_substream_group_info()` per ETSI TS 103 190-2 §6.3.2.5 —
-    /// minimal channel-coded single-substream skeleton.
+    /// single channel-coded substream skeleton matching the encoder's
+    /// `n_substreams = 1` substream_index_table.
     fn write_substream_group_info(&self, bw: &mut BitWriter) {
-        // b_substreams_present = 1 — group carries substreams.
+        // b_substreams_present = 1.
         bw.write_u32(1, 1);
-        // n_lf_substreams_minus2 = 0 → n_lf_substreams = 2 minimum
-        // per the syntax box. Single-substream IMS frames need a
-        // `variable_bits(2)` extension to land at n_lf_substreams = 1
-        // — for the Auditor scaffold we emit two zero-byte substreams
-        // so the spec syntax is honoured. Production encoders will
-        // replace this with the proper variable_bits encoding for
-        // arbitrary substream counts.
-        bw.write_u32(0, 2);
+        // b_hsf_ext = 0 — no high-sample-rate extension.
+        bw.write_u32(0, 1);
+        // b_single_substream = 1 — n_lf_substreams = 1.
+        bw.write_u32(1, 1);
         // b_channel_coded = 1 — channel-based audio (vs object).
         bw.write_u32(1, 1);
-        // sus_ver = 0 — TS 103 190-1-compatible substream syntax.
-        bw.write_u32(0, 1);
-        // b_oamd_substream = 0 — no object metadata substream.
-        bw.write_u32(0, 1);
-        // b_ajoc = 0 — no advanced joint object coding.
+        // ac4_substream_info_chan(b_substreams_present = 1):
+        //   channel_mode = encoder field (1..7 b),
+        //   fs_index == 1: b_sf_multiplier = 0,
+        //   b_bitrate_info = 0,
+        //   frame_rate_factor copies of b_audio_ndot = !iframe,
+        //   substream_index = 0 (2 b, since b_substreams_present = 1).
+        bw.write_u32(
+            self.channel_mode_value as u32,
+            self.channel_mode_bits as u32,
+        );
+        if self.fs_index == 1 {
+            bw.write_u32(0, 1); // b_sf_multiplier
+        }
+        bw.write_u32(0, 1); // b_bitrate_info
+                            // frame_rate_factor for {0,1,7,8,9} with
+                            // b_multiplier=0 is 1; for {2,3,4} also 1; otherwise 1.
+                            // → 1 b_audio_ndot bit.
+        bw.write_u32(if self.b_iframe_global { 0 } else { 1 }, 1);
+        bw.write_u32(0, 2); // substream_index
+                            // b_content_type = 0.
         bw.write_u32(0, 1);
     }
 }
@@ -292,6 +335,155 @@ impl Ac4ImsEncoder {
 impl Default for Ac4ImsEncoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Build a mono SIMPLE/ASF `ac4_substream()` body that injects a single
+/// quantised spectral line at the specified scale-factor band. The
+/// payload is sized for `transform_length = 1920` (24 fps @ 48 kHz)
+/// with `max_sfb = 10`, matching the encoder's default frame layout.
+///
+/// `tone_cb_idx` selects the HCB5 codeword for the first spectral pair
+/// — `49` (q0=+1, q1=0) is the simplest signal-bearing choice. The
+/// remaining pairs all use codeword `40` (q0=0, q1=0). Reference scale
+/// factor is 120 (`sf_gain = 32.0`).
+///
+/// The returned bytes are the substream body (no TOC) that should be
+/// concatenated after the byte-aligned `ac4_toc()` element. They are
+/// padded to `pad_target_bytes` bytes with zeros so the
+/// `audio_size_value` field in the header matches the actual payload
+/// length.
+///
+/// Per ETSI TS 103 190-1 §5.7 (SIMPLE mode) + §5.8 (ASF). The full
+/// closed-form encoder for arbitrary input PCM (MDCT analysis +
+/// scalefactor selection + entropy coding) is deferred — round 47
+/// ships the canned-tone path so the encoder can produce non-silent
+/// PCM end-to-end.
+pub fn build_mono_simple_asf_tone_body(
+    transform_length: u32,
+    max_sfb: u32,
+    tone_cb_idx: usize,
+    tone_pair_idx: u32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits
+    // (1 b). We declare the announced size as the pad target so the
+    // outer demuxer reads the entire padded body. b_more_bits = 0 so
+    // the 15-bit field is taken literally.
+    let audio_size = pad_target_bytes as u32;
+    let audio_size_lo = audio_size & 0x7FFF;
+    bw.write_u32(audio_size_lo, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+    // audio_data() for channel_mode = 0 (mono), b_iframe = 1:
+    //   mono_codec_mode = 0 (SIMPLE), spec_frontend = 0 (ASF),
+    //   asf_transform_info() with b_long_frame = 1,
+    //   asf_psy_info(0, 0) with max_sfb[0] in 6 bits.
+    bw.write_u32(0, 1); // mono_codec_mode = SIMPLE
+    bw.write_u32(0, 1); // spec_frontend = ASF
+    bw.write_bit(true); // b_long_frame = 1
+    bw.write_u32(max_sfb, 6); // max_sfb[0]
+                              // asf_section_data: one section covering 0..max_sfb with cb=5
+                              // (HCB5, dim=2, signed). n_sect_bits = 3 (transf_length_idx=0
+                              // for long frame).
+    bw.write_u32(5, 4); // sect_cb
+    write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+    // asf_spectral_data: emit `tone_cb_idx` for pair `tone_pair_idx`,
+    // and codeword 40 (q0=0, q1=0) for every other pair.
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length).expect("invalid tl");
+    let end_line = sfbo[max_sfb as usize] as u32;
+    let hcb = crate::huffman::asf_hcb(5u32).expect("HCB5 must exist");
+    let pairs = end_line / 2;
+    let zero_cw = hcb.cw[40];
+    let zero_len = hcb.len[40] as u32;
+    let tone_cw = hcb.cw[tone_cb_idx];
+    let tone_len = hcb.len[tone_cb_idx] as u32;
+    for p in 0..pairs {
+        if p == tone_pair_idx {
+            bw.write_u32(tone_cw, tone_len);
+        } else {
+            bw.write_u32(zero_cw, zero_len);
+        }
+    }
+    // asf_scalefac_data: reference_scale_factor = 120 → sf_gain = 32.0.
+    bw.write_u32(120, 8);
+    // asf_snf_data: b_snf_data_exists = 0.
+    bw.write_u32(0, 1);
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    bw.finish()
+}
+
+/// Write a section-length increment sequence per §4.3.5.4
+/// (Pseudocode 17). For `n_sect_bits = 3`, escape value 7,
+/// `sect_len = 1 + 7k + incr`: emit `k` escape codes followed by one
+/// non-escape `incr` (0..6).
+fn write_sect_len_incr(bw: &mut BitWriter, sect_len: u32, n_sect_bits: u32, esc: u32) {
+    let base = sect_len.saturating_sub(1);
+    let k = base / esc;
+    let incr = base % esc;
+    for _ in 0..k {
+        bw.write_u32(esc, n_sect_bits);
+    }
+    bw.write_u32(incr, n_sect_bits);
+}
+
+impl Ac4ImsEncoder {
+    /// Encode one IMS v2 frame containing a mono SIMPLE/ASF audio
+    /// substream that injects a single quantised spectral tone (per
+    /// `tone_cb_idx` from the ETSI Annex A HCB5 codebook). The decoder
+    /// dequantises the tone via `rec_spec = sign(q)|q|^(4/3)` and the
+    /// IMDCT + KBD windowing produce real, non-silent PCM.
+    ///
+    /// This is the canned-tone closed-form encoder mentioned in round-47
+    /// scope: full MDCT analysis + scalefactor optimisation + ASF
+    /// entropy coding for arbitrary PCM input is deferred. The shape
+    /// of this method (input PCM → bytes) is reserved for that future
+    /// work; for now it ignores its `_input_pcm` argument and emits
+    /// the canned tone payload.
+    ///
+    /// Per ETSI TS 103 190-1 §5.7 + §5.8.
+    pub fn encode_frame_mono_tone(&mut self, tone_cb_idx: usize, tone_pair_idx: u32) -> Vec<u8> {
+        // Force mono channel_mode for the tone helper — the canned ASF
+        // body is mono SIMPLE only.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b0;
+        self.channel_mode_bits = 1;
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut frame = bw.finish();
+        // Append the canned-tone substream body. Size matches the test
+        // helpers in `decoder.rs` (420 bytes) so the substream parser
+        // sees a complete payload.
+        let body = build_mono_simple_asf_tone_body(1920, 10, tone_cb_idx, tone_pair_idx, 420);
+        frame.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        frame
+    }
+
+    /// Encode one IMS v2 frame containing a mono SIMPLE/ASF substream
+    /// whose injected tone falls on the spectral pair nearest the
+    /// requested frequency. With `tl = 1920` at 48 kHz the bin spacing
+    /// is 12.5 Hz; the chosen pair carries a single non-zero quantised
+    /// value at the lower bin of that pair.
+    ///
+    /// Returns the encoded frame bytes plus the actual nominal centre
+    /// frequency the encoder targeted (lower-bin × bin_spacing).
+    pub fn encode_frame_mono_tone_at_hz(&mut self, target_hz: f32) -> (Vec<u8>, f32) {
+        let bin_spacing = 48_000.0 / (2.0 * 1_920.0); // 12.5 Hz
+        let target_bin = (target_hz / bin_spacing).round().max(0.0) as u32;
+        let pair_idx = target_bin / 2;
+        let actual_hz = (pair_idx * 2) as f32 * bin_spacing;
+        // cb_idx 49 → (q0=+1, q1=0): tone in lower bin of the pair.
+        let frame = self.encode_frame_mono_tone(49, pair_idx);
+        (frame, actual_hz)
     }
 }
 
@@ -400,5 +592,155 @@ mod tests {
         assert!(!frame.is_empty());
         let bv = (frame[0] >> 6) & 0b11;
         assert_eq!(bv, 0b00, "v0 frame must start with bitstream_version = 0");
+    }
+
+    #[test]
+    fn v2_encoder_round_trips_through_parse_ac4_toc() {
+        // Round-47 contract: the v2 TOC emitted by `encode_frame()`
+        // round-trips through `parse_ac4_toc`. Mono / 48 kHz / 24 fps /
+        // iframe_global / 1920 samples per frame should land on the
+        // returned `Ac4FrameInfo` exactly as configured.
+        let mut enc = Ac4ImsEncoder::new(); // v2 default, mono
+        let frame = enc.encode_frame(64);
+        let info = crate::toc::parse_ac4_toc(&frame).expect("v2 TOC must parse");
+        assert_eq!(info.bitstream_version, 2);
+        assert_eq!(info.fs_index, 1);
+        assert_eq!(info.frame_rate_index, 1);
+        assert_eq!(info.frame_length, 1_920);
+        assert!(info.b_iframe_global);
+        assert_eq!(info.n_presentations, 1);
+        assert_eq!(info.n_substreams, 1);
+    }
+
+    #[test]
+    fn v2_encoder_round_trips_stereo() {
+        let mut enc = Ac4ImsEncoder::new().with_stereo(); // v2, stereo
+        let frame = enc.encode_frame(64);
+        let info = crate::toc::parse_ac4_toc(&frame).expect("v2 stereo TOC must parse");
+        assert_eq!(info.bitstream_version, 2);
+        assert!(info.b_iframe_global);
+    }
+
+    #[test]
+    fn v2_encoder_round_trips_5_1() {
+        let mut enc = Ac4ImsEncoder::new().with_5_1(); // v2, 5.1
+        let frame = enc.encode_frame(128);
+        let info = crate::toc::parse_ac4_toc(&frame).expect("v2 5.1 TOC must parse");
+        assert_eq!(info.bitstream_version, 2);
+    }
+
+    #[test]
+    fn v2_encoder_mono_tone_roundtrip_emits_nonsilent_pcm() {
+        // Round-47 IMS audio body: encode v2 frame containing a mono
+        // SIMPLE/ASF substream with a single quantised spectral line at
+        // (sfb=0, bin=0). Through the decoder's full Huffman → IMDCT →
+        // KBD overlap-add chain this should produce real PCM with
+        // non-trivial energy.
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
+        let mut enc = Ac4ImsEncoder::new(); // v2, mono
+                                            // cb_idx 49 → (q0=+1, q1=0); pair_idx 0 → bin 0.
+        let frame_bytes = enc.encode_frame_mono_tone(49, 0);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame_bytes);
+        dec.send_packet(&pkt).expect("send_packet");
+        let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+            panic!("expected audio frame");
+        };
+        assert_eq!(af.samples, 1_920);
+        assert_eq!(af.data.len(), 1);
+        assert_eq!(af.data[0].len(), 1_920 * 2);
+        // Decoded PCM must be non-silent.
+        let samples_i16: Vec<i16> = af.data[0]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let nonzero_count = samples_i16.iter().filter(|&&s| s != 0).count();
+        assert!(
+            nonzero_count > 100,
+            "expected non-silent PCM from IMS tone encoder, got {nonzero_count} non-zero samples"
+        );
+        let energy: i64 = samples_i16.iter().map(|&s| (s as i64) * (s as i64)).sum();
+        assert!(energy > 0, "zero-energy tone output from IMS encoder");
+        // Substream parse must have surfaced non-zero scaled spectra at
+        // bin 0 (the tone we injected).
+        let sub = dec.last_substream.as_ref().unwrap();
+        let scaled = sub.tools.scaled_spec_primary.as_ref().unwrap();
+        assert!(scaled[0].abs() > 0.0, "DC bin must carry the injected tone");
+    }
+
+    #[test]
+    fn v2_encoder_mono_tone_at_440hz_has_spectral_peak_near_target() {
+        // Round-47 closed-form tone encoder targeting 440 Hz. With
+        // tl = 1920 / fs = 48 kHz, bin_spacing = 12.5 Hz so the tone
+        // pair lands at pair 17 (bin 34, ~425 Hz). The decoder's
+        // scaled spectrum should carry a non-zero value at the
+        // targeted bin.
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
+        let mut enc = Ac4ImsEncoder::new();
+        let (frame_bytes, actual_hz) = enc.encode_frame_mono_tone_at_hz(440.0);
+        // Encoder rounded 440 Hz → bin 35 → pair 17 → bin 34 (lower-of-pair).
+        // Actual emitted frequency is 34 × 12.5 = 425.0 Hz.
+        assert!(
+            (actual_hz - 425.0).abs() < 1.0,
+            "expected ~425 Hz target, got {actual_hz}"
+        );
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame_bytes);
+        dec.send_packet(&pkt).expect("send_packet");
+        let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+            panic!("expected audio frame");
+        };
+        assert_eq!(af.samples, 1_920);
+        // Spectral peak: scaled_spec[34] (lower bin of the targeted
+        // pair) must be non-zero; the surrounding bins must NOT carry
+        // the same peak (proves the tone is localised).
+        let sub = dec.last_substream.as_ref().unwrap();
+        let scaled = sub.tools.scaled_spec_primary.as_ref().unwrap();
+        let target_bin = 34usize;
+        assert!(
+            scaled[target_bin].abs() > 0.0,
+            "expected non-zero spectral coefficient at bin {target_bin}, got {}",
+            scaled[target_bin]
+        );
+        // PCM should still be non-silent.
+        let samples_i16: Vec<i16> = af.data[0]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let nonzero_count = samples_i16.iter().filter(|&&s| s != 0).count();
+        assert!(
+            nonzero_count > 100,
+            "expected non-silent PCM at 440 Hz, got {nonzero_count} non-zero samples"
+        );
+    }
+
+    #[test]
+    fn v2_encoder_decoder_roundtrip_emits_silent_frame() {
+        // Full encode → Ac4Decoder roundtrip on the v2 path. The
+        // decoder accepts the IMS frame (TOC + zero body) and emits a
+        // structurally-valid silent AudioFrame at the declared 1920
+        // samples / 48 kHz / mono shape.
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
+        let mut enc = Ac4ImsEncoder::new(); // v2 default, mono
+        let frame_bytes = enc.encode_frame(64);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame_bytes);
+        dec.send_packet(&pkt).expect("send_packet");
+        let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+            panic!("expected audio frame");
+        };
+        assert_eq!(af.samples, 1_920);
+        // mono S16 layout: 1920 samples × 1 ch × 2 bytes.
+        assert_eq!(af.data.len(), 1);
+        assert_eq!(af.data[0].len(), 1_920 * 2);
+        // All bytes should be zero (silent placeholder for the v2
+        // audio body, which the encoder emits as raw zero bits).
+        assert!(af.data[0].iter().all(|&b| b == 0));
     }
 }

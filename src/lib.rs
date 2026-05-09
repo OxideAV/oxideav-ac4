@@ -452,8 +452,24 @@
 //!   next step before real-bitstream metadata can fully round-trip.
 //!   `walk_ac4_substream` itself doesn't yet invoke the metadata walker
 //!   — that wiring is the follow-up to this round.
-//! * TS 103 190-2 IFM (immersive / object) decoding.
-//! * Encoder.
+//! * TS 103 190-2 IFM (immersive / object) decoding — round 47 lands the
+//!   v2 TOC walker (`bitstream_version >= 2` dispatch in
+//!   [`toc::parse_ac4_toc`] running `ac4_presentation_v1_info()` per
+//!   §6.2.1.3 + `ac4_substream_group_info()` per §6.3.2.5 +
+//!   `ac4_substream_info_chan()` per §6.2.1.8) and the matching
+//!   [`encoder_ims::Ac4ImsEncoder`] tone-encoder
+//!   ([`encoder_ims::Ac4ImsEncoder::encode_frame_mono_tone`] /
+//!   [`encoder_ims::Ac4ImsEncoder::encode_frame_mono_tone_at_hz`])
+//!   that produces a v2 frame whose mono SIMPLE/ASF audio body
+//!   round-trips through [`decoder::Ac4Decoder`] to non-silent PCM.
+//!   Object / a-joc substream parsing inside
+//!   `ac4_substream_group_info()` is still deferred — the walker
+//!   surfaces `Unsupported` on the first object substream.
+//! * Encoder for arbitrary PCM input — round 47 ships a closed-form
+//!   canned-tone encoder
+//!   ([`encoder_ims::build_mono_simple_asf_tone_body`]). MDCT analysis,
+//!   scalefactor selection, and ASF entropy coding for arbitrary input
+//!   PCM are the next step.
 //!
 //! The decoder emits real PCM for long-frame, single-window-group
 //! mono and stereo SIMPLE/ASF streams. The stereo path covers both
