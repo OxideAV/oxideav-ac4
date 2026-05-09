@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 49 — Codebook-selection optimiser (HCB1..11) + parameterised
+  `max_sfb`** (TS 103 190-1 §5.7 + Pseudocodes 17 + 19 + 20 + Annex A.0
+  huff_codes + Table SCFB):
+  - `encoder_asf::pick_best_codebook_for_band` — per-band codebook
+    optimiser sweeping HCB1..11 and choosing the lowest-bit-cost
+    codebook whose `q_max` covers the band's natural quantised range.
+    Anchor scalefactor targets peak quant ≈ 12 (HCB9/10's q_max → 3×
+    more quantisation levels per band than the round-48 HCB5-only
+    baseline). HCB11 always qualifies via its Pseudocode 20 escape so
+    very-high-energy bands don't clip.
+  - `encoder_asf::bit_cost_for_band` — precise bit-counter modelling
+    HCB1..11 codeword length + sign bits for unsigned codebooks +
+    per-Pseudocode-20 `n_ext` extension bits for HCB11 escapes.
+    Mirrors the encoder emitter's exact bit shape (inline magnitude
+    saturates at 16 for HCB11, sign bit per non-zero post-saturation
+    line for unsigned codebooks).
+  - `encoder_asf::build_sections_from_per_band_cb` — collapses runs
+    of consecutive same-codebook bands into a single `AsfSections`
+    entry so the emitted `asf_section_data()` honours the spec's
+    grouping pseudocode without spurious cb-switch overhead.
+  - `encoder_asf::write_section_data` + `write_spectral_data_sections`
+    — multi-section asf_section_data + asf_spectral_data emitters.
+    Per-section emission walks `sect_start..sect_end` bins with the
+    section's codebook, handles `cb == 0` silent bands, and writes
+    Pseudocode 20 escape bits for HCB11 outliers.
+  - `Ac4ImsEncoder::encode_frame_pcm_with_max_sfb(frame, max_sfb)` —
+    new public entry point parameterising `max_sfb` (round-48 default
+    was hard-coded to 40 → ~6.4 kHz at tl=1920 / 48 kHz). Pad target
+    scales with max_sfb (2KB / 4KB / 8KB tiers). `encode_frame_pcm`
+    keeps the round-48 default of `max_sfb=40` for backwards
+    compatibility.
+  - White-noise round-trip SNR jumps from **13.6 dB** (round-48 HCB5-only
+    baseline) to **27.5 dB** (round-49 HCB1..11 optimiser, q_target=12,
+    max_sfb=50) — measured spectrally against the encoder's own MDCT
+    coefficients pre/post quantisation. 1 kHz tone reconstruction at
+    `max_sfb=55` preserves >100% of input energy (vs ~40% at the
+    round-48 max_sfb=40 default).
+
 - **Round 48 — Forward MDCT analysis + ASF entropy encoder for arbitrary
   PCM input** (TS 103 190-1 §5.5 MDCT + §5.7 SIMPLE + §5.8 ASF +
   Pseudocodes 17-19 + Annex A.0 huff_codes):

@@ -498,6 +498,24 @@ impl Ac4ImsEncoder {
     /// Per ETSI TS 103 190-1 §5.5 (MDCT) + §5.7 / §5.8 (SIMPLE/ASF) +
     /// TS 103 190-2 §6.2.1.1 (IMS TOC).
     pub fn encode_frame_pcm(&mut self, frame: &[f32]) -> Vec<u8> {
+        // Default max_sfb = 40 (≤ 7.5 kHz at tl=1920) preserves
+        // round-48 behaviour for callers that haven't opted in to the
+        // wider-bandwidth encoder.
+        self.encode_frame_pcm_with_max_sfb(frame, 40)
+    }
+
+    /// Encode one IMS v2 mono frame from arbitrary float PCM input
+    /// (range `[-1.0, 1.0]`) at a caller-specified `max_sfb`. Larger
+    /// values widen the encoder's frequency coverage at the cost of
+    /// more bits per frame:
+    ///   * `max_sfb = 40` → bins 0..508 → ~6.35 kHz @ tl=1920
+    ///   * `max_sfb = 50` → bins 0..1216 → ~15.2 kHz @ tl=1920
+    ///   * `max_sfb = 55` → bins 0..1600 → ~20.0 kHz @ tl=1920
+    ///
+    /// `max_sfb` must satisfy `max_sfb <= num_sfb_48(frame_len)` (61 at
+    /// tl=1920). The pad budget scales with max_sfb so the announced
+    /// `audio_size` reliably exceeds the actual emission length.
+    pub fn encode_frame_pcm_with_max_sfb(&mut self, frame: &[f32], max_sfb: u32) -> Vec<u8> {
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };
@@ -506,9 +524,9 @@ impl Ac4ImsEncoder {
             frame_len as usize,
             "encode_frame_pcm: input length must match frame_len = {frame_len}"
         );
-        // Force mono — the round-48 forward analysis path is mono-only.
-        // (Multichannel needs SAP/M-S decision + per-channel state which
-        // is queued for round-49+.)
+        // Force mono — the forward analysis path is mono-only. (Multi-
+        // channel needs SAP/M-S decision + per-channel state which is
+        // queued for round-50+.)
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
         self.channel_mode_value = 0b0;
         self.channel_mode_bits = 1;
@@ -519,13 +537,22 @@ impl Ac4ImsEncoder {
         }
         let coeffs = self.mdct_state.as_mut().unwrap().analyse_frame(frame);
 
-        // 2-4. Build the substream body (quantise + entropy-code).
-        // max_sfb = 40 covers bins 0..508 at tl=1920 (~6.4 kHz), enough
-        // for typical speech / music content. Pad target is generous —
-        // the worst-case HCB5 emission for 508 bins is ~14 bits/pair *
-        // 254 pairs ≈ 450 bytes plus scalefactor codes; 1024 covers it.
-        let max_sfb = 40u32;
-        let body = build_mono_simple_asf_body_from_pcm_spectrum(frame_len, max_sfb, &coeffs, 1024);
+        // 2-4. Build the substream body (per-band codebook optimiser +
+        // entropy-coding). Pad target scales with max_sfb to keep the
+        // announced audio_size comfortably above the actual emission
+        // length: worst case is ~25 bits/pair (HCB11 with one escape
+        // per pair) × end_bin/2 pairs ≈ 3 × end_bin bytes.
+        let pad_target_bytes = match max_sfb {
+            0..=40 => 2048,
+            41..=50 => 4096,
+            _ => 8192,
+        };
+        let body = build_mono_simple_asf_body_from_pcm_spectrum(
+            frame_len,
+            max_sfb,
+            &coeffs,
+            pad_target_bytes,
+        );
 
         // 5. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
@@ -960,5 +987,301 @@ mod tests {
         assert_eq!(enc.sequence_counter, 1);
         let _ = enc.encode_frame_pcm(&frame);
         assert_eq!(enc.sequence_counter, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Round 49 — HCB1..11 codebook selection optimiser + wider max_sfb.
+    // ------------------------------------------------------------------
+
+    fn encode_decode_frames_with_max_sfb(frames: &[Vec<f32>], max_sfb: u32) -> Vec<Vec<i16>> {
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let mut enc = Ac4ImsEncoder::new();
+        let mut out: Vec<Vec<i16>> = Vec::with_capacity(frames.len());
+        for f in frames {
+            let bytes = enc.encode_frame_pcm_with_max_sfb(f, max_sfb);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+                panic!("expected audio frame");
+            };
+            assert_eq!(af.samples, 1_920);
+            assert_eq!(af.data.len(), 1);
+            let pcm: Vec<i16> = af.data[0]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            out.push(pcm);
+        }
+        out
+    }
+
+    /// White-noise input: encode via the round-49 optimiser, then decode
+    /// and pull the decoder's reconstructed scaled spectrum
+    /// (`scaled_spec_primary`) directly out of the substream. Compare
+    /// bin-for-bin against the encoder's input MDCT spectrum to measure
+    /// the codebook-selection / quantisation SNR — this isolates the
+    /// quantiser's noise contribution from the bandlimit / IMDCT
+    /// reconstruction noise that dominates a time-domain comparison.
+    ///
+    /// Round-48 HCB5-only baseline: ~12 dB SNR (|q| ≤ 4 ceiling).
+    /// Round-49 HCB1..11 with q_target = 12: ≥ 18 dB SNR.
+    #[test]
+    fn encode_frame_pcm_white_noise_snr_exceeds_hcb5_only_ceiling() {
+        use crate::decoder::Ac4Decoder;
+        use crate::encoder_mdct::EncoderMdctState;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
+        let n = 1920usize;
+        let max_sfb = 50u32;
+        let sfbo = crate::sfb_offset::sfb_offset_48(n as u32).unwrap();
+        let end_bin = sfbo[max_sfb as usize] as usize;
+        let make_frame = |seed_off: u64| -> Vec<f32> {
+            let mut s: u64 = 0xACE4_u64.wrapping_add(seed_off);
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = (s >> 33) as u32;
+                    (u as f32 / (1u32 << 31) as f32 - 1.0) * 0.3
+                })
+                .collect()
+        };
+        // Encode + decode 3 frames; pull the third for steady-state.
+        let frames: Vec<Vec<f32>> = (0..3).map(|i| make_frame(i as u64 * n as u64)).collect();
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let mut enc = Ac4ImsEncoder::new();
+        let mut last_recon_spec: Option<Vec<f32>> = None;
+        let mut mdct_in = EncoderMdctState::new(n as u32);
+        let mut last_orig_spec: Option<Vec<f32>> = None;
+        for f in &frames {
+            // Mirror the encoder's MDCT on the input.
+            let orig_coeffs = mdct_in.analyse_frame(f);
+            last_orig_spec = Some(orig_coeffs.clone());
+            let bytes = enc.encode_frame_pcm_with_max_sfb(f, max_sfb);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let _ = dec.receive_frame().expect("receive_frame");
+            let sub = dec.last_substream.as_ref().unwrap();
+            let scaled = sub.tools.scaled_spec_primary.as_ref().unwrap().clone();
+            last_recon_spec = Some(scaled);
+        }
+        let orig = last_orig_spec.unwrap();
+        let recon = last_recon_spec.unwrap();
+        let mut sig_e = 0.0_f64;
+        let mut err_e = 0.0_f64;
+        for k in 0..end_bin {
+            let o = orig[k] as f64;
+            let r = recon[k] as f64;
+            sig_e += o * o;
+            err_e += (o - r) * (o - r);
+        }
+        let snr_db = 10.0 * (sig_e / err_e.max(1e-30)).log10();
+        eprintln!("ROUND-49 white-noise spectral SNR (HCB1..11 optimiser, q_target=12, max_sfb=50): {snr_db:.1} dB");
+        assert!(
+            snr_db > 18.0,
+            "white-noise spectral SNR did not improve over HCB5-only ceiling: \
+             {snr_db:.1} dB (expected > 18 dB; round-48 HCB5-only baseline was ~12 dB)"
+        );
+    }
+
+    /// Wider max_sfb=55: 1 kHz tone reconstruction has ≥80% of input
+    /// energy preserved (vs ~40% with the round-48 max_sfb=40 default).
+    #[test]
+    fn encode_frame_pcm_max_sfb_55_preserves_tone_energy() {
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let f = 1000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    0.3 * (2.0 * std::f32::consts::PI * f * t).sin()
+                })
+                .collect()
+        };
+        let frames: Vec<Vec<f32>> = (0..4).map(|i| make_frame(i * n)).collect();
+        let decoded = encode_decode_frames_with_max_sfb(&frames, 55);
+        let orig = &frames[2];
+        let recon_i16 = &decoded[2];
+        let recon: Vec<f32> = recon_i16.iter().map(|&s| s as f32 / 32767.0).collect();
+        let orig_e: f64 = orig.iter().map(|&v| (v as f64).powi(2)).sum();
+        let recon_e: f64 = recon.iter().map(|&v| (v as f64).powi(2)).sum();
+        let ratio = recon_e / orig_e.max(1e-30);
+        eprintln!(
+            "ROUND-49 max_sfb=55 1 kHz tone energy preservation: {:.1}%",
+            ratio * 100.0
+        );
+        assert!(
+            ratio >= 0.80,
+            "expected ≥80% energy preservation at max_sfb=55, got {:.1}%",
+            ratio * 100.0
+        );
+    }
+
+    /// Backwards compatibility: `encode_frame_pcm` without an explicit
+    /// max_sfb still uses the round-48 default of 40, and the existing
+    /// 1 kHz tone fixture still round-trips through the decoder with the
+    /// optimiser-driven codebook selection enabled.
+    #[test]
+    fn encode_frame_pcm_default_max_sfb_still_works() {
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let f = 1000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    0.3 * (2.0 * std::f32::consts::PI * f * t).sin()
+                })
+                .collect()
+        };
+        let frames: Vec<Vec<f32>> = (0..4).map(|i| make_frame(i * n)).collect();
+        let decoded = encode_decode_frames(&frames); // default max_sfb=40
+        let pcm = &decoded[2];
+        let peak = pcm.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        assert!(
+            peak > 1000,
+            "expected peak amplitude > 1000 at default max_sfb=40, got {peak}"
+        );
+    }
+
+    /// Sanity baseline: with the HCB5-only encoder configuration
+    /// (`q_target = 4`) the white-noise spectral SNR caps near 12 dB.
+    /// We simulate this via a one-shot helper that uses HCB5 only on
+    /// every band, mirroring the round-48 build_mono_simple_asf body.
+    /// This test exists as a benchmark anchor so future regressions
+    /// against the round-48 baseline are visible at a glance.
+    #[test]
+    fn baseline_hcb5_only_white_noise_snr_logs_for_comparison() {
+        use crate::asf_data::{
+            dequantise_and_scale, parse_asf_scalefac_data, parse_asf_section_data,
+            parse_asf_spectral_data,
+        };
+        use crate::encoder_asf::{
+            pick_scalefactor_for_band, single_section, write_scalefac_data, write_sect_len_incr,
+            write_spectral_data_single_section,
+        };
+        use crate::encoder_mdct::EncoderMdctState;
+        use oxideav_core::bits::{BitReader, BitWriter};
+
+        let n = 1920usize;
+        let max_sfb = 50u32;
+        let sfbo = crate::sfb_offset::sfb_offset_48(n as u32).unwrap();
+        let end_bin = sfbo[max_sfb as usize] as usize;
+        let mut s: u64 = 0xACE4u64;
+        let pcm: Vec<f32> = (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = (s >> 33) as u32;
+                (u as f32 / (1u32 << 31) as f32 - 1.0) * 0.3
+            })
+            .collect();
+        let mut mdct = EncoderMdctState::new(n as u32);
+        let _ = mdct.analyse_frame(&pcm);
+        let coeffs = mdct.analyse_frame(&pcm);
+
+        // HCB5-only encoder body (round-48 path).
+        let cb: u8 = 5;
+        let q_max = 4u32;
+        let mut qspec = vec![0i32; end_bin];
+        let mut sf_per_band = vec![100i32; max_sfb as usize];
+        let mut max_quant_idx = vec![0u32; max_sfb as usize];
+        for sfb in 0..max_sfb as usize {
+            let a = sfbo[sfb] as usize;
+            let b = sfbo[sfb + 1] as usize;
+            let band = &coeffs[a..b.min(coeffs.len())];
+            let (sf, q) = pick_scalefactor_for_band(band, q_max);
+            sf_per_band[sfb] = sf;
+            for (i, &qi) in q.iter().enumerate() {
+                qspec[a + i] = qi;
+                max_quant_idx[sfb] = max_quant_idx[sfb].max(qi.unsigned_abs());
+            }
+        }
+        let mut bw = BitWriter::new();
+        bw.write_u32(4096, 15);
+        bw.write_bit(false);
+        bw.align_to_byte();
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 1);
+        bw.write_bit(true);
+        let (n_msfb_bits, _, _) = crate::tables::n_msfb_bits_48(n as u32).unwrap();
+        bw.write_u32(max_sfb, n_msfb_bits);
+        bw.write_u32(cb as u32, 4);
+        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        write_spectral_data_single_section(&mut bw, &qspec, sfbo, max_sfb, cb as u32);
+        let sections = single_section(max_sfb, cb);
+        write_scalefac_data(
+            &mut bw,
+            &sf_per_band,
+            &sections.sfb_cb,
+            &max_quant_idx,
+            max_sfb,
+        );
+        bw.write_u32(0, 1);
+        bw.align_to_byte();
+        while bw.byte_len() < 4096 {
+            bw.write_u32(0, 8);
+        }
+        let body = bw.finish();
+
+        // Walk through parser, then dequantise + compare.
+        let mut br = BitReader::new(&body);
+        let _ = br.read_u32(15).unwrap();
+        let _ = br.read_bit().unwrap();
+        br.align_to_byte();
+        let _ = br.read_u32(1).unwrap();
+        let _ = br.read_u32(1).unwrap();
+        let _ = br.read_bit().unwrap();
+        let _ = br.read_u32(n_msfb_bits).unwrap();
+        let parsed = parse_asf_section_data(&mut br, 0, n as u32, max_sfb).unwrap();
+        let (qs, mqi) = parse_asf_spectral_data(&mut br, &parsed, sfbo, max_sfb).unwrap();
+        let sfg = parse_asf_scalefac_data(&mut br, &parsed, &mqi, max_sfb, n as u32).unwrap();
+        let scaled = dequantise_and_scale(&qs, &sfg, sfbo, max_sfb);
+
+        let mut sig_e = 0.0_f64;
+        let mut err_e = 0.0_f64;
+        for k in 0..end_bin {
+            let o = coeffs[k] as f64;
+            let r = scaled[k] as f64;
+            sig_e += o * o;
+            err_e += (o - r) * (o - r);
+        }
+        let snr_db = 10.0 * (sig_e / err_e.max(1e-30)).log10();
+        eprintln!("ROUND-48 baseline white-noise spectral SNR (HCB5-only, q_target=4, max_sfb=50): {snr_db:.1} dB");
+        // Sanity: round-48 should be in the 8-15 dB range.
+        assert!(
+            snr_db < 18.0,
+            "round-48 HCB5-only baseline unexpectedly high: {snr_db:.1} dB"
+        );
+    }
+
+    /// max_sfb wider than the round-48 default: encoder emits a frame
+    /// the decoder parses without erroring.
+    #[test]
+    fn encode_frame_pcm_max_sfb_50_round_trips() {
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    let pi2 = 2.0 * std::f32::consts::PI;
+                    // Tones across the wider band: 1 kHz + 8 kHz.
+                    0.2 * (pi2 * 1000.0 * t).sin() + 0.2 * (pi2 * 8000.0 * t).sin()
+                })
+                .collect()
+        };
+        let frames: Vec<Vec<f32>> = (0..4).map(|i| make_frame(i * n)).collect();
+        let decoded = encode_decode_frames_with_max_sfb(&frames, 50);
+        // Steady-state frame must be substantially non-silent.
+        let pcm = &decoded[2];
+        let nonzero = pcm.iter().filter(|&&s| s != 0).count();
+        assert!(nonzero > 100, "expected non-silent recon, got {nonzero}");
     }
 }
