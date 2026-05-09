@@ -107,6 +107,38 @@ type SyncCompandingChannelEntry<'a> = (
 /// (passthrough case).
 type FiveXChannelEntry<'a> = (usize, Vec<f32>, Option<(&'a aspx::FiveXAspxTrailer, bool)>);
 
+/// Round 45: per-channel input bundle for the stereo-CPE M=2 synced
+/// companding helper [`Ac4Decoder::extend_stereo_cpe_pair_with_sync_companding`].
+/// Mirrors the per-channel arguments of [`Ac4Decoder::aspx_extend_pcm`]
+/// (the un-trailerised stereo-CPE form used by the primary / secondary
+/// dispatch path) so the two-channel cohort can run phase-1 → synced
+/// companding apply → phase-2 in lockstep.
+struct StereoCpeChannelInput<'a> {
+    /// Decoder-local channel index used to pick the right
+    /// `aspx_ext_state[ch_index]` carry-over (0 for primary, 1 for
+    /// secondary on a 2-channel CPE).
+    ch_index: usize,
+    /// IMDCT'd low-band PCM for this channel; the helper runs forward
+    /// QMF + HF generation + envelope adjustment + companding +
+    /// inverse QMF on this buffer.
+    pcm_in: &'a [f32],
+    /// `aspx_framing()` for this channel (per-channel in stereo CPE).
+    framing: Option<&'a aspx::AspxFraming>,
+    /// `aspx_data_sig` Huffman envelopes for this channel.
+    sig: Option<&'a [aspx::AspxHuffEnv]>,
+    /// `aspx_data_noise` Huffman envelopes for this channel.
+    noise: Option<&'a [aspx::AspxHuffEnv]>,
+    /// `aspx_qmode_env` quant-step for this channel's envelopes.
+    qmode: Option<aspx::AspxQuantStep>,
+    /// Per-envelope sign of the dpcm directionality (`f` flag in the
+    /// spec): `true` = freq-direction, `false` = time-direction.
+    delta_dir: Option<&'a aspx::AspxDeltaDir>,
+    /// `aspx_hfgen_iwc.add_harmonic[ch]` for tone injection.
+    add_harmonic: Option<&'a [bool]>,
+    /// `aspx_hfgen_iwc.tna_mode[ch]` for the chirp + α0 + α1 TNS body.
+    tna_mode: Option<&'a [u8]>,
+}
+
 impl Ac4Decoder {
     pub fn new(params: &CodecParameters) -> Self {
         Self {
@@ -908,6 +940,116 @@ impl Ac4Decoder {
             out.push((slot, pcm));
         }
         out
+    }
+
+    /// Round 45: stereo-CPE counterpart to
+    /// [`Self::extend_5x_channels_with_sync_companding`] for the M=2
+    /// case where the two channels are not 5_X trailer slots but the
+    /// primary / secondary of an `aspx_data_2ch` stereo CPE — in
+    /// particular the L/R carrier pair that drives a 5_X ASPX_ACPL_3
+    /// `run_acpl_5x_mch_pcm` synthesis (Pseudocode 118 expects the
+    /// extended carriers, not raw IMDCT'd PCM).
+    ///
+    /// When `companding_control(2)` carried `sync_flag == 1` the spec's
+    /// `g_synch(ts) = (∏_{ch=0..M} g_ch(ts))^(1/M)` collapses for M=2
+    /// to `√(g_0(ts) · g_1(ts))` — a single geometric-mean gain shared
+    /// across both channels rather than two independent per-channel
+    /// gains. This matches r44's 5_X SIMPLE/ASPX dispatch path:
+    /// phase-1 runs each channel through [`Self::aspx_extend_to_qmf`]
+    /// (capturing the post-extension QMF matrix + each channel's
+    /// `(sb0, sbz)` companding band), phase-2 calls
+    /// [`aspx::apply_synchronised_companding_across_channels`] to
+    /// write the synced gain into both QMF matrices, and phase-3
+    /// runs each channel through [`Self::qmf_synthesise_pcm`] to
+    /// produce the final PCM.
+    ///
+    /// `mode` MUST be one of
+    /// [`aspx::CompandingMode::SyncPerSlot`] / [`aspx::CompandingMode::SyncAveraged`]
+    /// (the cross-channel sync sub-branches of Pseudocode 121); any
+    /// other mode is a no-op for the synced pipeline and the caller
+    /// should run the per-channel `aspx_extend_pcm` path instead.
+    ///
+    /// `tables` / `cfg` are shared between the two channels in a
+    /// stereo CPE (one `aspx_config()` per substream). `sb0_override`
+    /// is `Some(acpl_qmf_band)` for the stereo ASPX_ACPL_1 path
+    /// (which substitutes `acpl_qmf_band` for `aspx_xover_band` per
+    /// §5.7.5.2 sb0 selection); `None` everywhere else (SIMPLE / ASPX
+    /// / ACPL_3 paths use `tables.sbx`).
+    ///
+    /// When either channel's phase-1 returns `None` (PCM length not a
+    /// multiple of 64, missing tables, etc.) that channel falls back
+    /// to its un-extended PCM — same contract as
+    /// [`Self::aspx_extend_pcm`] / [`Self::extend_5x_channels_with_sync_companding`].
+    #[allow(clippy::too_many_arguments)]
+    fn extend_stereo_cpe_pair_with_sync_companding(
+        &mut self,
+        primary: &StereoCpeChannelInput<'_>,
+        secondary: &StereoCpeChannelInput<'_>,
+        tables: &aspx::AspxFrequencyTables,
+        cfg: &aspx::AspxConfig,
+        num_ts_in_ats: u32,
+        mode: aspx::CompandingMode,
+        sb0_override: Option<u32>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        // Phase 1: drive each channel through aspx_extend_to_qmf and
+        // capture the post-extension QMF matrix + (sb0, sbz) band.
+        // Lay out as Vec so indices are stable across the
+        // borrow-juggle below.
+        let mut phase1: [(usize, usize, Option<AspxQmfPhase1>); 2] = [
+            (primary.ch_index, primary.pcm_in.len(), None),
+            (secondary.ch_index, secondary.pcm_in.len(), None),
+        ];
+        for (i, input) in [primary, secondary].iter().enumerate() {
+            while self.aspx_ext_state.len() <= input.ch_index {
+                self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
+            }
+            let state = &mut self.aspx_ext_state[input.ch_index];
+            phase1[i].2 = Self::aspx_extend_to_qmf(
+                input.pcm_in,
+                tables,
+                cfg,
+                input.framing,
+                input.sig,
+                input.noise,
+                input.qmode,
+                input.delta_dir,
+                input.add_harmonic,
+                input.tna_mode,
+                state,
+                num_ts_in_ats,
+            )
+            .map(|(q, sbx_eff, sbz_eff)| {
+                // sb0_override is shared across both channels of the
+                // stereo CPE (acpl_qmf_band for ASPX_ACPL_1 stereo,
+                // sbx everywhere else).
+                let sb0 = sb0_override.unwrap_or(sbx_eff);
+                (q, sb0, sbz_eff)
+            });
+        }
+        // Phase 2: collect every channel that survived phase 1 into
+        // the synced companding helper. M=2 → `g_synch(ts) = √(g_0(ts) · g_1(ts))`
+        // is written back into BOTH QMF matrices uniformly.
+        {
+            let mut sync_view: Vec<aspx::SyncCompandingEntry<'_>> = Vec::with_capacity(2);
+            for (_, _, q_opt) in phase1.iter_mut() {
+                if let Some((q, sb0, sbz)) = q_opt.as_mut() {
+                    sync_view.push((q, *sb0, *sbz));
+                }
+            }
+            aspx::apply_synchronised_companding_across_channels(&mut sync_view, mode);
+        }
+        // Phase 3: synthesise per-channel PCM. Channels whose phase-1
+        // returned None fall back to the unmodified input PCM (same
+        // contract as `aspx_extend_pcm`).
+        let pcm_out = |idx: usize, fallback: &[f32]| -> Vec<f32> {
+            match &phase1[idx].2 {
+                Some((q, _, _)) => Self::qmf_synthesise_pcm(q, phase1[idx].1),
+                None => fallback.to_vec(),
+            }
+        };
+        let pri = pcm_out(0, primary.pcm_in);
+        let sec = pcm_out(1, secondary.pcm_in);
+        (pri, sec)
     }
 
     /// Round 44: shared front-end for the 5_X SIMPLE/ASPX dispatchers
@@ -2159,64 +2301,148 @@ impl Decoder for Ac4Decoder {
         // duplicate-of-primary fallback.
         let use_acpl =
             channels as usize >= 2 && acpl_active_cfg.is_some() && acpl_active_data.is_some();
-        if let Some((scaled, n)) = primary_in {
-            if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
-                if use_aspx_ext {
-                    let pcm_f = self.imdct_channel_f32(0, &scaled, n);
-                    let state = &mut self.aspx_ext_state[0];
-                    let extended = Self::aspx_extend_pcm(
-                        &pcm_f,
-                        aspx_tables.as_ref().unwrap(),
-                        aspx_cfg.as_ref().unwrap(),
-                        framing_pri.as_ref(),
-                        sig_pri.as_deref(),
-                        noise_pri.as_deref(),
-                        qmode_pri,
-                        delta_dir_pri.as_ref(),
-                        ah_pri.as_deref(),
-                        tna_pri.as_deref(),
-                        state,
-                        num_ts_in_ats,
-                        compand_mode_pri,
-                        compand_sb0_override,
-                    );
-                    if use_acpl {
-                        if let (Some(cfg), Some(data)) =
-                            (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
-                        {
-                            // ASPX_ACPL_1: feed both M (extended) and S
-                            // PCM into the stereo A-CPL. The S spectrum
-                            // is already in `secondary_in`; we IMDCT it
-                            // here without ASPX (the `aspx_data_1ch` in
-                            // ACPL_1 covers the M channel only).
-                            let acpl1_result = if acpl1_active {
-                                if let Some((s_scaled, s_n)) = secondary_in.as_ref() {
-                                    if *s_n == n {
-                                        let s_pcm = self.imdct_channel_f32(1, s_scaled, *s_n);
-                                        acpl_synth::run_acpl_1ch_pcm_stereo(
-                                            &extended,
-                                            &s_pcm,
-                                            cfg,
-                                            data,
-                                            &mut self.acpl_state,
-                                        )
+        // Round 45: stereo-CPE M=2 synced companding. When
+        // `companding_control(2)` carried `sync_flag == 1` and the
+        // primary / secondary cohort both feed the standalone ASPX
+        // path (i.e. `!use_acpl` — ACPL_1 stereo only ASPX-extends
+        // the M-channel via the `acpl1_active` branch and so falls
+        // outside the synced cohort), the two channels share one
+        // geometric-mean gain `g_synch(ts) = √(g_0 · g_1)` per
+        // Pseudocode 121's `sync_flag == 1` branch instead of two
+        // independent per-channel gains. For 5_X ASPX_ACPL_3 the
+        // primary / secondary are the L / R carriers feeding
+        // Pseudocode 118's `run_acpl_5x_mch_pcm`, so this puts the
+        // ACPL_3 surround-pair driver on the same synced footing as
+        // r44's 5_X SIMPLE/ASPX dispatch. Resolves to `None` for
+        // `sync_flag == 0`, missing companding, or any non-sync
+        // sub-branch — falling back to the per-channel
+        // `aspx_extend_pcm` path below.
+        let stereo_cpe_synced_mode: Option<aspx::CompandingMode> = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.companding.as_ref())
+            .and_then(|cc| Self::five_x_synced_mode(Some(cc)));
+        let use_stereo_cpe_synced = use_aspx_ext
+            && !use_acpl
+            && channels as usize >= 2
+            && stereo_cpe_synced_mode.is_some()
+            && primary_in.is_some()
+            && secondary_in.is_some()
+            && primary_in.as_ref().map(|(_, n)| *n) == secondary_in.as_ref().map(|(_, n)| *n);
+        if use_stereo_cpe_synced {
+            // Synced stereo-CPE pipeline. IMDCT each channel, then
+            // run the M=2 phase-1 / sync-apply / phase-2 helper.
+            // SAFETY of the unwraps: guarded by `use_stereo_cpe_synced`
+            // (use_aspx_ext, primary_in.is_some(), secondary_in.is_some(),
+            // stereo_cpe_synced_mode.is_some()).
+            let (p_scaled, p_n) = primary_in.as_ref().unwrap();
+            let (s_scaled, s_n) = secondary_in.as_ref().unwrap();
+            let n = *p_n;
+            if n > 0 && n == samples as usize && *s_n == n && !pcm_per_channel.is_empty() {
+                let pcm_pri_f = self.imdct_channel_f32(0, p_scaled, n);
+                let pcm_sec_f = self.imdct_channel_f32(1, s_scaled, n);
+                let pri_input = StereoCpeChannelInput {
+                    ch_index: 0,
+                    pcm_in: &pcm_pri_f,
+                    framing: framing_pri.as_ref(),
+                    sig: sig_pri.as_deref(),
+                    noise: noise_pri.as_deref(),
+                    qmode: qmode_pri,
+                    delta_dir: delta_dir_pri.as_ref(),
+                    add_harmonic: ah_pri.as_deref(),
+                    tna_mode: tna_pri.as_deref(),
+                };
+                let sec_input = StereoCpeChannelInput {
+                    ch_index: 1,
+                    pcm_in: &pcm_sec_f,
+                    framing: framing_sec.as_ref().or(framing_pri.as_ref()),
+                    sig: sig_sec.as_deref(),
+                    noise: noise_sec.as_deref(),
+                    qmode: qmode_sec.or(qmode_pri),
+                    delta_dir: delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
+                    add_harmonic: ah_sec.as_deref().or(ah_pri.as_deref()),
+                    tna_mode: tna_sec.as_deref().or(tna_pri.as_deref()),
+                };
+                let (ext_pri, ext_sec) = self.extend_stereo_cpe_pair_with_sync_companding(
+                    &pri_input,
+                    &sec_input,
+                    aspx_tables.as_ref().unwrap(),
+                    aspx_cfg.as_ref().unwrap(),
+                    num_ts_in_ats,
+                    stereo_cpe_synced_mode.unwrap(),
+                    compand_sb0_override,
+                );
+                if pcm_per_channel.len() < 2 {
+                    while pcm_per_channel.len() < 2 {
+                        pcm_per_channel.push(None);
+                    }
+                }
+                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&ext_pri));
+                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&ext_sec));
+            }
+        }
+        if !use_stereo_cpe_synced {
+            if let Some((scaled, n)) = primary_in {
+                if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
+                    if use_aspx_ext {
+                        let pcm_f = self.imdct_channel_f32(0, &scaled, n);
+                        let state = &mut self.aspx_ext_state[0];
+                        let extended = Self::aspx_extend_pcm(
+                            &pcm_f,
+                            aspx_tables.as_ref().unwrap(),
+                            aspx_cfg.as_ref().unwrap(),
+                            framing_pri.as_ref(),
+                            sig_pri.as_deref(),
+                            noise_pri.as_deref(),
+                            qmode_pri,
+                            delta_dir_pri.as_ref(),
+                            ah_pri.as_deref(),
+                            tna_pri.as_deref(),
+                            state,
+                            num_ts_in_ats,
+                            compand_mode_pri,
+                            compand_sb0_override,
+                        );
+                        if use_acpl {
+                            if let (Some(cfg), Some(data)) =
+                                (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
+                            {
+                                // ASPX_ACPL_1: feed both M (extended) and S
+                                // PCM into the stereo A-CPL. The S spectrum
+                                // is already in `secondary_in`; we IMDCT it
+                                // here without ASPX (the `aspx_data_1ch` in
+                                // ACPL_1 covers the M channel only).
+                                let acpl1_result = if acpl1_active {
+                                    if let Some((s_scaled, s_n)) = secondary_in.as_ref() {
+                                        if *s_n == n {
+                                            let s_pcm = self.imdct_channel_f32(1, s_scaled, *s_n);
+                                            acpl_synth::run_acpl_1ch_pcm_stereo(
+                                                &extended,
+                                                &s_pcm,
+                                                cfg,
+                                                data,
+                                                &mut self.acpl_state,
+                                            )
+                                        } else {
+                                            None
+                                        }
                                     } else {
                                         None
                                     }
                                 } else {
-                                    None
+                                    acpl_synth::run_acpl_1ch_pcm(
+                                        &extended,
+                                        cfg,
+                                        data,
+                                        &mut self.acpl_state,
+                                    )
+                                };
+                                if let Some((left, right)) = acpl1_result {
+                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
+                                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
+                                } else {
+                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
                                 }
-                            } else {
-                                acpl_synth::run_acpl_1ch_pcm(
-                                    &extended,
-                                    cfg,
-                                    data,
-                                    &mut self.acpl_state,
-                                )
-                            };
-                            if let Some((left, right)) = acpl1_result {
-                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
-                                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
                             } else {
                                 pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
                             }
@@ -2224,49 +2450,47 @@ impl Decoder for Ac4Decoder {
                             pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
                         }
                     } else {
-                        pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
-                    }
-                } else {
-                    pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
-                }
-            }
-        }
-        if channels as usize >= 2 && !use_acpl {
-            if let Some((scaled, n)) = secondary_in {
-                if n > 0 && n == samples as usize {
-                    if use_aspx_ext {
-                        let pcm_f = self.imdct_channel_f32(1, &scaled, n);
-                        let state = &mut self.aspx_ext_state[1];
-                        let extended = Self::aspx_extend_pcm(
-                            &pcm_f,
-                            aspx_tables.as_ref().unwrap(),
-                            aspx_cfg.as_ref().unwrap(),
-                            framing_sec.as_ref().or(framing_pri.as_ref()),
-                            sig_sec.as_deref(),
-                            noise_sec.as_deref(),
-                            qmode_sec.or(qmode_pri),
-                            delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
-                            ah_sec.as_deref().or(ah_pri.as_deref()),
-                            tna_sec.as_deref().or(tna_pri.as_deref()),
-                            state,
-                            num_ts_in_ats,
-                            compand_mode_sec,
-                            compand_sb0_override,
-                        );
-                        pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
-                    } else {
-                        pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                        pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
                     }
                 }
             }
-        }
-        // SSF synthesis path — if either ssf_data_* is populated and
-        // the corresponding `pcm_per_channel[ch]` slot is still empty
-        // (the ASF Huffman pipeline didn't fire because spec_frontend
-        // was SSF), drive §5.2.3-5.2.7 → IMDCT to produce real PCM.
-        // Synthesize each granule into a `num_blocks * n_mdct`-long
-        // spectrum vector, then IMDCT each `n_mdct` block independently
-        // and concat the resulting overlap-added PCM.
+            if channels as usize >= 2 && !use_acpl {
+                if let Some((scaled, n)) = secondary_in {
+                    if n > 0 && n == samples as usize {
+                        if use_aspx_ext {
+                            let pcm_f = self.imdct_channel_f32(1, &scaled, n);
+                            let state = &mut self.aspx_ext_state[1];
+                            let extended = Self::aspx_extend_pcm(
+                                &pcm_f,
+                                aspx_tables.as_ref().unwrap(),
+                                aspx_cfg.as_ref().unwrap(),
+                                framing_sec.as_ref().or(framing_pri.as_ref()),
+                                sig_sec.as_deref(),
+                                noise_sec.as_deref(),
+                                qmode_sec.or(qmode_pri),
+                                delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
+                                ah_sec.as_deref().or(ah_pri.as_deref()),
+                                tna_sec.as_deref().or(tna_pri.as_deref()),
+                                state,
+                                num_ts_in_ats,
+                                compand_mode_sec,
+                                compand_sb0_override,
+                            );
+                            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
+                        } else {
+                            pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                        }
+                    }
+                }
+            }
+        } // end `if !use_stereo_cpe_synced`
+          // SSF synthesis path — if either ssf_data_* is populated and
+          // the corresponding `pcm_per_channel[ch]` slot is still empty
+          // (the ASF Huffman pipeline didn't fire because spec_frontend
+          // was SSF), drive §5.2.3-5.2.7 → IMDCT to produce real PCM.
+          // Synthesize each granule into a `num_blocks * n_mdct`-long
+          // spectrum vector, then IMDCT each `n_mdct` block independently
+          // and concat the resulting overlap-added PCM.
         if let Some(data) = ssf_primary.as_ref() {
             if !pcm_per_channel.is_empty() && pcm_per_channel[0].is_none() {
                 let pcm = self.run_ssf_channel(0, data, samples as usize);
@@ -5280,6 +5504,221 @@ mod tests {
             compand_avg: Some(false),
         };
         assert!(Ac4Decoder::five_x_synced_mode(Some(&cc_sync_off)).is_none());
+    }
+
+    /// Round 45: stereo-CPE M=2 synced companding helper —
+    /// `extend_stereo_cpe_pair_with_sync_companding` writes the
+    /// `g_synch(ts) = √(g_0(ts) · g_1(ts))` synced gain into BOTH
+    /// channels' QMF matrices, then runs inverse QMF synthesis. This
+    /// produces a different output than the per-channel
+    /// `aspx_extend_pcm` path with `PerSlot` mode (which writes
+    /// independent per-channel gains).
+    ///
+    /// The test pins:
+    ///   * Output cardinality + length (one extended PCM per input).
+    ///   * Output is non-silent (the HF tile copy + 0.5 flat envelope
+    ///     gain + companding apply produces audible content).
+    ///   * Synced output differs from per-channel output (proves the
+    ///     synced gain is actually applied, not silently skipped).
+    ///   * Synced output differs from `Off` output (proves the helper
+    ///     applies a non-trivial gain, not just passthrough).
+    ///
+    /// The numerical correctness of the geometric-mean formula is
+    /// already exhaustively covered by
+    /// `aspx::tests::apply_synchronised_companding_*` against the
+    /// bare QMF helper; this test just confirms the integration glue
+    /// (phase-1 + sync apply + phase-2) is wired correctly for the
+    /// stereo-CPE path that drives 5_X ASPX_ACPL_3's L/R surround
+    /// pair carriers.
+    #[test]
+    fn extend_stereo_cpe_pair_with_sync_companding_diverges_from_per_channel() {
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let n_slots = 24usize;
+        let n = n_slots * 64;
+        // Asymmetric carrier energies (8x amplitude difference) so
+        // per-channel companding produces clearly different per-slot
+        // gains for the two channels — synced gain (geometric mean)
+        // is the single common scale.
+        let mut pcm_a = vec![0.0f32; n];
+        let mut pcm_b = vec![0.0f32; n];
+        let f1 = 700.0_f32 / 48_000.0_f32;
+        let f2 = 1100.0_f32 / 48_000.0_f32;
+        for i in 0..n {
+            pcm_a[i] = 0.04 * (2.0 * std::f32::consts::PI * f1 * i as f32).sin();
+            pcm_b[i] = 0.32 * (2.0 * std::f32::consts::PI * f2 * i as f32).sin();
+        }
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        // Synced run.
+        let mut dec_sync = Ac4Decoder::new(&params);
+        let pri_input = StereoCpeChannelInput {
+            ch_index: 0,
+            pcm_in: &pcm_a,
+            framing: None,
+            sig: None,
+            noise: None,
+            qmode: None,
+            delta_dir: None,
+            add_harmonic: None,
+            tna_mode: None,
+        };
+        let sec_input = StereoCpeChannelInput {
+            ch_index: 1,
+            pcm_in: &pcm_b,
+            framing: None,
+            sig: None,
+            noise: None,
+            qmode: None,
+            delta_dir: None,
+            add_harmonic: None,
+            tna_mode: None,
+        };
+        let (sync_a, sync_b) = dec_sync.extend_stereo_cpe_pair_with_sync_companding(
+            &pri_input,
+            &sec_input,
+            &tables,
+            &cfg,
+            1,
+            aspx::CompandingMode::SyncPerSlot,
+            None,
+        );
+        // Helper-3 returns one PCM per input, both length-matched.
+        assert_eq!(sync_a.len(), n);
+        assert_eq!(sync_b.len(), n);
+        // Per-channel comparison run — same inputs, but each
+        // channel through its own `aspx_extend_pcm` with PerSlot
+        // mode (no cross-channel synchronisation).
+        let mut state_a = aspx::AspxChannelExtState::new();
+        let per_a = Ac4Decoder::aspx_extend_pcm(
+            &pcm_a,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_a,
+            1,
+            aspx::CompandingMode::PerSlot,
+            None,
+        );
+        let mut state_b = aspx::AspxChannelExtState::new();
+        let per_b = Ac4Decoder::aspx_extend_pcm(
+            &pcm_b,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_b,
+            1,
+            aspx::CompandingMode::PerSlot,
+            None,
+        );
+        // Companding-Off comparison — same shape but with the
+        // companding gain bypassed entirely (proves the synced
+        // helper writes a non-identity gain).
+        let mut state_off_a = aspx::AspxChannelExtState::new();
+        let off_a = Ac4Decoder::aspx_extend_pcm(
+            &pcm_a,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_off_a,
+            1,
+            aspx::CompandingMode::Off,
+            None,
+        );
+        let mut state_off_b = aspx::AspxChannelExtState::new();
+        let off_b = Ac4Decoder::aspx_extend_pcm(
+            &pcm_b,
+            &tables,
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state_off_b,
+            1,
+            aspx::CompandingMode::Off,
+            None,
+        );
+        let energy = |v: &[f32]| -> f64 { v.iter().map(|s| (*s as f64).powi(2)).sum() };
+        // Outputs are non-silent.
+        assert!(energy(&sync_a) > 0.0);
+        assert!(energy(&sync_b) > 0.0);
+        // Synced output differs from per-channel output —
+        // proves the synced gain (geometric mean across both
+        // channels) is genuinely different from the local gain
+        // each channel would produce on its own. The geometric
+        // mean of two unequal positive numbers is strictly
+        // between them, so neither channel's synced output
+        // matches its own per-channel output.
+        let diff_a: f64 = sync_a
+            .iter()
+            .zip(per_a.iter())
+            .map(|(s, p)| ((*s - *p) as f64).abs())
+            .sum();
+        let diff_b: f64 = sync_b
+            .iter()
+            .zip(per_b.iter())
+            .map(|(s, p)| ((*s - *p) as f64).abs())
+            .sum();
+        assert!(
+            diff_a > 0.0,
+            "synced channel A must differ from per-channel A (sync gain is geometric mean of g_a, g_b which differ)"
+        );
+        assert!(
+            diff_b > 0.0,
+            "synced channel B must differ from per-channel B (sync gain is geometric mean of g_a, g_b which differ)"
+        );
+        // Synced output also differs from Off output (the synced
+        // gain is non-trivial — not the identity).
+        let diff_off_a: f64 = sync_a
+            .iter()
+            .zip(off_a.iter())
+            .map(|(s, o)| ((*s - *o) as f64).abs())
+            .sum();
+        let diff_off_b: f64 = sync_b
+            .iter()
+            .zip(off_b.iter())
+            .map(|(s, o)| ((*s - *o) as f64).abs())
+            .sum();
+        assert!(
+            diff_off_a > 0.0,
+            "synced channel A must differ from companding-Off A"
+        );
+        assert!(
+            diff_off_b > 0.0,
+            "synced channel B must differ from companding-Off B"
+        );
     }
 
     /// Round 44: `extend_5x_channels_with_sync_companding` returns
