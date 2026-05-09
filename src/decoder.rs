@@ -85,6 +85,28 @@ pub struct Ac4Decoder {
     ssf_walker_state: Vec<ssf::SsfChannelState>,
 }
 
+/// Phase-1 result of [`Ac4Decoder::aspx_extend_to_qmf`]:
+/// `(qmf_matrix, sbx, sbz)` — the post-extension QMF matrix and the
+/// (sb0, sb1) range needed by the §5.7.5 companding tool.
+type AspxQmfPhase1 = (aspx::QmfMatrix, u32, u32);
+
+/// One per-channel entry consumed by
+/// [`Ac4Decoder::extend_5x_channels_with_sync_companding`].
+type SyncCompandingChannelEntry<'a> = (
+    usize,                             // output slot (0..=4)
+    &'a [f32],                         // pcm_in
+    &'a aspx::FiveXAspxTrailer,        // trailer
+    &'a aspx::FiveXAspxChannelTrailer, // channel trailer
+    &'a aspx::AspxConfig,              // aspx config
+    Option<u32>,                       // sb0 override (acpl_qmf_band)
+);
+
+/// One per-channel entry consumed by [`Ac4Decoder::extend_5x_entries`]:
+/// `(slot, pcm_f32, trailer_pair)` where `trailer_pair` is
+/// `(trailer, is_secondary)` — `None` when the channel has no trailer
+/// (passthrough case).
+type FiveXChannelEntry<'a> = (usize, Vec<f32>, Option<(&'a aspx::FiveXAspxTrailer, bool)>);
+
 impl Ac4Decoder {
     pub fn new(params: &CodecParameters) -> Self {
         Self {
@@ -167,15 +189,73 @@ impl Ac4Decoder {
         compand_mode: aspx::CompandingMode,
         compand_sb0_override: Option<u32>,
     ) -> Vec<f32> {
+        let extended = Self::aspx_extend_to_qmf(
+            pcm_in,
+            tables,
+            cfg,
+            framing,
+            sig_deltas,
+            noise_deltas,
+            qmode_env,
+            delta_dir,
+            add_harmonic,
+            tna_mode,
+            state,
+            num_ts_in_ats,
+        );
+        match extended {
+            Some((mut q, sbx_eff, sbz_eff)) => {
+                let compand_sb0 = compand_sb0_override.unwrap_or(sbx_eff);
+                aspx::apply_companding_on_qmf_with_mode(&mut q, compand_sb0, sbz_eff, compand_mode);
+                Self::qmf_synthesise_pcm(&q, pcm_in.len())
+            }
+            None => pcm_in.to_vec(),
+        }
+    }
+
+    /// Round 44: phase-1 of the A-SPX HF-extension pipeline — runs the
+    /// QMF analysis, HF generation (TNS / tile-copy), envelope
+    /// adjustment + noise / tone injection, and updates `state` — but
+    /// stops BEFORE the §5.7.5 companding gain and the inverse-QMF
+    /// synthesis. Returns the post-extension QMF matrix `q[sb][ts]`
+    /// along with the (`sbx`, `sbz`) the companding tool will need.
+    ///
+    /// Returns `None` (and leaves `state` untouched in the same
+    /// preconditions [`aspx_extend_pcm`] historically returned the
+    /// input PCM verbatim) when the input fails the multiple-of-64
+    /// length check, the frequency tables are degenerate, or the
+    /// patches couldn't be derived.
+    ///
+    /// This split exists so that cross-channel synchronised companding
+    /// (`sync_flag == 1`, see [`aspx::apply_synchronised_companding_across_channels`])
+    /// can collect every channel's QMF matrix, compute the
+    /// geometric-mean gain across them, then apply the synced gain
+    /// uniformly before each channel runs its own synthesis via
+    /// [`Self::qmf_synthesise_pcm`].
+    #[allow(clippy::too_many_arguments)]
+    fn aspx_extend_to_qmf(
+        pcm_in: &[f32],
+        tables: &aspx::AspxFrequencyTables,
+        cfg: &aspx::AspxConfig,
+        framing: Option<&aspx::AspxFraming>,
+        sig_deltas: Option<&[aspx::AspxHuffEnv]>,
+        noise_deltas: Option<&[aspx::AspxHuffEnv]>,
+        qmode_env: Option<aspx::AspxQuantStep>,
+        delta_dir: Option<&aspx::AspxDeltaDir>,
+        add_harmonic: Option<&[bool]>,
+        tna_mode: Option<&[u8]>,
+        state: &mut aspx::AspxChannelExtState,
+        num_ts_in_ats: u32,
+    ) -> Option<AspxQmfPhase1> {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         // Need PCM length as a multiple of 64 for whole QMF slots.
         if pcm_in.is_empty() || pcm_in.len() % NUM_QMF != 0 {
-            return pcm_in.to_vec();
+            return None;
         }
         let sbx = tables.sbx as usize;
         let sbz = tables.sbz as usize;
         if sbx == 0 || sbx >= NUM_QMF || sbz <= sbx || sbz > NUM_QMF {
-            return pcm_in.to_vec();
+            return None;
         }
         let n_slots = pcm_in.len() / NUM_QMF;
         // Forward QMF analysis on the low-band PCM.
@@ -204,7 +284,7 @@ impl Ac4Decoder {
             is_highres,
         );
         if patches.num_sbg_patches == 0 {
-            return pcm_in.to_vec();
+            return None;
         }
         // Truncate the high band (ASPX substreams only carry spectral
         // data up to sbx in the core path; the bandwidth-extension
@@ -372,20 +452,29 @@ impl Ac4Decoder {
             state.tsg_ptr_prev = 0;
             state.num_atsg_sig_prev = 0;
         }
-        // Round 43: §5.7.5 companding — applied per-channel on the
-        // QMF matrix per Pseudocode 121's chosen branch. The tool
-        // operates on `[sb0, sbz)` for the full A-SPX interval (all
-        // qmf timeslots in our single-frame call). Inverts the
-        // encoder-side gain reshaping, shaping the coding noise by
-        // the slot-mean signal energy. `sb0` is normally `tables.sbx`
-        // (aspx_xover_band); for the ASPX_ACPL_1 codec mode it's
-        // `acpl_qmf_band` per §5.7.5.2's sb0 selection rule.
-        let compand_sb0 = compand_sb0_override.unwrap_or(tables.sbx);
-        aspx::apply_companding_on_qmf_with_mode(&mut q, compand_sb0, tables.sbz, compand_mode);
-        // Inverse QMF synthesis. Transpose q[sb][ts] -> slot[ts][sb] per
-        // §4.4.7 inverse QMF synthesis bank.
+        // Phase-1 returns the post-extension QMF matrix + the (sbx,
+        // sbz) the §5.7.5 companding tool will need. Companding +
+        // inverse-QMF synthesis happen in `aspx_extend_pcm` (single
+        // channel) or in the caller via
+        // [`aspx::apply_synchronised_companding_across_channels`] +
+        // [`Self::qmf_synthesise_pcm`] (cross-channel sync_flag=1).
+        Some((q, tables.sbx, tables.sbz))
+    }
+
+    /// Round 44: phase-2 of the A-SPX HF-extension pipeline — runs the
+    /// inverse-QMF synthesis on a `q[sb][ts]` matrix and returns
+    /// `out_len`-long PCM. Caller is responsible for having applied
+    /// the §5.7.5 companding gain (per-channel via
+    /// [`aspx::apply_companding_on_qmf_with_mode`] or cross-channel
+    /// via [`aspx::apply_synchronised_companding_across_channels`]).
+    fn qmf_synthesise_pcm(q: &[Vec<(f32, f32)>], out_len: usize) -> Vec<f32> {
+        const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
+        if q.len() < NUM_QMF || out_len == 0 {
+            return Vec::new();
+        }
+        let n_slots = out_len / NUM_QMF;
         let mut syn = qmf::QmfSynthesisBank::new();
-        let mut out = Vec::with_capacity(pcm_in.len());
+        let mut out = Vec::with_capacity(out_len);
         #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-2 §4.4.7 q[sb][ts] indexing
         for ts in 0..n_slots {
             let mut slot = [(0.0f32, 0.0f32); NUM_QMF];
@@ -706,6 +795,223 @@ impl Ac4Decoder {
         )
     }
 
+    /// Round 44: cross-channel synchronised A-SPX bandwidth-extension
+    /// for the 5_X SIMPLE/ASPX path when the parsed
+    /// `companding_control()` carries `sync_flag == 1`.
+    ///
+    /// Pseudocode 121's `sync_flag == 1` branch defines the gain as
+    /// `g_synch(ts) = (∏_{ch=0..M} g_ch(ts))^(1/M)` and applies it
+    /// uniformly to every contributing channel — i.e. one cross-channel
+    /// gain per slot, NOT one per-channel gain. The pre-r44 pipeline
+    /// approximated this with the per-channel `g_ch(ts)` (exact for
+    /// `M = 1`); this entry-point closes the gap by:
+    ///
+    ///   1. Driving each contributing channel through phase-1
+    ///      [`Self::aspx_extend_to_qmf`] to capture the post-extension
+    ///      QMF matrix `q_ch[sb][ts]` along with each channel's
+    ///      `(sb0, sbz)` companding band.
+    ///   2. Calling [`aspx::apply_synchronised_companding_across_channels`]
+    ///      with the collected QMF matrices and bands — that walks
+    ///      Pseudocode 121's geometric-mean across channels and writes
+    ///      the synced gain back into every QMF matrix.
+    ///   3. Driving each channel through phase-2
+    ///      [`Self::qmf_synthesise_pcm`] to produce the final PCM.
+    ///
+    /// Channels whose phase-1 returned `None` (length / table /
+    /// patch-derivation guard tripped — e.g. a slot whose IMDCT'd PCM
+    /// length isn't a multiple of 64) fall back to the unmodified
+    /// input PCM for that slot — same behaviour as the per-channel
+    /// `aspx_extend_pcm` helper used to give.
+    ///
+    /// `entries[i]` is `(slot, pcm_in, trailer, ch, sb0_override)`:
+    ///   * `slot` — output channel index (0..=4 for 5_X), used to
+    ///     pick the right `aspx_ext_state[slot]` carry-over.
+    ///   * `pcm_in` — IMDCT'd LF PCM for that output channel.
+    ///   * `trailer` — captured 5_X trailer (carries
+    ///     `frequency_tables`).
+    ///   * `ch` — primary or secondary channel within `trailer`.
+    ///   * `sb0_override` — `Some(acpl_qmf_band)` for ASPX_ACPL_1
+    ///     (`acpl_qmf_band` replaces `aspx_xover_band` per §5.7.5.2);
+    ///     `None` for SIMPLE / ASPX (sb0 = trailer.sbx).
+    ///
+    /// Returns one `(slot, Vec<f32>)` per entry, in the order they
+    /// were passed in. The caller is responsible for the trailing
+    /// f32→i16 cast and writeback into `pcm_per_channel[slot]`.
+    ///
+    /// `mode` MUST be either [`aspx::CompandingMode::SyncPerSlot`] or
+    /// [`aspx::CompandingMode::SyncAveraged`]; no-op (i.e. the
+    /// per-channel pipeline outputs without companding gain) for any
+    /// other mode.
+    fn extend_5x_channels_with_sync_companding(
+        &mut self,
+        entries: &[SyncCompandingChannelEntry<'_>],
+        num_ts_in_ats: u32,
+        mode: aspx::CompandingMode,
+    ) -> Vec<(usize, Vec<f32>)> {
+        // Phase 1: drive each entry through aspx_extend_to_qmf,
+        // capturing the post-extension QMF matrix (or `None` if the
+        // extension preconditions tripped — that channel will pass
+        // through unchanged).
+        let mut phase1: Vec<(usize, usize, Option<AspxQmfPhase1>)> =
+            Vec::with_capacity(entries.len());
+        for (slot, pcm_in, trailer, ch, cfg, sb0_override) in entries.iter() {
+            while self.aspx_ext_state.len() <= *slot {
+                self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
+            }
+            let state = &mut self.aspx_ext_state[*slot];
+            let qres = Self::aspx_extend_to_qmf(
+                pcm_in,
+                &trailer.frequency_tables,
+                cfg,
+                Some(&ch.framing),
+                Some(&ch.data_sig),
+                Some(&ch.data_noise),
+                Some(ch.qmode_env),
+                Some(&ch.delta_dir),
+                ch.add_harmonic.as_deref(),
+                ch.tna_mode.as_deref(),
+                state,
+                num_ts_in_ats,
+            );
+            // Resolve the effective sb0 for the synced companding —
+            // sb0_override (acpl_qmf_band for ASPX_ACPL_1) or sbx (the
+            // A-SPX crossover band for SIMPLE / ASPX).
+            let q_with_band = qres.map(|(q, sbx, sbz)| {
+                let sb0 = sb0_override.unwrap_or(sbx);
+                (q, sb0, sbz)
+            });
+            phase1.push((*slot, pcm_in.len(), q_with_band));
+        }
+        // Phase 2: collect every channel that survived phase 1 into
+        // the synced companding helper. Only mutable references to
+        // the QMF matrices are passed in; the helper reads each
+        // channel's level, computes geometric-mean across them, and
+        // writes back the synced scales.
+        {
+            let mut sync_view: Vec<aspx::SyncCompandingEntry<'_>> = Vec::new();
+            for (_, _, q_opt) in phase1.iter_mut() {
+                if let Some((q, sb0, sbz)) = q_opt.as_mut() {
+                    sync_view.push((q, *sb0, *sbz));
+                }
+            }
+            aspx::apply_synchronised_companding_across_channels(&mut sync_view, mode);
+        }
+        // Phase 3: synthesise per-channel PCM. Channels whose phase
+        // returned None fall back to a clone of the input PCM (same
+        // contract as the original `aspx_extend_pcm`).
+        let mut out: Vec<(usize, Vec<f32>)> = Vec::with_capacity(entries.len());
+        for (i, (slot, pcm_len, q_opt)) in phase1.into_iter().enumerate() {
+            let pcm = match q_opt {
+                Some((q, _, _)) => Self::qmf_synthesise_pcm(&q, pcm_len),
+                None => entries[i].1.to_vec(),
+            };
+            out.push((slot, pcm));
+        }
+        out
+    }
+
+    /// Round 44: shared front-end for the 5_X SIMPLE/ASPX dispatchers
+    /// that resolves the synced-companding mode for the whole 5_X
+    /// frame. With `sync_flag == 1`, every channel resolves to the
+    /// SAME mode (Pseudocode 121 broadcasts `compand_on[0]`); with
+    /// `sync_flag == 0` (or no companding) the per-channel
+    /// [`Self::five_x_compand_mode_for_slot`] is what callers want.
+    ///
+    /// Returns `Some(mode)` when the cross-channel synced pipeline
+    /// should run (mode is `SyncPerSlot` or `SyncAveraged`); `None`
+    /// when the per-channel pipeline should run (sync_flag missing /
+    /// false, or sync_flag=true resolves to `Off`).
+    fn five_x_synced_mode(cc: Option<&aspx::CompandingControl>) -> Option<aspx::CompandingMode> {
+        let cc = cc?;
+        if !matches!(cc.sync_flag, Some(true)) {
+            return None;
+        }
+        let mode = aspx::CompandingMode::from_control(cc, 0);
+        match mode {
+            aspx::CompandingMode::SyncPerSlot | aspx::CompandingMode::SyncAveraged => Some(mode),
+            _ => None,
+        }
+    }
+
+    /// Round 44: drive every entry through the synced-companding
+    /// pipeline (when `synced_mode` is `Some`), apply the resulting
+    /// PCM to `pcm_per_channel[slot]`. Otherwise (sync mode = None),
+    /// drive each entry through the per-channel pipeline.
+    ///
+    /// Each entry is `(slot, pcm_f, trailer, ch, sb0_override)`.
+    /// `aspx_cfg` is shared across all entries (one config per 5_X
+    /// substream).
+    #[allow(clippy::too_many_arguments)]
+    fn extend_5x_entries(
+        &mut self,
+        entries: Vec<FiveXChannelEntry<'_>>,
+        aspx_cfg: Option<aspx::AspxConfig>,
+        companding: Option<&aspx::CompandingControl>,
+        num_ts_in_ats: u32,
+        pcm_per_channel: &mut [Option<Vec<i16>>],
+    ) {
+        let synced = Self::five_x_synced_mode(companding);
+        if let (Some(mode), Some(cfg)) = (synced, aspx_cfg) {
+            // Cross-channel synced path. Build the entries-with-trailer
+            // list (skipping any whose trailer is missing — those fall
+            // back to the unmodified PCM for that slot).
+            let mut sync_entries: Vec<SyncCompandingChannelEntry<'_>> = Vec::new();
+            // Track which entries had no trailer — they pass through
+            // the PCM unchanged.
+            let mut passthrough: Vec<(usize, &[f32])> = Vec::new();
+            for (slot, pcm_f, trailer_pair) in entries.iter() {
+                match trailer_pair {
+                    Some((trailer, is_secondary)) => {
+                        let ch = if *is_secondary {
+                            trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                        } else {
+                            &trailer.primary
+                        };
+                        sync_entries.push((*slot, pcm_f.as_slice(), trailer, ch, &cfg, None));
+                    }
+                    None => {
+                        passthrough.push((*slot, pcm_f.as_slice()));
+                    }
+                }
+            }
+            let extended =
+                self.extend_5x_channels_with_sync_companding(&sync_entries, num_ts_in_ats, mode);
+            for (slot, pcm) in extended {
+                pcm_per_channel[slot] = Some(Self::pcm_f32_to_i16(&pcm));
+            }
+            for (slot, pcm) in passthrough {
+                pcm_per_channel[slot] = Some(Self::pcm_f32_to_i16(pcm));
+            }
+            return;
+        }
+        // Per-channel path (sync_flag == 0 or sync_flag == 1 + Off).
+        for (slot, pcm_f, trailer_pair) in entries.into_iter() {
+            let pcm_i16 = match (aspx_cfg, trailer_pair) {
+                (Some(cfg), Some((trailer, is_secondary))) => {
+                    let ch = if is_secondary {
+                        trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                    } else {
+                        &trailer.primary
+                    };
+                    let compand_mode = Self::five_x_compand_mode_for_slot(companding, slot);
+                    let extended = self.aspx_extend_with_trailer(
+                        &pcm_f,
+                        trailer,
+                        ch,
+                        &cfg,
+                        slot,
+                        num_ts_in_ats,
+                        compand_mode,
+                        None,
+                    );
+                    Self::pcm_f32_to_i16(&extended)
+                }
+                _ => Self::pcm_f32_to_i16(&pcm_f),
+            };
+            pcm_per_channel[slot] = Some(pcm_i16);
+        }
+    }
+
     /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 2`
     /// dispatch: the parsed `four_channel_data` carries L/R/Ls/Rs in
     /// `scaled_spec_per_channel[0..4]` and the trailing
@@ -773,64 +1079,33 @@ impl Ac4Decoder {
             aspx_ls_rs.map(|t| (t, false)), // Ls
             aspx_ls_rs.map(|t| (t, true)),  // Rs
         ];
+        // Build the per-slot entries (slot, pcm_f, trailer_pair) for
+        // the L/R/Ls/Rs quartet, plus the centre. The centre joins the
+        // synced-companding cohort when both `back_mono` and a centre
+        // trailer are present — that way Pseudocode 121's
+        // `g_synch(ts) = (∏ g_ch(ts))^(1/M)` averages across all five
+        // 5_X channels, not just the four front/surround.
+        let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
         for (ch_in, &slot) in SLOT_MAP.iter().enumerate() {
             let Some(scaled) = four.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
             let pcm_f = self.imdct_channel_f32(slot, scaled, n);
-            let pcm = match (aspx_cfg, trailers_for_ch[ch_in]) {
-                (Some(cfg), Some((trailer, is_secondary))) => {
-                    let ch = if is_secondary {
-                        trailer.secondary.as_ref().unwrap_or(&trailer.primary)
-                    } else {
-                        &trailer.primary
-                    };
-                    let compand_mode = Self::five_x_compand_mode_for_slot(companding, slot);
-                    let extended = self.aspx_extend_with_trailer(
-                        &pcm_f,
-                        trailer,
-                        ch,
-                        &cfg,
-                        slot,
-                        num_ts_in_ats,
-                        compand_mode,
-                        // SIMPLE/ASPX cfg2 is not ASPX_ACPL_1, so sb0 ==
-                        // aspx_xover_band (the trailer's tables.sbx);
-                        // pass `None` to use the default.
-                        None,
-                    );
-                    Self::pcm_f32_to_i16(&extended)
-                }
-                _ => Self::pcm_f32_to_i16(&pcm_f),
-            };
-            pcm_per_channel[slot] = Some(pcm);
+            entries.push((slot, pcm_f, trailers_for_ch[ch_in]));
         }
-        // Centre — slot 2. `cfg2_back_mono` may carry a body when the
-        // walker decoded the trailing `mono_data(0)`; otherwise the
-        // centre stays silent. When the 1ch trailer + aspx_config are
-        // present, run the ASPX extension on the centre PCM.
         if let Some(mono) = back_mono {
             if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
-                let pcm = match (aspx_cfg, aspx_centre) {
-                    (Some(cfg), Some(trailer)) => {
-                        let compand_mode = Self::five_x_compand_mode_for_slot(companding, 2);
-                        let extended = self.aspx_extend_with_trailer(
-                            &pcm_f,
-                            trailer,
-                            &trailer.primary,
-                            &cfg,
-                            2,
-                            num_ts_in_ats,
-                            compand_mode,
-                            None,
-                        );
-                        Self::pcm_f32_to_i16(&extended)
-                    }
-                    _ => Self::pcm_f32_to_i16(&pcm_f),
-                };
-                pcm_per_channel[2] = Some(pcm);
+                let centre_pair = aspx_centre.map(|t| (t, false));
+                entries.push((2, pcm_f, centre_pair));
             }
         }
+        self.extend_5x_entries(
+            entries,
+            aspx_cfg,
+            companding,
+            num_ts_in_ats,
+            pcm_per_channel,
+        );
     }
 
     /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 0`
@@ -904,56 +1179,63 @@ impl Ac4Decoder {
         //   slot 3 (Ls) -> aspx_ls_rs.primary
         //   slot 4 (Rs) -> aspx_ls_rs.secondary
         //   slot 2 (C)  -> aspx_centre.primary
+        let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
         for (ch_in, &slot) in slot_map_a.iter().enumerate() {
             let Some(scaled) = tcd_a.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
             let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
-            let pcm = self.maybe_extend_5x_slot(
+            entries.push((
                 slot,
                 pcm_f,
-                aspx_lr,
-                aspx_ls_rs,
-                aspx_centre,
-                aspx_cfg,
-                companding,
-                num_ts_in_ats,
-            );
-            pcm_per_channel[slot] = Some(pcm);
+                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+            ));
         }
         for (ch_in, &slot) in slot_map_b.iter().enumerate() {
             let Some(scaled) = tcd_b.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
             let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
-            let pcm = self.maybe_extend_5x_slot(
+            entries.push((
                 slot,
                 pcm_f,
-                aspx_lr,
-                aspx_ls_rs,
-                aspx_centre,
-                aspx_cfg,
-                companding,
-                num_ts_in_ats,
-            );
-            pcm_per_channel[slot] = Some(pcm);
+                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+            ));
         }
-        // Centre — slot 2. `cfg0_centre_mono` carries the trailing
-        // `mono_data(0)` body when the walker decoded it.
         if let Some(mono) = centre_mono {
             if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
-                let pcm = self.maybe_extend_5x_slot(
+                entries.push((
                     2,
                     pcm_f,
-                    aspx_lr,
-                    aspx_ls_rs,
-                    aspx_centre,
-                    aspx_cfg,
-                    companding,
-                    num_ts_in_ats,
-                );
-                pcm_per_channel[2] = Some(pcm);
+                    Self::trailer_for_5x_slot(2, aspx_lr, aspx_ls_rs, aspx_centre),
+                ));
             }
+        }
+        self.extend_5x_entries(
+            entries,
+            aspx_cfg,
+            companding,
+            num_ts_in_ats,
+            pcm_per_channel,
+        );
+    }
+
+    /// Round 42: canonical Table-25 trailer-to-slot mapping for the
+    /// 5_X SIMPLE/ASPX dispatchers. Returns `(trailer, is_secondary)`
+    /// when the appropriate trailer is present, else `None`.
+    fn trailer_for_5x_slot<'a>(
+        slot: usize,
+        aspx_lr: Option<&'a aspx::FiveXAspxTrailer>,
+        aspx_ls_rs: Option<&'a aspx::FiveXAspxTrailer>,
+        aspx_centre: Option<&'a aspx::FiveXAspxTrailer>,
+    ) -> Option<(&'a aspx::FiveXAspxTrailer, bool)> {
+        match slot {
+            0 => aspx_lr.map(|t| (t, false)),
+            1 => aspx_lr.map(|t| (t, true)),
+            2 => aspx_centre.map(|t| (t, false)),
+            3 => aspx_ls_rs.map(|t| (t, false)),
+            4 => aspx_ls_rs.map(|t| (t, true)),
+            _ => None,
         }
     }
 
@@ -971,6 +1253,7 @@ impl Ac4Decoder {
     ///   slot 4 (Rs) -> aspx_ls_rs.secondary
     ///   slot 2 (C)  -> aspx_centre.primary
     /// Trailers / config absent -> i16 cast of `pcm_f` only.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn maybe_extend_5x_slot(
         &mut self,
@@ -983,14 +1266,7 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
     ) -> Vec<i16> {
-        let trailer_pair: Option<(&aspx::FiveXAspxTrailer, bool)> = match slot {
-            0 => aspx_lr.map(|t| (t, false)),
-            1 => aspx_lr.map(|t| (t, true)),
-            2 => aspx_centre.map(|t| (t, false)),
-            3 => aspx_ls_rs.map(|t| (t, false)),
-            4 => aspx_ls_rs.map(|t| (t, true)),
-            _ => None,
-        };
+        let trailer_pair = Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre);
         match (aspx_cfg, trailer_pair) {
             (Some(cfg), Some((trailer, is_secondary))) => {
                 let ch = if is_secondary {
@@ -1064,22 +1340,17 @@ impl Ac4Decoder {
             pcm_per_channel.push(None);
         }
         const THREE_SLOTS: [usize; 3] = [0, 1, 2];
+        let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
         for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {
             let Some(scaled) = three.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
             let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
-            let pcm = self.maybe_extend_5x_slot(
+            entries.push((
                 slot,
                 pcm_f,
-                aspx_lr,
-                aspx_ls_rs,
-                aspx_centre,
-                aspx_cfg,
-                companding,
-                num_ts_in_ats,
-            );
-            pcm_per_channel[slot] = Some(pcm);
+                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+            ));
         }
         const TWO_SLOTS: [usize; 2] = [3, 4];
         for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
@@ -1087,18 +1358,19 @@ impl Ac4Decoder {
                 continue;
             };
             let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
-            let pcm = self.maybe_extend_5x_slot(
+            entries.push((
                 slot,
                 pcm_f,
-                aspx_lr,
-                aspx_ls_rs,
-                aspx_centre,
-                aspx_cfg,
-                companding,
-                num_ts_in_ats,
-            );
-            pcm_per_channel[slot] = Some(pcm);
+                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+            ));
         }
+        self.extend_5x_entries(
+            entries,
+            aspx_cfg,
+            companding,
+            num_ts_in_ats,
+            pcm_per_channel,
+        );
     }
 
     /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 3`
@@ -1138,23 +1410,25 @@ impl Ac4Decoder {
             pcm_per_channel.push(None);
         }
         const SLOT_MAP: [usize; 5] = [0, 1, 2, 3, 4];
+        let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
         for (ch_in, &slot) in SLOT_MAP.iter().enumerate() {
             let Some(scaled) = five.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
             let pcm_f = self.imdct_channel_f32(slot, scaled, n);
-            let pcm = self.maybe_extend_5x_slot(
+            entries.push((
                 slot,
                 pcm_f,
-                aspx_lr,
-                aspx_ls_rs,
-                aspx_centre,
-                aspx_cfg,
-                companding,
-                num_ts_in_ats,
-            );
-            pcm_per_channel[slot] = Some(pcm);
+                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+            ));
         }
+        self.extend_5x_entries(
+            entries,
+            aspx_cfg,
+            companding,
+            num_ts_in_ats,
+            pcm_per_channel,
+        );
     }
 
     /// §5.3.4.4.1 / Table 182 / Table 183 — 7_X SIMPLE/ASPX additional-
@@ -4952,5 +5226,150 @@ mod tests {
             diffs_per_avg > 0,
             "Averaged must diverge from PerSlot (diffs={diffs_per_avg})"
         );
+    }
+
+    /// Round 44: `five_x_synced_mode` returns `Some(SyncPerSlot)` /
+    /// `Some(SyncAveraged)` only when sync_flag=1 + the appropriate
+    /// `compand_on[0]` / `compand_avg` flags resolve to one of the
+    /// active sync sub-branches; returns `None` for all other states
+    /// (no companding control, sync_flag=0, sync_flag=1+Off).
+    #[test]
+    fn five_x_synced_mode_resolves_each_branch() {
+        // No companding control -> None.
+        assert!(Ac4Decoder::five_x_synced_mode(None).is_none());
+        // sync_flag=0 -> None (per-channel path).
+        let cc_per = aspx::CompandingControl {
+            sync_flag: Some(false),
+            compand_on: vec![true, false, true, false, true],
+            compand_avg: Some(true),
+        };
+        assert!(Ac4Decoder::five_x_synced_mode(Some(&cc_per)).is_none());
+        // sync_flag=None (mono case) -> None.
+        let cc_mono = aspx::CompandingControl {
+            sync_flag: None,
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        assert!(Ac4Decoder::five_x_synced_mode(Some(&cc_mono)).is_none());
+        // sync_flag=1, compand_on[0]=true -> SyncPerSlot.
+        let cc_sync_on = aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![true],
+            compand_avg: None,
+        };
+        assert_eq!(
+            Ac4Decoder::five_x_synced_mode(Some(&cc_sync_on)),
+            Some(aspx::CompandingMode::SyncPerSlot)
+        );
+        // sync_flag=1, compand_on[0]=false, compand_avg=true -> SyncAveraged.
+        let cc_sync_avg = aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![false],
+            compand_avg: Some(true),
+        };
+        assert_eq!(
+            Ac4Decoder::five_x_synced_mode(Some(&cc_sync_avg)),
+            Some(aspx::CompandingMode::SyncAveraged)
+        );
+        // sync_flag=1, compand_on[0]=false, compand_avg=false -> None
+        // (companding actually off; per-channel path takes the no-op
+        // branch).
+        let cc_sync_off = aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![false],
+            compand_avg: Some(false),
+        };
+        assert!(Ac4Decoder::five_x_synced_mode(Some(&cc_sync_off)).is_none());
+    }
+
+    /// Round 44: `extend_5x_channels_with_sync_companding` returns
+    /// one output PCM slice per input entry, in input order. The
+    /// helper is the integration glue between the per-channel
+    /// `aspx_extend_to_qmf` phase and the cross-channel
+    /// `apply_synchronised_companding_across_channels` apply — this
+    /// test pins the output cardinality + slot order. The numerical
+    /// behaviour (geometric-mean equalisation) is exhaustively
+    /// covered in `aspx::tests::apply_synchronised_companding_*`
+    /// against the bare QMF helper.
+    #[test]
+    fn extend_5x_channels_with_sync_companding_returns_one_output_per_entry() {
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        };
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let ch = aspx::FiveXAspxChannelTrailer {
+            framing: aspx::AspxFraming {
+                int_class: aspx::AspxIntClass::FixFix,
+                num_env: 1,
+                num_noise: 1,
+                freq_res: vec![true],
+                var_bord_left: None,
+                var_bord_right: None,
+                num_rel_left: 0,
+                num_rel_right: 0,
+                rel_bord_left: vec![],
+                rel_bord_right: vec![],
+                tsg_ptr: None,
+            },
+            qmode_env: aspx::AspxQuantStep::Fine,
+            data_sig: vec![],
+            data_noise: vec![],
+            delta_dir: aspx::AspxDeltaDir {
+                sig_delta_dir: vec![],
+                noise_delta_dir: vec![],
+            },
+            add_harmonic: None,
+            tna_mode: None,
+        };
+        let trailer = aspx::FiveXAspxTrailer {
+            xover: 0,
+            frequency_tables: tables,
+            primary: ch.clone(),
+            secondary: Some(ch.clone()),
+        };
+        let n_slots = 24usize;
+        let n = n_slots * 64;
+        let mut pcm_a = vec![0.0f32; n];
+        let mut pcm_b = vec![0.0f32; n];
+        let f1 = 700.0_f32 / 48_000.0_f32;
+        let f2 = 1100.0_f32 / 48_000.0_f32;
+        for i in 0..n {
+            pcm_a[i] = 0.05 * (2.0 * std::f32::consts::PI * f1 * i as f32).sin();
+            pcm_b[i] = 0.8 * (2.0 * std::f32::consts::PI * f2 * i as f32).sin();
+        }
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let entries: Vec<SyncCompandingChannelEntry<'_>> = vec![
+            (0, &pcm_a, &trailer, &trailer.primary, &cfg, None),
+            (
+                3,
+                &pcm_b,
+                &trailer,
+                trailer.secondary.as_ref().unwrap(),
+                &cfg,
+                None,
+            ),
+        ];
+        let out = dec.extend_5x_channels_with_sync_companding(
+            &entries,
+            1,
+            aspx::CompandingMode::SyncPerSlot,
+        );
+        assert_eq!(out.len(), 2);
+        // Slot indices preserved in input order.
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[1].0, 3);
+        // Each PCM matches the input length.
+        assert_eq!(out[0].1.len(), n);
+        assert_eq!(out[1].1.len(), n);
     }
 }

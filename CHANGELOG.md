@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 44 — companding `sync_flag == 1` cross-channel synchronisation
+  (Pseudocode 121's exact `g_synch(ts) = (∏ g_ch)^(1/M)`)** (TS 103
+  190-1 §5.7.5.2 + Pseudocode 121):
+  - `aspx::compute_companding_levels(q, sb0, sb1)` exposes the
+    per-slot energy `L_ch(ts) = 0.9105 * mean E_ch(sb,ts)` without
+    applying gain — the building block the synced path collects
+    across channels.
+  - `aspx::levels_to_scales_per_slot(levels)` and
+    `aspx::levels_to_scale_averaged(levels)` produce the per-slot
+    array (PerSlot / SyncPerSlot) and single constant (Averaged /
+    SyncAveraged) scales `g(ts) * G` from a level vector.
+  - `aspx::apply_companding_scales_on_qmf(q, sb0, sb1, scales)`
+    applies pre-computed scales — used by both the single-channel
+    legacy path and the synced multi-channel path.
+  - `aspx::apply_synchronised_companding_across_channels(channels, mode)`
+    implements Pseudocode 121's `sync_flag == 1` branch directly:
+    collects every channel's `L_ch(ts)`, computes `g_synch(ts)` as
+    the geometric mean across `M` channels (`SyncPerSlot`) or
+    `g_avg,synch` from per-channel averaged levels (`SyncAveraged`),
+    then applies the synced gain `g_synch(ts) * G` UNIFORMLY to
+    every contributing channel. Geometric mean is computed via
+    log-sum / exp for numerical stability across many channels.
+  - `Ac4Decoder::aspx_extend_to_qmf(...)` is the new phase-1 split:
+    runs the QMF analysis + HF generation + envelope adjustment +
+    noise / tone injection, returns `(qmf_matrix, sbx, sbz)` BEFORE
+    companding + synthesis. Returns `None` when the QMF
+    preconditions trip (length / table / patch derivation).
+  - `Ac4Decoder::qmf_synthesise_pcm(q, out_len)` is the phase-2
+    split: runs the inverse QMF synthesis and returns PCM. Caller
+    is responsible for having applied any §5.7.5 gain.
+  - `Ac4Decoder::extend_5x_channels_with_sync_companding(...)` is
+    the integration glue: drives every entry through phase-1,
+    collects QMF matrices, calls the synced apply, drives every
+    entry through phase-2. Channels whose phase-1 returned `None`
+    fall through to the unmodified PCM (matching the per-channel
+    `aspx_extend_pcm` contract).
+  - `Ac4Decoder::extend_5x_entries(...)` is the shared front-end
+    used by `dispatch_5x_cfg{0,1,2,3}_simple_aspx`: routes through
+    the synced cross-channel path when `companding.sync_flag == 1`,
+    otherwise through the per-channel path.
+  - `Ac4Decoder::five_x_synced_mode(cc)` resolves the synced mode
+    once for the whole 5_X frame (Pseudocode 121 broadcasts
+    `compand_on[0]` to every channel under `sync_flag == 1`).
+  - All four `dispatch_5x_cfg{0,1,2,3}_simple_aspx` routes
+    refactored to build a per-channel entries list then route
+    through `extend_5x_entries`. Cfg2 now also folds the centre
+    channel into the synced cohort when `back_mono` is present, so
+    `M == 5` for the geometric mean across all five 5_X channels
+    (was `M == 4` in the round-43 approximation).
+  - The round-43 single-channel approximation (`SyncPerSlot` /
+    `SyncAveraged` collapsing to per-channel `g_ch` / `g_avg,ch`)
+    is RETIRED — every 5_X SIMPLE/ASPX dispatcher now applies the
+    exact synchronised gain across all contributing channels.
+
 - **Round 43 — companding `b_compand_avg` + `sync_flag == 1` branches +
   ASPX_ACPL_1 sb0 = `acpl_qmf_band` hookup** (TS 103 190-1 §5.7.5.2 +
   Pseudocode 121):

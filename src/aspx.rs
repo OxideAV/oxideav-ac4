@@ -706,12 +706,16 @@ pub fn parse_companding_control(
 ///                                 -> Off          (no-op)
 /// ```
 ///
-/// In the current per-channel decode pipeline the sync branches are
-/// approximated by the per-channel branches (geometric mean across
-/// `M = 1` channels reduces to the single channel's gain). Multi-channel
-/// synchronisation is documented as a known limitation; the per-channel
-/// gain shape is still applied so the decoder still inverts the
-/// encoder's gain reshaping.
+/// As of round 44 the multi-channel sync branches are no longer
+/// approximated by per-channel gain: the
+/// [`apply_synchronised_companding_across_channels`] helper drives
+/// Pseudocode 121's `g_synch(ts) = (∏_{ch=0..M} g_ch(ts))^(1/M)`
+/// across all `M` contributing channels of a 5_X frame, then applies
+/// the synchronised gain uniformly to every channel via the shared
+/// front-end `Ac4Decoder::extend_5x_entries`. The single-channel
+/// `apply_companding_on_qmf_with_mode(SyncPerSlot)` path still exists
+/// for the M=1 case (and is exact there — geometric mean of one
+/// element collapses to the element itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompandingMode {
     /// `b_compand_on[ch] == FALSE && (b_compand_avg == FALSE || not signalled)`.
@@ -720,11 +724,14 @@ pub enum CompandingMode {
     PerSlot,
     /// `sync_flag == 0 && b_compand_on[ch] == FALSE && b_compand_avg == TRUE`.
     Averaged,
-    /// `sync_flag == 1 && b_compand_on[0] == TRUE`. In a single-channel
-    /// pipeline this collapses onto the per-slot gain (`M = 1` case).
+    /// `sync_flag == 1 && b_compand_on[0] == TRUE`. Round 44: the
+    /// multi-channel exact `g_synch(ts) = (∏ g_ch)^(1/M)` is applied
+    /// via [`apply_synchronised_companding_across_channels`]. With
+    /// `M = 1` the geometric mean collapses onto the per-slot gain.
     SyncPerSlot,
     /// `sync_flag == 1 && b_compand_on[0] == FALSE && b_compand_avg == TRUE`.
-    /// Averaged, single-channel approximation as above.
+    /// Round 44: averaged geometric-mean across all M channels, exact
+    /// per Pseudocode 121.
     SyncAveraged,
 }
 
@@ -782,11 +789,13 @@ impl CompandingMode {
 ///
 /// Branch behaviour per [`CompandingMode`]:
 ///   * `Off` — no-op (channel passes through untouched).
-///   * `PerSlot` / `SyncPerSlot` — apply g(ts) per timeslot. (For
-///     `SyncPerSlot` with `M > 1` the spec averages g_ch across
-///     channels via geometric mean; the per-channel pipeline can't see
-///     other channels' gains so we apply the local gain — exact for
-///     `M == 1`.)
+///   * `PerSlot` / `SyncPerSlot` — apply g(ts) per timeslot. With
+///     `M > 1` and `SyncPerSlot`, the spec's `g_synch(ts) = (∏
+///     g_ch)^(1/M)` cross-channel synchronisation is handled by
+///     [`apply_synchronised_companding_across_channels`] from the
+///     5_X dispatcher front-end (`Ac4Decoder::extend_5x_entries`);
+///     this single-channel entry-point applies the local
+///     `g_ch(ts)` (exact for `M == 1`).
 ///   * `Averaged` / `SyncAveraged` — average L_ch(ts) over the entire
 ///     A-SPX interval, derive a single constant gain, apply it.
 pub fn apply_companding_on_qmf_with_mode(
@@ -818,8 +827,8 @@ pub fn apply_companding_on_qmf_with_mode(
     if k <= 0.0 {
         return;
     }
-    const ALPHA: f32 = 0.65;
-    let g_const = 2.0_f32.powf(ALPHA); // G in §5.7.5.2.
+    const ALPHA: f32 = COMPANDING_ALPHA;
+    let g_const = companding_g(); // G = 2^alpha in §5.7.5.2.
     let exp_g = (1.0 - ALPHA) / ALPHA;
     // Per-slot absolute level L_ch(ts).
     let mut levels = Vec::with_capacity(n_slots);
@@ -882,6 +891,276 @@ pub fn apply_companding_on_qmf_with_mode(
 /// through.
 pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
     apply_companding_on_qmf_with_mode(q, sbx, sbz, CompandingMode::PerSlot);
+}
+
+/// Companding alpha coefficient per §5.7.5.2.
+const COMPANDING_ALPHA: f32 = 0.65;
+
+/// `G = 2^alpha` per §5.7.5.2. Derived at call-time (not as a const)
+/// so the value matches `2.0_f32.powf(ALPHA)` exactly across the
+/// per-channel ([`apply_companding_on_qmf_with_mode`]) and synced
+/// ([`apply_synchronised_companding_across_channels`]) paths — a
+/// pre-computed `f32` literal trips the round-43 bit-equality test
+/// that the new helpers must hold against the legacy single-call
+/// branch.
+#[inline]
+fn companding_g() -> f32 {
+    2.0_f32.powf(COMPANDING_ALPHA)
+}
+
+/// Type alias for one channel's QMF time-domain matrix
+/// (`q[sb][ts] = (re, im)`). Used by the cross-channel synced
+/// companding path to thread mutable references through Pseudocode
+/// 121's geometric-mean computation.
+pub type QmfMatrix = Vec<Vec<(f32, f32)>>;
+
+/// Type alias for an entry in the cross-channel synced companding
+/// view: `(qmf_matrix, sb0, sb1)` per channel.
+pub type SyncCompandingEntry<'a> = (&'a mut QmfMatrix, u32, u32);
+
+/// Compute the per-slot energy levels `L_ch(ts)` for one channel's
+/// QMF matrix per ETSI TS 103 190-1 §5.7.5.2:
+///
+/// ```text
+/// E_ch(sb,ts) = max(|Re|,|Im|) + 0.5 * min(|Re|,|Im|)
+/// L_ch(ts)    = 0.9105 * mean_{sb in [sb0,sb1)} E_ch(sb,ts)
+/// ```
+///
+/// Returns one value per QMF time-slot — the smallest `n_slots` across
+/// affected subbands. Returns an empty vector when the input range is
+/// degenerate (`sb1 <= sb0`, sbz out of range, etc.).
+///
+/// Does NOT apply any gain — caller composes gains and calls
+/// [`apply_companding_scales_on_qmf`] to write back. This split is what
+/// the cross-channel `sync_flag == 1` synchronisation path
+/// ([`apply_synchronised_companding_across_channels`]) builds on:
+/// every channel's L is collected, their per-channel gains are
+/// combined into one `g_synch(ts)`, then re-applied uniformly.
+pub fn compute_companding_levels(q: &[Vec<(f32, f32)>], sb0: u32, sb1: u32) -> Vec<f32> {
+    let sb0_u = sb0 as usize;
+    let sb1_u = sb1 as usize;
+    if sb1_u <= sb0_u || q.len() < sb1_u {
+        return Vec::new();
+    }
+    let mut n_slots = usize::MAX;
+    for row in q.iter().take(sb1_u).skip(sb0_u) {
+        if row.len() < n_slots {
+            n_slots = row.len();
+        }
+    }
+    if n_slots == usize::MAX || n_slots == 0 {
+        return Vec::new();
+    }
+    let k = (sb1_u - sb0_u) as f32;
+    if k <= 0.0 {
+        return Vec::new();
+    }
+    let mut levels = Vec::with_capacity(n_slots);
+    for ts in 0..n_slots {
+        let mut sum: f32 = 0.0;
+        for row in q.iter().take(sb1_u).skip(sb0_u) {
+            let (re, im) = row[ts];
+            let ar = re.abs();
+            let ai = im.abs();
+            sum += ar.max(ai) + 0.5 * ar.min(ai);
+        }
+        levels.push(0.9105 * (sum / k));
+    }
+    levels
+}
+
+/// Convert per-slot level array to per-slot scales `g(ts) * G` per
+/// Pseudocode 121's per-slot branches:
+///
+/// ```text
+/// g(ts) = (L(ts))^((1-alpha)/alpha)   if L(ts) > 0
+/// g(ts) = 1                            otherwise (silent slot)
+/// scale(ts) = g(ts) * G
+/// ```
+///
+/// Used by [`apply_companding_on_qmf_with_mode`] for the per-slot
+/// branches (`PerSlot` / `SyncPerSlot`) and by
+/// [`apply_synchronised_companding_across_channels`] for the slot-wise
+/// portion of `g_synch(ts)`.
+pub fn levels_to_scales_per_slot(levels: &[f32]) -> Vec<f32> {
+    let exp_g = (1.0 - COMPANDING_ALPHA) / COMPANDING_ALPHA;
+    levels
+        .iter()
+        .map(|&l| {
+            let g = if l > 0.0 { l.powf(exp_g) } else { 1.0 };
+            g * companding_g()
+        })
+        .collect()
+}
+
+/// Convert per-slot level array to a single constant scale per
+/// Pseudocode 121's averaged branches:
+///
+/// ```text
+/// L_avg = mean_{ts} L(ts)
+/// g_avg = (L_avg)^((1-alpha)/alpha)   if L_avg > 0
+/// g_avg = 1                            otherwise (all-silent interval)
+/// scale = g_avg * G                   (broadcast over all slots)
+/// ```
+///
+/// Used by [`apply_companding_on_qmf_with_mode`] for the averaged
+/// branches (`Averaged` / `SyncAveraged`).
+pub fn levels_to_scale_averaged(levels: &[f32]) -> f32 {
+    if levels.is_empty() {
+        return companding_g();
+    }
+    let l_avg = levels.iter().sum::<f32>() / (levels.len() as f32);
+    let exp_g = (1.0 - COMPANDING_ALPHA) / COMPANDING_ALPHA;
+    let g = if l_avg > 0.0 { l_avg.powf(exp_g) } else { 1.0 };
+    g * companding_g()
+}
+
+/// Apply pre-computed per-slot scales to the QMF matrix bands
+/// `[sb0, sb1)`. `scales` length must match the smallest `n_slots`
+/// across the affected subbands. No-op when the range is degenerate
+/// or `scales` is empty.
+pub fn apply_companding_scales_on_qmf(
+    q: &mut [Vec<(f32, f32)>],
+    sb0: u32,
+    sb1: u32,
+    scales: &[f32],
+) {
+    let sb0_u = sb0 as usize;
+    let sb1_u = sb1 as usize;
+    if sb1_u <= sb0_u || q.len() < sb1_u || scales.is_empty() {
+        return;
+    }
+    let n_slots = scales.len();
+    for row in q.iter_mut().take(sb1_u).skip(sb0_u) {
+        let take = row.len().min(n_slots);
+        for ts in 0..take {
+            let (re, im) = row[ts];
+            let s = scales[ts];
+            row[ts] = (re * s, im * s);
+        }
+    }
+}
+
+/// Cross-channel synchronised companding per ETSI TS 103 190-1
+/// §5.7.5.2 / Pseudocode 121's `sync_flag == 1` branches.
+///
+/// Pseudocode 121 specifies:
+///
+/// ```text
+/// for each ts:
+///   for each ch in 0..M:
+///     L_ch(ts)  = 0.9105 * mean_{sb in [sb0_ch,sb1_ch)} E_ch(sb,ts)
+///     g_ch(ts)  = L_ch(ts) ^ ((1-alpha)/alpha)
+///   g_synch(ts) = (prod_{ch=0..M} g_ch(ts)) ^ (1/M)
+///   ; g_synch(ts) is then applied to EVERY channel:
+///   for each ch in 0..M:
+///     scale = g_synch(ts) * G
+///     for each sb in [sb0_ch, sb1_ch), apply scale * Q_in[sb][ts]
+/// ```
+///
+/// For `SyncPerSlot` (`b_compand_on[0] == TRUE`) this is the per-slot
+/// path. For `SyncAveraged` (`b_compand_on[0] == FALSE && b_compand_avg
+/// == TRUE`) the same product/root is applied to the per-channel
+/// averaged levels (`L_avg,ch`) producing a single constant
+/// `g_avg,synch` broadcast to every slot.
+///
+/// `channels` carries one mutable QMF matrix per output channel, paired
+/// with that channel's `[sb0, sb1)` band range (typically
+/// `aspx_xover_band` for SIMPLE/ASPX, `acpl_qmf_band` for
+/// ASPX_ACPL_1). Channels with degenerate ranges or empty matrices are
+/// skipped from BOTH gain accumulation and gain application — the
+/// remaining channels still synchronise across themselves.
+///
+/// `mode` must be either [`CompandingMode::SyncPerSlot`] or
+/// [`CompandingMode::SyncAveraged`]; any other variant (including
+/// `Off` and the non-sync per-channel modes) is treated as a no-op.
+///
+/// Geometric-mean computation uses log/exp to stay numerically stable
+/// when the per-channel gains span many orders of magnitude. A
+/// per-channel `g_ch <= 0` is replaced with `1` (the silent-slot
+/// convention from [`levels_to_scales_per_slot`]) so the geometric
+/// mean stays well-defined.
+pub fn apply_synchronised_companding_across_channels(
+    channels: &mut [SyncCompandingEntry<'_>],
+    mode: CompandingMode,
+) {
+    if !matches!(
+        mode,
+        CompandingMode::SyncPerSlot | CompandingMode::SyncAveraged
+    ) {
+        return;
+    }
+    if channels.is_empty() {
+        return;
+    }
+    // Collect per-channel level vectors. Skip channels whose level
+    // computation came back empty (degenerate band / empty QMF).
+    let mut per_ch_levels: Vec<(usize, Vec<f32>)> = Vec::with_capacity(channels.len());
+    let mut common_n_slots = usize::MAX;
+    for (idx, (q, sb0, sb1)) in channels.iter().enumerate() {
+        let levels = compute_companding_levels(q, *sb0, *sb1);
+        if levels.is_empty() {
+            continue;
+        }
+        if levels.len() < common_n_slots {
+            common_n_slots = levels.len();
+        }
+        per_ch_levels.push((idx, levels));
+    }
+    if per_ch_levels.is_empty() || common_n_slots == 0 || common_n_slots == usize::MAX {
+        return;
+    }
+    let m = per_ch_levels.len() as f32;
+    let exp_g = (1.0 - COMPANDING_ALPHA) / COMPANDING_ALPHA;
+    // Per-channel per-slot gain g_ch(ts) (pre-G), trimmed to the
+    // common slot count so all channels share one synchronised slot
+    // axis. Silent slots use g = 1 per the per-slot branch convention.
+    let per_ch_g: Vec<Vec<f32>> = per_ch_levels
+        .iter()
+        .map(|(_, lv)| {
+            lv.iter()
+                .take(common_n_slots)
+                .map(|&l| if l > 0.0 { l.powf(exp_g) } else { 1.0 })
+                .collect::<Vec<f32>>()
+        })
+        .collect();
+    let synced_scales: Vec<f32> = match mode {
+        CompandingMode::SyncPerSlot => {
+            // g_synch(ts) = (prod_ch g_ch(ts))^(1/M). Use sum of logs
+            // to keep the product stable across many channels.
+            let mut scales = Vec::with_capacity(common_n_slots);
+            for ts in 0..common_n_slots {
+                let mut log_sum = 0.0_f32;
+                for g_row in per_ch_g.iter() {
+                    let g = g_row[ts].max(1e-30); // guard log(0)
+                    log_sum += g.ln();
+                }
+                let g_sync = (log_sum / m).exp();
+                scales.push(g_sync * companding_g());
+            }
+            scales
+        }
+        CompandingMode::SyncAveraged => {
+            // g_avg,synch = (prod_ch g_avg,ch)^(1/M).
+            // g_avg,ch derived from per-channel averaged L (Pseudocode
+            // 121's `L_avg,ch = mean_{ts} L_ch(ts)`).
+            let mut log_sum = 0.0_f32;
+            for (_, lv) in per_ch_levels.iter() {
+                let l_avg = lv.iter().sum::<f32>() / (lv.len() as f32);
+                let g_avg = if l_avg > 0.0 { l_avg.powf(exp_g) } else { 1.0 };
+                log_sum += g_avg.max(1e-30).ln();
+            }
+            let g_sync = (log_sum / m).exp();
+            let constant = g_sync * companding_g();
+            vec![constant; common_n_slots]
+        }
+        _ => unreachable!("guarded by the early-return above"),
+    };
+    // Apply the synchronised scales to every contributing channel.
+    for &(idx, _) in per_ch_levels.iter() {
+        let (q, sb0, sb1) = &mut channels[idx];
+        apply_companding_scales_on_qmf(q, *sb0, *sb1, &synced_scales);
+    }
 }
 
 /// Captured bitstream state for one 5_X SIMPLE/ASPX trailer
@@ -6082,5 +6361,267 @@ mod tests {
         let (sig, noise) = derive_atsg_borders(16, &frm).unwrap();
         assert_eq!(sig, vec![12, 16]);
         assert_eq!(noise, vec![0, 16]); // 1 noise env => [0, T]
+    }
+
+    /// Round 44: `compute_companding_levels` returns one value per
+    /// QMF time-slot, computing `0.9105 * mean E_ch(sb,ts)` over the
+    /// affected band. On a constant-magnitude QMF input, every level
+    /// must equal the constant `0.9105 * E` (where E = max + 0.5*min
+    /// of the per-sample re/im pair).
+    #[test]
+    fn compute_companding_levels_returns_constant_on_constant_input() {
+        // QMF matrix: 64 subbands * 16 slots, each (re, im) = (0.4, 0.2).
+        let q: Vec<Vec<(f32, f32)>> = vec![vec![(0.4_f32, 0.2_f32); 16]; 64];
+        // E = max(0.4, 0.2) + 0.5 * min(0.4, 0.2) = 0.4 + 0.5*0.2 = 0.5
+        // L = 0.9105 * 0.5 = 0.45525
+        let levels = compute_companding_levels(&q, 8, 32);
+        assert_eq!(levels.len(), 16);
+        for &l in levels.iter() {
+            assert!(
+                (l - 0.45525_f32).abs() < 1e-5,
+                "expected L=0.45525 on constant input, got {l}"
+            );
+        }
+    }
+
+    /// Round 44: `compute_companding_levels` returns an empty vector
+    /// for degenerate ranges (sb1 <= sb0, sb1 > q.len()).
+    #[test]
+    fn compute_companding_levels_returns_empty_on_degenerate_range() {
+        let q: Vec<Vec<(f32, f32)>> = vec![vec![(1.0_f32, 1.0_f32); 8]; 64];
+        assert!(compute_companding_levels(&q, 16, 16).is_empty());
+        assert!(compute_companding_levels(&q, 32, 8).is_empty());
+        assert!(compute_companding_levels(&q, 0, 65).is_empty());
+    }
+
+    /// Round 44: `levels_to_scales_per_slot` matches the per-slot
+    /// scale that `apply_companding_on_qmf_with_mode(PerSlot)`
+    /// produces internally. The product `g(ts) * G` should be
+    /// identical between the split helper + the legacy single-call
+    /// path on the same input.
+    #[test]
+    fn levels_to_scales_per_slot_matches_legacy_per_slot_branch() {
+        // Build a QMF with varying per-slot energy (so g_ch(ts)
+        // differs per slot). Use a ramp.
+        let n_slots = 8;
+        let mut q: Vec<Vec<(f32, f32)>> = (0..64)
+            .map(|sb| {
+                (0..n_slots)
+                    .map(|ts| {
+                        let v = (sb as f32 + ts as f32 + 1.0) * 0.05;
+                        (v, v * 0.5)
+                    })
+                    .collect()
+            })
+            .collect();
+        let q_baseline = q.clone();
+        // Apply the legacy path.
+        apply_companding_on_qmf_with_mode(&mut q, 4, 16, CompandingMode::PerSlot);
+        // Apply the split path on a copy.
+        let mut q2 = q_baseline.clone();
+        let levels = compute_companding_levels(&q2, 4, 16);
+        let scales = levels_to_scales_per_slot(&levels);
+        apply_companding_scales_on_qmf(&mut q2, 4, 16, &scales);
+        for sb in 0..64 {
+            for ts in 0..n_slots {
+                let (a_re, a_im) = q[sb][ts];
+                let (b_re, b_im) = q2[sb][ts];
+                assert!(
+                    (a_re - b_re).abs() < 1e-5 && (a_im - b_im).abs() < 1e-5,
+                    "split path diverges at (sb={sb}, ts={ts}): legacy=({a_re},{a_im}) split=({b_re},{b_im})"
+                );
+            }
+        }
+    }
+
+    /// Round 44: `apply_synchronised_companding_across_channels` with
+    /// `M = 1` collapses to the same gain as
+    /// `apply_companding_on_qmf_with_mode(SyncPerSlot)` (since the
+    /// geometric mean of one element is the element itself). Verifies
+    /// the sync helper preserves the round-43 single-channel
+    /// approximation behaviour as the M=1 base case.
+    #[test]
+    fn apply_synchronised_companding_collapses_to_per_slot_for_single_channel() {
+        let n_slots = 12;
+        let mut q1: Vec<Vec<(f32, f32)>> = (0..64)
+            .map(|sb| {
+                (0..n_slots)
+                    .map(|ts| {
+                        let v = ((sb + 1) as f32) * (1.0 + 0.1 * ts as f32) * 0.05;
+                        (v, v * 0.3)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut q2 = q1.clone();
+        apply_companding_on_qmf_with_mode(&mut q1, 6, 24, CompandingMode::SyncPerSlot);
+        let mut view: Vec<SyncCompandingEntry<'_>> = vec![(&mut q2, 6, 24)];
+        apply_synchronised_companding_across_channels(&mut view, CompandingMode::SyncPerSlot);
+        // ln+exp roundtrip introduces FP rounding (~1e-4 relative) vs
+        // the direct multiply path; bound the divergence accordingly.
+        for sb in 0..64 {
+            for ts in 0..n_slots {
+                let (a_re, a_im) = q1[sb][ts];
+                let (b_re, b_im) = q2[sb][ts];
+                let scale = a_re.abs().max(a_im.abs()).max(1e-3);
+                let tol = 1e-4 * scale;
+                assert!(
+                    (a_re - b_re).abs() < tol && (a_im - b_im).abs() < tol,
+                    "M=1 sync diverges from per-slot at (sb={sb}, ts={ts}): per-slot=({a_re},{a_im}) sync=({b_re},{b_im})"
+                );
+            }
+        }
+    }
+
+    /// Round 44: `apply_synchronised_companding_across_channels`
+    /// applies the SAME gain to every channel (the geometric-mean
+    /// gain), regardless of each channel's individual energy. Build
+    /// two channels with very different per-slot levels: the synced
+    /// gain on each must equal sqrt(g0(ts) * g1(ts)) * G — and so the
+    /// ratio Q_out/Q_in for each channel matches that synced scale.
+    #[test]
+    fn apply_synchronised_companding_uses_geometric_mean_across_channels() {
+        let n_slots = 6;
+        // Channel 0: low energy.
+        let mut q_lo: Vec<Vec<(f32, f32)>> = (0..64)
+            .map(|_sb| (0..n_slots).map(|_| (0.1_f32, 0.05_f32)).collect())
+            .collect();
+        // Channel 1: high energy.
+        let mut q_hi: Vec<Vec<(f32, f32)>> = (0..64)
+            .map(|_sb| (0..n_slots).map(|_| (0.9_f32, 0.45_f32)).collect())
+            .collect();
+        let q_lo_orig = q_lo.clone();
+        let q_hi_orig = q_hi.clone();
+        // Compute expected: g_lo(ts) * G applied to lo channel only
+        // (PerSlot baseline); g_synch(ts) * G after sync (geometric
+        // mean of g_lo and g_hi).
+        let l_lo = compute_companding_levels(&q_lo, 4, 16);
+        let l_hi = compute_companding_levels(&q_hi, 4, 16);
+        // Per-slot per-channel g_ch (pre-G).
+        let exp_g = (1.0 - COMPANDING_ALPHA) / COMPANDING_ALPHA;
+        let g_lo_ts: Vec<f32> = l_lo
+            .iter()
+            .map(|&l| if l > 0.0 { l.powf(exp_g) } else { 1.0 })
+            .collect();
+        let g_hi_ts: Vec<f32> = l_hi
+            .iter()
+            .map(|&l| if l > 0.0 { l.powf(exp_g) } else { 1.0 })
+            .collect();
+        let g_synch_ts: Vec<f32> = g_lo_ts
+            .iter()
+            .zip(g_hi_ts.iter())
+            .map(|(&a, &b)| (a * b).sqrt())
+            .collect();
+        // Apply synced companding.
+        let mut view: Vec<SyncCompandingEntry<'_>> = vec![(&mut q_lo, 4, 16), (&mut q_hi, 4, 16)];
+        apply_synchronised_companding_across_channels(&mut view, CompandingMode::SyncPerSlot);
+        // For each ts, the ratio Q_out/Q_in for both channels should
+        // equal g_synch(ts) * G — same scale on both!
+        for ts in 0..n_slots {
+            let ratio_lo = q_lo[5][ts].0 / q_lo_orig[5][ts].0;
+            let ratio_hi = q_hi[5][ts].0 / q_hi_orig[5][ts].0;
+            let expected = g_synch_ts[ts] * companding_g();
+            assert!(
+                (ratio_lo - expected).abs() < 1e-4,
+                "sync scale mismatch on lo channel at ts={ts}: got {ratio_lo}, expected {expected}"
+            );
+            assert!(
+                (ratio_hi - expected).abs() < 1e-4,
+                "sync scale mismatch on hi channel at ts={ts}: got {ratio_hi}, expected {expected}"
+            );
+            // Both channels share the same scale.
+            assert!(
+                (ratio_lo - ratio_hi).abs() < 1e-4,
+                "lo/hi sync scales must match at ts={ts}: lo={ratio_lo}, hi={ratio_hi}"
+            );
+        }
+    }
+
+    /// Round 44: `apply_synchronised_companding_across_channels` with
+    /// the `SyncAveraged` mode applies a single constant
+    /// (geometric-mean of per-channel averaged gains) across all slots.
+    /// Verifies the broadcast: every slot on every channel gets the
+    /// SAME scale.
+    #[test]
+    fn apply_synchronised_companding_averaged_broadcasts_one_constant_per_channel() {
+        let n_slots = 8;
+        let mut q1: Vec<Vec<(f32, f32)>> = (0..64)
+            .map(|_sb| {
+                (0..n_slots)
+                    .map(|ts| {
+                        let v = (1.0 + 0.2 * ts as f32) * 0.1;
+                        (v, v * 0.3)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut q2: Vec<Vec<(f32, f32)>> = (0..64)
+            .map(|_sb| {
+                (0..n_slots)
+                    .map(|ts| {
+                        let v = (2.0 - 0.1 * ts as f32) * 0.2;
+                        (v, v * 0.4)
+                    })
+                    .collect()
+            })
+            .collect();
+        let q1_orig = q1.clone();
+        let q2_orig = q2.clone();
+        let mut view: Vec<SyncCompandingEntry<'_>> = vec![(&mut q1, 4, 16), (&mut q2, 4, 16)];
+        apply_synchronised_companding_across_channels(&mut view, CompandingMode::SyncAveraged);
+        // Every slot on every channel got the same scale.
+        let ratio_q1_first = q1[5][0].0 / q1_orig[5][0].0;
+        let ratio_q2_first = q2[5][0].0 / q2_orig[5][0].0;
+        assert!(
+            (ratio_q1_first - ratio_q2_first).abs() < 1e-4,
+            "averaged sync scale must match across channels: {ratio_q1_first} vs {ratio_q2_first}"
+        );
+        for ts in 1..n_slots {
+            let r1 = q1[5][ts].0 / q1_orig[5][ts].0;
+            let r2 = q2[5][ts].0 / q2_orig[5][ts].0;
+            assert!(
+                (r1 - ratio_q1_first).abs() < 1e-4,
+                "averaged scale must be constant across slots on q1 (ts={ts}): {r1} vs {ratio_q1_first}"
+            );
+            assert!(
+                (r2 - ratio_q2_first).abs() < 1e-4,
+                "averaged scale must be constant across slots on q2 (ts={ts}): {r2} vs {ratio_q2_first}"
+            );
+        }
+    }
+
+    /// Round 44: a non-sync mode (`Off`, `PerSlot`, `Averaged`) is a
+    /// no-op for the cross-channel synced helper — it must NOT
+    /// silently apply per-channel companding when the wrong mode is
+    /// passed in (callers route those modes through the per-channel
+    /// path).
+    #[test]
+    fn apply_synchronised_companding_is_noop_on_non_sync_modes() {
+        let mut q: Vec<Vec<(f32, f32)>> = (0..64)
+            .map(|_| (0..8).map(|_| (0.5_f32, 0.3_f32)).collect())
+            .collect();
+        let q_orig = q.clone();
+        for mode in [
+            CompandingMode::Off,
+            CompandingMode::PerSlot,
+            CompandingMode::Averaged,
+        ] {
+            let mut view: Vec<SyncCompandingEntry<'_>> = vec![(&mut q, 4, 16)];
+            apply_synchronised_companding_across_channels(&mut view, mode);
+            assert_eq!(q, q_orig, "synced helper must no-op on mode {mode:?}");
+        }
+    }
+
+    /// Round 44: empty input or empty channel list is a no-op.
+    #[test]
+    fn apply_synchronised_companding_handles_empty_inputs() {
+        let mut empty: Vec<SyncCompandingEntry<'_>> = Vec::new();
+        apply_synchronised_companding_across_channels(&mut empty, CompandingMode::SyncPerSlot);
+        // Single channel with degenerate range -> no-op.
+        let mut q: Vec<Vec<(f32, f32)>> = vec![vec![(1.0_f32, 1.0_f32); 4]; 64];
+        let q_orig = q.clone();
+        let mut view: Vec<SyncCompandingEntry<'_>> = vec![(&mut q, 32, 32)];
+        apply_synchronised_companding_across_channels(&mut view, CompandingMode::SyncPerSlot);
+        assert_eq!(q, q_orig);
     }
 }
