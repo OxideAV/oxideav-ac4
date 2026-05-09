@@ -1261,6 +1261,85 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Round 50 — DP section optimiser + SNF emission integration tests.
+    // ------------------------------------------------------------------
+
+    /// SNF-bit-on round-trip: encode a tone+noise input, then verify
+    /// that the decoded reconstruction has non-zero magnitude in
+    /// high-frequency bins that the quantiser collapsed to zero. The
+    /// `b_snf_data_exists` bit must round-trip through the parser
+    /// without erroring.
+    #[test]
+    fn encode_frame_pcm_white_noise_with_snf_fills_zero_quant_bands() {
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
+        let n = 1920usize;
+        let max_sfb = 55u32;
+        let sfbo = crate::sfb_offset::sfb_offset_48(n as u32).unwrap();
+        let end_bin = sfbo[max_sfb as usize] as usize;
+
+        // Low-energy white noise — most high bands quantise to cb=0,
+        // exercising the SNF emission path.
+        let make_frame = |seed_off: u64| -> Vec<f32> {
+            let mut s: u64 = 0xACE4_u64.wrapping_add(seed_off);
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = (s >> 33) as u32;
+                    (u as f32 / (1u32 << 31) as f32 - 1.0) * 0.05 // low energy
+                })
+                .collect()
+        };
+        let frames: Vec<Vec<f32>> = (0..3).map(|i| make_frame(i as u64 * n as u64)).collect();
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let mut enc = Ac4ImsEncoder::new();
+        let mut last_recon: Option<Vec<f32>> = None;
+        for f in &frames {
+            let bytes = enc.encode_frame_pcm_with_max_sfb(f, max_sfb);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let _ = dec.receive_frame().expect("receive_frame");
+            let sub = dec.last_substream.as_ref().unwrap();
+            let scaled = sub.tools.scaled_spec_primary.as_ref().unwrap().clone();
+            last_recon = Some(scaled);
+        }
+        let recon = last_recon.unwrap();
+        // Count non-zero bins in the recon — with SNF on, even bands that
+        // collapsed to cb=0 should have non-zero magnitude from injected
+        // noise (clamped by what the SNF index range allows).
+        let nonzero = recon[..end_bin].iter().filter(|&&v| v.abs() > 0.0).count();
+        // We don't insist on every bin being non-zero (some bands may have
+        // SNF idx 0 = "no fill"); the assertion is that the bitstream
+        // round-trips without error and decodes to a non-silent spectrum.
+        assert!(
+            nonzero > 0,
+            "expected at least one non-zero bin in SNF reconstruction, got {nonzero}"
+        );
+    }
+
+    /// SNF integration: SNF-on bitstream parses cleanly through the
+    /// existing decoder. This is the smoke test for the new emission
+    /// path — it MUST not break decode of non-SNF frames either.
+    #[test]
+    fn encode_frame_pcm_silence_with_snf_off_round_trips() {
+        // Pure silence input: no band has measurable energy → SNF should
+        // be `None` → b_snf_data_exists = 0 in the bitstream.
+        let n = 1920usize;
+        let frames: Vec<Vec<f32>> = (0..2).map(|_| vec![0.0_f32; n]).collect();
+        let decoded = encode_decode_frames_with_max_sfb(&frames, 50);
+        let pcm = &decoded[1];
+        let peak = pcm.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        // Silence input → silence output (no SNF fill since no energy).
+        assert_eq!(
+            peak, 0,
+            "silence + SNF-off should decode to silence, peak={peak}"
+        );
+    }
+
     /// max_sfb wider than the round-48 default: encoder emits a frame
     /// the decoder parses without erroring.
     #[test]

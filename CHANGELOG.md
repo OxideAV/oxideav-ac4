@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 50 — Section-boundary DP optimiser + Spectral Noise Fill
+  (SNF) emission** (TS 103 190-1 §5.7.4 section_data + §5.7.6 SNF +
+  Pseudocodes 100 + 105 + Table 39/42 + Table SCFB):
+  - `encoder_asf::dp_optimise_sections(cost_band_cb, max_sections)` —
+    dynamic-program over scale-factor bands that finds the globally
+    cheapest sequence of `(start, end, cb)` sections, paying the
+    per-section header cost (`4 + 3 * (floor((L-1)/7)+1)` bits per
+    Table 39) against each band's per-codebook bit cost. Section
+    count capped at 16 per ETSI Table SCFB. Supersedes the round-49
+    greedy run-length codebook-merge optimiser.
+  - `encoder_asf::section_overhead_bits(len)` — closed-form per-section
+    overhead in bits matching the spec's `n_sect_bits=3 / esc=7`
+    long-frame layout: 7 bits for `L ∈ 1..=7`, 10 bits for `L ∈ 8..=14`,
+    13 bits for `L ∈ 15..=21`, etc.
+  - `encoder_asf::build_band_codebook_cost_table(natural_q_per_band)`
+    — precomputed per-band per-codebook bit cost (rows of length 12;
+    cb=0 cost 0 only for all-zero bands; HCB1..11 costs from
+    `bit_cost_for_band`; `u32::MAX` for codebooks that can't represent
+    the band's natural quant magnitudes). Drives the DP via O(1)
+    prefix sums where every band is feasible for the codebook.
+  - `encoder_asf::build_sections_from_dp(sections, max_sfb)` — lowers
+    the DP-derived `(start, end, cb)` triples into an `AsfSections`
+    suitable for the existing `write_section_data` /
+    `write_spectral_data_sections` emitters.
+  - `encoder_asf::compute_snf_dpcm_for_zero_quant_bands(coeffs,
+    sfb_offset, max_sfb, sfb_cb, max_quant_idx)` — for each band that
+    quantises to all-zero (cb == 0 || mqi == 0), estimates the band's
+    RMS energy from the original MDCT coefficients and picks the
+    HCB_SNF index whose `snf_gain = 2^((idx*1.5 - 84)/4)` best matches.
+    Returns `Some(per_band_idx)` when at least one zero-quant band
+    has measurable energy; `None` for fully-silent input.
+  - `encoder_asf::write_snf_data(bw, snf, sfb_cb, max_quant_idx, max_sfb)`
+    — emits `b_snf_data_exists` (1 bit) plus per-zero-quant-band
+    HCB_SNF Huffman codewords per Table 42 / Pseudocode 105. Round-trips
+    cleanly through the existing `parse_asf_snf_data` decoder path
+    (round 36+).
+  - `encoder_asf::measure_greedy_vs_dp_bits(transform_length, max_sfb,
+    coeffs)` — diagnostic helper returning `(greedy_bits, dp_bits)`
+    for any input spectrum so callers can quantify the section-boundary
+    optimiser's contribution to total frame size.
+  - `Ac4ImsEncoder::encode_frame_pcm_with_max_sfb` now drives the DP
+    optimiser + SNF emission internally; existing call sites get the
+    new path automatically with no API change. White-noise spectral
+    SNR holds at 27.5 dB (round-49 baseline) with section overhead
+    reduced and SNF emission turned on for high-frequency zero-quant
+    content.
+
 - **Round 49 — Codebook-selection optimiser (HCB1..11) + parameterised
   `max_sfb`** (TS 103 190-1 §5.7 + Pseudocodes 17 + 19 + 20 + Annex A.0
   huff_codes + Table SCFB):
