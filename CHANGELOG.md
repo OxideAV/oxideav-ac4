@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.4...v0.0.5) - 2026-05-09
+
+### Other
+
+- ac4 round 50: section-boundary DP optimiser + SNF emission
+- ac4 round 49: HCB1..11 codebook-selection optimiser + parameterised max_sfb
+- ac4 round 48: forward MDCT + ASF entropy encoder for arbitrary PCM
+- ac4 round 47: IMS bitstream_version=2 TOC parser + mono SIMPLE/ASF tone encoder
+- round 46: AC-4 IMS encoder scaffold + ACPL_1 surround Ls/Rs spec audit
+- ac4 round 45: stereo-CPE M=2 synced companding for ACPL_3 surround pair
+- ac4 round 44: companding sync_flag=1 cross-channel exact synchronisation
+- ac4 round 43: companding sync_flag=1/avg branches + ACPL_1 sb0 hookup
+- ac4 round 42: cfg0/cfg1/cfg3 trailer-aware ASPX + §5.7.5 companding
+- ac4 round 41: 5_X cfg2 ASPX trailers + Table 181 SAP for ACPL_1
+- ac4 round 40: SAP a/b/c/d (Pseudocode 59) + Table 183 + Ls/Rs walker
+- ac4 round 39: 5_X cfg0/cfg1/cfg3 dispatch + 7_X additional-channel pair
+- ac4 round 38: LFE body decoder + cfg2_back_mono end-to-end + ACPL_3 centre
+- ac4 round 37: wire 7_X ACPL_1/_2 dispatch + cfg0 centre end-to-end decode
+- ac4 round 36: wire 5_X ASPX_ACPL_1 / ACPL_2 Pseudocode 117 into decoder
+- Round 35: extend ETSI validation suite to float reference tables
+- drop dead `linkme` dep
+- round 35 — EMDF payloads_substream parser + DRC PCM gain application
+- cargo fmt pass after round 34
+- update round 34 status (SNF + FIXVAR/VARFIX/VARVAR atsg + ACPL_3)
+- ac4 round 34: FIXVAR/VARFIX/VARVAR atsg + SNF inject + 5_X ACPL_3 wiring
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-ac4/pull/502))
+
 ### Added
 
 - **Round 50 — Section-boundary DP optimiser + Spectral Noise Fill
