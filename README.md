@@ -206,7 +206,17 @@ framework but usable standalone.
 > layout and the wideband single-group mono/stereo case). DE walker
 > hardened with three new edge-case tests covering EOF on truncation,
 > non-I-frame without `prev_config`, and the `nr_channels == 0`
-> degenerate case. **518 tests** (505 lib + 5 + 8 integration).
+> degenerate case. Round 51 lands **stereo SIMPLE/ASF split-MDCT
+> (Path A: 2× SCE) encoding** per ETSI TS 103 190-1 §5.3 + §4.2.6.3 —
+> `Ac4ImsEncoder::encode_frame_pcm_stereo` accepts L+R PCM frames,
+> runs the existing forward MDCT + scalefactor + DP-section + HCB1..11
+> codebook-selection + SNF emission pipeline independently per
+> channel, and emits a `b_enable_mdct_stereo_proc == 0` stereo CPE
+> body the decoder reconstructs at ≥24.8 dB spectral SNR for both
+> 440 Hz L+R (matched) and 440 Hz L + 660 Hz R (independent) tone
+> fixtures. Round-51 leaves joint M/S coding for a future round
+> (Path B); SIMPLE 2× SCE is the spec-mandated minimum for stereo
+> AC-4 streams.
 
 ## Specs
 

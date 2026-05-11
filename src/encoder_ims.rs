@@ -68,7 +68,10 @@
 
 use oxideav_core::bits::BitWriter;
 
-use crate::encoder_asf::build_mono_simple_asf_body_from_pcm_spectrum;
+use crate::encoder_asf::{
+    build_mono_simple_asf_body_from_pcm_spectrum,
+    build_stereo_simple_asf_split_body_from_pcm_spectra,
+};
 use crate::encoder_mdct::EncoderMdctState;
 
 /// Encoder-side builder for AC-4 IMS frames. One instance per audio
@@ -107,6 +110,11 @@ pub struct Ac4ImsEncoder {
     /// the previous frame's `N` PCM samples so the 50% TDAC overlap
     /// runs correctly across frames. Lazy-initialised on first use.
     pub mdct_state: Option<EncoderMdctState>,
+    /// Forward-MDCT analysis state for the secondary (right) channel of
+    /// `encode_frame_pcm_stereo()`. Identical role to `mdct_state` but
+    /// for the second channel — separate so 50% TDAC overlap is
+    /// per-channel.
+    pub mdct_state_r: Option<EncoderMdctState>,
 }
 
 impl Ac4ImsEncoder {
@@ -124,6 +132,7 @@ impl Ac4ImsEncoder {
             channel_mode_value: 0b0,
             channel_mode_bits: 1,
             mdct_state: None,
+            mdct_state_r: None,
         }
     }
 
@@ -551,6 +560,119 @@ impl Ac4ImsEncoder {
             frame_len,
             max_sfb,
             &coeffs,
+            pad_target_bytes,
+        );
+
+        // 5. Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // Restore caller's channel_mode setting.
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Encode one IMS v2 stereo frame from arbitrary float PCM input
+    /// (range `[-1.0, 1.0]`) for both L and R. Returns the produced
+    /// frame bytes.
+    ///
+    /// **Path A — 2× SCE (split-MDCT)** per ETSI TS 103 190-1 §5.3 +
+    /// §4.2.6.3 Table 22 (`stereo_data()` with
+    /// `b_enable_mdct_stereo_proc == 0`): each channel is encoded
+    /// independently with the shared forward analysis pipeline (KBD-
+    /// windowed MDCT, per-band scalefactor, DP-optimal sectioning,
+    /// HCB1..11 codebook selection, SNF emission). No joint M/S coding.
+    ///
+    /// `frame_l` / `frame_r` must each be exactly `frame_len` samples
+    /// long (1920 samples for the default 48 kHz / 24 fps configuration).
+    /// The encoder forces stereo channel mode (`channel_mode_value =
+    /// 0b10`) for this call. The decoder's
+    /// [`crate::asf::parse_stereo_data_body_stateful`] split-MDCT path
+    /// consumes the frame and reconstructs both channels through the
+    /// shared ASF Huffman pipeline.
+    ///
+    /// `max_sfb` defaults to 40 (matching the round-48 mono default,
+    /// covers bins 0..508 ≈ 0..6.35 kHz at tl = 1920) when called via
+    /// [`Self::encode_frame_pcm_stereo`]; use
+    /// [`Self::encode_frame_pcm_stereo_with_max_sfb`] for wider coverage.
+    /// The decoder's split-MDCT branch reads BOTH L and R `max_sfb` with
+    /// the full `n_msfb_bits` width (the spec's `b_side_limited` only
+    /// applies to joint-MDCT stereo per §4.3.6.2), so the encoder isn't
+    /// limited by the narrower `n_side_bits`.
+    ///
+    /// Per ETSI TS 103 190-1 §5.3 + §4.2.6.3 + §5.5 (MDCT) +
+    /// §5.7 / §5.8 (SIMPLE/ASF) + TS 103 190-2 §6.2.1.1 (IMS TOC).
+    pub fn encode_frame_pcm_stereo(&mut self, frame_l: &[f32], frame_r: &[f32]) -> Vec<u8> {
+        // Default max_sfb = 40 (matches the round-48 mono default).
+        self.encode_frame_pcm_stereo_with_max_sfb(frame_l, frame_r, 40)
+    }
+
+    /// Encode one IMS v2 stereo frame from arbitrary float PCM input
+    /// (range `[-1.0, 1.0]`) at a caller-specified `max_sfb`. Both
+    /// channels use the same `max_sfb` — the encoder uses the full
+    /// `n_msfb_bits` field width for both. See
+    /// [`Self::encode_frame_pcm_stereo`].
+    pub fn encode_frame_pcm_stereo_with_max_sfb(
+        &mut self,
+        frame_l: &[f32],
+        frame_r: &[f32],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        assert_eq!(
+            frame_l.len(),
+            frame_len as usize,
+            "encode_frame_pcm_stereo: L input length must match frame_len = {frame_len}"
+        );
+        assert_eq!(
+            frame_r.len(),
+            frame_len as usize,
+            "encode_frame_pcm_stereo: R input length must match frame_len = {frame_len}"
+        );
+        // Cap max_sfb at n_msfb_bits=6's max (63 for tl=1920) and at the
+        // transform's actual `num_sfb_48` cap (61 at tl=1920).
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force stereo channel_mode (prefix '10', 2 bits) — the
+        // split-MDCT body builder requires the TOC to declare 2 channels.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b10;
+        self.channel_mode_bits = 2;
+
+        // 1. Forward MDCT analysis per channel (separate state for
+        //    independent 50% TDAC overlap continuity).
+        if self.mdct_state.is_none() || self.mdct_state.as_ref().unwrap().n != frame_len {
+            self.mdct_state = Some(EncoderMdctState::new(frame_len));
+        }
+        if self.mdct_state_r.is_none() || self.mdct_state_r.as_ref().unwrap().n != frame_len {
+            self.mdct_state_r = Some(EncoderMdctState::new(frame_len));
+        }
+        let coeffs_l = self.mdct_state.as_mut().unwrap().analyse_frame(frame_l);
+        let coeffs_r = self.mdct_state_r.as_mut().unwrap().analyse_frame(frame_r);
+
+        // 2-4. Build the stereo split-MDCT body. Pad budget is 2× the
+        //      mono budget since we carry two independent spectra.
+        let pad_target_bytes = match max_sfb {
+            0..=20 => 2048,
+            21..=40 => 4096,
+            41..=50 => 8192,
+            _ => 16384,
+        };
+        let body = build_stereo_simple_asf_split_body_from_pcm_spectra(
+            frame_len,
+            max_sfb,
+            &coeffs_l,
+            &coeffs_r,
             pad_target_bytes,
         );
 
@@ -1362,5 +1484,312 @@ mod tests {
         let pcm = &decoded[2];
         let nonzero = pcm.iter().filter(|&&s| s != 0).count();
         assert!(nonzero > 100, "expected non-silent recon, got {nonzero}");
+    }
+
+    // ------------------------------------------------------------------
+    // Round 51 — Stereo SIMPLE/ASF split-MDCT (Path A, 2× SCE) tests.
+    // ------------------------------------------------------------------
+
+    /// Helper: encode a sequence of stereo PCM frames (each `(L, R)`)
+    /// through `encode_frame_pcm_stereo`, then decode them via
+    /// `Ac4Decoder` and return per-frame deinterleaved `(L, R)` i16 PCM.
+    fn encode_decode_stereo_frames(
+        frames_lr: &[(Vec<f32>, Vec<f32>)],
+    ) -> Vec<(Vec<i16>, Vec<i16>)> {
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let mut enc = Ac4ImsEncoder::new();
+        let mut out: Vec<(Vec<i16>, Vec<i16>)> = Vec::with_capacity(frames_lr.len());
+        for (l, r) in frames_lr {
+            let bytes = enc.encode_frame_pcm_stereo(l, r);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+                panic!("expected audio frame");
+            };
+            assert_eq!(af.samples, 1_920);
+            assert_eq!(af.data.len(), 1);
+            // Stereo S16 interleaved: 1920 samples × 2 ch × 2 bytes.
+            assert_eq!(af.data[0].len(), 1_920 * 2 * 2);
+            let buf = &af.data[0];
+            let mut pcm_l: Vec<i16> = Vec::with_capacity(1_920);
+            let mut pcm_r: Vec<i16> = Vec::with_capacity(1_920);
+            for i in 0..1_920usize {
+                let off_l = i * 4;
+                let off_r = off_l + 2;
+                pcm_l.push(i16::from_le_bytes([buf[off_l], buf[off_l + 1]]));
+                pcm_r.push(i16::from_le_bytes([buf[off_r], buf[off_r + 1]]));
+            }
+            out.push((pcm_l, pcm_r));
+        }
+        out
+    }
+
+    /// Stereo encoder bumps sequence_counter once per frame, just like
+    /// the mono path.
+    #[test]
+    fn encode_frame_pcm_stereo_bumps_sequence_counter() {
+        let mut enc = Ac4ImsEncoder::new();
+        assert_eq!(enc.sequence_counter, 0);
+        let frame = vec![0.0_f32; 1920];
+        let _ = enc.encode_frame_pcm_stereo(&frame, &frame);
+        assert_eq!(enc.sequence_counter, 1);
+        let _ = enc.encode_frame_pcm_stereo(&frame, &frame);
+        assert_eq!(enc.sequence_counter, 2);
+    }
+
+    /// Stereo encoder produces a frame whose TOC declares 2 channels and
+    /// whose decoded PCM layout is stereo (1920 × 2 × 2 bytes).
+    #[test]
+    fn encode_frame_pcm_stereo_produces_stereo_layout_pcm() {
+        let n = 1920usize;
+        let frames: Vec<(Vec<f32>, Vec<f32>)> = (0..2)
+            .map(|_| (vec![0.0_f32; n], vec![0.0_f32; n]))
+            .collect();
+        let decoded = encode_decode_stereo_frames(&frames);
+        // Both decoded frames have the stereo S16 byte layout.
+        for (l, r) in &decoded {
+            assert_eq!(l.len(), 1_920);
+            assert_eq!(r.len(), 1_920);
+        }
+    }
+
+    /// Stereo encoder roundtrip: decoder produces non-silent PCM in
+    /// both channels with peak amplitudes reflecting the input level.
+    #[test]
+    fn encode_frame_pcm_stereo_440hz_steady_state_nonsilent_both_channels() {
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                })
+                .collect()
+        };
+        let frames_lr: Vec<(Vec<f32>, Vec<f32>)> = (0..5)
+            .map(|i| (make_frame(i * n), make_frame(i * n)))
+            .collect();
+        let decoded = encode_decode_stereo_frames(&frames_lr);
+        let (l, r) = &decoded[2];
+        let nz_l = l.iter().filter(|&&s| s != 0).count();
+        let nz_r = r.iter().filter(|&&s| s != 0).count();
+        let peak_l = l.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        let peak_r = r.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        assert!(nz_l > 100, "L too few non-zero samples: {nz_l}");
+        assert!(nz_r > 100, "R too few non-zero samples: {nz_r}");
+        // 0.3 input amplitude → ~0.3 * 32767 ≈ 9830 i16 peak. The
+        // encoder/decoder lossy round-trip stays comfortably above 1000.
+        assert!(peak_l > 1000, "L peak too low: {peak_l}");
+        assert!(peak_r > 1000, "R peak too low: {peak_r}");
+    }
+
+    /// Stereo encoder TOC declares 2 channels and the substream parser
+    /// surfaces both per-channel scaled spectra.
+    #[test]
+    fn encode_frame_pcm_stereo_substream_parses() {
+        use crate::decoder::Ac4Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
+        let mut enc = Ac4ImsEncoder::new();
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let frame: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / fs;
+                0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+            })
+            .collect();
+        let bytes = enc.encode_frame_pcm_stereo(&frame, &frame);
+        let info = crate::toc::parse_ac4_toc(&bytes).expect("parse_ac4_toc");
+        assert_eq!(info.channels, 2);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+        dec.send_packet(&pkt).expect("send_packet");
+        let _ = dec.receive_frame().expect("receive_frame");
+        let sub = dec.last_substream.as_ref().expect("substream parsed");
+        // SIMPLE stereo mode + b_enable_mdct_stereo_proc = 0 (split-MDCT
+        // path). Both channel's spectra populated.
+        assert!(matches!(
+            sub.tools.stereo_mode,
+            Some(crate::asf::StereoCodecMode::Simple)
+        ));
+        assert!(!sub.tools.mdct_stereo_proc);
+        assert!(sub.tools.scaled_spec_primary.is_some());
+        assert!(sub.tools.scaled_spec_secondary.is_some());
+    }
+
+    /// Round 48 stereo SNR target: 440 Hz tone on L + 440 Hz tone on R
+    /// (identical content) round-trips with **spectral SNR ≥ 20 dB** on
+    /// the steady-state frame for both channels.
+    ///
+    /// Spectral SNR is measured by mirroring the encoder's forward MDCT
+    /// over the input PCM and comparing the input MDCT spectrum bin-for-
+    /// bin against the decoder's reconstructed `scaled_spec_*`. This
+    /// isolates the encoder's quantisation contribution from the IMDCT/
+    /// KBD overlap-add reconstruction noise (which dominates a time-
+    /// domain comparison since the IMDCT introduces a half-frame phase
+    /// shift between the original and reconstructed waveforms even for
+    /// perfect-reconstruction transforms — same convention used by the
+    /// round-49 white-noise test
+    /// `encode_frame_pcm_white_noise_snr_exceeds_hcb5_only_ceiling`).
+    #[test]
+    fn encode_frame_pcm_stereo_440hz_both_channels_snr_exceeds_20db() {
+        use crate::decoder::Ac4Decoder;
+        use crate::encoder_mdct::EncoderMdctState;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                })
+                .collect()
+        };
+        let frames: Vec<Vec<f32>> = (0..3).map(|i| make_frame(i * n)).collect();
+        // Mirror the encoder's MDCT on the input for both channels (same
+        // PCM here, so we only need one mirror state).
+        let mut mdct_in = EncoderMdctState::new(n as u32);
+        let mut last_input_spec: Option<Vec<f32>> = None;
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let mut enc = Ac4ImsEncoder::new();
+        let mut last_pri: Option<Vec<f32>> = None;
+        let mut last_sec: Option<Vec<f32>> = None;
+        for f in &frames {
+            let input_coeffs = mdct_in.analyse_frame(f);
+            last_input_spec = Some(input_coeffs);
+            let bytes = enc.encode_frame_pcm_stereo(f, f);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let _ = dec.receive_frame().expect("receive_frame");
+            let sub = dec.last_substream.as_ref().unwrap();
+            last_pri = sub.tools.scaled_spec_primary.clone();
+            last_sec = sub.tools.scaled_spec_secondary.clone();
+        }
+        let input = last_input_spec.unwrap();
+        let pri = last_pri.unwrap();
+        let sec = last_sec.unwrap();
+        let snr = |orig: &[f32], recon: &[f32]| -> f64 {
+            let mut sig_e = 0.0_f64;
+            let mut err_e = 0.0_f64;
+            let n_compare = orig.len().min(recon.len());
+            for k in 0..n_compare {
+                let o = orig[k] as f64;
+                let r = recon[k] as f64;
+                sig_e += o * o;
+                err_e += (o - r) * (o - r);
+            }
+            10.0 * (sig_e / err_e.max(1e-30)).log10()
+        };
+        let snr_l = snr(&input, &pri);
+        let snr_r = snr(&input, &sec);
+        eprintln!(
+            "ROUND-51 stereo 440Hz L+R spectral SNR: SNR_L = {snr_l:.1} dB, SNR_R = {snr_r:.1} dB"
+        );
+        assert!(
+            snr_l > 20.0,
+            "L channel spectral SNR too low: {snr_l:.1} dB (expected > 20 dB)"
+        );
+        assert!(
+            snr_r > 20.0,
+            "R channel spectral SNR too low: {snr_r:.1} dB (expected > 20 dB)"
+        );
+    }
+
+    /// Round 48 stereo independence target: 440 Hz tone on L + 660 Hz
+    /// tone on R round-trips with **spectral SNR ≥ 20 dB** on the
+    /// steady-state frame for both channels (proves channels are encoded
+    /// independently — no cross-channel bleed). See the docstring on
+    /// [`encode_frame_pcm_stereo_440hz_both_channels_snr_exceeds_20db`]
+    /// for why we compare in the spectral domain.
+    #[test]
+    fn encode_frame_pcm_stereo_440l_660r_independent_channels_snr_exceeds_20db() {
+        use crate::decoder::Ac4Decoder;
+        use crate::encoder_mdct::EncoderMdctState;
+        use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let make_frame_at = |freq: f32| -> Box<dyn Fn(usize) -> Vec<f32>> {
+            Box::new(move |start: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        let t = (start + i) as f32 / fs;
+                        0.3 * (2.0 * std::f32::consts::PI * freq * t).sin()
+                    })
+                    .collect()
+            })
+        };
+        let make_l = make_frame_at(440.0);
+        let make_r = make_frame_at(660.0);
+        let frames_lr: Vec<(Vec<f32>, Vec<f32>)> =
+            (0..3).map(|i| (make_l(i * n), make_r(i * n))).collect();
+        // Mirror MDCT on each channel's input independently.
+        let mut mdct_l = EncoderMdctState::new(n as u32);
+        let mut mdct_r = EncoderMdctState::new(n as u32);
+        let mut last_in_l: Option<Vec<f32>> = None;
+        let mut last_in_r: Option<Vec<f32>> = None;
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let mut enc = Ac4ImsEncoder::new();
+        let mut last_pri: Option<Vec<f32>> = None;
+        let mut last_sec: Option<Vec<f32>> = None;
+        for (l, r) in &frames_lr {
+            last_in_l = Some(mdct_l.analyse_frame(l));
+            last_in_r = Some(mdct_r.analyse_frame(r));
+            let bytes = enc.encode_frame_pcm_stereo(l, r);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let _ = dec.receive_frame().expect("receive_frame");
+            let sub = dec.last_substream.as_ref().unwrap();
+            last_pri = sub.tools.scaled_spec_primary.clone();
+            last_sec = sub.tools.scaled_spec_secondary.clone();
+        }
+        let in_l = last_in_l.unwrap();
+        let in_r = last_in_r.unwrap();
+        let pri = last_pri.unwrap();
+        let sec = last_sec.unwrap();
+        let snr = |orig: &[f32], recon: &[f32]| -> f64 {
+            let mut sig_e = 0.0_f64;
+            let mut err_e = 0.0_f64;
+            let n_compare = orig.len().min(recon.len());
+            for k in 0..n_compare {
+                let o = orig[k] as f64;
+                let r = recon[k] as f64;
+                sig_e += o * o;
+                err_e += (o - r) * (o - r);
+            }
+            10.0 * (sig_e / err_e.max(1e-30)).log10()
+        };
+        let snr_l = snr(&in_l, &pri);
+        let snr_r = snr(&in_r, &sec);
+        eprintln!(
+            "ROUND-51 stereo 440L+660R independent spectral SNR: SNR_L = {snr_l:.1} dB, SNR_R = {snr_r:.1} dB"
+        );
+        assert!(
+            snr_l > 20.0,
+            "L (440 Hz) channel spectral SNR too low: {snr_l:.1} dB (expected > 20 dB)"
+        );
+        assert!(
+            snr_r > 20.0,
+            "R (660 Hz) channel spectral SNR too low: {snr_r:.1} dB (expected > 20 dB)"
+        );
+        // Independence sanity check: L and R reconstructions should differ
+        // (different input frequencies → different waveforms in the
+        // spectrum).
+        let differs = pri
+            .iter()
+            .zip(sec.iter())
+            .filter(|(a, b)| (*a - *b).abs() > 0.01)
+            .count();
+        assert!(
+            differs > 10,
+            "L and R reconstructed spectra should differ for independent tones (got {differs} diffs)"
+        );
     }
 }

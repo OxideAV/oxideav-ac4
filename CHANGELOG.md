@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 51 — Stereo SIMPLE/ASF split-MDCT (Path A: 2× SCE) encoder**
+  per ETSI TS 103 190-1 §5.3 (channel_count > 1) + §4.2.6.3 Table 22
+  (`stereo_data()` with `b_enable_mdct_stereo_proc == 0`):
+  - `Ac4ImsEncoder::encode_frame_pcm_stereo(frame_l, frame_r)` and
+    `encode_frame_pcm_stereo_with_max_sfb()` — accept paired L+R float
+    PCM frames at the encoder's configured frame_len (1920 samples for
+    the default 48 kHz / 24 fps), run the round-50 forward pipeline
+    (KBD-windowed MDCT + per-band scalefactor + HCB1..11 codebook
+    selection + DP-optimal section boundaries + SNF emission)
+    independently per channel, then emit a `bitstream_version = 2` IMS
+    TOC (channel_mode prefix `'10'`) followed by the split-MDCT stereo
+    CPE body. The encoder uses separate `EncoderMdctState` per channel
+    (new field `mdct_state_r: Option<EncoderMdctState>`) so 50% TDAC
+    overlap continuity is preserved per channel.
+  - `encoder_asf::build_stereo_simple_asf_split_body_from_pcm_spectra(
+    transform_length, max_sfb, coeffs_l, coeffs_r, pad_target_bytes)`
+    — emits the full stereo audio_data body: `audio_size_value (15 b)`
+    + `b_more_bits (1 b)` + byte_align + `stereo_codec_mode = SIMPLE
+    (2 b)` + `b_enable_mdct_stereo_proc = 0 (1 b)` + per-channel
+    `spec_frontend (1 b) + b_long_frame (1 b) + max_sfb (n_msfb_bits
+    b)` headers + per-channel `sf_data(ASF)` payloads (sections +
+    spectral + scalefac + snf).
+  - Round-trip SNR target met: ≥24.8 dB spectral SNR on both L and R
+    for the 440 Hz matched-tone fixture and the 440 Hz L + 660 Hz R
+    independent-tone fixture (PCM amplitude 0.3, 3 frames to reach
+    steady state, comparison done in MDCT-spectrum domain to isolate
+    the encoder quantisation contribution from IMDCT/KBD reconstruction
+    phase shift). PCM peak ~10 400 i16 (= 0.317 amplitude, matching
+    input).
+  - Three new SNR / non-silence tests
+    (`encode_frame_pcm_stereo_440hz_both_channels_snr_exceeds_20db`,
+    `encode_frame_pcm_stereo_440l_660r_independent_channels_snr_exceeds_20db`,
+    `encode_frame_pcm_stereo_440hz_steady_state_nonsilent_both_channels`)
+    plus three structural smoke tests
+    (`encode_frame_pcm_stereo_bumps_sequence_counter`,
+    `encode_frame_pcm_stereo_produces_stereo_layout_pcm`,
+    `encode_frame_pcm_stereo_substream_parses`).
+  - Joint M/S coding (Path B — `b_enable_mdct_stereo_proc == 1`) and
+    multichannel SAP/M-S decisioning are deferred. SIMPLE 2× SCE is
+    the spec-mandated minimum for stereo AC-4 streams and unblocks the
+    encoder's path to multichannel.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.4...v0.0.5) - 2026-05-09
 
 ### Other

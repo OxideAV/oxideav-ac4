@@ -1012,6 +1012,150 @@ pub fn build_mono_simple_asf_body_from_pcm_spectrum(
     bytes
 }
 
+/// Build the full stereo SIMPLE/ASF substream body for the long-frame
+/// single-window-group case in **split-MDCT (Path A: 2× SCE)** form per
+/// ETSI TS 103 190-1 §5.3 + §4.2.6.3 Table 22 (`stereo_data()` with
+/// `b_enable_mdct_stereo_proc == 0`).
+///
+/// Round 48 stereo encoder: encodes L + R as two independent ASF carrier
+/// spectra (no joint M/S coding). Each channel runs the same forward
+/// pipeline as the mono encoder — anchor scalefactor + DP-optimal section
+/// boundaries + HCB1..11 codebook selection + SNF emission for zero-quant
+/// bands. The decoder's `parse_stereo_data_body_stateful` for the
+/// `b_enable_mdct_stereo_proc == 0` branch consumes:
+///
+///   * `stereo_codec_mode` (2 b) = 0 (SIMPLE)
+///   * `b_enable_mdct_stereo_proc` (1 b) = 0
+///   * Left:  `spec_frontend_l` (1 b) = 0 (ASF) + `b_long_frame` (1 b) = 1
+///     + `max_sfb_l` (`n_msfb_bits` b)
+///   * Right: `spec_frontend_r` (1 b) = 0 (ASF) + `b_long_frame` (1 b) = 1
+///     + `max_sfb_r` (`n_side_bits` b — secondary uses `b_side_limited = 1`)
+///   * Left:  `sf_data(ASF)` for L = section_data + spectral + scalefac + snf
+///   * Right: `sf_data(ASF)` for R = section_data + spectral + scalefac + snf
+///
+/// `coeffs_l` / `coeffs_r` are the windowed forward-MDCT spectra for the
+/// two channels (each length ≥ `sfb_offset[max_sfb]`).
+///
+/// Returns the substream bytes (audio_size header + audio_data + zero-
+/// padding) sized to `pad_target_bytes`.
+pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let end_bin = sfbo[max_sfb as usize] as usize;
+
+    // Per-channel: anchor scalefactor + natural-q quantisation + DP
+    // section optimiser + SNF emission. Each channel is independent —
+    // no cross-channel sharing of sections, scalefactors, or codebooks.
+    /// `(qspec, sf_per_band, max_quant_idx, sections, snf)` — output of
+    /// the per-channel forward analysis closure used by
+    /// [`build_stereo_simple_asf_split_body_from_pcm_spectra`].
+    type StereoChannelAnalysis = (Vec<i32>, Vec<i32>, Vec<u32>, AsfSections, Option<Vec<i32>>);
+    let prepare_channel = |coeffs: &[f32]| -> StereoChannelAnalysis {
+        let mut qspec = vec![0i32; end_bin];
+        let mut sf_per_band = vec![100i32; max_sfb as usize];
+        let mut max_quant_idx = vec![0u32; max_sfb as usize];
+        let mut natural_q_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb as usize);
+        for sfb in 0..max_sfb as usize {
+            let a = sfbo[sfb] as usize;
+            let b = sfbo[sfb + 1] as usize;
+            let band = &coeffs[a..b.min(coeffs.len())];
+            let (_cb_picked, sf, q, _cost) = pick_best_codebook_for_band(band);
+            sf_per_band[sfb] = sf;
+            let mut max_q: u32 = 0;
+            for (i, &qi) in q.iter().enumerate() {
+                qspec[a + i] = qi;
+                max_q = max_q.max(qi.unsigned_abs());
+            }
+            max_quant_idx[sfb] = max_q;
+            natural_q_per_band.push(q);
+        }
+        let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
+        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let sections = build_sections_from_dp(&dp_sections, max_sfb);
+        let snf = compute_snf_dpcm_for_zero_quant_bands(
+            coeffs,
+            sfbo,
+            max_sfb,
+            &sections.sfb_cb,
+            &max_quant_idx,
+        );
+        (qspec, sf_per_band, max_quant_idx, sections, snf)
+    };
+
+    let (qspec_l, sf_l, mqi_l, sections_l, snf_l) = prepare_channel(coeffs_l);
+    let (qspec_r, sf_r, mqi_r, sections_r, snf_r) = prepare_channel(coeffs_r);
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+    // stereo_codec_mode = SIMPLE (0b00, 2 b).
+    bw.write_u32(0, 2);
+    // b_enable_mdct_stereo_proc = 0 (split-MDCT path).
+    bw.write_bit(false);
+    // n_msfb_bits width from Table 106. The decoder's
+    // `parse_stereo_data_body_stateful` split-MDCT branch calls
+    // `parse_asf_psy_info(br, ti, frame_len_base, false, false)` for BOTH
+    // L and R (i.e. `b_side_limited = false` on both), so both channels
+    // use the full `n_msfb_bits` width. The ETSI §4.3.6.2 spec text
+    // describes a `b_side_limited = 1` reading on the side channel of
+    // joint-MDCT stereo (when `b_enable_mdct_stereo_proc == 1`); for the
+    // split-MDCT path both channels are independent and use the full width.
+    let (n_msfb_bits, _, _) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    // --- Left channel header ---
+    bw.write_u32(0, 1); // spec_frontend_l = ASF
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(max_sfb, n_msfb_bits); // max_sfb_l
+                                        // --- Right channel header ---
+    bw.write_u32(0, 1); // spec_frontend_r = ASF
+    bw.write_bit(true); // b_long_frame
+    bw.write_u32(max_sfb, n_msfb_bits); // max_sfb_r (same width as L in
+                                        // this split-MDCT path)
+
+    // --- Left channel sf_data(ASF) ---
+    write_section_data(&mut bw, &sections_l);
+    write_spectral_data_sections(&mut bw, &qspec_l, sfbo, &sections_l);
+    write_scalefac_data(&mut bw, &sf_l, &sections_l.sfb_cb, &mqi_l, max_sfb);
+    write_snf_data(
+        &mut bw,
+        snf_l.as_deref(),
+        &sections_l.sfb_cb,
+        &mqi_l,
+        max_sfb,
+    );
+
+    // --- Right channel sf_data(ASF) ---
+    write_section_data(&mut bw, &sections_r);
+    write_spectral_data_sections(&mut bw, &qspec_r, sfbo, &sections_r);
+    write_scalefac_data(&mut bw, &sf_r, &sections_r.sfb_cb, &mqi_r, max_sfb);
+    write_snf_data(
+        &mut bw,
+        snf_r.as_deref(),
+        &sections_r.sfb_cb,
+        &mqi_r,
+        max_sfb,
+    );
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 /// Round-50 helper: count total bits the body would emit if we used the
 /// greedy run-length section merge instead of the DP optimiser. Returns
 /// (greedy_bits, dp_bits) so callers (and tests) can quantify the
