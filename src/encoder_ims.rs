@@ -69,7 +69,8 @@
 use oxideav_core::bits::BitWriter;
 
 use crate::encoder_asf::{
-    build_mono_simple_asf_body_from_pcm_spectrum,
+    average_per_sfb_correlation, build_mono_simple_asf_body_from_pcm_spectrum,
+    build_stereo_simple_asf_joint_body_from_pcm_spectra,
     build_stereo_simple_asf_split_body_from_pcm_spectra,
 };
 use crate::encoder_mdct::EncoderMdctState;
@@ -612,16 +613,84 @@ impl Ac4ImsEncoder {
         self.encode_frame_pcm_stereo_with_max_sfb(frame_l, frame_r, 40)
     }
 
+    /// Round-52 heuristic threshold for joint M/S coding. When the
+    /// per-SFB average Pearson correlation between L and R MDCT spectra
+    /// exceeds this value, the encoder switches to Path B (joint M/S CPE,
+    /// `b_enable_mdct_stereo_proc == 1`); otherwise Path A (split-MDCT,
+    /// 2× SCE) is used. The 0.7 threshold matches the spec's §5.3
+    /// guidance plus the headline number cited in this crate's round-52
+    /// task brief.
+    pub const STEREO_JOINT_MS_CORRELATION_THRESHOLD: f32 = 0.7;
+
     /// Encode one IMS v2 stereo frame from arbitrary float PCM input
     /// (range `[-1.0, 1.0]`) at a caller-specified `max_sfb`. Both
     /// channels use the same `max_sfb` — the encoder uses the full
     /// `n_msfb_bits` field width for both. See
     /// [`Self::encode_frame_pcm_stereo`].
+    ///
+    /// **Round 52 — Path A vs Path B dispatch.** The encoder computes the
+    /// per-SFB average Pearson correlation between the L and R MDCT
+    /// spectra (via [`average_per_sfb_correlation`]) and, when it exceeds
+    /// [`Self::STEREO_JOINT_MS_CORRELATION_THRESHOLD`] (default 0.7),
+    /// switches to **joint M/S CPE (Path B,
+    /// `b_enable_mdct_stereo_proc == 1`)** per ETSI TS 103 190-1 §5.3 +
+    /// §4.2.6.3 Table 22 + §7.5 (Pseudocode 77). Otherwise it stays on
+    /// the round-51 split-MDCT path (Path A, 2× SCE,
+    /// `b_enable_mdct_stereo_proc == 0`). Per-SFB M/S vs L/R selection
+    /// within the joint path is driven by the natural-q bit-cost
+    /// comparison inside
+    /// [`build_stereo_simple_asf_joint_body_from_pcm_spectra`].
+    ///
+    /// Use [`Self::encode_frame_pcm_stereo_split_with_max_sfb`] or
+    /// [`Self::encode_frame_pcm_stereo_joint_with_max_sfb`] to force a
+    /// specific path regardless of correlation.
     pub fn encode_frame_pcm_stereo_with_max_sfb(
         &mut self,
         frame_l: &[f32],
         frame_r: &[f32],
         max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_stereo_dispatched(frame_l, frame_r, max_sfb, None)
+    }
+
+    /// Force the split-MDCT (Path A: 2× SCE) encoder path regardless of
+    /// the L-vs-R correlation. Useful for tests / fixtures that need a
+    /// deterministic on-wire layout. See
+    /// [`Self::encode_frame_pcm_stereo_with_max_sfb`].
+    pub fn encode_frame_pcm_stereo_split_with_max_sfb(
+        &mut self,
+        frame_l: &[f32],
+        frame_r: &[f32],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_stereo_dispatched(frame_l, frame_r, max_sfb, Some(false))
+    }
+
+    /// Force the joint-MDCT (Path B: M/S CPE) encoder path regardless of
+    /// the L-vs-R correlation. Useful for tests / fixtures that need a
+    /// deterministic on-wire layout. See
+    /// [`Self::encode_frame_pcm_stereo_with_max_sfb`].
+    pub fn encode_frame_pcm_stereo_joint_with_max_sfb(
+        &mut self,
+        frame_l: &[f32],
+        frame_r: &[f32],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_stereo_dispatched(frame_l, frame_r, max_sfb, Some(true))
+    }
+
+    /// Shared body for the stereo encode dispatch — runs forward MDCT,
+    /// computes the cross-channel correlation (when `force_joint` is
+    /// `None`) and picks Path A vs Path B accordingly. `force_joint =
+    /// Some(true)` always emits joint M/S, `Some(false)` always emits
+    /// split-MDCT, `None` selects via the
+    /// [`Self::STEREO_JOINT_MS_CORRELATION_THRESHOLD`] threshold.
+    fn encode_frame_pcm_stereo_dispatched(
+        &mut self,
+        frame_l: &[f32],
+        frame_r: &[f32],
+        max_sfb: u32,
+        force_joint: Option<bool>,
     ) -> Vec<u8> {
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
@@ -643,8 +712,9 @@ impl Ac4ImsEncoder {
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
         let max_sfb = max_sfb.min(n_msfb_cap);
 
-        // Force stereo channel_mode (prefix '10', 2 bits) — the
-        // split-MDCT body builder requires the TOC to declare 2 channels.
+        // Force stereo channel_mode (prefix '10', 2 bits) — both the
+        // split-MDCT and joint-MDCT body builders require the TOC to
+        // declare 2 channels.
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
         self.channel_mode_value = 0b10;
         self.channel_mode_bits = 2;
@@ -660,23 +730,42 @@ impl Ac4ImsEncoder {
         let coeffs_l = self.mdct_state.as_mut().unwrap().analyse_frame(frame_l);
         let coeffs_r = self.mdct_state_r.as_mut().unwrap().analyse_frame(frame_r);
 
-        // 2-4. Build the stereo split-MDCT body. Pad budget is 2× the
-        //      mono budget since we carry two independent spectra.
+        // 2. Path A vs Path B dispatch per round-52 heuristic.
+        let use_joint = match force_joint {
+            Some(b) => b,
+            None => {
+                let rho = average_per_sfb_correlation(frame_len, max_sfb, &coeffs_l, &coeffs_r);
+                rho >= Self::STEREO_JOINT_MS_CORRELATION_THRESHOLD
+            }
+        };
+
+        // 3-5. Build the stereo body. Pad budget is 2× the mono budget
+        //      since we carry two spectra (joint or split).
         let pad_target_bytes = match max_sfb {
             0..=20 => 2048,
             21..=40 => 4096,
             41..=50 => 8192,
             _ => 16384,
         };
-        let body = build_stereo_simple_asf_split_body_from_pcm_spectra(
-            frame_len,
-            max_sfb,
-            &coeffs_l,
-            &coeffs_r,
-            pad_target_bytes,
-        );
+        let body = if use_joint {
+            build_stereo_simple_asf_joint_body_from_pcm_spectra(
+                frame_len,
+                max_sfb,
+                &coeffs_l,
+                &coeffs_r,
+                pad_target_bytes,
+            )
+        } else {
+            build_stereo_simple_asf_split_body_from_pcm_spectra(
+                frame_len,
+                max_sfb,
+                &coeffs_l,
+                &coeffs_r,
+                pad_target_bytes,
+            )
+        };
 
-        // 5. Wrap in v2 IMS TOC.
+        // 6. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);
         bw.align_to_byte();
@@ -1486,6 +1575,73 @@ mod tests {
         assert!(nonzero > 100, "expected non-silent recon, got {nonzero}");
     }
 
+    /// Round 52 sanity: identical L=R PCM → MDCT spectra are bit-identical
+    /// → per-SFB energy-weighted correlation is exactly 1.0; the
+    /// dispatcher would route this frame to Path B (joint M/S).
+    #[test]
+    fn round52_correlation_identical_channels_is_one() {
+        use crate::encoder_asf::average_per_sfb_correlation;
+        use crate::encoder_mdct::EncoderMdctState;
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let make_frame = |start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                })
+                .collect()
+        };
+        let mut mdct_l = EncoderMdctState::new(n as u32);
+        let mut mdct_r = EncoderMdctState::new(n as u32);
+        let mut rhos: Vec<f32> = Vec::new();
+        for i in 0..3 {
+            let f = make_frame(i * n);
+            let cl = mdct_l.analyse_frame(&f);
+            let cr = mdct_r.analyse_frame(&f);
+            let rho = average_per_sfb_correlation(n as u32, 40, &cl, &cr);
+            rhos.push(rho);
+        }
+        for (i, &rho) in rhos.iter().enumerate() {
+            assert!(
+                (rho - 1.0).abs() < 1e-4,
+                "frame {i} rho expected 1.0, got {rho}"
+            );
+        }
+    }
+
+    /// Round 52 sanity: 440 Hz L + 660 Hz R independent channels have
+    /// well-separated MDCT spectra → energy-weighted per-SFB correlation
+    /// falls below the 0.7 dispatch threshold; Path A is chosen.
+    #[test]
+    fn round52_correlation_independent_tones_below_threshold() {
+        use crate::encoder_asf::average_per_sfb_correlation;
+        use crate::encoder_mdct::EncoderMdctState;
+        let n = 1920usize;
+        let fs = 48_000.0_f32;
+        let make_frame = |freq: f32, start: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = (start + i) as f32 / fs;
+                    0.3 * (2.0 * std::f32::consts::PI * freq * t).sin()
+                })
+                .collect()
+        };
+        let mut mdct_l = EncoderMdctState::new(n as u32);
+        let mut mdct_r = EncoderMdctState::new(n as u32);
+        let mut rhos: Vec<f32> = Vec::new();
+        for i in 0..3 {
+            let fl = make_frame(440.0, i * n);
+            let fr = make_frame(660.0, i * n);
+            let cl = mdct_l.analyse_frame(&fl);
+            let cr = mdct_r.analyse_frame(&fr);
+            rhos.push(average_per_sfb_correlation(n as u32, 40, &cl, &cr));
+        }
+        for (i, &rho) in rhos.iter().enumerate() {
+            assert!(rho.abs() < 0.6, "frame {i} rho expected < 0.6, got {rho}");
+        }
+    }
+
     // ------------------------------------------------------------------
     // Round 51 — Stereo SIMPLE/ASF split-MDCT (Path A, 2× SCE) tests.
     // ------------------------------------------------------------------
@@ -1588,7 +1744,11 @@ mod tests {
     }
 
     /// Stereo encoder TOC declares 2 channels and the substream parser
-    /// surfaces both per-channel scaled spectra.
+    /// surfaces both per-channel scaled spectra. Round 52 update: with
+    /// identical channels (L=R), the cross-channel correlation is 1.0 so
+    /// the dispatcher routes the frame through Path B (joint M/S CPE,
+    /// `b_enable_mdct_stereo_proc == 1`). Force the split-MDCT path so
+    /// this structural test continues to exercise Path A.
     #[test]
     fn encode_frame_pcm_stereo_substream_parses() {
         use crate::decoder::Ac4Decoder;
@@ -1602,7 +1762,7 @@ mod tests {
                 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
             })
             .collect();
-        let bytes = enc.encode_frame_pcm_stereo(&frame, &frame);
+        let bytes = enc.encode_frame_pcm_stereo_split_with_max_sfb(&frame, &frame, 40);
         let info = crate::toc::parse_ac4_toc(&bytes).expect("parse_ac4_toc");
         assert_eq!(info.channels, 2);
         let params = CodecParameters::audio(CodecId::new("ac4"));
@@ -1612,7 +1772,8 @@ mod tests {
         let _ = dec.receive_frame().expect("receive_frame");
         let sub = dec.last_substream.as_ref().expect("substream parsed");
         // SIMPLE stereo mode + b_enable_mdct_stereo_proc = 0 (split-MDCT
-        // path). Both channel's spectra populated.
+        // path forced by `encode_frame_pcm_stereo_split_with_max_sfb`).
+        // Both channels' spectra populated.
         assert!(matches!(
             sub.tools.stereo_mode,
             Some(crate::asf::StereoCodecMode::Simple)

@@ -214,9 +214,21 @@ framework but usable standalone.
 > channel, and emits a `b_enable_mdct_stereo_proc == 0` stereo CPE
 > body the decoder reconstructs at ≥24.8 dB spectral SNR for both
 > 440 Hz L+R (matched) and 440 Hz L + 660 Hz R (independent) tone
-> fixtures. Round-51 leaves joint M/S coding for a future round
-> (Path B); SIMPLE 2× SCE is the spec-mandated minimum for stereo
-> AC-4 streams.
+> fixtures. Round 52 lands the matching **joint M/S CPE (Path B,
+> `b_enable_mdct_stereo_proc == 1`) encoder** per §5.3 + §4.2.6.3
+> + §7.5: `encode_frame_pcm_stereo` now dispatches between Path A
+> and Path B based on an energy-weighted per-SFB correlation rising
+> above the 0.7 threshold. Path B emits one shared `asf_section_data`
+> + two `asf_spectral_data` (M/S or L/R per band based on bit-cost
+> comparison) + shared `asf_scalefac_data` + per-active-sfb `ms_used`
+> flags + shared `asf_snf_data`. A frame-level "matched-channels"
+> gate (S/M energy ratio < 0.15) bumps the M-channel q_target up to
+> 16 to spend the bits saved on the silent / near-silent S residual
+> on finer M quantisation. End-to-end SNR on the 440 Hz L=R matched
+> fixture rises from round-51's 24.8 dB to 34.5 dB; the half-
+> correlated 440 Hz amplitude-imbalance fixture clears ≥ 26 dB;
+> independent 440 L + 660 R correctly routes via Path A and
+> preserves the round-51 SNR floor.
 
 ## Specs
 

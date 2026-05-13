@@ -331,6 +331,20 @@ fn quantise_band_for_cb(coeffs: &[f32], sf: i32, cb_id: u8) -> Vec<i32> {
 /// Empty bands return `(0, 100, [], 0)` — codebook 0 = "all-zero", no
 /// emission, scalefactor doesn't matter.
 pub fn pick_best_codebook_for_band(coeffs: &[f32]) -> (u8, i32, Vec<i32>, u32) {
+    pick_best_codebook_for_band_with_q_target(coeffs, 12.0)
+}
+
+/// Variant of [`pick_best_codebook_for_band`] that lets the caller bump
+/// the per-band peak-quant target. Larger `q_target` → smaller anchor
+/// scalefactor → finer quant step → higher per-band SNR at the cost of
+/// more bits per coefficient (HCB11 with escape carries longer codewords
+/// for the larger natural-q magnitudes). Used by round-52's joint M/S
+/// CPE encoder to spend the bits saved on the silent / near-silent S
+/// channel on a finer M-channel quantisation.
+pub fn pick_best_codebook_for_band_with_q_target(
+    coeffs: &[f32],
+    q_target: f32,
+) -> (u8, i32, Vec<i32>, u32) {
     if coeffs.is_empty() {
         return (0, 100, Vec::new(), 0);
     }
@@ -338,13 +352,9 @@ pub fn pick_best_codebook_for_band(coeffs: &[f32]) -> (u8, i32, Vec<i32>, u32) {
     if max_abs <= 1e-12 {
         return (0, 100, vec![0i32; coeffs.len()], 0);
     }
-    // Anchor scalefactor: target peak quant ≈ 12 (HCB9/10's q_max).
-    // This gives 3× more quantisation levels per band than the round-48
-    // HCB5-only baseline (q_max=4) → roughly +10 dB extra SNR per band
-    // before the bit budget is dominated by codeword length. Bands with
-    // very small natural peaks still get a chance to pick a smaller-q
-    // codebook below; very large peaks fall through to HCB11 + escape.
-    let q_target: f32 = 12.0;
+    // Anchor scalefactor: target peak quant ≈ q_target (default 12 for
+    // the round-49 mono path; round-52 joint M/S bumps the M-channel
+    // target as high as 30 to spend bits saved on a silent S channel).
     let q_target_43 = q_target.powf(4.0 / 3.0);
     let sf_gain_min = max_abs / q_target_43;
     let sf_anchor_f = 100.0 + 4.0 * sf_gain_min.log2();
@@ -1142,6 +1152,398 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
         snf_r.as_deref(),
         &sections_r.sfb_cb,
         &mqi_r,
+        max_sfb,
+    );
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+/// Round-52: energy-weighted average per-SFB Pearson correlation between
+/// two MDCT spectra.
+///
+/// For each scale-factor band over `0..max_sfb` the function computes the
+/// normalised cross-correlation `rho = sum(l*r) / sqrt(sum(l^2) * sum(r^2))`
+/// from the band's L and R coefficients, then returns the energy-weighted
+/// average over bands that have measurable energy in BOTH channels. The
+/// per-band weight is `sqrt(s_ll * s_rr)` (the band's geometric-mean energy)
+/// so bands where only one channel has content don't contaminate the metric:
+/// a tone on L and a different tone on R wind up with low geometric-mean
+/// energy on each tone's spread region, so the channel-specific bands carry
+/// negligible weight in the average.
+///
+/// This is the cheap `b_enable_mdct_stereo_proc` heuristic per ETSI
+/// TS 103 190-1 §5.3 — when the weighted mean correlation exceeds the
+/// threshold the encoder switches to joint M/S (Path B); otherwise it
+/// stays on split-MDCT (Path A, 2× SCE).
+///
+/// Returns a value in `[-1.0, 1.0]`. Returns `0.0` when neither channel
+/// has measurable energy.
+pub fn average_per_sfb_correlation(
+    transform_length: u32,
+    max_sfb: u32,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+) -> f32 {
+    let sfbo = match crate::sfb_offset::sfb_offset_48(transform_length) {
+        Some(t) => t,
+        None => return 0.0,
+    };
+    let mut acc: f64 = 0.0;
+    let mut weight_total: f64 = 0.0;
+    for sfb in 0..max_sfb as usize {
+        let a = sfbo[sfb] as usize;
+        let b = sfbo[sfb + 1] as usize;
+        let bmax = b.min(coeffs_l.len()).min(coeffs_r.len());
+        if bmax <= a {
+            continue;
+        }
+        let mut s_lr: f64 = 0.0;
+        let mut s_ll: f64 = 0.0;
+        let mut s_rr: f64 = 0.0;
+        for k in a..bmax {
+            let l = coeffs_l[k] as f64;
+            let r = coeffs_r[k] as f64;
+            s_lr += l * r;
+            s_ll += l * l;
+            s_rr += r * r;
+        }
+        if s_ll <= 1e-20 || s_rr <= 1e-20 {
+            continue;
+        }
+        let denom = (s_ll * s_rr).sqrt();
+        if denom <= 1e-20 {
+            continue;
+        }
+        let rho = (s_lr / denom).clamp(-1.0, 1.0);
+        // Geometric-mean band energy as the weight — favours bands where
+        // BOTH channels carry signal. Tones at different frequencies
+        // (L=440 Hz vs R=660 Hz) wind up with the L-tone region
+        // contributing low geometric-mean energy (R is near-zero there)
+        // and vice versa, so the metric naturally tracks "do they
+        // co-vary on the bands where both have content".
+        let w = denom;
+        acc += rho * w;
+        weight_total += w;
+    }
+    if weight_total <= 1e-20 {
+        return 0.0;
+    }
+    (acc / weight_total) as f32
+}
+
+/// Build the full stereo SIMPLE/ASF substream body for the long-frame
+/// single-window-group case in **joint-MDCT (Path B: M/S CPE)** form per
+/// ETSI TS 103 190-1 §5.3 + §4.2.6.3 Table 22 (`stereo_data()` with
+/// `b_enable_mdct_stereo_proc == 1`) + §7.5 (joint stereo Pseudocode 77).
+///
+/// Round 52 joint M/S encoder. The shared analysis pipeline:
+///   1. M = (L + R) / 2, S = (L - R) / 2 per §7.5.
+///   2. Per-SFB M/S decision: code as M/S OR keep L/R based on which
+///      shape costs fewer bits at the current scalefactor anchor.
+///      Bands flagged `ms_used[sfb] = true` carry M and S residuals;
+///      others carry L and R unchanged. The decoder's inverse step
+///      `L = M+S, R = M-S` (only when `ms_used == 1`) is the exact
+///      inverse, so per-band selection is a free perceptual / bit-rate
+///      knob.
+///   3. Shared section_data over the union of the chosen (per-channel)
+///      residuals' codebook needs — pick whichever codebook covers both
+///      M and S (or L and R) per band; sections are merged across bands
+///      by the DP optimiser.
+///   4. Shared scalefac_data — the spec stores one set of scalefactors;
+///      since each band's two residuals are quantised at the same anchor
+///      they share `sf`. `max_quant_idx` becomes `max(mqi_m, mqi_s)` per
+///      band so the DPCM stream walks every band that has any energy.
+///   5. Per-sfb `ms_used[sfb]` flag — one bit for each band that is
+///      coded (`cb != 0 && max_quant_idx > 0`) per §7.5 Pseudocode 77.
+///   6. SNF emission over zero-quant bands (single shared spectrum: the
+///      M energy approximates the joint band content; the decoder fills
+///      both reconstructed channels symmetrically).
+///
+/// The decoder's `parse_stereo_data_body_stateful` for
+/// `b_enable_mdct_stereo_proc == 1` consumes:
+///
+///   * `stereo_codec_mode` (2 b) = 0 (SIMPLE)
+///   * `b_enable_mdct_stereo_proc` (1 b) = 1
+///   * `b_long_frame` (1 b) = 1 (shared transform)
+///   * `max_sfb` (`n_msfb_bits` b) — shared between M and S
+///   * `asf_section_data()` — shared section partition
+///   * `asf_spectral_data()` for primary residual (M or L per band)
+///   * `asf_spectral_data()` for secondary residual (S or R per band)
+///   * `asf_scalefac_data()` — shared scalefactors
+///   * per-active-sfb `ms_used[sfb]` (1 b each)
+///   * `asf_snf_data()` — shared SNF
+///
+/// The `b_side_limited` field-width reduction documented in §4.3.6.2
+/// applies only to this joint-MDCT branch: the shared `max_sfb` field
+/// uses `n_msfb_bits = 6` (full primary width) — the spec's `n_side_bits`
+/// reduction governs a separate side max_sfb that the joint branch's
+/// `parse_asf_psy_info(0, 0)` call does not read.
+pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let end_bin = sfbo[max_sfb as usize] as usize;
+
+    // 1. Compute M and S spectra. Per §7.5: M = (L+R)/2, S = (L-R)/2.
+    let n_coeffs = coeffs_l.len().min(coeffs_r.len()).min(end_bin);
+    let mut spec_m = vec![0.0_f32; end_bin];
+    let mut spec_s = vec![0.0_f32; end_bin];
+    for k in 0..n_coeffs {
+        let l = coeffs_l[k];
+        let r = coeffs_r[k];
+        spec_m[k] = 0.5 * (l + r);
+        spec_s[k] = 0.5 * (l - r);
+    }
+
+    // 2. Per-SFB M/S decision: for each band evaluate the natural-q bit
+    //    cost of (M, S) vs (L, R) at the same anchor scalefactor, then
+    //    pick the cheaper representation. Track which residual goes into
+    //    the primary / secondary stream and the ms_used flag.
+    let mut q_pri = vec![0i32; end_bin];
+    let mut q_sec = vec![0i32; end_bin];
+    let mut sf_per_band = vec![100i32; max_sfb as usize];
+    let mut max_quant_idx = vec![0u32; max_sfb as usize];
+    let mut natural_q_pri_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb as usize);
+    let mut natural_q_sec_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb as usize);
+    let mut ms_used_per_band = vec![false; max_sfb as usize];
+
+    // Round-52: frame-level "matched-channel" detection. When the
+    // FRAME's total S energy is far below its M energy, every band's
+    // M-quant gets a `q_target` bump applied uniformly. The bump tapers
+    // back to the default 12 as the frame's S/M ratio grows. Per-band
+    // bumps were tried in development but interact destructively with
+    // the shared joint-section cost table — when some bands are bumped
+    // and others aren't, the joint scalefactor sequence misaligns the
+    // decoder's quantised-spectrum dequantisation. The frame-level gate
+    // keeps the bump self-consistent across the section partition.
+    let frame_e_m: f64 = spec_m[..end_bin].iter().map(|&v| (v as f64).powi(2)).sum();
+    let frame_e_s: f64 = spec_s[..end_bin].iter().map(|&v| (v as f64).powi(2)).sum();
+    let frame_ratio = if frame_e_m > 1e-20 {
+        (frame_e_s / (frame_e_m + frame_e_s)) as f32
+    } else {
+        1.0
+    };
+    let matched_channels = frame_ratio < 0.15;
+    let frame_q_target_m: f32 = if matched_channels {
+        // Smooth taper from 16 at ratio=0 to 12 at ratio=0.15.
+        let max_q = 16.0_f32;
+        let min_q = 12.0_f32;
+        max_q - (max_q - min_q) * (frame_ratio / 0.15).min(1.0)
+    } else {
+        12.0
+    };
+
+    // Round-52 per-SFB pipeline. For each scale-factor band:
+    //
+    //   1. Pick the "natural" anchor scalefactor + codebook for each of
+    //      the four candidate residuals — L, R, M, S — at the baseline
+    //      q_target = 12 (matches the round-49 mono path).
+    //   2. Compute bit cost for M/S vs L/R and pick the cheaper option
+    //      per band. The `ms_used[sfb]` flag rides this decision.
+    //   3. When use_ms is chosen AND the band's S energy is far below its
+    //      M energy (the "matched-channels" regime), re-anchor M at a
+    //      bumped q_target (up to 16) to spend the bits saved on the
+    //      near-silent S residual on a finer M quantisation. The bump
+    //      tapers back to 12 when S energy approaches M.
+    //   4. Resolve the shared on-wire scalefactor (the joint syntax has
+    //      one set of scalefactors covering both residuals).
+    //   5. Re-quantise both residuals at the shared sf.
+    for sfb in 0..max_sfb as usize {
+        let a = sfbo[sfb] as usize;
+        let b = sfbo[sfb + 1] as usize;
+        let bmax = b.min(end_bin);
+        let band_l = &coeffs_l[a..bmax.min(coeffs_l.len())];
+        let band_r = &coeffs_r[a..bmax.min(coeffs_r.len())];
+        let band_m = &spec_m[a..bmax];
+        let band_s = &spec_s[a..bmax];
+
+        let (cb_l, sf_l, ql, cost_l) = pick_best_codebook_for_band(band_l);
+        let (cb_r, sf_r, qr, cost_r) = pick_best_codebook_for_band(band_r);
+        let (cb_m_base, sf_m_base, qm_base, cost_m_base) = pick_best_codebook_for_band(band_m);
+        let (cb_s, sf_s, qs, cost_s) = pick_best_codebook_for_band(band_s);
+
+        // M/S vs L/R decision — cost compare runs at the BASELINE
+        // q_target=12 so the M-channel `q_target` bump doesn't bias the
+        // encoder toward L/R coding.
+        let ms_total = cost_m_base.saturating_add(cost_s);
+        let lr_total = cost_l.saturating_add(cost_r);
+        let use_ms = ms_total < lr_total;
+        ms_used_per_band[sfb] = use_ms;
+
+        // Round-52 q_target bump for the M-channel: applied at the
+        // FRAME level when the entire frame qualifies as "matched
+        // channels" (total S energy ≪ M energy). Per-band bumps were
+        // tried in development but interact destructively with the
+        // shared joint-section cost table — when some bands are bumped
+        // and others aren't, the resulting scalefactor sequence
+        // misaligns the decoder's quantised-spectrum dequantisation.
+        // The frame-level gate keeps the bump self-consistent across
+        // every band so the joint section partition stays valid.
+        let (cb_m, sf_m, qm, cost_m) = if use_ms && matched_channels {
+            pick_best_codebook_for_band_with_q_target(band_m, frame_q_target_m)
+        } else {
+            (cb_m_base, sf_m_base, qm_base, cost_m_base)
+        };
+        let _ = (cb_l, cb_r, cb_m, cb_s, ql, qr, qm, qs, cost_m);
+
+        let (sf_a, sf_b) = if use_ms { (sf_m, sf_s) } else { (sf_l, sf_r) };
+
+        // Shared scalefactor — when one residual is silent (its anchor
+        // falls back to the empty-band default sf=100), use the other
+        // residual's anchor outright; otherwise take the max so neither
+        // channel's quants overflow its codebook's representable range.
+        let a_silent = if use_ms {
+            cost_m_base == 0 && cb_m_base == 0
+        } else {
+            cost_l == 0 && cb_l == 0
+        };
+        let b_silent = if use_ms {
+            cost_s == 0 && cb_s == 0
+        } else {
+            cost_r == 0 && cb_r == 0
+        };
+        let sf = match (a_silent, b_silent) {
+            (true, true) => 100,
+            (true, false) => sf_b,
+            (false, true) => sf_a,
+            (false, false) => sf_a.max(sf_b),
+        };
+        sf_per_band[sfb] = sf;
+
+        // Re-quantise both residuals at the shared sf.
+        let coeff_a: Vec<f32> = if use_ms {
+            band_m.to_vec()
+        } else {
+            band_l.to_vec()
+        };
+        let coeff_b: Vec<f32> = if use_ms {
+            band_s.to_vec()
+        } else {
+            band_r.to_vec()
+        };
+        let q_a_re = quantise_band_for_cb(&coeff_a, sf, 11);
+        let q_b_re = quantise_band_for_cb(&coeff_b, sf, 11);
+        let mut mq: u32 = 0;
+        for (i, &qi) in q_a_re.iter().enumerate() {
+            if a + i < q_pri.len() {
+                q_pri[a + i] = qi;
+            }
+            mq = mq.max(qi.unsigned_abs());
+        }
+        for (i, &qi) in q_b_re.iter().enumerate() {
+            if a + i < q_sec.len() {
+                q_sec[a + i] = qi;
+            }
+            mq = mq.max(qi.unsigned_abs());
+        }
+        max_quant_idx[sfb] = mq;
+        natural_q_pri_per_band.push(q_a_re);
+        natural_q_sec_per_band.push(q_b_re);
+    }
+
+    // 3. Shared section_data driven by the *union* of both residuals'
+    //    codebook needs. Build a cost table whose per-band cost is the
+    //    sum of pri + sec costs for each candidate codebook (HCB11 always
+    //    qualifies via escape; other codebooks only qualify if their q_max
+    //    covers BOTH residuals).
+    let cost_table_pri = build_band_codebook_cost_table(&natural_q_pri_per_band);
+    let cost_table_sec = build_band_codebook_cost_table(&natural_q_sec_per_band);
+    let mut cost_table_joint: Vec<[u32; 12]> = Vec::with_capacity(natural_q_pri_per_band.len());
+    for sfb in 0..max_sfb as usize {
+        let mut row = [u32::MAX; 12];
+        let pri_zero = natural_q_pri_per_band[sfb].iter().all(|&qi| qi == 0);
+        let sec_zero = natural_q_sec_per_band[sfb].iter().all(|&qi| qi == 0);
+        if pri_zero && sec_zero {
+            row[0] = 0;
+        }
+        for cb_id in 1u8..=11 {
+            let p = cost_table_pri[sfb][cb_id as usize];
+            let s = cost_table_sec[sfb][cb_id as usize];
+            if p == u32::MAX || s == u32::MAX {
+                continue;
+            }
+            row[cb_id as usize] = p.saturating_add(s);
+        }
+        cost_table_joint.push(row);
+    }
+    let dp_sections = dp_optimise_sections(&cost_table_joint, 16);
+    let sections = build_sections_from_dp(&dp_sections, max_sfb);
+
+    // 4. SNF over zero-quant bands — measured from M (which carries the
+    //    band's joint energy). The decoder applies the same SNF to both
+    //    channels symmetrically via `dequantise_and_scale`; on
+    //    ms_used == false bands the SNF only adds noise to the M side.
+    let snf = compute_snf_dpcm_for_zero_quant_bands(
+        &spec_m,
+        sfbo,
+        max_sfb,
+        &sections.sfb_cb,
+        &max_quant_idx,
+    );
+
+    // 5. Emit the joint stereo_data() body.
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+    // stereo_codec_mode = SIMPLE (0b00, 2 b).
+    bw.write_u32(0, 2);
+    // b_enable_mdct_stereo_proc = 1 (joint-MDCT path).
+    bw.write_bit(true);
+    // Shared transform / psy info — decoder's
+    // `parse_asf_transform_info()` reads one bit (b_long_frame) at
+    // frame_len_base >= 1536 and infers the long-frame transform length.
+    bw.write_bit(true); // b_long_frame
+                        // Shared psy_info: asf_psy_info(0, 0). With
+                        // b_dual_maxsfb=false / b_side_limited=false there's a
+                        // single max_sfb field at n_msfb_bits width. No
+                        // scale_factor_grouping bits in long-frame mode.
+    let (n_msfb_bits, _, _) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    bw.write_u32(max_sfb, n_msfb_bits);
+
+    // Shared sf_data: section_data → primary spectral → secondary
+    // spectral → scalefac → ms_used[] → snf.
+    write_section_data(&mut bw, &sections);
+    write_spectral_data_sections(&mut bw, &q_pri, sfbo, &sections);
+    write_spectral_data_sections(&mut bw, &q_sec, sfbo, &sections);
+    write_scalefac_data(
+        &mut bw,
+        &sf_per_band,
+        &sections.sfb_cb,
+        &max_quant_idx,
+        max_sfb,
+    );
+    // ms_used[] — one bit per active band (cb != 0 && mqi > 0). The
+    // decoder skips this read for inactive bands so silent / all-zero
+    // bands must not emit a bit.
+    for sfb in 0..max_sfb as usize {
+        let cb = sections.sfb_cb[sfb];
+        if cb == 0 || max_quant_idx[sfb] == 0 {
+            continue;
+        }
+        bw.write_bit(ms_used_per_band[sfb]);
+    }
+    write_snf_data(
+        &mut bw,
+        snf.as_deref(),
+        &sections.sfb_cb,
+        &max_quant_idx,
         max_sfb,
     );
 

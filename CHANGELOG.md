@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 52 — Joint M/S CPE (Path B: `b_enable_mdct_stereo_proc == 1`) encoder**
+  per ETSI TS 103 190-1 §5.3 (channel_count > 1) + §4.2.6.3 Table 22
+  (`stereo_data()` with `b_enable_mdct_stereo_proc == 1`) + §7.5
+  (Pseudocode 77 joint stereo, inverse M/S = `L = M+S, R = M-S`):
+  - `encoder_asf::average_per_sfb_correlation(transform_length, max_sfb,
+    coeffs_l, coeffs_r)` — energy-weighted per-SFB Pearson correlation
+    between the L and R MDCT spectra. Bands are weighted by their
+    geometric-mean energy `sqrt(s_ll * s_rr)` so spectrally-disjoint
+    tones don't contaminate the metric. Returns a value in `[-1.0, 1.0]`.
+  - `encoder_asf::build_stereo_simple_asf_joint_body_from_pcm_spectra(
+    transform_length, max_sfb, coeffs_l, coeffs_r, pad_target_bytes)`
+    — emits the full joint stereo audio_data body:
+    `audio_size_value (15 b)` + `b_more_bits (1 b)` + byte_align +
+    `stereo_codec_mode = SIMPLE (2 b)` + `b_enable_mdct_stereo_proc = 1
+    (1 b)` + `b_long_frame (1 b)` + shared `max_sfb (n_msfb_bits b)`
+    + shared `asf_section_data()` + per-channel `asf_spectral_data()`
+    for M and S residuals + shared `asf_scalefac_data()` + per-active-
+    sfb `ms_used[sfb]` (1 b each) + shared `asf_snf_data()`.
+  - Per-SFB M/S vs L/R decision: bit-cost compare between (M, S) and
+    (L, R) at the baseline q_target=12 picks the cheaper representation
+    band-by-band. The `ms_used[sfb]` flag on each active band tells the
+    decoder whether to apply the inverse-M/S transform.
+  - Frame-level "matched-channels" q_target bump: when the frame's
+    total S energy is below 15% of M (e.g. for matched / near-matched
+    stereo content), the M-channel anchor scalefactor is re-picked at a
+    bumped peak-quant target (up to 16, smoothly tapering down to 12
+    at the 15% threshold), spending the bits saved on the silent /
+    near-silent S residual on a finer M quantisation. Per-band bumps
+    were tried first but interact destructively with the shared joint-
+    section cost table — when some bands are bumped and others aren't
+    the joint scalefactor sequence misaligns the decoder's
+    dequantisation. The frame-level gate keeps the bump self-
+    consistent across the section partition.
+  - `Ac4ImsEncoder::encode_frame_pcm_stereo` now dispatches between
+    Path A (round 51, split-MDCT) and Path B (this round, joint M/S)
+    based on the energy-weighted per-SFB correlation rising above
+    `Ac4ImsEncoder::STEREO_JOINT_MS_CORRELATION_THRESHOLD` (0.7). New
+    `encode_frame_pcm_stereo_split_with_max_sfb` /
+    `encode_frame_pcm_stereo_joint_with_max_sfb` force a specific path
+    regardless of correlation — used by tests / fixtures that need a
+    deterministic on-wire layout.
+  - Round-trip SNR targets met:
+    * Matched 440 Hz L=R: ≥ 34.5 dB spectral SNR (vs round-51's
+      24.8 dB on this fixture) — the q_target bump tightens the M
+      quantisation step by ~half, S quantises to all-zero, and the
+      decoder reconstructs L = M+0, R = M-0 with the bumped precision.
+    * Independent 440 Hz L + 660 Hz R: routed via Path A (correlation
+      0.0 by design), preserving round-51's ≥ 24.8 dB SNR floor.
+    * Half-correlated stereo (amplitude-imbalanced 440 Hz at
+      0.30 / 0.36): routed via Path B, frame-level S/M ratio ≈ 0.003
+      triggers the q_target bump, output ≥ 26.4 dB / 28.0 dB per
+      channel — between the pure-matched and fully-independent
+      regimes.
+  - Six new tests in `tests/round52_joint_ms_stereo.rs`
+    (`round52_matched_stereo_joint_ms_snr_exceeds_28db`,
+    `round52_independent_stereo_routes_via_split_path_a`,
+    `round52_half_correlated_stereo_joint_ms_snr_exceeds_26db`,
+    `round52_joint_ms_full_pcm_roundtrip_through_ac4decoder`) plus two
+    in-module correlation sanity tests
+    (`round52_correlation_identical_channels_is_one`,
+    `round52_correlation_independent_tones_below_threshold`).
+
 - **Round 51 — Stereo SIMPLE/ASF split-MDCT (Path A: 2× SCE) encoder**
   per ETSI TS 103 190-1 §5.3 (channel_count > 1) + §4.2.6.3 Table 22
   (`stereo_data()` with `b_enable_mdct_stereo_proc == 0`):
