@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 74 — 5.0 SIMPLE/ASF Cfg3Five multichannel forward analysis (5 SCE)
+  encoder** per ETSI TS 103 190-1 §4.2.6.6 Table 25 row
+  `case SIMPLE: coding_config == 3` + §4.2.7.5 Table 29 (`five_channel_data()`)
+  + §4.2.10.1 Table 47 (`chparam_info()`):
+  - `encoder_asf::build_5_0_simple_asf_body_from_pcm_spectra(transform_length,
+    max_sfb, &[&[f32]; 5], pad_target_bytes)` — emits the full 5.0
+    multichannel audio_data body for `5_X_codec_mode = SIMPLE` /
+    `coding_config = 3` (Cfg3Five): `audio_size_value (15 b)` +
+    `b_more_bits (1 b)` + byte_align + `5_X_codec_mode = SIMPLE (3 b)` +
+    `coding_config = 3 (2 b)` + `five_channel_data()` (shared
+    `asf_transform_info` + shared `asf_psy_info` + `five_channel_info` with
+    `chel_matsel = 0` + 5x `chparam_info` with `sap_mode = 0` for identity
+    SAP + 5x `sf_data(ASF)` bodies). No joint-MDCT mixing happens at decode
+    time — every output channel comes straight from its own `sf_data(ASF)`
+    body. SIMPLE has no `aspx_config()` / `acpl_config_*()` (those are
+    I-frame I/O for ASPX modes only), no companding, no LFE
+    `mono_data(b_lfe=1)` (5.0 → `b_has_lfe = false`).
+  - `Ac4ImsEncoder::with_5_0()` — channel-mode prefix `0b1101` (4 b — Table
+    85 channel_mode 3) for the 5.0 surround layout (`L, R, C, Ls, Rs`)
+    without LFE.
+  - `Ac4ImsEncoder::encode_frame_pcm_5_0(&[&[f32]; 5])` +
+    `encode_frame_pcm_5_0_with_max_sfb()` — accept paired L/R/C/Ls/Rs float
+    PCM frames at the encoder's configured frame_len (1920 samples for the
+    default 48 kHz / 24 fps), run the round-50 forward pipeline (KBD-
+    windowed MDCT + per-band scalefactor + DP-optimal sectioning +
+    HCB1..11 codebook selection + SNF emission) independently per channel,
+    then emit a `bitstream_version = 2` IMS TOC (channel_mode prefix
+    `'1101'`) followed by the 5.0 SIMPLE/Cfg3Five body. The encoder uses
+    one [`encoder_mdct::EncoderMdctState`] per channel (new field
+    `mdct_states_multi: Vec<EncoderMdctState>`) so 50% TDAC overlap
+    continuity is preserved per channel.
+  - The decoder's existing `dispatch_5x_cfg3_simple_aspx` path (round 39)
+    consumes the body, IMDCTs each per-channel spectrum into output slots
+    0..4 (L/R/C/Ls/Rs per Table 180 row `coding_config == 3`), and emits
+    5-channel interleaved S16 PCM at the declared sample rate.
+  - Round-trip SNR target met: ≥ 20 dB spectral SNR per channel on the
+    independent-tone fixture (220 / 440 / 660 / 880 / 1100 Hz on L/R/C/Ls/Rs).
+    Measured: L=24.5, R=24.8, C=25.0, Ls=23.4, Rs=27.4 dB — comfortably above
+    the 20 dB floor and in the same band as the round-51 stereo Path A SNR
+    (24.8 dB on 440 Hz). The decoder's 5-channel S16 interleaved layout
+    (1920 × 5 × 2 = 19,200 bytes) round-trips cleanly through
+    `Ac4Decoder::receive_frame`.
+  - Seven new tests in `tests/round74_5_0_multichannel.rs`
+    (`round74_5_0_encoder_produces_5channel_layout_pcm`,
+    `round74_5_0_encoder_bumps_sequence_counter`,
+    `round74_5_0_encoder_toc_declares_5_channels`,
+    `round74_5_0_independent_tones_per_channel_round_trip_with_distinct_audio`,
+    `round74_5_0_per_channel_spectral_snr_exceeds_20db`,
+    `round74_5_0_substream_parses_via_walk_ac4_substream`,
+    `round74_5_0_silence_round_trips_to_silence`).
+  - 5.1 (channel_mode `0b1110` — adds LFE), 7.0/7.1 (channel_mode
+    `0b11110000`/`0b11110001` — adds front-extension / back-surround pair),
+    and the ASPX/A-CPL multichannel modes (`5_X_codec_mode in
+    {ASPX, ASPX_ACPL_1, ASPX_ACPL_2, ASPX_ACPL_3}`) are deferred. 5.0
+    SIMPLE Cfg3Five is the spec-mandated minimum for 5-channel AC-4
+    streams and unblocks the encoder's path to LFE / immersive layouts.
+
 - **Round 52 — Joint M/S CPE (Path B: `b_enable_mdct_stereo_proc == 1`) encoder**
   per ETSI TS 103 190-1 §5.3 (channel_count > 1) + §4.2.6.3 Table 22
   (`stereo_data()` with `b_enable_mdct_stereo_proc == 1`) + §7.5

@@ -1558,6 +1558,176 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
     bytes
 }
 
+/// Build the full 5.0 SIMPLE/ASF substream body for the long-frame
+/// single-window-group case in **5_X_codec_mode = SIMPLE / coding_config =
+/// Cfg3Five** form per ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case SIMPLE:
+/// coding_config == 3` + §4.2.7.5 Table 29 (`five_channel_data()`) + §4.2.10.1
+/// Table 47 (`chparam_info()`).
+///
+/// Round 74 multichannel forward analysis (5.0, 5 SCE):
+///   1. Per-channel forward analysis (anchor scalefactor + DP-optimal section
+///      partition + HCB1..11 codebook selection + SNF emission) — identical to
+///      the round-50 mono pipeline applied 5 times.
+///   2. One shared `sf_info(ASF, 0, 0)` header (`b_long_frame = 1`,
+///      `max_sfb[0]` in `n_msfb_bits` bits) precedes the per-channel data —
+///      both `b_dual_maxsfb` and `b_side_limited` are zero so all channels
+///      bind to a single `max_sfb`.
+///   3. `five_channel_info()`: 4-bit `chel_matsel = 0` + five `chparam_info()`
+///      payloads each with `sap_mode = 0` (no MDCT-stereo data, no SAP) so
+///      the channels are independent. This is the simplest spec-conformant
+///      shape — every output channel is decoded straight from its own
+///      `sf_data(ASF)` body with no joint-MDCT mixing.
+///   4. Five per-channel `sf_data(ASF)` bodies: `asf_section_data` +
+///      `asf_spectral_data` + `asf_scalefac_data` + `asf_snf_data` (the same
+///      quartet the round-50 mono path emits, run independently per channel).
+///
+/// The decoder's [`crate::mch::parse_5x_audio_data_outer`] for
+/// `5_X_codec_mode == SIMPLE && coding_config == 3` (Cfg3Five) consumes:
+///
+///   * `5_X_codec_mode` (3 b) = 0 (SIMPLE) — no `aspx_config()` /
+///     `acpl_config_*()` follow (those are I-frame I/O for ASPX modes only).
+///   * `coding_config` (2 b) = 3 (Cfg3Five) — no `companding_control()` in
+///     SIMPLE mode.
+///   * `five_channel_data()` per Table 29 — shared `sf_info` + 5x
+///     `sf_data(ASF)` bodies.
+///
+/// Each emitted `sf_data(ASF)` body lands on
+/// `tools.five_channel_data.scaled_spec_per_channel[i]` via
+/// [`crate::mch::decode_mch_sf_data_channels`]; the decoder's
+/// `dispatch_5x_cfg3_simple_aspx` then IMDCTs each spectrum into one of the
+/// five output slots (L=0, R=1, C=2, Ls=3, Rs=4) per Table 180 row
+/// `coding_config == 3`.
+///
+/// `coeffs_per_channel[i]` is the windowed forward-MDCT spectrum for output
+/// channel `i` (length ≥ `sfb_offset[max_sfb]`); the slice order matches the
+/// 5.0 output layout (`L, R, C, Ls, Rs`).
+///
+/// Returns the substream bytes (audio_size header + audio_data + zero-padding)
+/// sized to `pad_target_bytes`.
+pub fn build_5_0_simple_asf_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    coeffs_per_channel: &[&[f32]; 5],
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let end_bin = sfbo[max_sfb as usize] as usize;
+
+    // Per-channel forward analysis. Each channel is independent — no shared
+    // sections, no shared scalefactors, no joint-MDCT processing (sap_mode = 0
+    // on every chparam_info).
+    /// `(qspec, sf_per_band, max_quant_idx, sections, snf)` — output of the
+    /// per-channel forward analysis closure used by
+    /// [`build_5_0_simple_asf_body_from_pcm_spectra`].
+    type FiveZeroChannelAnalysis = (Vec<i32>, Vec<i32>, Vec<u32>, AsfSections, Option<Vec<i32>>);
+    let prepare_channel = |coeffs: &[f32]| -> FiveZeroChannelAnalysis {
+        let mut qspec = vec![0i32; end_bin];
+        let mut sf_per_band = vec![100i32; max_sfb as usize];
+        let mut max_quant_idx = vec![0u32; max_sfb as usize];
+        let mut natural_q_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb as usize);
+        for sfb in 0..max_sfb as usize {
+            let a = sfbo[sfb] as usize;
+            let b = sfbo[sfb + 1] as usize;
+            let band = &coeffs[a..b.min(coeffs.len())];
+            let (_cb_picked, sf, q, _cost) = pick_best_codebook_for_band(band);
+            sf_per_band[sfb] = sf;
+            let mut max_q: u32 = 0;
+            for (i, &qi) in q.iter().enumerate() {
+                qspec[a + i] = qi;
+                max_q = max_q.max(qi.unsigned_abs());
+            }
+            max_quant_idx[sfb] = max_q;
+            natural_q_per_band.push(q);
+        }
+        let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
+        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let sections = build_sections_from_dp(&dp_sections, max_sfb);
+        let snf = compute_snf_dpcm_for_zero_quant_bands(
+            coeffs,
+            sfbo,
+            max_sfb,
+            &sections.sfb_cb,
+            &max_quant_idx,
+        );
+        (qspec, sf_per_band, max_quant_idx, sections, snf)
+    };
+
+    let analyses: [FiveZeroChannelAnalysis; 5] = [
+        prepare_channel(coeffs_per_channel[0]),
+        prepare_channel(coeffs_per_channel[1]),
+        prepare_channel(coeffs_per_channel[2]),
+        prepare_channel(coeffs_per_channel[3]),
+        prepare_channel(coeffs_per_channel[4]),
+    ];
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_channel_element() outer shell — §4.2.6.6 Table 25.
+    // 5_X_codec_mode = SIMPLE (0) — 3 bits.
+    bw.write_u32(0, 3);
+    // SIMPLE has no I-frame aspx_config / acpl_config block, no LFE
+    // mono_data() (b_has_lfe = false for 5.0), no companding_control().
+    // coding_config = Cfg3Five (3) — 2 bits.
+    bw.write_u32(3, 2);
+
+    // five_channel_data() per Table 29 — shared sf_info + 5x sf_data bodies.
+    //
+    // asf_transform_info(): b_long_frame = 1.
+    bw.write_bit(true);
+    // asf_psy_info(ASF, b_dual_maxsfb = 0, b_side_limited = 0):
+    //   max_sfb[0] in n_msfb_bits bits — shared across all 5 channels.
+    let (n_msfb_bits, _, _) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    bw.write_u32(max_sfb, n_msfb_bits);
+
+    // five_channel_info() per Table 32: 4-bit chel_matsel + 5x chparam_info().
+    // chel_matsel = 0 — no channel-element matrix mixing (each channel is
+    // its own independent SCE).
+    bw.write_u32(0, 4);
+    // 5x chparam_info() with sap_mode = 0 each: no ms_used follow-on, no
+    // sap_data follow-on. Each chparam_info emits just the 2-bit sap_mode.
+    for _ in 0..5 {
+        bw.write_u32(0, 2);
+    }
+
+    // 5x sf_data(ASF) bodies — one per output channel in L/R/C/Ls/Rs order.
+    for analysis in &analyses {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 /// Round-50 helper: count total bits the body would emit if we used the
 /// greedy run-length section merge instead of the DP optimiser. Returns
 /// (greedy_bits, dp_bits) so callers (and tests) can quantify the

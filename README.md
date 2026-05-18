@@ -228,7 +228,27 @@ framework but usable standalone.
 > fixture rises from round-51's 24.8 dB to 34.5 dB; the half-
 > correlated 440 Hz amplitude-imbalance fixture clears ≥ 26 dB;
 > independent 440 L + 660 R correctly routes via Path A and
-> preserves the round-51 SNR floor.
+> preserves the round-51 SNR floor. Round 74 lands the first
+> **multichannel forward-analysis encoder**: a 5.0
+> SIMPLE/Cfg3Five path (5 SCE, no LFE, no joint coding) per
+> §4.2.6.6 Table 25 row `case SIMPLE: coding_config == 3` +
+> §4.2.7.5 Table 29 (`five_channel_data()`). New
+> `Ac4ImsEncoder::with_5_0()` flips the TOC channel_mode prefix
+> to `0b1101` (4 b — Table 85 channel_mode 3), and
+> `encode_frame_pcm_5_0(&[L, R, C, Ls, Rs])` runs the round-50
+> forward pipeline (KBD-MDCT + DP-optimal sectioning + HCB1..11
+> + SNF) independently per channel into a shared `sf_info(ASF,
+> 0, 0)` header followed by `five_channel_info()` (identity SAP:
+> `chel_matsel = 0` + 5x `chparam_info` with `sap_mode = 0`)
+> and 5x `sf_data(ASF)` bodies. Decoder's existing
+> `dispatch_5x_cfg3_simple_aspx` (round 39) consumes the body
+> and emits 5-channel interleaved S16 PCM. End-to-end per-
+> channel spectral SNR ≥ 20 dB on the independent-tone fixture
+> (220/440/660/880/1100 Hz on L/R/C/Ls/Rs — measured
+> L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 dB), matching
+> the round-51 stereo Path A SNR floor. 5.1 (LFE), 7.0/7.1
+> (immersive add-channel pair), and the ASPX / A-CPL
+> multichannel modes remain deferred.
 
 ## Specs
 

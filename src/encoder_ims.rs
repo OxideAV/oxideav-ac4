@@ -69,7 +69,8 @@
 use oxideav_core::bits::BitWriter;
 
 use crate::encoder_asf::{
-    average_per_sfb_correlation, build_mono_simple_asf_body_from_pcm_spectrum,
+    average_per_sfb_correlation, build_5_0_simple_asf_body_from_pcm_spectra,
+    build_mono_simple_asf_body_from_pcm_spectrum,
     build_stereo_simple_asf_joint_body_from_pcm_spectra,
     build_stereo_simple_asf_split_body_from_pcm_spectra,
 };
@@ -116,6 +117,12 @@ pub struct Ac4ImsEncoder {
     /// for the second channel — separate so 50% TDAC overlap is
     /// per-channel.
     pub mdct_state_r: Option<EncoderMdctState>,
+    /// Forward-MDCT analysis state for the multichannel encoder paths
+    /// (`encode_frame_pcm_5_0()` and any future N>2 variants). One
+    /// [`EncoderMdctState`] per output channel — separate so 50% TDAC
+    /// overlap continuity is preserved per channel across frames. Lazy-
+    /// initialised on first use; grown to the required channel count.
+    pub mdct_states_multi: Vec<EncoderMdctState>,
 }
 
 impl Ac4ImsEncoder {
@@ -134,6 +141,7 @@ impl Ac4ImsEncoder {
             channel_mode_bits: 1,
             mdct_state: None,
             mdct_state_r: None,
+            mdct_states_multi: Vec::new(),
         }
     }
 
@@ -149,6 +157,17 @@ impl Ac4ImsEncoder {
     pub fn with_stereo(mut self) -> Self {
         self.channel_mode_value = 0b10;
         self.channel_mode_bits = 2;
+        self
+    }
+
+    /// 5.0 channel mode (`0b1101`, 4 b) per Table 85 — channel_mode 3 —
+    /// the 5.0 surround layout (`L, R, C, Ls, Rs`) without LFE. Drives the
+    /// decoder's `5_X_channel_element()` walker for `channels == 5` (no
+    /// `b_has_lfe` block) and the corresponding `dispatch_5x_cfg3_simple_aspx`
+    /// PCM output path.
+    pub fn with_5_0(mut self) -> Self {
+        self.channel_mode_value = 0b1101;
+        self.channel_mode_bits = 4;
         self
     }
 
@@ -766,6 +785,135 @@ impl Ac4ImsEncoder {
         };
 
         // 6. Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // Restore caller's channel_mode setting.
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Encode one IMS v2 5.0 frame from arbitrary float PCM input (range
+    /// `[-1.0, 1.0]`) for L, R, C, Ls, Rs.
+    ///
+    /// **Path SIMPLE/Cfg3Five — 5 SCE multichannel forward analysis** per
+    /// ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case SIMPLE: coding_config ==
+    /// 3` + §4.2.7.5 Table 29 (`five_channel_data()`): each of the five
+    /// channels is encoded independently with the shared forward-analysis
+    /// pipeline (KBD-windowed MDCT, per-band scalefactor, DP-optimal
+    /// section partition, HCB1..11 codebook selection, SNF emission). One
+    /// shared `sf_info(ASF, 0, 0)` precedes the per-channel data; the
+    /// `five_channel_info()` uses identity SAP (`sap_mode = 0` on every
+    /// `chparam_info()`, `chel_matsel = 0`) so no joint-MDCT mixing happens
+    /// at decode time — every output channel comes straight from its own
+    /// `sf_data(ASF)` body. This is the spec-mandated minimum for the 5.0
+    /// SIMPLE path and unblocks the encoder's path to multichannel.
+    ///
+    /// `frames[i]` must each be exactly `frame_len` samples long
+    /// (1920 samples for the default 48 kHz / 24 fps configuration). The
+    /// slice order matches the 5.0 output layout (`L, R, C, Ls, Rs` —
+    /// Table 180 row `coding_config == 3`). The encoder forces the 5.0
+    /// channel mode (`channel_mode_value = 0b1101`, 4 b — Table 85
+    /// channel_mode 3) for this call.
+    ///
+    /// The decoder's [`crate::mch::parse_5x_audio_data_outer`] for
+    /// `channels == 5` (no LFE) consumes the body, IMDCTs each per-channel
+    /// spectrum into slots 0..4, and emits 5-channel interleaved S16 PCM at
+    /// the declared sample rate. There is no companding / ASPX / A-CPL on
+    /// the SIMPLE path so the round-trip is purely the per-channel MDCT
+    /// quantisation noise (≥ 20 dB spectral SNR per channel on tone /
+    /// white-noise fixtures).
+    ///
+    /// `max_sfb` defaults to 40 (matching the round-49 mono default).
+    /// Use [`Self::encode_frame_pcm_5_0_with_max_sfb`] for wider coverage.
+    ///
+    /// Per ETSI TS 103 190-1 §4.2.6.6 + §4.2.7.5 + §5.5 (MDCT) +
+    /// §5.7 / §5.8 (SIMPLE/ASF) + TS 103 190-2 §6.2.1.1 (IMS TOC).
+    pub fn encode_frame_pcm_5_0(&mut self, frames: &[&[f32]; 5]) -> Vec<u8> {
+        // Default max_sfb = 40 (matches the round-48 mono default).
+        self.encode_frame_pcm_5_0_with_max_sfb(frames, 40)
+    }
+
+    /// Encode one IMS v2 5.0 frame from arbitrary float PCM input at a
+    /// caller-specified `max_sfb`. All five channels share the same
+    /// `max_sfb` (the joint `sf_info` header carries one value). See
+    /// [`Self::encode_frame_pcm_5_0`] for the rest of the contract.
+    pub fn encode_frame_pcm_5_0_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_0: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        // Cap max_sfb at n_msfb_bits=6's max (63 for tl=1920) and at the
+        // transform's actual `num_sfb_48` cap (61 at tl=1920).
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force 5.0 channel_mode (prefix '1101', 4 bits — Table 85
+        // channel_mode 3). The body builder requires the TOC to declare
+        // 5 channels so the decoder's `walk_ac4_substream` dispatch
+        // routes through `parse_5x_audio_data_outer(b_has_lfe = false)`.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1101;
+        self.channel_mode_bits = 4;
+
+        // 1. Forward MDCT analysis per channel (separate state for
+        //    independent 50% TDAC overlap continuity).
+        while self.mdct_states_multi.len() < 5 {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        // Run analyses sequentially — borrow each state mutably one at a
+        // time so we don't conflict on `self.mdct_states_multi`.
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(5);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // 2-4. Build the 5.0 SIMPLE/Cfg3Five body. Pad budget is 5× the
+        //      mono budget since we carry five spectra independently.
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+        let body = build_5_0_simple_asf_body_from_pcm_spectra(
+            frame_len,
+            max_sfb,
+            &[
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[2],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+            ],
+            pad_target_bytes,
+        );
+
+        // 5. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);
         bw.align_to_byte();
