@@ -2962,6 +2962,28 @@ impl Decoder for Ac4Decoder {
                 );
             }
         }
+        // Round 80: 5.1 / 7.1 LFE channel render. When the 5_X / 7_X
+        // walker parsed a `mono_data(b_lfe = 1)` payload (per §4.2.6.6
+        // Table 25 `if (b_has_lfe) mono_data(1);` / §4.2.6.14 Table 33
+        // equivalent) the LFE scaled spectrum lives on
+        // `tools.lfe_mono_data.scaled_spec`. IMDCT it into the trailing
+        // LFE PCM slot — slot 5 for 5.1 (after L/R/C/Ls/Rs) and slot 7
+        // for 7.1 (after L/R/C/Ls/Rs/Lb/Rb).
+        if channels == 6 || channels == 8 {
+            let lfe_slot = (channels as usize) - 1;
+            let lfe_mono = self
+                .last_substream
+                .as_ref()
+                .and_then(|sub| sub.tools.lfe_mono_data.clone());
+            if let Some(lfe) = lfe_mono.as_ref() {
+                if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(lfe, lfe_slot, samples as usize) {
+                    while pcm_per_channel.len() <= lfe_slot {
+                        pcm_per_channel.push(None);
+                    }
+                    pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
+                }
+            }
+        }
         self.last_info = Some(info);
         let byte_count = (samples as usize) * (channels as usize) * 2; // S16 interleaved.
         let any_decoded = pcm_per_channel.iter().any(|p| p.is_some());

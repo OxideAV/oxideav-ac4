@@ -246,9 +246,26 @@ framework but usable standalone.
 > channel spectral SNR ≥ 20 dB on the independent-tone fixture
 > (220/440/660/880/1100 Hz on L/R/C/Ls/Rs — measured
 > L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 dB), matching
-> the round-51 stereo Path A SNR floor. 5.1 (LFE), 7.0/7.1
-> (immersive add-channel pair), and the ASPX / A-CPL
-> multichannel modes remain deferred.
+> the round-51 stereo Path A SNR floor. Round 80 extends the
+> multichannel encoder to **5.1 (Cfg3Five + LFE)** per §4.2.6.6
+> Table 25 (`if (b_has_lfe) mono_data(1);`) + §4.2.8 (`sf_info_lfe()`
+> Table 35 / Table 106 column 4 `n_msfbl_bits`):
+> `Ac4ImsEncoder::encode_frame_pcm_5_1(&[L, R, C, Ls, Rs, LFE])`
+> flips the TOC channel_mode prefix to `0b1110` (4 b — Table 85
+> channel_mode 4) and `build_5_1_simple_asf_body_from_pcm_spectra`
+> prepends an LFE `mono_data(1)` element
+> (`b_long_frame = 1` + `sf_info_lfe()` with `max_sfb_lfe` capped to
+> `n_msfbl_bits = 3` → 7 sfb / ≈350 Hz at tl = 1920) before the
+> Cfg3Five `five_channel_data()` body. The decoder side gains a
+> matching LFE PCM render in `Ac4Decoder::receive_frame`: when
+> `channels == 6` (5.1) or `channels == 8` (7.1) and
+> `tools.lfe_mono_data.scaled_spec` is present, the LFE spectrum is
+> IMDCT'd into the trailing PCM slot (slot 5 for 5.1, slot 7 for
+> 7.1). Non-LFE per-channel SNR matches the 5.0 numbers
+> (L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 dB ≥ 20 dB floor); a
+> 60 Hz LFE tone round-trips to a non-silent reconstructed LFE
+> channel. 7.0/7.1 (immersive add-channel pair) and the ASPX /
+> A-CPL multichannel modes remain deferred.
 
 ## Specs
 

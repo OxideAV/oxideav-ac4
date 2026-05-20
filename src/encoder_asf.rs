@@ -1728,6 +1728,188 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
     bytes
 }
 
+/// Build a 5.1 SIMPLE/Cfg3Five substream body — same as
+/// [`build_5_0_simple_asf_body_from_pcm_spectra`] but with an extra
+/// LFE `mono_data(1)` element inserted between the
+/// `5_X_codec_mode` and the `coding_config` selector per ETSI
+/// TS 103 190-1 §4.2.6.6 Table 25 (`if (b_has_lfe) mono_data(1);`).
+///
+/// `coeffs_per_channel` is in `[L, R, C, Ls, Rs, LFE]` order matching the
+/// 5.1 output layout. The LFE channel is coded as ASF long-frame
+/// (`b_long_frame = 1`) with `sf_info_lfe()` carrying `max_sfb_lfe` in
+/// `n_msfbl_bits` bits (Table 106 column 4 — 3 bits for `tl = 1920` so
+/// `max_sfb_lfe` is capped at 7). The LFE `sf_data(ASF)` body itself
+/// shares the same `(section + spectral + scalefac + snf)` shape as any
+/// other long-frame ASF channel — only the `max_sfb_lfe` cap differs.
+///
+/// The decoder's [`crate::mch::parse_5x_audio_data_outer`] for
+/// `b_has_lfe == true` consumes the LFE `mono_data(1)` between the
+/// I-frame config block (absent for SIMPLE) and the `coding_config`
+/// selector. The five non-LFE channels then run through the same
+/// Cfg3Five `five_channel_data()` body as the 5.0 path.
+///
+/// Returns the substream bytes (audio_size header + audio_data + zero-
+/// padding) sized to `pad_target_bytes`.
+pub fn build_5_1_simple_asf_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: u32,
+    coeffs_per_channel: &[&[f32]; 6],
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let end_bin = sfbo[max_sfb as usize] as usize;
+    let end_bin_lfe = sfbo[max_sfb_lfe as usize] as usize;
+
+    /// `(qspec, sf_per_band, max_quant_idx, sections, snf)` — output of the
+    /// per-channel forward analysis closure used by
+    /// [`build_5_1_simple_asf_body_from_pcm_spectra`].
+    type FiveOneChannelAnalysis = (Vec<i32>, Vec<i32>, Vec<u32>, AsfSections, Option<Vec<i32>>);
+    let prepare_channel = |coeffs: &[f32], max_sfb_use: u32| -> FiveOneChannelAnalysis {
+        let local_end = sfbo[max_sfb_use as usize] as usize;
+        let mut qspec = vec![0i32; local_end];
+        let mut sf_per_band = vec![100i32; max_sfb_use as usize];
+        let mut max_quant_idx = vec![0u32; max_sfb_use as usize];
+        let mut natural_q_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb_use as usize);
+        for sfb in 0..max_sfb_use as usize {
+            let a = sfbo[sfb] as usize;
+            let b = sfbo[sfb + 1] as usize;
+            let band = &coeffs[a..b.min(coeffs.len())];
+            let (_cb_picked, sf, q, _cost) = pick_best_codebook_for_band(band);
+            sf_per_band[sfb] = sf;
+            let mut max_q: u32 = 0;
+            for (i, &qi) in q.iter().enumerate() {
+                qspec[a + i] = qi;
+                max_q = max_q.max(qi.unsigned_abs());
+            }
+            max_quant_idx[sfb] = max_q;
+            natural_q_per_band.push(q);
+        }
+        let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
+        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
+        let snf = compute_snf_dpcm_for_zero_quant_bands(
+            coeffs,
+            sfbo,
+            max_sfb_use,
+            &sections.sfb_cb,
+            &max_quant_idx,
+        );
+        (qspec, sf_per_band, max_quant_idx, sections, snf)
+    };
+
+    // Five non-LFE channel analyses (L/R/C/Ls/Rs) at the shared max_sfb.
+    let analyses: [FiveOneChannelAnalysis; 5] = [
+        prepare_channel(coeffs_per_channel[0], max_sfb),
+        prepare_channel(coeffs_per_channel[1], max_sfb),
+        prepare_channel(coeffs_per_channel[2], max_sfb),
+        prepare_channel(coeffs_per_channel[3], max_sfb),
+        prepare_channel(coeffs_per_channel[4], max_sfb),
+    ];
+    // LFE analysis at max_sfb_lfe — Table 106 column 4 caps this to a
+    // smaller range than the regular max_sfb.
+    let lfe_analysis = prepare_channel(coeffs_per_channel[5], max_sfb_lfe);
+    let _ = end_bin; // silence dead-code lint on end_bin (used for asserts in debug)
+    let _ = end_bin_lfe;
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_channel_element(b_has_lfe = 1, ...) outer shell — §4.2.6.6 Table 25.
+    // 5_X_codec_mode = SIMPLE (0) — 3 bits. No I-frame aspx/acpl block for
+    // SIMPLE; LFE mono_data(1) follows directly.
+    bw.write_u32(0, 3);
+
+    // LFE: mono_data(b_lfe = 1) per Table 21. No leading spec_frontend bit.
+    // asf_transform_info(): b_long_frame = 1 (LFE is always long-frame).
+    bw.write_bit(true);
+    // sf_info_lfe(): max_sfb[0] written with n_msfbl_bits (Table 106 col 4).
+    let (_n_msfb_bits, _, n_msfbl_bits) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    assert!(
+        n_msfbl_bits > 0,
+        "encoder: LFE not permitted at transform_length = {transform_length}"
+    );
+    let n_msfbl_cap = (1u32 << n_msfbl_bits) - 1;
+    let max_sfb_lfe_clamped = max_sfb_lfe.min(n_msfbl_cap);
+    bw.write_u32(max_sfb_lfe_clamped, n_msfbl_bits);
+    // LFE sf_data(ASF): section + spectral + scalefac + snf.
+    {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = &lfe_analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_lfe_clamped,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_lfe_clamped,
+        );
+    }
+
+    // SIMPLE has no companding_control(). coding_config = Cfg3Five (3) — 2 bits.
+    bw.write_u32(3, 2);
+
+    // five_channel_data() per Table 29 — shared sf_info + 5x sf_data bodies.
+    //
+    // asf_transform_info(): b_long_frame = 1.
+    bw.write_bit(true);
+    // asf_psy_info(ASF, b_dual_maxsfb = 0, b_side_limited = 0):
+    //   max_sfb[0] in n_msfb_bits bits — shared across all 5 non-LFE channels.
+    let (n_msfb_bits, _, _) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    bw.write_u32(max_sfb, n_msfb_bits);
+
+    // five_channel_info() per Table 32: 4-bit chel_matsel + 5x chparam_info().
+    bw.write_u32(0, 4);
+    for _ in 0..5 {
+        bw.write_u32(0, 2);
+    }
+
+    // 5x sf_data(ASF) bodies — one per non-LFE output channel.
+    for analysis in &analyses {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 /// Round-50 helper: count total bits the body would emit if we used the
 /// greedy run-length section merge instead of the DP optimiser. Returns
 /// (greedy_bits, dp_bits) so callers (and tests) can quantify the

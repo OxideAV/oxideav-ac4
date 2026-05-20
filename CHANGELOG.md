@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 80 — 5.1 SIMPLE/ASF Cfg3Five multichannel forward analysis (5 SCE
+  + LFE) encoder** per ETSI TS 103 190-1 §4.2.6.6 Table 25 (`if (b_has_lfe)
+  mono_data(1);`) + §4.2.7.5 Table 29 + §4.2.8 (`sf_info_lfe()` Table 35 /
+  Table 106 column 4 `n_msfbl_bits`):
+  - `encoder_asf::build_5_1_simple_asf_body_from_pcm_spectra(transform_length,
+    max_sfb, max_sfb_lfe, &[&[f32]; 6], pad_target_bytes)` — emits the full
+    5.1 multichannel `audio_data` body for `5_X_codec_mode = SIMPLE`,
+    `b_has_lfe = 1`, `coding_config = 3` (Cfg3Five): the round-74 5.0
+    `five_channel_data()` payload is preceded by an LFE `mono_data(1)`
+    element (no leading `spec_frontend` bit per Table 21,
+    `b_long_frame = 1`, `sf_info_lfe()` with `max_sfb_lfe` in
+    `n_msfbl_bits` bits, then a single
+    `(section + spectral + scalefac + snf)` ASF body capped to the LFE
+    band budget). At `tl = 1920` `n_msfbl_bits = 3`, so the LFE channel
+    spans at most 7 scalefactor bands (≈0–350 Hz) — comfortably more than
+    the 120 Hz LFE crossover and the 60 Hz tone used by the new tests.
+  - `Ac4ImsEncoder::encode_frame_pcm_5_1(&[L, R, C, Ls, Rs, LFE])` and
+    `encode_frame_pcm_5_1_with_max_sfb(..., max_sfb, max_sfb_lfe)` —
+    forces the 5.1 channel_mode prefix (`0b1110`, 4 b — Table 85
+    channel_mode 4) so the decoder's `walk_ac4_substream` dispatches
+    `channels == 6` through `parse_5x_audio_data_outer(b_has_lfe = true)`,
+    runs the round-74 forward MDCT pipeline (KBD-windowed MDCT +
+    DP-optimal sectioning + HCB1..11 + SNF) per channel, and wraps the
+    body in the v2 IMS TOC with `bitstream_version = 2`.
+  - **Decoder LFE PCM render** in `Ac4Decoder::receive_frame`: when
+    `channels == 6` (5.1) or `channels == 8` (7.1) and the 5_X / 7_X
+    walker populated `tools.lfe_mono_data.scaled_spec`, the LFE
+    spectrum is IMDCT'd into the trailing PCM slot (slot 5 for 5.1,
+    slot 7 for 7.1) using the per-channel overlap-add history.
+    Pre-r80 the LFE block was parsed but its PCM was silently dropped.
+  - **Spectral SNR** on the 220 / 440 / 660 / 880 / 1100 Hz independent-tone
+    fixture matches the round-74 5.0 numbers
+    (L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 dB) and clears the ≥ 20 dB
+    floor; the 60 Hz LFE tone round-trips to a non-silent reconstructed
+    LFE channel. 7.0 / 7.1 (immersive add-channel pair) and the ASPX /
+    A-CPL multichannel modes remain deferred.
+  - **New test suite** `tests/round80_5_1_multichannel.rs` (7 tests) covers
+    the layout, sequence-counter rolling, walker contract
+    (`b_has_lfe == true` + populated `lfe_mono_data.scaled_spec`),
+    silence round-trip, independent-tone round-trip with audible LFE, and
+    per-channel SNR ≥ 20 dB.
+
 - **Round 74 — 5.0 SIMPLE/ASF Cfg3Five multichannel forward analysis (5 SCE)
   encoder** per ETSI TS 103 190-1 §4.2.6.6 Table 25 row
   `case SIMPLE: coding_config == 3` + §4.2.7.5 Table 29 (`five_channel_data()`)

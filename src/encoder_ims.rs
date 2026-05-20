@@ -70,7 +70,7 @@ use oxideav_core::bits::BitWriter;
 
 use crate::encoder_asf::{
     average_per_sfb_correlation, build_5_0_simple_asf_body_from_pcm_spectra,
-    build_mono_simple_asf_body_from_pcm_spectrum,
+    build_5_1_simple_asf_body_from_pcm_spectra, build_mono_simple_asf_body_from_pcm_spectrum,
     build_stereo_simple_asf_joint_body_from_pcm_spectra,
     build_stereo_simple_asf_split_body_from_pcm_spectra,
 };
@@ -909,6 +909,130 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[2],
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
+            ],
+            pad_target_bytes,
+        );
+
+        // 5. Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // Restore caller's channel_mode setting.
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Encode one IMS v2 5.1 frame from float PCM input per ETSI
+    /// TS 103 190-1 §4.2.6.6 + §4.2.7.5 + TS 103 190-2 §6.2.1.1, building
+    /// on top of the 5.0 Cfg3Five forward analysis path with an extra
+    /// LFE `mono_data(1)` element per Table 25
+    /// (`if (b_has_lfe) mono_data(1);`).
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, LFE]` order. Each slice must
+    /// have length `frame_len` (1920 for the default 48 kHz / 24 fps
+    /// configuration); panics otherwise.
+    ///
+    /// The encoder forces the 5.1 channel_mode prefix (`0b1110`, 4 b —
+    /// Table 85 channel_mode 4) so the decoder's
+    /// `walk_ac4_substream` dispatches `channels == 6` through
+    /// `parse_5x_audio_data_outer(b_has_lfe = true)`. The LFE channel
+    /// is coded with `sf_info_lfe()` (Table 35) carrying `max_sfb` in
+    /// `n_msfbl_bits` bits (Table 106 column 4 — 3 bits for `tl = 1920`
+    /// → max_sfb_lfe is capped at 7). The five non-LFE channels share
+    /// the same Cfg3Five `five_channel_data()` body as the 5.0 path
+    /// (identity SAP, independent per-channel SCE).
+    ///
+    /// `max_sfb` defaults to 40 (matching the round-49 mono / round-74
+    /// 5.0 default); `max_sfb_lfe` defaults to 7 (the LFE-spec cap at
+    /// `tl = 1920`). Use [`Self::encode_frame_pcm_5_1_with_max_sfb`]
+    /// for wider coverage.
+    pub fn encode_frame_pcm_5_1(&mut self, frames: &[&[f32]; 6]) -> Vec<u8> {
+        self.encode_frame_pcm_5_1_with_max_sfb(frames, 40, 7)
+    }
+
+    /// Encode one IMS v2 5.1 frame from arbitrary float PCM input at
+    /// caller-specified `max_sfb` (non-LFE channels) and `max_sfb_lfe`
+    /// (LFE channel). See [`Self::encode_frame_pcm_5_1`] for the rest of
+    /// the contract.
+    pub fn encode_frame_pcm_5_1_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 6],
+        max_sfb: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_1: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        // Cap max_sfb at the non-LFE max_sfb width's max and at the actual
+        // num_sfb_48 cap.
+        let (n_msfb_bits, _, n_msfbl_bits) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        assert!(
+            n_msfbl_bits > 0,
+            "encode_frame_pcm_5_1: tl = {frame_len} not permitted for LFE"
+        );
+        let n_msfbl_cap = (1u32 << n_msfbl_bits) - 1;
+        let max_sfb_lfe = max_sfb_lfe.min(n_msfbl_cap);
+
+        // Force 5.1 channel_mode (prefix '1110', 4 bits — Table 85
+        // channel_mode 4). The body builder requires the TOC to declare
+        // 6 channels so the decoder's `walk_ac4_substream` dispatch
+        // routes through `parse_5x_audio_data_outer(b_has_lfe = true)`.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1110;
+        self.channel_mode_bits = 4;
+
+        // 1. Forward MDCT analysis per channel (separate state for
+        //    independent 50% TDAC overlap continuity). Six channels here
+        //    so the multi-channel state vector needs to grow.
+        while self.mdct_states_multi.len() < 6 {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(6);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // 2-4. Build the 5.1 SIMPLE/Cfg3Five body. Pad budget is 6× the
+        //      mono budget since we carry six spectra independently.
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+        let body = build_5_1_simple_asf_body_from_pcm_spectra(
+            frame_len,
+            max_sfb,
+            max_sfb_lfe,
+            &[
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[2],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
             ],
             pad_target_bytes,
         );
