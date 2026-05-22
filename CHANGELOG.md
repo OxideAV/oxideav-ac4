@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 95 — 5_X SIMPLE/ASPX_ACPL_3 multichannel encoder path** per
+  ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case ASPX_ACPL_3:` +
+  §4.2.12.1 Table 50 (aspx_config) + §4.2.13.2 Table 60 (acpl_config_2ch)
+  + §4.2.13.4 Table 62 (acpl_data_2ch) + §4.2.12.4 Table 52
+  (aspx_data_2ch) + §4.2.11 Table 49 (companding_control) + §4.2.6.3
+  Table 22 (stereo_data). Symmetric counterpart to the decoder's round-34
+  `parse_5x_audio_data_outer` ASPX_ACPL_3 walker (5a58f6a). New
+  `encoder_acpl3` module:
+  - `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3(&[L, R, C])` and
+    `encode_frame_pcm_5_1_acpl3(&[L, R, C, LFE])` — emit IMS v2 frames
+    in 5_X_codec_mode = ASPX_ACPL_3 (4). Channel_mode prefix forced to
+    `0b1101` (5 ch) / `0b1110` (6 ch) per Table 85.
+  - `encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra` — shared
+    body builder. Layout: `5_X_codec_mode = 4` (3 b) + I-frame block
+    (`aspx_config()` 15 b + `acpl_config_2ch()` 4 b) + optional LFE
+    `mono_data(b_lfe = 1)` + `companding_control(2)` (sync=1, on=1) +
+    `stereo_data()` (split-MDCT path) + `aspx_data_2ch()` + `acpl_data_2ch()`.
+  - `encoder_acpl3::write_aspx_config` / `write_acpl_config_2ch` /
+    `write_companding_control_2ch_sync_on` — bit-exact emitters for
+    the small configuration elements. Round-trip-verified against the
+    matching parsers via unit tests.
+  - ASPX/A-CPL parameter bits emitted as minimum-bit-cost zero-delta
+    Huffman codewords: `pick_zero_delta_cw(len, cw, cb_off)` picks the
+    entry at `index == cb_off` (zero delta for DF/DT) and
+    `pick_min_len_cw` picks the smallest-length entry (used for F0
+    seeds). Covers all 18 ASPX HCBs (Annex A.2 Tables A.16-A.33) and
+    all 24 ACPL HCBs (Annex A.3 Tables A.34-A.57).
+  - `write_aspx_data_2ch_minimal` emits the FIXFIX + num_env=1 path
+    with `aspx_balance = 1`, all-FREQ delta directions, and per-channel
+    SBG counts derived from `aspx::derive_aspx_frequency_tables`.
+  - `write_acpl_data_2ch_minimal` emits `acpl_framing_data()` (smooth
+    interp, num_param_sets = 1) + 11 × `acpl_huff_data()` (alpha1/2,
+    beta1/2/3, gamma1..6) with `diff_type = 0` (FREQ) and zero-delta
+    DF codewords.
+  - Decoder round-trip verified: 5.0 ACPL_3 → 5-channel S16
+    interleaved PCM (1920 samples × 5 ch × 2 bytes); 5.1 ACPL_3 →
+    6-channel S16. The decoder walks the full Table 25 body
+    (`parse_stereo_data_body` + `parse_aspx_data_2ch_body` +
+    `parse_acpl_data_2ch`) and resolves `five_x_mode == AspxAcpl3` +
+    `acpl_config_2ch.is_some() && acpl_data_2ch.is_some()`. The 5-channel
+    `[L, R, C, Ls, Rs]` synthesis runs via `acpl_synth::run_acpl_5x_mch_pcm`
+    (Pseudocode 118) with all-zero ACPL parameter deltas — Ls/Rs
+    collapses to ducker-driven reconstruction from the L/R carriers.
+  - 4 new integration tests in `tests/round95_5_x_acpl3_encoder.rs`:
+    encode_5_0_acpl3_produces_5_channel_audio_frame,
+    encode_5_1_acpl3_produces_6_channel_audio_frame,
+    encode_5_0_acpl3_advances_sequence_counter,
+    encode_5_0_acpl3_decoder_resolves_aspx_acpl_3_mode.
+  - 7 new unit tests in `encoder_acpl3::tests` covering bit-order
+    round-trips for aspx_config / acpl_config_2ch / companding_control /
+    acpl_data_2ch + minimum-cost / zero-delta HCB picker invariants.
+  - Total test count: 691 (was 680) — 0 ignored, 0 failed.
+  - Follow-ups (deferred to subsequent rounds): replace zero-delta
+    ACPL parameter writer with real QMF-domain `(alpha, beta, gamma)`
+    parameter extractor (per-band downmix correction estimated from
+    L/R/Ls/Rs source PCM); replace zero-delta ASPX envelope coder
+    with real envelope extraction; matching encoder paths for
+    5_X_codec_mode in `{ASPX_ACPL_1, ASPX_ACPL_2}` (Pseudocode 117).
+
 - **Round 91 — 7.1 (3/4/0.1) SIMPLE/ASF Cfg3Five multichannel forward
   analysis (7 SCE + LFE) encoder + decoder 7_X SIMPLE/Cfg3Five core
   render** per ETSI TS 103 190-1 §4.2.6.14 Table 33 + §4.2.7.5 Table 29

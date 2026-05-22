@@ -281,11 +281,42 @@ framework but usable standalone.
 > to the 5_X Cfg3Five case). Per-channel spectral SNR on the
 > 220/440/660/880/1100/1320/1540 Hz independent-tone 7.1 fixture:
 > L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 / Lb=25.4 / Rb=26.0 dB
-> — all above the ≥ 20 dB floor. Joint-MDCT mixing for the 7_X
-> ASPX / ACPL multichannel modes (ACPL_3, ASPX_ACPL_{1,2}) remains
-> deferred (gated on the 5_X encoder paths for those tools — the
-> 7_X paths inherit the same `aspx_data` / `acpl_data` shape as 5_X
-> so they're queued behind the 5_X work landing first).
+> — all above the ≥ 20 dB floor. Round 95 lands the **5_X
+> SIMPLE/ASPX_ACPL_3 multichannel encoder path** per §4.2.6.6
+> Table 25 row `case ASPX_ACPL_3:` — symmetric counterpart to the
+> round-34 decoder ACPL_3 walker (5a58f6a).
+> `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3(&[L, R, C])` and
+> `encode_frame_pcm_5_1_acpl3(&[L, R, C, LFE])` emit IMS v2 frames
+> with `5_X_codec_mode = 4` (ASPX_ACPL_3). The new `encoder_acpl3`
+> module ships bit-exact emitters for `aspx_config()` (Table 50,
+> 15 b), `acpl_config_2ch()` (Table 60, 4 b), `companding_control(2)`
+> (Table 49, 2 b), plus minimum-bit-cost zero-delta Huffman writers
+> covering all 18 ASPX HCBs (Annex A.2 Tables A.16-A.33) and all 24
+> ACPL HCBs (Annex A.3 Tables A.34-A.57) — `pick_zero_delta_cw`
+> picks the entry at `index == cb_off` (zero delta for DF/DT) and
+> `pick_min_len_cw` picks the smallest-length entry (used for F0
+> seeds). The body layout is `5_X_codec_mode = 4 (3 b)` +
+> I-frame `aspx_config() + acpl_config_2ch()` + optional LFE
+> `mono_data(b_lfe = 1)` + `companding_control(2)` + `stereo_data()`
+> (split-MDCT path, two carrier channels) + `aspx_data_2ch()`
+> (FIXFIX num_env=1, balance=1, all-FREQ deltas) + `acpl_data_2ch()`
+> (1 param set, 7 param bands, 11 EC streams with `diff_type = 0`
+> and zero-delta DF). Decoder round-trip: 5.0 ACPL_3 → 5-channel
+> S16 interleaved PCM (1920 samples × 5 ch × 2 bytes); 5.1
+> ACPL_3 → 6-channel S16 (with LFE slot 5). The decoder walks
+> the full Table 25 body and resolves `five_x_mode == AspxAcpl3`
+> + `acpl_config_2ch.is_some() && acpl_data_2ch.is_some()`. The
+> 5-channel `[L, R, C, Ls, Rs]` synthesis runs via
+> `acpl_synth::run_acpl_5x_mch_pcm` (Pseudocode 118) — with
+> all-zero ACPL parameter deltas Ls/Rs collapses to ducker-driven
+> reconstruction from the L/R carriers (non-silent in the general
+> case). Total tests 691 (was 680). Real per-band
+> `(alpha, beta, gamma)` parameter extraction (replacing the
+> zero-delta scaffold), real ASPX envelope coding, and matching
+> encoder paths for `5_X_codec_mode in {ASPX_ACPL_1, ASPX_ACPL_2}`
+> (Pseudocode 117) remain deferred. The 7_X paths inherit the
+> same `aspx_data` / `acpl_data` shape as 5_X so they're queued
+> behind the 5_X work continuing to harden.
 
 ## Specs
 

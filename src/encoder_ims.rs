@@ -1214,6 +1214,181 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Encode one IMS v2 5.X frame in 5_X_codec_mode = ASPX_ACPL_3 per
+    /// ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case ASPX_ACPL_3:`
+    /// (round 95). Symmetric counterpart to the decoder's round-34
+    /// [`crate::mch::parse_5x_audio_data_outer`] ASPX_ACPL_3 walker.
+    ///
+    /// `frames` is in `[L, R, C]` order — three carrier channels. The
+    /// L/R pair feeds the `stereo_data()` body (split-MDCT path) and
+    /// drives the A-CPL Ls/Rs surround reconstruction via Pseudocode 118
+    /// at decode time. The centre carrier `C` is present in the
+    /// `coeffs_per_channel` slice but unused on the spec ASPX_ACPL_3
+    /// path — the decoder reconstructs the centre from
+    /// `cfg0_centre_mono.scaled_spec` (which the ASPX_ACPL_3 walker
+    /// doesn't populate), so the decoder's centre output is zero-filled.
+    ///
+    /// The encoder forces the 5.0 channel_mode prefix (`0b1101`, 4 b —
+    /// Table 85 channel_mode 3) so the decoder's `walk_ac4_substream`
+    /// dispatches `channels == 5` through
+    /// `parse_5x_audio_data_outer(b_has_lfe = false)` with
+    /// `5_X_codec_mode = AspxAcpl3`.
+    ///
+    /// The ASPX/A-CPL parameter bits are emitted as
+    /// minimum-bit-cost zero-delta Huffman codewords (per round-95
+    /// "structural scaffold" mode — see [`crate::encoder_acpl3`]).
+    /// The decoder walks the full Table 25 body and produces
+    /// 5-channel `[L, R, C, Ls, Rs]` PCM via
+    /// [`crate::acpl_synth::run_acpl_5x_mch_pcm`]. With all-zero ACPL
+    /// parameter deltas the surround pair Ls/Rs collapses to the
+    /// ducker-driven reconstruction from the L/R carriers.
+    ///
+    /// `max_sfb` defaults to 40 (matching the round-49 mono / round-74
+    /// 5.0 default).
+    pub fn encode_frame_pcm_5_0_acpl3(&mut self, frames: &[&[f32]; 3]) -> Vec<u8> {
+        self.encode_frame_pcm_5_x_acpl3_with_max_sfb(frames, None, 40, None)
+    }
+
+    /// Encode one IMS v2 5.1 frame in 5_X_codec_mode = ASPX_ACPL_3 with
+    /// an LFE channel per ETSI TS 103 190-1 §4.2.6.6 Table 25
+    /// (`if (b_has_lfe) mono_data(1);`) + §4.2.8 (`sf_info_lfe()`).
+    ///
+    /// `frames` is in `[L, R, C, LFE]` order. The L/R carrier pair drives
+    /// the stereo body + A-CPL Ls/Rs reconstruction (same as
+    /// [`Self::encode_frame_pcm_5_0_acpl3`]); the LFE channel is coded
+    /// as a leading `mono_data(b_lfe = 1)` element per Table 21.
+    pub fn encode_frame_pcm_5_1_acpl3(&mut self, frames: &[&[f32]; 4]) -> Vec<u8> {
+        // Decompose into the 3-carrier slice + the LFE slice for the
+        // shared dispatcher.
+        let carriers: [&[f32]; 3] = [frames[0], frames[1], frames[2]];
+        self.encode_frame_pcm_5_x_acpl3_with_max_sfb(&carriers, Some(frames[3]), 40, Some(7))
+    }
+
+    /// Shared body for [`Self::encode_frame_pcm_5_0_acpl3`] and
+    /// [`Self::encode_frame_pcm_5_1_acpl3`]. `frames` carries the three
+    /// non-LFE channels (`[L, R, C]`); `lfe` is `Some` for the 5.1 path,
+    /// `None` for 5.0.
+    fn encode_frame_pcm_5_x_acpl3_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 3],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_lfe: Option<u32>,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl3: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(lfe_buf) = lfe {
+            assert_eq!(
+                lfe_buf.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl3: LFE input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force the right channel_mode based on whether LFE is present.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        if lfe.is_some() {
+            // 5.1 channel_mode prefix '1110', 4 b → channel_mode 4.
+            self.channel_mode_value = 0b1110;
+            self.channel_mode_bits = 4;
+        } else {
+            // 5.0 channel_mode prefix '1101', 4 b → channel_mode 3.
+            self.channel_mode_value = 0b1101;
+            self.channel_mode_bits = 4;
+        }
+
+        // 1. Forward MDCT analysis per channel (separate state for
+        //    independent 50% TDAC overlap continuity).
+        let n_channels = if lfe.is_some() { 4 } else { 3 };
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+        let coeffs_lfe: Option<Vec<f32>> = lfe.map(|buf| {
+            // LFE channel uses its own MDCT state at index 3.
+            self.mdct_states_multi[3].analyse_frame(buf)
+        });
+
+        // 2. Build the ASPX_ACPL_3 body via the shared builder. ASPX
+        //    config: small low-res scale so the SBG counts stay small —
+        //    keeps the ASPX_data_2ch body compact.
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0, // num_noise_sbgroups = 1
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // ACPL: num_param_bands_id = 3 → 7 param bands; quant_modes Fine.
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_qm0 = crate::acpl::AcplQuantMode::Fine;
+        let acpl_qm1 = crate::acpl::AcplQuantMode::Fine;
+
+        // Pad budget: scale with max_sfb and channel count (3 or 4).
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let body = crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra(
+            frame_len,
+            max_sfb,
+            max_sfb_lfe,
+            self.b_iframe_global,
+            &coeffs_per_channel[0],
+            &coeffs_per_channel[1],
+            coeffs_lfe.as_deref(),
+            &aspx_cfg,
+            acpl_num_param_bands_id,
+            acpl_qm0,
+            acpl_qm1,
+            pad_target_bytes,
+        );
+
+        // 3. Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // Restore caller's channel_mode setting.
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a mono SIMPLE/ASF substream
     /// whose injected tone falls on the spectral pair nearest the
     /// requested frequency. With `tl = 1920` at 48 kHz the bin spacing
