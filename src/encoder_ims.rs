@@ -70,7 +70,8 @@ use oxideav_core::bits::BitWriter;
 
 use crate::encoder_asf::{
     average_per_sfb_correlation, build_5_0_simple_asf_body_from_pcm_spectra,
-    build_5_1_simple_asf_body_from_pcm_spectra, build_mono_simple_asf_body_from_pcm_spectrum,
+    build_5_1_simple_asf_body_from_pcm_spectra, build_7_1_simple_asf_body_from_pcm_spectra,
+    build_mono_simple_asf_body_from_pcm_spectrum,
     build_stereo_simple_asf_joint_body_from_pcm_spectra,
     build_stereo_simple_asf_split_body_from_pcm_spectra,
 };
@@ -175,6 +176,21 @@ impl Ac4ImsEncoder {
     pub fn with_5_1(mut self) -> Self {
         self.channel_mode_value = 0b1110;
         self.channel_mode_bits = 4;
+        self
+    }
+
+    /// 7.1 (3/4/0.1) channel mode (`0b1111001`, 7 b) per ETSI TS 103 190-1
+    /// §4.3.3.7.1 Table 88 — channel_mode value `1111001` → ch_mode 6 → 8
+    /// channels with layout `L, C, R, Ls, Rs, Lb, Rb, LFE`. Drives the
+    /// decoder's `7_X_channel_element()` walker for `channels == 8` (with
+    /// `b_has_lfe`) per §4.2.6.14 Table 33. The decoder's internal coding
+    /// order for the inner `five_channel_data()` is `[L, R, C, Ls, Rs]`
+    /// per Table 180 (the inner SCE order differs from the surface
+    /// Table 88 listing's `L, C, R` ordering — the decoder treats the
+    /// inner five_channel_data slots as L/R/C/Ls/Rs).
+    pub fn with_7_1(mut self) -> Self {
+        self.channel_mode_value = 0b1111001;
+        self.channel_mode_bits = 7;
         self
     }
 
@@ -1033,6 +1049,153 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
                 &coeffs_per_channel[5],
+            ],
+            pad_target_bytes,
+        );
+
+        // 5. Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // Restore caller's channel_mode setting.
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Encode one IMS v2 7.1 (3/4/0.1) frame from float PCM input per ETSI
+    /// TS 103 190-1 §4.2.6.14 Table 33 + §4.2.7.5 Table 29
+    /// (`five_channel_data()`) + §4.2.7.4 Table 26 (`two_channel_data()`),
+    /// building on top of the 5.1 Cfg3Five forward analysis path with an
+    /// extra trailing `two_channel_data()` for the immersive
+    /// additional-channel pair (Lb, Rb) per the SIMPLE/ASPX
+    /// additional-channel block in §4.2.6.14:
+    /// `b_use_sap_add_ch + two_channel_data()`.
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb, LFE]` order (matching
+    /// the decoder's output slot convention: slots 0..4 from
+    /// `five_channel_data()` per Table 180, slots 5/6 from the additional
+    /// `two_channel_data()` per `dispatch_7x_additional_channel_pair` /
+    /// Table 183 row "3/4/0.x" identity-SAP path, slot 7 from the LFE
+    /// `mono_data(1)`). Each slice must have length `frame_len` (1920
+    /// for the default 48 kHz / 24 fps configuration); panics otherwise.
+    ///
+    /// The encoder forces the 7.1 (3/4/0.1) channel_mode prefix
+    /// (`0b1111001`, 7 b — Table 88 channel_mode 6) so the decoder's
+    /// `walk_ac4_substream` dispatches `channels == 8` through
+    /// `parse_7x_audio_data_outer(b_has_lfe = true)`. The LFE channel
+    /// is coded with `sf_info_lfe()` (Table 35) carrying `max_sfb` in
+    /// `n_msfbl_bits` bits (Table 106 column 4 — 3 bits for `tl = 1920`
+    /// → max_sfb_lfe is capped at 7). The five non-LFE front/surround
+    /// channels share the same Cfg3Five `five_channel_data()` body as
+    /// the 5.1 path; the additional pair (Lb, Rb) is coded as a single
+    /// `two_channel_data()` with identity SAP (`b_use_sap_add_ch = 0`,
+    /// `sap_mode = 0` on its `chparam_info`) so no joint-MDCT mixing
+    /// happens at decode time and slots 5/6 receive Lb/Rb directly.
+    ///
+    /// `max_sfb` defaults to 40 (matching the round-49 mono / round-74
+    /// 5.0 / round-80 5.1 default); `max_sfb_add` defaults to 40 (same
+    /// width as the 5.1 non-LFE channels); `max_sfb_lfe` defaults to 7
+    /// (the LFE-spec cap at `tl = 1920`). Use
+    /// [`Self::encode_frame_pcm_7_1_with_max_sfb`] for wider coverage.
+    pub fn encode_frame_pcm_7_1(&mut self, frames: &[&[f32]; 8]) -> Vec<u8> {
+        self.encode_frame_pcm_7_1_with_max_sfb(frames, 40, 40, 7)
+    }
+
+    /// Encode one IMS v2 7.1 (3/4/0.1) frame from arbitrary float PCM
+    /// input at caller-specified `max_sfb` (five-channel front/surround
+    /// SCEs), `max_sfb_add` (additional Lb/Rb pair), and `max_sfb_lfe`
+    /// (LFE channel). See [`Self::encode_frame_pcm_7_1`] for the rest of
+    /// the contract.
+    pub fn encode_frame_pcm_7_1_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 8],
+        max_sfb: u32,
+        max_sfb_add: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_1: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        // Cap max_sfb at the non-LFE max_sfb width's max and at the actual
+        // num_sfb_48 cap. Same cap applies to both the inner
+        // five_channel_data and the additional two_channel_data — they
+        // share the n_msfb_bits width.
+        let (n_msfb_bits, _, n_msfbl_bits) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        let max_sfb_add = max_sfb_add.min(n_msfb_cap);
+        assert!(
+            n_msfbl_bits > 0,
+            "encode_frame_pcm_7_1: tl = {frame_len} not permitted for LFE"
+        );
+        let n_msfbl_cap = (1u32 << n_msfbl_bits) - 1;
+        let max_sfb_lfe = max_sfb_lfe.min(n_msfbl_cap);
+
+        // Force 7.1 (3/4/0.1) channel_mode (prefix '1111001', 7 bits —
+        // Table 88 channel_mode 6). The body builder requires the TOC to
+        // declare 8 channels so the decoder's `walk_ac4_substream`
+        // dispatch routes through `parse_7x_audio_data_outer(b_has_lfe =
+        // true)`.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1111001;
+        self.channel_mode_bits = 7;
+
+        // 1. Forward MDCT analysis per channel (separate state for
+        //    independent 50% TDAC overlap continuity). Eight channels
+        //    here so the multi-channel state vector needs to grow.
+        while self.mdct_states_multi.len() < 8 {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(8);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // 2-4. Build the 7.1 SIMPLE/Cfg3Five body. Pad budget is ~8× the
+        //      mono budget since we carry eight spectra independently.
+        //      Capped at 32767 — the 15-bit `audio_size_value` field
+        //      saturates there (extending via `b_more_bits` is permitted
+        //      by §4.3.4.1 but not needed for the default max_sfb path).
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 12288,
+            41..=50 => 24576,
+            _ => 32767,
+        };
+        let body = build_7_1_simple_asf_body_from_pcm_spectra(
+            frame_len,
+            max_sfb,
+            max_sfb_add,
+            max_sfb_lfe,
+            &[
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[2],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
+                &coeffs_per_channel[7],
             ],
             pad_target_bytes,
         );

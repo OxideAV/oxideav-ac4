@@ -1910,6 +1910,235 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
     bytes
 }
 
+/// Build a 7.1 (3/4/0.1) SIMPLE/Cfg3Five substream body — extends
+/// [`build_5_1_simple_asf_body_from_pcm_spectra`] for the immersive
+/// 7.X channel-element shell per ETSI TS 103 190-1 §4.2.6.14 Table 33.
+/// The differences from the 5.1 builder are:
+///
+/// * `5_X_codec_mode` (3 b) becomes `7_X_codec_mode` (2 b — Table 98,
+///   only SIMPLE/ASPX/ASPX_ACPL_1/ASPX_ACPL_2; no Reserved values).
+/// * After the inner `five_channel_data()` for L/R/C/Ls/Rs (sharing the
+///   same Cfg3Five Table 29 body as the 5.1 path), the SIMPLE/ASPX
+///   additional-channel block emits `b_use_sap_add_ch (1 b) +
+///   two_channel_data()` carrying the immersive pair Lb/Rb per Table 26.
+///   With identity SAP (`b_use_sap_add_ch = 0`) the decoder's
+///   `dispatch_7x_additional_channel_pair` consumes those two spectra
+///   directly into output slots 5/6 (Table 183 row "3/4/0.x" identity
+///   path).
+/// * The trailing `mono_data(0)` slot is **absent** for `coding_config
+///   = 3` (Cfg3Five) — that gate fires only for Cfg0/Cfg2 in the 7.X
+///   walker.
+/// * No ASPX trailers (SIMPLE) and no ACPL data pair (SIMPLE).
+///
+/// `coeffs_per_channel` is in `[L, R, C, Ls, Rs, Lb, Rb, LFE]` order
+/// matching the 7.1 output layout (Table 88 channel_mode 6, decoded into
+/// slots 0..7 by the parse-and-render dispatch chain). The LFE channel
+/// is coded as ASF long-frame with `sf_info_lfe()` (Table 35) carrying
+/// `max_sfb_lfe` in `n_msfbl_bits` bits — same LFE shape as 5.1.
+///
+/// Returns the substream bytes (audio_size header + audio_data + zero-
+/// padding) sized to `pad_target_bytes`.
+pub fn build_7_1_simple_asf_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_add: u32,
+    max_sfb_lfe: u32,
+    coeffs_per_channel: &[&[f32]; 8],
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+
+    /// Per-channel forward analysis closure output — same shape as the
+    /// 5.0 / 5.1 builders' `FiveZeroChannelAnalysis` /
+    /// `FiveOneChannelAnalysis` aliases.
+    type SevenOneChannelAnalysis = (Vec<i32>, Vec<i32>, Vec<u32>, AsfSections, Option<Vec<i32>>);
+    let prepare_channel = |coeffs: &[f32], max_sfb_use: u32| -> SevenOneChannelAnalysis {
+        let local_end = sfbo[max_sfb_use as usize] as usize;
+        let mut qspec = vec![0i32; local_end];
+        let mut sf_per_band = vec![100i32; max_sfb_use as usize];
+        let mut max_quant_idx = vec![0u32; max_sfb_use as usize];
+        let mut natural_q_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb_use as usize);
+        for sfb in 0..max_sfb_use as usize {
+            let a = sfbo[sfb] as usize;
+            let b = sfbo[sfb + 1] as usize;
+            let band = &coeffs[a..b.min(coeffs.len())];
+            let (_cb_picked, sf, q, _cost) = pick_best_codebook_for_band(band);
+            sf_per_band[sfb] = sf;
+            let mut max_q: u32 = 0;
+            for (i, &qi) in q.iter().enumerate() {
+                qspec[a + i] = qi;
+                max_q = max_q.max(qi.unsigned_abs());
+            }
+            max_quant_idx[sfb] = max_q;
+            natural_q_per_band.push(q);
+        }
+        let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
+        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
+        let snf = compute_snf_dpcm_for_zero_quant_bands(
+            coeffs,
+            sfbo,
+            max_sfb_use,
+            &sections.sfb_cb,
+            &max_quant_idx,
+        );
+        (qspec, sf_per_band, max_quant_idx, sections, snf)
+    };
+
+    // Five front/surround (L/R/C/Ls/Rs) at the shared max_sfb.
+    let analyses_five: [SevenOneChannelAnalysis; 5] = [
+        prepare_channel(coeffs_per_channel[0], max_sfb),
+        prepare_channel(coeffs_per_channel[1], max_sfb),
+        prepare_channel(coeffs_per_channel[2], max_sfb),
+        prepare_channel(coeffs_per_channel[3], max_sfb),
+        prepare_channel(coeffs_per_channel[4], max_sfb),
+    ];
+    // Additional pair (Lb/Rb) at its own max_sfb_add.
+    let analyses_add: [SevenOneChannelAnalysis; 2] = [
+        prepare_channel(coeffs_per_channel[5], max_sfb_add),
+        prepare_channel(coeffs_per_channel[6], max_sfb_add),
+    ];
+    // LFE analysis at max_sfb_lfe.
+    let lfe_analysis = prepare_channel(coeffs_per_channel[7], max_sfb_lfe);
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_channel_element(channel_mode=7.1/3/4/0.1, b_iframe=1) outer
+    // shell — §4.2.6.14 Table 33.
+    // 7_X_codec_mode = SIMPLE (0) — 2 bits (vs 3 for the 5_X variant).
+    // SIMPLE has no I-frame aspx_config / acpl_config block; the LFE
+    // mono_data(1) follows directly.
+    bw.write_u32(0, 2);
+
+    // LFE: mono_data(b_lfe = 1) per Table 21. No leading spec_frontend
+    // bit. asf_transform_info(): b_long_frame = 1 (LFE is always
+    // long-frame). sf_info_lfe(): max_sfb[0] in n_msfbl_bits bits
+    // (Table 106 col 4).
+    bw.write_bit(true);
+    let (n_msfb_bits, _, n_msfbl_bits) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    assert!(
+        n_msfbl_bits > 0,
+        "encoder: LFE not permitted at transform_length = {transform_length}"
+    );
+    let n_msfbl_cap = (1u32 << n_msfbl_bits) - 1;
+    let max_sfb_lfe_clamped = max_sfb_lfe.min(n_msfbl_cap);
+    bw.write_u32(max_sfb_lfe_clamped, n_msfbl_bits);
+    {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = &lfe_analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_lfe_clamped,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_lfe_clamped,
+        );
+    }
+
+    // 7.X SIMPLE skips companding_control (per §4.2.6.14 Table 33 — only
+    // ASPX_ACPL_{1,2} get a leading companding_control(5) here).
+    // coding_config = Cfg3Five (3) — 2 bits.
+    bw.write_u32(3, 2);
+
+    // five_channel_data() per Table 29 — shared sf_info + 5x sf_data
+    // bodies. asf_transform_info(): b_long_frame = 1.
+    bw.write_bit(true);
+    // asf_psy_info(ASF, b_dual_maxsfb=0, b_side_limited=0):
+    //   max_sfb[0] in n_msfb_bits bits — shared across all 5 SCEs.
+    bw.write_u32(max_sfb, n_msfb_bits);
+    // five_channel_info() per Table 32: 4-bit chel_matsel + 5x
+    // chparam_info(sap_mode=0). Identity SAP → no joint-MDCT mixing.
+    bw.write_u32(0, 4);
+    for _ in 0..5 {
+        bw.write_u32(0, 2);
+    }
+    // 5x sf_data(ASF) bodies — one per L/R/C/Ls/Rs SCE.
+    for analysis in &analyses_five {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+    }
+
+    // 7.X SIMPLE/ASPX additional-channel block. b_use_sap_add_ch = 0 →
+    // identity SAP, no chparam_info pair follows. The decoder's
+    // `dispatch_7x_additional_channel_pair` then routes Lb/Rb directly
+    // to slots 5/6 (Table 183 row "3/4/0.x" identity path).
+    bw.write_bit(false);
+
+    // Additional `two_channel_data()` for Lb/Rb per Table 26. The shape
+    // is `asf_transform_info() + asf_psy_info() + chparam_info() +
+    // sf_data(ASF) + sf_data(ASF)`.
+    bw.write_bit(true); // b_long_frame = 1
+                        // asf_psy_info(): max_sfb[0] in n_msfb_bits bits — shared
+                        // between Lb and Rb.
+    bw.write_u32(max_sfb_add, n_msfb_bits);
+    // chparam_info(): single sap_mode (2 b) for the pair — identity SAP
+    // (`sap_mode = 0`) so no follow-on ms_used / sap_data.
+    bw.write_u32(0, 2);
+    // 2x sf_data(ASF) bodies — one per Lb/Rb.
+    for analysis in &analyses_add {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_add,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_add,
+        );
+    }
+
+    // No trailing `mono_data(0)` for Cfg3 (the 7.X trailing-mono gate is
+    // `coding_config in {0, 2}` only). No ASPX trailers for SIMPLE.
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 /// Round-50 helper: count total bits the body would emit if we used the
 /// greedy run-length section merge instead of the DP optimiser. Returns
 /// (greedy_bits, dp_bits) so callers (and tests) can quantify the

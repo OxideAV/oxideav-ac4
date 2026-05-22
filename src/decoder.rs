@@ -2871,6 +2871,51 @@ impl Decoder for Ac4Decoder {
                 _ => {}
             }
         }
+        // Round 91: 7_X SIMPLE/ASPX inner 5-channel core render (slots
+        // 0..4). The 7_X SIMPLE/Cfg3Five path inherits the inner
+        // `five_channel_data()` from the 5_X Table 29 layout (5 SCEs in
+        // L/R/C/Ls/Rs order, identity SAP via 5x `chparam_info(sap_mode
+        // = 0)`); the only difference from the 5_X dispatch is which
+        // walker populated `tools.five_channel_data` (7_X here, vs 5_X
+        // for the 5.0/5.1 paths). The 5_X dispatch fires the same
+        // IMDCT/KBD/overlap-add chain regardless of which walker
+        // populated the slot, so we route the 7_X-walker-produced
+        // five_channel_data through it. With identity SAP no joint-MDCT
+        // mixing happens at decode time so each output slot 0..4 reflects
+        // only its own input SCE. ASPX trailers for the 7_X path land in
+        // different `tools.*_aspx_*` slots (the 7_X walker has its own
+        // ASPX trailer plumbing — out of scope here); pass `None` for
+        // the trailer slots so the round-91 SIMPLE path reduces to
+        // low-band only. Cfg0/Cfg1/Cfg2 7_X variants need their own
+        // wiring (queued for follow-up rounds — they share the same
+        // 5_X core dispatchers, just with the 7_X-specific trailing
+        // `mono_data(0)` gate and ASPX trailer plumbing).
+        if seven_x_simple_aspx_active
+            && matches!(
+                self.last_substream
+                    .as_ref()
+                    .and_then(|sub| sub.tools.seven_x_coding_config),
+                Some(crate::mch::FiveXCodingConfig::Cfg3Five)
+            )
+        {
+            if let Some(five) = self
+                .last_substream
+                .as_ref()
+                .and_then(|sub| sub.tools.five_channel_data.clone())
+            {
+                self.dispatch_5x_cfg3_simple_aspx(
+                    &five,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    num_ts_in_ats,
+                    samples as usize,
+                    &mut pcm_per_channel,
+                );
+            }
+        }
         // Round 39 / 40: §5.3.4.4.1 / Table 182 + Table 183 — 7_X
         // SIMPLE/ASPX additional-channel pair render. The walker populates
         // `seven_x_additional_channel_data` (two sf_data(ASF) bodies)

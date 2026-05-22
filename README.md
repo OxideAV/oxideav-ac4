@@ -264,8 +264,28 @@ framework but usable standalone.
 > 7.1). Non-LFE per-channel SNR matches the 5.0 numbers
 > (L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 dB ≥ 20 dB floor); a
 > 60 Hz LFE tone round-trips to a non-silent reconstructed LFE
-> channel. 7.0/7.1 (immersive add-channel pair) and the ASPX /
-> A-CPL multichannel modes remain deferred.
+> channel. Round 91 extends the multichannel encoder to **7.1
+> (3/4/0.1) SIMPLE/Cfg3Five + LFE** per §4.2.6.14 Table 33 + §4.2.7.4
+> Table 26 (additional-channel `two_channel_data()`) + Table 88
+> channel_mode 6 (`0b1111001`, 7 b):
+> `Ac4ImsEncoder::with_7_1()` +
+> `encode_frame_pcm_7_1(&[L, R, C, Ls, Rs, Lb, Rb, LFE])` emit a 7_X
+> SIMPLE/Cfg3Five body whose inner `five_channel_data()` reuses the
+> round-80 5.1 forward pipeline, followed by `b_use_sap_add_ch = 0`
+> identity-SAP + `two_channel_data()` for the immersive Lb/Rb pair.
+> The decoder side gains the inner 5-channel core render for the
+> 7_X SIMPLE/Cfg3Five path (it previously parsed but never IMDCT'd
+> slots 0..4 — only the round-39 additional-pair slots 5/6 and the
+> round-80 LFE slot 7 were touched); slots 0..4 now route through
+> `dispatch_5x_cfg3_simple_aspx` (the inner SCE shape is identical
+> to the 5_X Cfg3Five case). Per-channel spectral SNR on the
+> 220/440/660/880/1100/1320/1540 Hz independent-tone 7.1 fixture:
+> L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 / Lb=25.4 / Rb=26.0 dB
+> — all above the ≥ 20 dB floor. Joint-MDCT mixing for the 7_X
+> ASPX / ACPL multichannel modes (ACPL_3, ASPX_ACPL_{1,2}) remains
+> deferred (gated on the 5_X encoder paths for those tools — the
+> 7_X paths inherit the same `aspx_data` / `acpl_data` shape as 5_X
+> so they're queued behind the 5_X work landing first).
 
 ## Specs
 

@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 91 — 7.1 (3/4/0.1) SIMPLE/ASF Cfg3Five multichannel forward
+  analysis (7 SCE + LFE) encoder + decoder 7_X SIMPLE/Cfg3Five core
+  render** per ETSI TS 103 190-1 §4.2.6.14 Table 33 + §4.2.7.5 Table 29
+  + §4.2.7.4 Table 26 + §4.2.8 Table 35 + §4.3.3.7.1 Table 88
+  (channel_mode 6 = 7.1 (3/4/0.1)):
+  - `encoder_asf::build_7_1_simple_asf_body_from_pcm_spectra(transform_length,
+    max_sfb, max_sfb_add, max_sfb_lfe, &[&[f32]; 8], pad_target_bytes)` —
+    emits the full 7.1 multichannel `audio_data` body for `7_X_codec_mode
+    = SIMPLE`, `b_has_lfe = 1`, `coding_config = 3` (Cfg3Five). Differs
+    from the round-80 5.1 builder in three places per Table 33: (1)
+    `7_X_codec_mode` is 2 bits (vs 3 for `5_X_codec_mode` per Table 25);
+    (2) SIMPLE skips the leading `companding_control(5)` (5_X SIMPLE
+    skips it too, but the 7_X-only ASPX path also skips it whereas 5_X
+    ASPX would emit it); (3) after the inner `five_channel_data()` for
+    L/R/C/Ls/Rs the SIMPLE/ASPX additional-channel block emits
+    `b_use_sap_add_ch (1 b) = 0 + two_channel_data()` carrying the
+    immersive pair Lb/Rb (identity SAP with `sap_mode = 0` on its
+    `chparam_info`) per Table 26. No trailing `mono_data(0)` for Cfg3
+    (gated on `coding_config in {0, 2}` only); no ASPX trailers / ACPL
+    data pair for SIMPLE.
+  - `Ac4ImsEncoder::with_7_1()` — channel-mode prefix `0b1111001` (7 b
+    — Table 88 channel_mode 6) for the 7.1 (3/4/0.1) layout. Builder
+    method parity with `with_5_0()` / `with_5_1()`.
+  - `Ac4ImsEncoder::encode_frame_pcm_7_1(&[L, R, C, Ls, Rs, Lb, Rb, LFE])`
+    and `encode_frame_pcm_7_1_with_max_sfb(..., max_sfb, max_sfb_add,
+    max_sfb_lfe)` — force the 7.1 channel_mode prefix so the decoder's
+    `walk_ac4_substream` dispatches `channels == 8` through
+    `parse_7x_audio_data_outer(b_has_lfe = true)`, run the round-50
+    forward MDCT pipeline (KBD-windowed MDCT + DP-optimal sectioning +
+    HCB1..11 + SNF) independently per channel, and wrap the body in
+    the v2 IMS TOC.
+  - **Decoder 7_X SIMPLE/Cfg3Five core render** in
+    `Ac4Decoder::receive_frame`: when `seven_x_mode in {SIMPLE, ASPX}`
+    and `seven_x_coding_config == Cfg3Five`, drive
+    `dispatch_5x_cfg3_simple_aspx` on the inner `five_channel_data` to
+    IMDCT slots 0..4 (L/R/C/Ls/Rs). The 7_X walker had been populating
+    `tools.five_channel_data` for ~50+ rounds but the inner 5-channel
+    PCM was never rendered — only slots 5/6 (the additional-pair F/G)
+    and slot 7 (LFE, round 80) were touched. This change inherits the
+    5_X core IMDCT/KBD/overlap-add chain unchanged (the per-channel
+    body shape is identical to the 5_X Cfg3Five case). ASPX trailer
+    plumbing (cfg3_aspx_lr / cfg3_aspx_ls_rs / cfg3_aspx_centre) is
+    passed as `None` — the 7_X walker has its own ASPX trailer slots
+    that need separate wiring (deferred).
+  - **Spectral SNR** on the 220 / 440 / 660 / 880 / 1100 / 1320 /
+    1540 Hz independent-tone 7.1 fixture: L=24.5 / R=24.8 / C=25.0 /
+    Ls=23.4 / Rs=27.4 / Lb=25.4 / Rb=26.0 dB — all above the ≥ 20 dB
+    floor, identical to round-80 5.1 for the L/R/C/Ls/Rs channels (same
+    forward pipeline) with Lb/Rb tracking the same SNR-bandwidth
+    relationship. The 60 Hz LFE tone round-trips to a non-silent
+    reconstructed LFE channel via the shared round-80 LFE render in
+    `receive_frame`.
+  - **New test suite** `tests/round91_7_1_multichannel.rs` (8 tests):
+    layout (8-channel S16 interleaved PCM), TOC channels=8, sequence
+    counter roll, `with_7_1()` builder TOC contract, walker contract
+    (`b_has_lfe == true`, populated `lfe_mono_data.scaled_spec`,
+    populated `five_channel_data` + `seven_x_additional_channel_data`
+    with `b_use_sap_add_ch = false`), silence round-trip, independent-
+    tone round-trip with audible PCM in every non-LFE slot + audible
+    LFE + verified Lb/Rb separation, and per-channel SNR ≥ 20 dB.
+  - ACPL_3 multichannel ASPX / A-CPL encoder remains deferred (the
+    5_X ASPX_ACPL_3 / 5_X ASPX_ACPL_{1,2} encoder paths haven't
+    landed; 7_X ASPX modes are gated on those).
+
 - **Round 80 — 5.1 SIMPLE/ASF Cfg3Five multichannel forward analysis (5 SCE
   + LFE) encoder** per ETSI TS 103 190-1 §4.2.6.6 Table 25 (`if (b_has_lfe)
   mono_data(1);`) + §4.2.7.5 Table 29 + §4.2.8 (`sf_info_lfe()` Table 35 /
