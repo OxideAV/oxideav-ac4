@@ -344,7 +344,35 @@ framework but usable standalone.
 > The ASPX_ACPL_1 encoder path (joint-MDCT residual + PARTIAL-mode
 > `acpl_config_1ch` with `acpl_qmf_band`), real `(alpha, beta)`
 > parameter extraction, and the 7_X ASPX_ACPL_{1,2} encoder paths
-> remain deferred.
+> remain deferred. Round 103 lands the **5_X SIMPLE/ASPX_ACPL_1
+> multichannel encoder path** per §4.2.6.6 Table 25 row
+> `case ASPX_ACPL_1:` — the round-100 follow-up and the symmetric
+> counterpart to the decoder's round-25 `parse_aspx_acpl_1_2_inner_body`
+> ASPX_ACPL_1 branch (Pseudocode 117).
+> `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1(&[L, R, C, Ls, Rs])` emits
+> an IMS v2 frame with `5_X_codec_mode = ASPX_ACPL_1 (2)`. The body
+> differs from the ACPL_2 path in two structural places:
+> (1) `acpl_config_1ch` is PARTIAL — `write_acpl_config_1ch_partial`
+> (Table 59, 6 b: id + quant_mode + `acpl_qmf_band_minus1`), so the
+> `acpl_data_1ch()` start_band resolves from `qmf_band` via `sb_to_pb`;
+> (2) the body carries an explicit joint-MDCT residual layer —
+> `write_acpl_1_residual_layer` emits `max_sfb_master` (n_side bits) +
+> 2× identity-SAP `chparam_info` + 2× `sf_data(ASF)` for the Ls/Rs
+> surround pair (sSMP,3 / sSMP,4 per Table 181), so the encoder takes a
+> full 5-channel input instead of reconstructing Ls/Rs from the L/R
+> carriers. New `build_5_x_acpl1_body_from_pcm_spectra` lays out
+> `5_X_codec_mode = 2 + aspx_config() + acpl_config_1ch(PARTIAL) +
+> companding_control(3) + coding_config = 0 + two_channel_data() +
+> residual-layer + mono_data(0) + aspx_data_2ch() + aspx_data_1ch() +
+> 2× acpl_data_1ch()`. Decoder round-trip: 5.0 ACPL_1 → 5-channel S16
+> interleaved PCM; the decoder resolves `five_x_mode == AspxAcpl1`,
+> the PARTIAL config, the persisted residual pair, the Cfg0 centre, and
+> both `acpl_data_1ch_pair` entries, then synthesises `[L, R, C, Ls, Rs]`
+> via `acpl_synth::run_acpl_5x_pair_pcm`. Total tests 708 (was 700).
+> Real per-band `(alpha, beta)` extraction, real ASPX envelope coding,
+> real Table-181 SAP-derived residual content (the residual sf_data
+> currently codes the raw Ls/Rs spectra), and the 7_X ASPX_ACPL_{1,2}
+> encoder paths remain deferred.
 
 ## Specs
 

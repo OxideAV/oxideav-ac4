@@ -1517,6 +1517,141 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Encode one IMS v2 frame containing a 5.0 SIMPLE/ASPX_ACPL_1
+    /// multichannel substream per ETSI TS 103 190-1 §4.2.6.6 Table 25 row
+    /// `case ASPX_ACPL_1:` (Pseudocode 117).
+    ///
+    /// Unlike ASPX_ACPL_2 (which reconstructs the Ls/Rs surround pair
+    /// purely from the L/R carriers + the two `acpl_data_1ch()` parameter
+    /// sets), ASPX_ACPL_1 transmits the surround signal explicitly as a
+    /// **joint-MDCT residual layer** (`max_sfb_master + 2× chparam_info +
+    /// 2× sf_data(ASF)`) keyed by the `acpl_config_1ch(PARTIAL)` element's
+    /// `acpl_qmf_band` field. It therefore accepts a full 5-channel
+    /// `[L, R, C, Ls, Rs]` input: L/R become the `two_channel_data()`
+    /// carriers, C the Cfg0 `mono_data(0)`, and Ls/Rs the residual pair
+    /// (sSMP,3 / sSMP,4 per Table 181).
+    ///
+    /// The encoder forces the 5.0 channel_mode prefix (`0b1101`, 4 b —
+    /// Table 85 channel_mode 3) so the decoder's `walk_ac4_substream`
+    /// dispatches `channels == 5` through
+    /// `parse_5x_audio_data_outer(b_has_lfe = false)` with
+    /// `5_X_codec_mode = AspxAcpl1`. The ASPX/A-CPL parameter bits use the
+    /// round-95 minimum-bit-cost zero-delta Huffman scaffold. The decoder
+    /// walks the full Table 25 ASPX_ACPL_1 body — including the residual
+    /// layer that IMDCTs into the Ls/Rs PCM carriers — and produces
+    /// 5-channel `[L, R, C, Ls, Rs]` PCM via
+    /// [`crate::acpl_synth::run_acpl_5x_pair_pcm`] (Pseudocode 117).
+    ///
+    /// `max_sfb` defaults to 40; `max_sfb_master` (the residual-layer band
+    /// budget) defaults to 20.
+    pub fn encode_frame_pcm_5_0_acpl1(&mut self, frames: &[&[f32]; 5]) -> Vec<u8> {
+        self.encode_frame_pcm_5_0_acpl1_with_max_sfb(frames, 40, 20)
+    }
+
+    /// `max_sfb` / `max_sfb_master`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_0_acpl1`].
+    pub fn encode_frame_pcm_5_0_acpl1_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        max_sfb: u32,
+        max_sfb_master: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_0_acpl1: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force 5.0 channel_mode prefix '1101', 4 b → channel_mode 3.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1101;
+        self.channel_mode_bits = 4;
+
+        // Forward MDCT analysis per carrier channel (L, R, C, Ls, Rs — 5
+        // states).
+        let n_channels = 5;
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // ASPX config: small low-res scale so the SBG counts stay small —
+        // keeps the ASPX_data bodies compact. Matches the round-95 / 100
+        // ASPX_ACPL_3 / ACPL_2 config exactly.
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0, // num_noise_sbgroups = 1
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // ACPL: num_param_bands_id = 3 → 7 param bands; quant_mode Fine;
+        // acpl_qmf_band_minus1 = 0 → qmf_band = 1 (PARTIAL mode).
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+        let acpl_qmf_band_minus1: u8 = 0;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let body = crate::encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra(
+            frame_len,
+            max_sfb,
+            max_sfb_master,
+            self.b_iframe_global,
+            &coeffs_per_channel[0],
+            &coeffs_per_channel[1],
+            &coeffs_per_channel[2],
+            &coeffs_per_channel[3],
+            &coeffs_per_channel[4],
+            &aspx_cfg,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+            pad_target_bytes,
+        );
+
+        // Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a mono SIMPLE/ASF substream
     /// whose injected tone falls on the spectral pair nearest the
     /// requested frequency. With `tl = 1920` at 48 kHz the bin spacing

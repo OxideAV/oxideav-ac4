@@ -1030,6 +1030,206 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra(
 }
 
 // ====================================================================
+// ASPX_ACPL_1 emitters — §4.2.6.6 Table 25 row `case ASPX_ACPL_1:`
+// (round 103)
+// ====================================================================
+
+/// Emit an `acpl_config_1ch()` element in PARTIAL mode per §4.2.13.1
+/// Table 59: 2-bit `acpl_num_param_bands_id` + 1-bit `acpl_quant_mode` +
+/// 3-bit `acpl_qmf_band_minus1`. PARTIAL mode carries the extra
+/// `acpl_qmf_band_minus1` field that FULL mode omits — that 3-bit field
+/// is the structural difference between the ASPX_ACPL_1 (PARTIAL) and
+/// ASPX_ACPL_2 (FULL) `acpl_config_1ch()` calls. Total: 6 bits. The
+/// decoder's [`crate::acpl::parse_acpl_config_1ch`] with
+/// [`crate::acpl::Acpl1chMode::Partial`] reads exactly this ordering and
+/// resolves `qmf_band = acpl_qmf_band_minus1 + 1`.
+pub fn write_acpl_config_1ch_partial(
+    bw: &mut BitWriter,
+    num_param_bands_id: u8,
+    quant_mode: crate::acpl::AcplQuantMode,
+    qmf_band_minus1: u8,
+) {
+    bw.write_u32(num_param_bands_id as u32 & 0b11, 2);
+    bw.write_bit(matches!(quant_mode, crate::acpl::AcplQuantMode::Coarse));
+    bw.write_u32(qmf_band_minus1 as u32 & 0b111, 3);
+}
+
+/// Emit the ASPX_ACPL_1-only joint-MDCT residual layer per §4.2.6.6
+/// Table 25 (`case ASPX_ACPL_1:` arm, after the channel data):
+///
+/// ```text
+///   max_sfb_master              // n_side bits — Table 106 column
+///   chparam_info(): sap_mode=0  // 2 b — residual ch0
+///   chparam_info(): sap_mode=0  // 2 b — residual ch1
+///   sf_data(ASF)                // residual ch0 spectrum (sSMP,3)
+///   sf_data(ASF)                // residual ch1 spectrum (sSMP,4)
+/// ```
+///
+/// The two residual `sf_data(ASF)` bodies carry the joint-MDCT residual
+/// spectra the decoder IMDCTs into the Ls/Rs surround PCM carriers
+/// (Table 181 sSMP,3 / sSMP,4). Both bodies share the same long-frame
+/// transform length and the explicit `max_sfb_master` band bound.
+/// Mirrors the decoder's residual-layer walk in
+/// [`crate::mch::parse_aspx_acpl_1_2_inner_body`].
+///
+/// `max_sfb_master` is clamped to the band budget at `transform_length`
+/// and to the `n_side`-bit field width. Returns the clamped value the
+/// decoder will recover.
+fn write_acpl_1_residual_layer(
+    bw: &mut BitWriter,
+    transform_length: u32,
+    max_sfb_master: u32,
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+) -> u32 {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let (_n_msfb, n_side, _n_msfbl) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    let num_sfb_cap = crate::tables::num_sfb_48(transform_length).expect("encoder: bad tl");
+    let n_side_cap = (1u32 << n_side) - 1;
+    // The decoder bails on max_sfb_master == 0; keep at least 1 band.
+    let max_sfb_master = max_sfb_master.clamp(1, num_sfb_cap.min(n_side_cap));
+
+    // max_sfb_master in n_side bits.
+    bw.write_u32(max_sfb_master, n_side);
+    // Two chparam_info() calls — one per residual channel, sap_mode = 0.
+    bw.write_u32(0, 2);
+    bw.write_u32(0, 2);
+    // Two sf_data(ASF) bodies bounded by max_sfb_master.
+    for coeffs in [coeffs_ls, coeffs_rs] {
+        let (qspec, sf, max_q, sections, snf) =
+            prepare_stereo_channel(coeffs, sfbo, max_sfb_master);
+        write_section_data(bw, &sections);
+        write_spectral_data_sections(bw, &qspec, sfbo, &sections);
+        write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb_master);
+        write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb_master);
+    }
+    max_sfb_master
+}
+
+/// Build a 5_X SIMPLE/ASPX_ACPL_1 substream body per §4.2.6.6 Table 25
+/// row `case ASPX_ACPL_1:` that the decoder's
+/// [`crate::mch::parse_5x_audio_data_outer`] (with `mode = AspxAcpl1`)
+/// walks end-to-end and synthesises 5-channel `[L, R, C, Ls, Rs]` PCM
+/// via [`crate::acpl_synth::run_acpl_5x_pair_pcm`] (Pseudocode 117).
+///
+/// Body layout (Table 25, `coding_config = 0` — the AcplLite2 / two-
+/// channel false-branch):
+///
+/// ```text
+///   5_X_codec_mode = ASPX_ACPL_1 (2)        // 3 b
+///   if (b_iframe) {
+///       aspx_config();                       // 15 b — Table 50
+///       acpl_config_1ch(PARTIAL);            //  6 b — Table 59
+///   }
+///   companding_control(3);                   // sync = 1, on = 1 — Table 49
+///   coding_config = 0;                        //  1 b
+///   two_channel_data();                       // L/R carriers — Table 26
+///   max_sfb_master;                           // joint-MDCT residual layer
+///   chparam_info(); chparam_info();           // residual ch0 / ch1
+///   sf_data(ASF); sf_data(ASF);               // residual sSMP,3 / sSMP,4
+///   mono_data(0);                             // centre (Cfg0 only) — Table 21
+///   if (b_iframe) {
+///       aspx_data_2ch();                     // Table 52
+///       aspx_data_1ch();                     // Table 51
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[0]
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[1]
+///   }
+/// ```
+///
+/// `coeffs_l` / `coeffs_r` are the forward-MDCT L/R carrier spectra;
+/// `coeffs_c` is the centre carrier coded via the Cfg0 `mono_data(0)`;
+/// `coeffs_ls` / `coeffs_rs` are the Ls/Rs surround spectra coded as the
+/// joint-MDCT residual pair (sSMP,3 / sSMP,4). Unlike ASPX_ACPL_2 (which
+/// reconstructs Ls/Rs purely from the L/R carriers + the `acpl_data_1ch`
+/// parameter pair), ASPX_ACPL_1 transmits the surround residual
+/// explicitly, so it accepts a full 5-channel `[L, R, C, Ls, Rs]` input.
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl1_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_1 (2) — 3 bits.
+    bw.write_u32(2, 3);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_1ch(PARTIAL) (6 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+
+    // companding_control(3): sync = 1, on = 1.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (1 b) — false → AcplLite2 / two_channel_data path.
+    bw.write_bit(false);
+
+    // two_channel_data(): L/R carriers.
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // ASPX_ACPL_1 joint-MDCT residual layer: Ls/Rs surround residual.
+    write_acpl_1_residual_layer(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+    );
+
+    // Cfg0 (coding_config == 0): mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    // I-frame ASPX + A-CPL trailers.
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        // PARTIAL acpl_config_1ch carries a qmf_band → resolve start_band.
+        let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+        let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+// ====================================================================
 // Tests
 // ====================================================================
 
@@ -1298,5 +1498,118 @@ mod tests {
         write_aspx_data_1ch_minimal(&mut bw, &cfg).unwrap();
         bw.align_to_byte();
         assert!(!bw.finish().is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // Round 103 — ASPX_ACPL_1 emitter tests
+    // ----------------------------------------------------------------
+
+    /// `write_acpl_config_1ch_partial` round-trips through
+    /// `parse_acpl_config_1ch(PARTIAL)` and emits exactly 6 bits (2-bit
+    /// id, 1-bit quant_mode, 3-bit acpl_qmf_band_minus1). The recovered
+    /// `qmf_band` equals `acpl_qmf_band_minus1 + 1`.
+    #[test]
+    fn write_acpl_config_1ch_partial_round_trips_through_parser() {
+        let mut bw = BitWriter::new();
+        write_acpl_config_1ch_partial(&mut bw, 3, crate::acpl::AcplQuantMode::Fine, 2);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let parsed =
+            crate::acpl::parse_acpl_config_1ch(&mut br, crate::acpl::Acpl1chMode::Partial).unwrap();
+        assert_eq!(parsed.num_param_bands_id, 3);
+        assert_eq!(parsed.num_param_bands, 7);
+        assert!(matches!(
+            parsed.quant_mode,
+            crate::acpl::AcplQuantMode::Fine
+        ));
+        // PARTIAL mode → qmf_band = qmf_band_minus1 + 1 = 3.
+        assert_eq!(parsed.qmf_band, 3);
+    }
+
+    /// `write_acpl_1_residual_layer` produces a body whose
+    /// `max_sfb_master` + 2× chparam_info + 2× sf_data(ASF) round-trip
+    /// through the decoder's residual-layer walk. We exercise the parse
+    /// directly via `parse_chparam_info` + `decode_asf_long_mono_body_*`
+    /// mirroring `parse_aspx_acpl_1_2_inner_body`; here we just confirm the
+    /// writer returns the clamped band budget and emits a non-empty body.
+    #[test]
+    fn write_acpl_1_residual_layer_clamps_and_emits() {
+        let tl = 1920u32;
+        let coeffs_ls = vec![0.0f32; tl as usize / 2];
+        let coeffs_rs = vec![0.0f32; tl as usize / 2];
+        let mut bw = BitWriter::new();
+        // Request a band budget above the n_side cap (31 @ tl=1920) →
+        // clamped to 31.
+        let used = write_acpl_1_residual_layer(&mut bw, tl, 40, &coeffs_ls, &coeffs_rs);
+        bw.align_to_byte();
+        assert_eq!(used, 31, "max_sfb_master clamped to n_side cap (5 b → 31)");
+        assert!(!bw.finish().is_empty());
+
+        // A zero request clamps up to 1 (the decoder bails on 0).
+        let mut bw2 = BitWriter::new();
+        let used2 = write_acpl_1_residual_layer(&mut bw2, tl, 0, &coeffs_ls, &coeffs_rs);
+        assert_eq!(
+            used2, 1,
+            "max_sfb_master clamped up to 1 (decoder bails on 0)"
+        );
+    }
+
+    /// The full ASPX_ACPL_1 body builder produces output the decoder walks
+    /// to `FiveXCodecMode::AspxAcpl1` with the PARTIAL config, the residual
+    /// pair, the centre mono, and both acpl_data_1ch parameter sets.
+    #[test]
+    fn build_5_x_acpl1_body_decoder_resolves_full_body() {
+        let tl = 1920u32;
+        let half = tl as usize / 2;
+        let zeros = vec![0.0f32; half];
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let body = build_5_x_acpl1_body_from_pcm_spectra(
+            tl,
+            16,
+            8,
+            true,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            0,
+            4096,
+        );
+        // Skip the 2-byte ac4_substream() audio_size header the builder
+        // prepends (15 b size + 1 b more_bits, byte-aligned).
+        let mut br = BitReader::new(&body[2..]);
+        let mut tools = crate::asf::SubstreamTools::default();
+        crate::mch::parse_5x_audio_data_outer(&mut br, &mut tools, false, true, tl).unwrap();
+        assert_eq!(
+            tools.five_x_mode,
+            Some(crate::mch::FiveXCodecMode::AspxAcpl1)
+        );
+        let cfg_partial = tools
+            .acpl_config_1ch_partial
+            .expect("PARTIAL config parsed");
+        assert_eq!(cfg_partial.qmf_band, 1); // qmf_band_minus1 = 0 → 1
+        assert_eq!(tools.two_channel_data.len(), 1);
+        assert!(tools.cfg0_centre_mono.is_some());
+        assert_eq!(tools.acpl_1_residual_max_sfb_master, Some(8));
+        assert!(tools.acpl_1_residual_pair[0].is_some());
+        assert!(tools.acpl_1_residual_pair[1].is_some());
+        assert!(tools.acpl_data_1ch_pair[0].is_some());
+        assert!(tools.acpl_data_1ch_pair[1].is_some());
     }
 }
