@@ -316,7 +316,35 @@ framework but usable standalone.
 > encoder paths for `5_X_codec_mode in {ASPX_ACPL_1, ASPX_ACPL_2}`
 > (Pseudocode 117) remain deferred. The 7_X paths inherit the
 > same `aspx_data` / `acpl_data` shape as 5_X so they're queued
-> behind the 5_X work continuing to harden.
+> behind the 5_X work continuing to harden. Round 100 lands the
+> **5_X SIMPLE/ASPX_ACPL_2 multichannel encoder path** per §4.2.6.6
+> Table 25 row `case ASPX_ACPL_2:` — the symmetric counterpart to the
+> round-25 decoder `parse_aspx_acpl_1_2_inner_body` walker (Pseudocode
+> 117). `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl2(&[L, R, C])` emits an
+> IMS v2 frame with `5_X_codec_mode = ASPX_ACPL_2 (3)` whose body is
+> `aspx_config() + acpl_config_1ch(FULL) + companding_control(3) +
+> coding_config = 0 + two_channel_data() (L/R carriers) +
+> mono_data(0) (centre) + aspx_data_2ch() + aspx_data_1ch() + two
+> acpl_data_1ch()` parameter sets. The ASPX_ACPL_1-only joint-MDCT
+> residual layer (`max_sfb_master + 2× chparam_info + 2× sf_data`) is
+> skipped for ACPL_2 — that's the structural difference that makes the
+> ACPL_2 path the cleanest encoder win. New `encoder_acpl3` emitters:
+> `write_acpl_config_1ch_full` (Table 59, 3 b), `write_two_channel_data`
+> (Table 26 — shared `sf_info(ASF)` + identity-SAP `chparam_info` +
+> 2× `sf_data`), `write_mono_data_centre` (Table 21 non-LFE),
+> `write_aspx_data_1ch_minimal` (Table 51 FIXFIX num_env=1) and
+> `write_acpl_data_1ch_minimal` (Table 61). The 1ch ASPX SIGNAL band
+> count uses `num_sbg_sig_highres` to match `parse_aspx_ec_data`'s
+> empty-`freq_res` fallback. Decoder round-trip: 5.0 ACPL_2 →
+> 5-channel S16 interleaved PCM; the decoder resolves
+> `five_x_mode == AspxAcpl2`, walks `acpl_config_1ch_full`,
+> `two_channel_data`, the Cfg0 centre `mono_data(0)`, and both
+> `acpl_data_1ch_pair` entries, then synthesises `[L, R, C, Ls, Rs]`
+> via `acpl_synth::run_acpl_5x_pair_pcm`. Total tests 700 (was 691).
+> The ASPX_ACPL_1 encoder path (joint-MDCT residual + PARTIAL-mode
+> `acpl_config_1ch` with `acpl_qmf_band`), real `(alpha, beta)`
+> parameter extraction, and the 7_X ASPX_ACPL_{1,2} encoder paths
+> remain deferred.
 
 ## Specs
 

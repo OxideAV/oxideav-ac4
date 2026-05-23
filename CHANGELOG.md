@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 100 — 5_X SIMPLE/ASPX_ACPL_2 multichannel encoder path** per
+  ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case ASPX_ACPL_2:` +
+  §4.2.12.1 Table 50 (aspx_config) + §4.2.13.1 Table 59
+  (acpl_config_1ch FULL) + §4.2.7.4 Table 26 (two_channel_data) +
+  §4.2.6.5 Table 21 (mono_data) + §4.2.12.4 Table 52 (aspx_data_2ch)
+  + §4.2.12.3 Table 51 (aspx_data_1ch) + §4.2.13.3 Table 61
+  (acpl_data_1ch) + §4.2.11 Table 49 (companding_control). Symmetric
+  counterpart to the decoder's round-25 `parse_aspx_acpl_1_2_inner_body`
+  walker (Pseudocode 117). Extends the `encoder_acpl3` module:
+  - `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl2(&[L, R, C])` +
+    `..._with_max_sfb(&[L, R, C], max_sfb)` — emit IMS v2 frames in
+    `5_X_codec_mode = ASPX_ACPL_2 (3)`. Channel_mode prefix forced to
+    `0b1101` (5 ch) per Table 85 so the decoder dispatches `channels
+    == 5` through `parse_5x_audio_data_outer(b_has_lfe = false)`.
+  - `encoder_acpl3::build_5_x_acpl2_body_from_pcm_spectra` — shared
+    body builder. Layout: `5_X_codec_mode = 3` (3 b) + I-frame block
+    (`aspx_config()` 15 b + `acpl_config_1ch(FULL)` 3 b) +
+    `companding_control(3)` (sync=1, on=1) + `coding_config = 0` (1 b,
+    AcplLite2 / two-channel false-branch) + `two_channel_data()` (L/R
+    carriers) + Cfg0 `mono_data(0)` (centre carrier) + I-frame
+    `aspx_data_2ch()` + `aspx_data_1ch()` + two `acpl_data_1ch()`
+    parameter sets (Pseudocode 117 D0 / D1). The ASPX_ACPL_1-only
+    joint-MDCT residual layer (`max_sfb_master + 2× chparam_info +
+    2× sf_data`) is **skipped** for ACPL_2 — that's the structural
+    difference that makes the ACPL_2 path the cleanest encoder win.
+  - New bit-exact emitters: `write_acpl_config_1ch_full` (Table 59,
+    2-bit id + 1-bit quant_mode, no qmf_band), `write_two_channel_data`
+    (Table 26 shared `sf_info(ASF)` + identity-SAP `chparam_info` +
+    2× `sf_data`), `write_mono_data_centre` (Table 21 non-LFE:
+    `spec_frontend = 0` + `sf_info(ASF)` + `sf_data`),
+    `write_aspx_data_1ch_minimal` (Table 51 FIXFIX num_env=1 path),
+    `write_acpl_data_1ch_minimal` (Table 61: `acpl_framing_data` +
+    `acpl_ec_data(ALPHA)` + `acpl_ec_data(BETA)`, 1 param set, DF
+    zero-delta). The 1ch ASPX SIGNAL band count uses
+    `num_sbg_sig_highres` (matching `parse_aspx_ec_data`'s empty-
+    `freq_res` fallback when `freq_res_mode != Signalled`).
+  - Decoder round-trip verified: 5.0 ACPL_2 → 5-channel S16
+    interleaved PCM (1920 samples × 5 ch × 2 bytes). The decoder
+    walks the full Table 25 ASPX_ACPL_2 body and resolves
+    `five_x_mode == AspxAcpl2`, `acpl_config_1ch_full.is_some()`,
+    `two_channel_data.len() == 1`, `cfg0_centre_mono.is_some()`, and
+    both `acpl_data_1ch_pair[0/1].is_some()` — the 5-channel
+    `[L, R, C, Ls, Rs]` synthesis runs via
+    `acpl_synth::run_acpl_5x_pair_pcm` (Pseudocode 117). With all-zero
+    ACPL parameter deltas Ls/Rs collapses to ducker-driven
+    reconstruction from the L/R carriers.
+  - 4 new integration tests in `tests/round100_5_x_acpl2_encoder.rs`
+    (5-channel layout, sequence-counter roll, full-body decoder
+    resolution, silence round-trip) + 5 new unit tests in
+    `encoder_acpl3::tests` (bit-order round-trips for
+    acpl_config_1ch_full / two_channel_data / mono_data(0) /
+    acpl_data_1ch + aspx_data_1ch emit).
+  - Total test count: 700 (was 691) — 0 ignored, 0 failed.
+  - Follow-ups (deferred): the ASPX_ACPL_1 encoder path (adds the
+    joint-MDCT residual layer + PARTIAL-mode `acpl_config_1ch` with
+    `acpl_qmf_band`); real per-band `(alpha, beta)` extraction
+    replacing the zero-delta scaffold; matching 7_X ASPX_ACPL_{1,2}
+    encoder paths (the 7_X walker shares this 1ch acpl/aspx shape).
+
 - **Round 95 — 5_X SIMPLE/ASPX_ACPL_3 multichannel encoder path** per
   ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case ASPX_ACPL_3:` +
   §4.2.12.1 Table 50 (aspx_config) + §4.2.13.2 Table 60 (acpl_config_2ch)

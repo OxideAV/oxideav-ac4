@@ -723,6 +723,313 @@ fn write_lfe_mono_data(
 }
 
 // ====================================================================
+// ASPX_ACPL_2 emitters — §4.2.6.6 Table 25 row `case ASPX_ACPL_2:`
+// (round 100)
+// ====================================================================
+
+/// Emit an `acpl_config_1ch()` element in FULL mode per §4.2.13.1
+/// Table 59: 2-bit `acpl_num_param_bands_id` + 1-bit `acpl_quant_mode`.
+/// FULL mode carries no `acpl_qmf_band_minus1` field (that 3-bit field
+/// is PARTIAL-only — used by ASPX_ACPL_1). Total: 3 bits. The decoder's
+/// [`crate::acpl::parse_acpl_config_1ch`] with
+/// [`crate::acpl::Acpl1chMode::Full`] reads exactly this ordering.
+pub fn write_acpl_config_1ch_full(
+    bw: &mut BitWriter,
+    num_param_bands_id: u8,
+    quant_mode: crate::acpl::AcplQuantMode,
+) {
+    bw.write_u32(num_param_bands_id as u32 & 0b11, 2);
+    bw.write_bit(matches!(quant_mode, crate::acpl::AcplQuantMode::Coarse));
+}
+
+/// Emit a `two_channel_data()` body per §4.2.7.4 Table 26 for the
+/// long-frame, single-window-group, identity-SAP case:
+///
+/// ```text
+///   asf_transform_info(): b_long_frame = 1            // 1 b
+///   asf_psy_info(ASF,0,0): max_sfb[0] in n_msfb_bits  // shared
+///   chparam_info(): sap_mode = 0                       // 2 b
+///   sf_data(ASF) ch0                                   // L carrier
+///   sf_data(ASF) ch1                                   // R carrier
+/// ```
+///
+/// Unlike `stereo_data()` (split-MDCT — a *per-channel* transform_info /
+/// psy_info each), `two_channel_data()` shares one `sf_info(ASF)` header
+/// across both channels then runs two `sf_data(ASF)` bodies. Mirrors
+/// [`crate::mch::parse_two_channel_data`].
+fn write_two_channel_data(
+    bw: &mut BitWriter,
+    transform_length: u32,
+    max_sfb: u32,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+) {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let (n_msfb_bits, _, _) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    // Shared sf_info(ASF, 0, 0).
+    bw.write_bit(true); // asf_transform_info: b_long_frame = 1
+    bw.write_u32(max_sfb, n_msfb_bits); // asf_psy_info: max_sfb[0]
+                                        // chparam_info(): sap_mode = 0 (identity SAP, no ms_used / sap_data).
+    bw.write_u32(0, 2);
+
+    // Two sf_data(ASF) bodies, one per channel.
+    for coeffs in [coeffs_l, coeffs_r] {
+        let (qspec, sf, max_q, sections, snf) = prepare_stereo_channel(coeffs, sfbo, max_sfb);
+        write_section_data(bw, &sections);
+        write_spectral_data_sections(bw, &qspec, sfbo, &sections);
+        write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb);
+        write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb);
+    }
+}
+
+/// Emit a non-LFE `mono_data(0)` element per Table 21:
+///
+/// ```text
+///   spec_frontend = 0 (ASF)                           // 1 b
+///   asf_transform_info(): b_long_frame = 1            // 1 b
+///   asf_psy_info(ASF,0,0): max_sfb[0] in n_msfb_bits
+///   sf_data(ASF)                                       // mono spectrum
+/// ```
+///
+/// Mirrors [`crate::mch::parse_mono_data`] with `b_lfe = false`.
+fn write_mono_data_centre(bw: &mut BitWriter, transform_length: u32, max_sfb: u32, coeffs: &[f32]) {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let (n_msfb_bits, _, _) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    // spec_frontend = 0 (ASF).
+    bw.write_bit(false);
+    // asf_transform_info(): b_long_frame = 1.
+    bw.write_bit(true);
+    // asf_psy_info(ASF, 0, 0): max_sfb[0].
+    bw.write_u32(max_sfb, n_msfb_bits);
+    // sf_data(ASF).
+    let (qspec, sf, max_q, sections, snf) = prepare_stereo_channel(coeffs, sfbo, max_sfb);
+    write_section_data(bw, &sections);
+    write_spectral_data_sections(bw, &qspec, sfbo, &sections);
+    write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb);
+    write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb);
+}
+
+/// Emit a minimum-viable `aspx_data_1ch()` body per §4.2.12.3 Table 51
+/// with the FIXFIX + num_env = 1 path:
+///
+/// ```text
+///   aspx_xover_subband_offset = 0                      // 3 b
+///   aspx_framing(0): FIXFIX, tmp_num_env = 0           // 2 + envbits b
+///   aspx_delta_dir(0): 1 SIGNAL + 1 NOISE bit (FREQ)   // 2 b
+///   aspx_hfgen_iwc_1ch(): num_sbg_noise × 2 b tna_mode + 3 × present=0
+///   aspx_ec_data(SIGNAL): F0 + (num_sbg_sig - 1) × DF
+///   aspx_ec_data(NOISE):  F0 + (num_sbg_noise - 1) × DF
+/// ```
+///
+/// All stereo_mode = LEVEL (mono — there is no balance dimension). The
+/// SIGNAL band count is derived per [`parse_aspx_ec_data`]: when the
+/// `aspx_config` does not signal per-envelope frequency resolution
+/// (`freq_res_mode != Signalled`), the framing carries no
+/// `aspx_freq_res[0]` bit, so the parser's `freq_res` vector is empty
+/// and the SIGNAL ec_data falls back to the **high-res** subband count.
+/// We therefore drive the writer with `num_sbg_sig_highres`.
+fn write_aspx_data_1ch_minimal(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+) -> Result<(), &'static str> {
+    let xover: u32 = 0;
+    bw.write_u32(xover, 3);
+
+    // aspx_framing(0): FIXFIX (int_class '11', 2 b), tmp_num_env = 0.
+    bw.write_u32(0b11, 2);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(0, envbits); // tmp_num_env = 0 → num_env = 1
+    if cfg.signals_freq_res() {
+        bw.write_bit(false); // aspx_freq_res[0] = 0
+    }
+    // aspx_delta_dir(0): num_env = 1 SIGNAL bit + num_noise = 1 NOISE bit.
+    bw.write_bit(false); // sig_delta_dir[0] = false (FREQ)
+    bw.write_bit(false); // noise_delta_dir[0] = false (FREQ)
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    // aspx_hfgen_iwc_1ch(): tna_mode[0..num_sbg_noise] = 0 (2 b each) +
+    // ah_present / fic_present / tic_present = 0 (3 × 1 b).
+    for _ in 0..counts.num_sbg_noise {
+        bw.write_u32(0, 2);
+    }
+    bw.write_bit(false); // ah_present = 0
+    bw.write_bit(false); // fic_present = 0
+    bw.write_bit(false); // tic_present = 0
+
+    // num_env = 1 with empty freq_res → SIGNAL ec_data reads the high-res
+    // subband count (see doc comment).
+    let num_sbg_sig = counts.num_sbg_sig_highres;
+    let num_sbg_noise = counts.num_sbg_noise;
+
+    // SIGNAL ec_data (LEVEL). FIXFIX + num_env == 1 → qmode forced Fine.
+    let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+    if num_sbg_sig >= 1 {
+        write_aspx_sig_f0(bw, qmode_sig, aspx::AspxStereoMode::Level);
+    }
+    for _ in 1..num_sbg_sig {
+        write_aspx_sig_df_zero(bw, qmode_sig, aspx::AspxStereoMode::Level);
+    }
+    // NOISE ec_data (LEVEL, qmode Fine per Table 51).
+    if num_sbg_noise >= 1 {
+        write_aspx_noise_f0(bw, aspx::AspxStereoMode::Level);
+    }
+    for _ in 1..num_sbg_noise {
+        write_aspx_noise_df_zero(bw, aspx::AspxStereoMode::Level);
+    }
+    Ok(())
+}
+
+/// Emit a minimum-viable `acpl_data_1ch()` body per §4.2.13.3 Table 61:
+///
+/// ```text
+///   acpl_framing_data(): smooth interp + num_param_sets = 1   // 2 b
+///   acpl_ec_data(ALPHA): 1 param set × acpl_huff_data()
+///   acpl_ec_data(BETA):  1 param set × acpl_huff_data()
+/// ```
+///
+/// Each `acpl_huff_data()` emits `diff_type = 0` (DIFF_FREQ) then one
+/// F0 codeword + `(num_bands - start_band - 1)` DF zero-delta codewords.
+/// The recovered `(alpha, beta)` per-band deltas are all 0 — the
+/// minimal-cost scaffold matching the round-95 ACPL_3 emitter. Mirrors
+/// [`crate::acpl::parse_acpl_data_1ch`].
+fn write_acpl_data_1ch_minimal(
+    bw: &mut BitWriter,
+    num_bands: u32,
+    start_band: u32,
+    quant_mode: crate::acpl::AcplQuantMode,
+) {
+    // acpl_framing_data(): smooth interp (1 b) + num_param_sets_cod = 0 (1 b).
+    bw.write_bit(false);
+    bw.write_bit(false);
+    // num_param_sets = 1 → each acpl_ec_data() runs one acpl_huff_data().
+
+    let emit_one = |bw: &mut BitWriter, dt: crate::acpl::AcplDataType| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        if num_bands > start_band {
+            write_acpl_f0_zero(bw, dt, quant_mode);
+        }
+        for _ in (start_band + 1)..num_bands {
+            write_acpl_df_zero(bw, dt, quant_mode);
+        }
+    };
+
+    // alpha1 — ALPHA codebook family.
+    emit_one(bw, crate::acpl::AcplDataType::Alpha);
+    // beta1 — BETA codebook family.
+    emit_one(bw, crate::acpl::AcplDataType::Beta);
+}
+
+/// Build a 5_X SIMPLE/ASPX_ACPL_2 substream body per §4.2.6.6 Table 25
+/// row `case ASPX_ACPL_2:` that the decoder's
+/// [`crate::mch::parse_5x_audio_data_outer`] (with `mode = AspxAcpl2`)
+/// walks end-to-end and synthesises 5-channel `[L, R, C, Ls, Rs]` PCM
+/// via [`crate::acpl_synth::run_acpl_5x_pair_pcm`] (Pseudocode 117).
+///
+/// Body layout (Table 25, `coding_config = 0` — the AcplLite2 / two-
+/// channel false-branch):
+///
+/// ```text
+///   5_X_codec_mode = ASPX_ACPL_2 (3)        // 3 b
+///   if (b_iframe) {
+///       aspx_config();                       // 15 b — Table 50
+///       acpl_config_1ch(FULL);               //  3 b — Table 59
+///   }
+///   companding_control(3);                   // sync = 1, on = 1 — Table 49
+///   coding_config = 0;                        //  1 b
+///   two_channel_data();                       // L/R carriers — Table 26
+///   // (ASPX_ACPL_1 joint-MDCT residual layer is SKIPPED for ACPL_2)
+///   mono_data(0);                             // centre (Cfg0 only) — Table 21
+///   if (b_iframe) {
+///       aspx_data_2ch();                     // Table 52
+///       aspx_data_1ch();                     // Table 51
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[0]
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[1]
+///   }
+/// ```
+///
+/// `coeffs_l` / `coeffs_r` are the forward-MDCT L/R carrier spectra;
+/// `coeffs_c` is the centre carrier coded via the Cfg0 `mono_data(0)`.
+/// ASPX_ACPL_2 has no surround carriers — the Ls/Rs PCM is reconstructed
+/// from the L/R carriers + the two `acpl_data_1ch()` parameter sets.
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl2_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_2 (3) — 3 bits.
+    bw.write_u32(3, 3);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_1ch(FULL) (3 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
+    }
+
+    // companding_control(3): sync = 1, on = 1, no avg (same wire shape as
+    // the 2-channel sync-on case).
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (1 b) — false → AcplLite2 / two_channel_data path.
+    bw.write_bit(false);
+
+    // two_channel_data(): L/R carriers.
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // (No ASPX_ACPL_1 residual layer for ACPL_2.)
+
+    // Cfg0 (coding_config == 0): mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    // I-frame ASPX + A-CPL trailers.
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        // acpl_config_1ch(FULL) has no qmf_band → start_band = 0.
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, 0, acpl_quant_mode);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, 0, acpl_quant_mode);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+// ====================================================================
 // Tests
 // ====================================================================
 
@@ -876,5 +1183,120 @@ mod tests {
         // Note: parse_aspx_data_2ch_body is pub(crate) and takes
         // SubstreamTools; full round-trip is exercised via the integration
         // test in tests/round95_5_x_acpl3_encoder.rs.
+    }
+
+    // ----------------------------------------------------------------
+    // Round 100 — ASPX_ACPL_2 emitter tests
+    // ----------------------------------------------------------------
+
+    /// `write_acpl_config_1ch_full` round-trips through
+    /// `parse_acpl_config_1ch(FULL)` and emits exactly 3 bits (2-bit id +
+    /// 1-bit quant_mode, no qmf_band).
+    #[test]
+    fn write_acpl_config_1ch_full_round_trips_through_parser() {
+        let mut bw = BitWriter::new();
+        write_acpl_config_1ch_full(&mut bw, 3, crate::acpl::AcplQuantMode::Fine);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let parsed =
+            crate::acpl::parse_acpl_config_1ch(&mut br, crate::acpl::Acpl1chMode::Full).unwrap();
+        assert_eq!(parsed.num_param_bands_id, 3);
+        assert_eq!(parsed.num_param_bands, 7);
+        assert!(matches!(
+            parsed.quant_mode,
+            crate::acpl::AcplQuantMode::Fine
+        ));
+        // FULL mode → qmf_band is 0 (no acpl_qmf_band_minus1 read).
+        assert_eq!(parsed.qmf_band, 0);
+    }
+
+    /// `write_two_channel_data` produces a body that round-trips through
+    /// `parse_two_channel_data` for the long-frame identity-SAP case.
+    #[test]
+    fn write_two_channel_data_round_trips_through_parser() {
+        let tl = 1920u32;
+        let max_sfb = 8u32;
+        let coeffs_l = vec![0.0f32; tl as usize / 2];
+        let coeffs_r = vec![0.0f32; tl as usize / 2];
+        let mut bw = BitWriter::new();
+        write_two_channel_data(&mut bw, tl, max_sfb, &coeffs_l, &coeffs_r);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let d = crate::mch::parse_two_channel_data(&mut br, tl).unwrap();
+        assert_eq!(d.transform_info.as_ref().unwrap().transform_length_0, tl);
+        assert_eq!(d.psy_info.as_ref().unwrap().max_sfb_0, max_sfb);
+        assert_eq!(d.chparam.as_ref().unwrap().sap_mode, 0);
+        assert_eq!(d.scaled_spec_per_channel.len(), 2);
+        assert!(d.scaled_spec_per_channel.iter().all(|c| c.is_some()));
+    }
+
+    /// `write_mono_data_centre` produces a non-LFE `mono_data(0)` body
+    /// that round-trips through `parse_mono_data(b_lfe = false)`.
+    #[test]
+    fn write_mono_data_centre_round_trips_through_parser() {
+        let tl = 1920u32;
+        let max_sfb = 6u32;
+        let coeffs = vec![0.0f32; tl as usize / 2];
+        let mut bw = BitWriter::new();
+        write_mono_data_centre(&mut bw, tl, max_sfb, &coeffs);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let m = crate::mch::parse_mono_data(&mut br, false, tl).unwrap();
+        assert!(!m.b_lfe);
+        assert_eq!(m.spec_frontend_bit, 0);
+        assert_eq!(m.psy_info.as_ref().unwrap().max_sfb_0, max_sfb);
+        assert!(m.scaled_spec.is_some());
+    }
+
+    /// `write_acpl_data_1ch_minimal` produces a body that round-trips
+    /// through `parse_acpl_data_1ch` with all-zero recovered deltas.
+    #[test]
+    fn acpl_data_1ch_minimal_round_trips() {
+        let num_bands: u32 = 7; // num_param_bands_id = 3
+        let qm = crate::acpl::AcplQuantMode::Fine;
+        let mut bw = BitWriter::new();
+        write_acpl_data_1ch_minimal(&mut bw, num_bands, 0, qm);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let parsed = crate::acpl::parse_acpl_data_1ch(&mut br, num_bands, 0, qm).unwrap();
+        assert_eq!(parsed.framing.num_param_sets, 1);
+        assert_eq!(parsed.alpha1.len(), 1);
+        assert_eq!(parsed.alpha1[0].values.len(), num_bands as usize);
+        assert_eq!(parsed.beta1[0].values.len(), num_bands as usize);
+        // F0 + DF zero-delta → all subsequent values are 0.
+        for v in &parsed.alpha1[0].values[1..] {
+            assert_eq!(*v, 0);
+        }
+        for v in &parsed.beta1[0].values[1..] {
+            assert_eq!(*v, 0);
+        }
+    }
+
+    /// `write_aspx_data_1ch_minimal` emits without erroring for the small
+    /// `AspxConfig` used by the ASPX_ACPL_2 encoder path. Full round-trip
+    /// is exercised via the integration test
+    /// `tests/round100_5_x_acpl2_encoder.rs`.
+    #[test]
+    fn aspx_data_1ch_minimal_emits_without_error() {
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let mut bw = BitWriter::new();
+        write_aspx_data_1ch_minimal(&mut bw, &cfg).unwrap();
+        bw.align_to_byte();
+        assert!(!bw.finish().is_empty());
     }
 }
