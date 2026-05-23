@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 107 — 7.0 SIMPLE/ASPX_ACPL_2 multichannel encoder path** per
+  ETSI TS 103 190-1 §4.2.6.14 Table 33 row `case ASPX_ACPL_2:` +
+  §4.2.12.1 Table 50 (aspx_config) + §4.2.13.1 Table 59
+  (acpl_config_1ch FULL) + §4.2.7.4 Table 26 (two_channel_data) +
+  §4.2.6.5 Table 21 (mono_data) + §4.2.12.4 Table 52 (aspx_data_2ch) +
+  §4.2.12.3 Table 51 (aspx_data_1ch) + §4.2.13.3 Table 61
+  (acpl_data_1ch) + §4.2.11 Table 49 (companding_control). The 7_X
+  (immersive) symmetric counterpart to the round-100 5_X ASPX_ACPL_2
+  encoder and the encoder side of the decoder's round-27
+  `parse_7x_audio_data_outer` ASPX_ACPL_2 branch. Reuses the same 1ch
+  ACPL / ASPX parameter shape (Pseudocode 117) as the 5_X path but emits
+  the 7_X channel element's distinct framing.
+  - `Ac4ImsEncoder::encode_frame_pcm_7_0_acpl2(&[L, R, C, Ls, Rs, Lb, Rb])`
+    + `..._with_max_sfb(&[..], max_sfb)` — emit IMS v2 frames in
+    `7_X_codec_mode = ASPX_ACPL_2 (3)`. Channel_mode prefix forced to
+    `0b1111000` (7 b — Table 85 channel_mode 5, 7.0 (3/4/0)) so the
+    decoder dispatches `channels == 7` through
+    `parse_7x_audio_data_outer(b_has_lfe = false)`.
+  - `encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra` — shared body
+    builder. Layout: `7_X_codec_mode = 3` (**2 b**, vs the 5_X 3-bit
+    field) + I-frame block (`aspx_config()` 15 b + `acpl_config_1ch(FULL)`
+    3 b) + `companding_control(5)` (sync=1, on=1 — the 2-bit sync-on wire
+    shape is identical to companding_control(2/3)) + `coding_config = 0`
+    (**2 b**, Cfg0) + `b_2ch_mode` + `two_channel_data()` (L/R carriers) +
+    `two_channel_data()` (Ls/Rs carriers) + trailing Cfg0 `mono_data(0)`
+    (centre) + I-frame `aspx_data_2ch() + aspx_data_2ch() +
+    aspx_data_1ch()` envelope trailer + two `acpl_data_1ch()` parameter
+    sets (Pseudocode 117 D0 / D1). Structural differences from the 5_X
+    ACPL_2 path: 2-bit codec_mode, 2-bit coding_config, the centre
+    `mono_data(0)` moves out of the coding_config switch to a single
+    trailing element, the body carries two stereo pairs (the surround pair
+    rides the second `two_channel_data`), and the ASPX trailer carries an
+    extra `aspx_data_2ch()`. The ASPX_ACPL_1-only joint-MDCT residual
+    layer and the SIMPLE/ASPX additional-channel block are both skipped
+    for ASPX_ACPL_2.
+  - Decoder round-trip verified: 7.0 ACPL_2 → 7-channel S16 interleaved
+    PCM (1920 samples × 7 ch × 2 bytes). The decoder walks the full
+    Table 33 ASPX_ACPL_2 body and resolves
+    `seven_x_mode == AspxAcpl2`, `acpl_config_1ch_full.is_some()`,
+    `two_channel_data.len() == 2`, `cfg0_centre_mono.is_some()`, and both
+    `acpl_data_1ch_pair[0/1].is_some()` — the existing round-37/40 7_X
+    pair dispatch synthesises `[L, R, C, Ls, Rs]` (slots 0..4) via
+    `acpl_synth::run_acpl_5x_pair_pcm`; the back pair Lb/Rb (slots 5/6)
+    stays silent per the documented Table 202 ACPL_2 channel mapping.
+  - 5 new integration tests in `tests/round107_7_x_acpl2_encoder.rs`
+    (7-channel layout, sequence-counter roll, full-body decoder resolution
+    including the two-pair Cfg0 + no-residual assertion, silence
+    round-trip, wide-max_sfb round-trip) + 1 new unit test in
+    `encoder_acpl3::tests` (full-body decoder resolution via
+    `parse_7x_audio_data_outer`).
+  - Total test count: 714 (was 708) — 0 ignored, 0 failed.
+  - Follow-ups (deferred): the 7.1 (LFE) ASPX_ACPL_2 path
+    (`b_has_lfe = true` leading `mono_data(1)`); the 7_X ASPX_ACPL_1 path
+    (PARTIAL config + joint-MDCT residual layer, the 7_X analogue of
+    round 103); real per-band `(alpha, beta)` extraction replacing the
+    zero-delta scaffold; real ASPX envelope coding; back-pair Lb/Rb
+    carriage (currently silent on the ACPL_2 path).
+
 - **Round 103 — 5_X SIMPLE/ASPX_ACPL_1 multichannel encoder path** per
   ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case ASPX_ACPL_1:` +
   §4.2.12.1 Table 50 (aspx_config) + §4.2.13.1 Table 59

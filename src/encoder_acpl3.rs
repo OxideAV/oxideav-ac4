@@ -1230,6 +1230,146 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra(
 }
 
 // ====================================================================
+// 7_X ASPX_ACPL_2 emitter — §4.2.6.14 Table 33 row `case ASPX_ACPL_2:`
+// (round 107)
+// ====================================================================
+
+/// Build a 7.0 SIMPLE/ASPX_ACPL_2 substream body per §4.2.6.14 Table 33
+/// row `case ASPX_ACPL_2:` that the decoder's
+/// [`crate::mch::parse_7x_audio_data_outer`] (with `mode = AspxAcpl2`)
+/// walks end-to-end. The 7_X immersive channel element shares the same
+/// 1ch ACPL / ASPX parameter shape as the round-100 5_X ASPX_ACPL_2 path
+/// (Pseudocode 117) but differs in five structural places versus the
+/// 5_X walker:
+///
+/// 1. `7_X_codec_mode` is **2 bits** (vs the 5_X 3-bit `5_X_codec_mode`).
+///    ASPX_ACPL_2 = value 3.
+/// 2. `companding_control(5)` sits **before** `coding_config` (the 5_X
+///    ASPX_ACPL_{1,2} walker reads `companding_control(3)` first too, but
+///    the 7_X `num_chan` argument is 5 — with `sync_flag = 1` the wire
+///    shape is identical: 1 sync bit + 1 on bit).
+/// 3. `coding_config` is **2 bits** (Table 33 4-way selector) — Cfg0 = 0.
+/// 4. Cfg0 body is `b_2ch_mode + two_channel_data + two_channel_data`
+///    (two stereo pairs — L/R then Ls/Rs), and the centre `mono_data(0)`
+///    moves **out** of the coding_config switch to a single trailing
+///    element after the (skipped-for-ACPL_2) additional-channel block.
+/// 5. The I-frame ASPX trailer is `aspx_data_2ch() + aspx_data_2ch() +
+///    aspx_data_1ch()` (two 2ch + one 1ch — the 5_X ACPL_2 path emits a
+///    single `aspx_data_2ch() + aspx_data_1ch()`). The extra 2ch envelope
+///    covers the second stereo pair.
+///
+/// Body layout (Table 33, `coding_config = 0`):
+///
+/// ```text
+///   7_X_codec_mode = ASPX_ACPL_2 (3)        // 2 b
+///   if (b_iframe) {
+///       aspx_config();                       // 15 b — Table 50
+///       acpl_config_1ch(FULL);               //  3 b — Table 59
+///   }
+///   companding_control(5);                   // sync = 1, on = 1 — Table 49
+///   coding_config = 0;                        //  2 b
+///   b_2ch_mode;                               //  1 b
+///   two_channel_data();                       // L/R carriers — Table 26
+///   two_channel_data();                       // Ls/Rs carriers — Table 26
+///   // (additional-channel block SKIPPED for ASPX_ACPL_2)
+///   // (ASPX_ACPL_1 joint-MDCT residual layer SKIPPED for ACPL_2)
+///   mono_data(0);                             // centre (Cfg0) — Table 21
+///   if (b_iframe) {
+///       aspx_data_2ch();                     // Table 52 — L/R envelope
+///       aspx_data_2ch();                     // Table 52 — Ls/Rs envelope
+///       aspx_data_1ch();                     // Table 51 — centre envelope
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[0]
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[1]
+///   }
+/// ```
+///
+/// `coeffs_l` / `coeffs_r` are the forward-MDCT L/R carrier spectra
+/// (first `two_channel_data`); `coeffs_ls` / `coeffs_rs` are the surround
+/// carriers (second `two_channel_data`); `coeffs_c` is the centre coded
+/// via the trailing Cfg0 `mono_data(0)`. The decoder's 7_X ACPL_2
+/// dispatch reconstructs the Ls/Rs PCM from the L/R carriers + the two
+/// `acpl_data_1ch()` parameter sets — the second `two_channel_data()`
+/// keeps the body well-formed for the walker.
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl2_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    coeffs_c: &[f32],
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_codec_mode = ASPX_ACPL_2 (3) — 2 bits.
+    bw.write_u32(3, 2);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_1ch(FULL) (3 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
+    }
+
+    // (No LFE for 7.0.)
+
+    // companding_control(5): sync = 1, on = 1 — same 2-bit wire shape as
+    // the 5_X companding_control(2/3) sync-on case (the `num_chan`
+    // argument only changes how many `b_compand_on` bits follow when
+    // `sync_flag == 0`; here sync_flag == 1 so exactly one bit follows).
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (2 b) — Cfg0.
+    bw.write_u32(0, 2);
+
+    // Cfg0: b_2ch_mode (1 b) + two_channel_data (L/R) + two_channel_data
+    // (Ls/Rs).
+    bw.write_bit(false); // b_2ch_mode = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
+
+    // (Additional-channel block SKIPPED for ASPX_ACPL_2.)
+    // (ASPX_ACPL_1 residual layer SKIPPED for ACPL_2.)
+
+    // Trailing Cfg0 mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    // I-frame ASPX + A-CPL trailers: aspx_data_2ch + aspx_data_2ch +
+    // aspx_data_1ch + acpl_data_1ch × 2.
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        // acpl_config_1ch(FULL) has no qmf_band → start_band = 0.
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, 0, acpl_quant_mode);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, 0, acpl_quant_mode);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+// ====================================================================
 // Tests
 // ====================================================================
 
@@ -1611,5 +1751,59 @@ mod tests {
         assert!(tools.acpl_1_residual_pair[1].is_some());
         assert!(tools.acpl_data_1ch_pair[0].is_some());
         assert!(tools.acpl_data_1ch_pair[1].is_some());
+    }
+
+    /// The 7_X ASPX_ACPL_2 body builder produces output the decoder's
+    /// `parse_7x_audio_data_outer` walks to `SevenXCodecMode::AspxAcpl2`
+    /// with the FULL acpl config, both stereo pairs (L/R + Ls/Rs), the
+    /// trailing Cfg0 centre mono, and both `acpl_data_1ch` parameter sets.
+    #[test]
+    fn build_7_x_acpl2_body_decoder_resolves_full_body() {
+        let tl = 1920u32;
+        let half = tl as usize / 2;
+        let zeros = vec![0.0f32; half];
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let body = build_7_x_acpl2_body_from_pcm_spectra(
+            tl,
+            16,
+            true,
+            &zeros, // L
+            &zeros, // R
+            &zeros, // Ls
+            &zeros, // Rs
+            &zeros, // C
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            4096,
+        );
+        // Skip the 2-byte ac4_substream() audio_size header.
+        let mut br = BitReader::new(&body[2..]);
+        let mut tools = crate::asf::SubstreamTools::default();
+        crate::mch::parse_7x_audio_data_outer(&mut br, &mut tools, false, true, tl).unwrap();
+        assert_eq!(
+            tools.seven_x_mode,
+            Some(crate::mch::SevenXCodecMode::AspxAcpl2)
+        );
+        assert!(tools.acpl_config_1ch_full.is_some());
+        // Cfg0 in the 7_X walker carries two two_channel_data pairs.
+        assert_eq!(tools.two_channel_data.len(), 2);
+        assert!(tools.cfg0_centre_mono.is_some());
+        assert!(tools.acpl_data_1ch_pair[0].is_some());
+        assert!(tools.acpl_data_1ch_pair[1].is_some());
+        // ASPX_ACPL_2 has no joint-MDCT residual layer.
+        assert!(tools.acpl_1_residual_pair[0].is_none());
+        assert!(tools.acpl_1_residual_pair[1].is_none());
     }
 }

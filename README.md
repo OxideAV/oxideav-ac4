@@ -372,7 +372,35 @@ framework but usable standalone.
 > Real per-band `(alpha, beta)` extraction, real ASPX envelope coding,
 > real Table-181 SAP-derived residual content (the residual sf_data
 > currently codes the raw Ls/Rs spectra), and the 7_X ASPX_ACPL_{1,2}
-> encoder paths remain deferred.
+> encoder paths remain deferred. Round 107 lands the first of those
+> deferred 7_X encoder paths: the **7.0 SIMPLE/ASPX_ACPL_2 multichannel
+> encoder** per §4.2.6.14 Table 33 row `case ASPX_ACPL_2:` — the 7_X
+> (immersive) counterpart to the round-100 5_X ASPX_ACPL_2 path and the
+> encoder side of the decoder's round-27 `parse_7x_audio_data_outer`
+> ASPX_ACPL_2 branch. `Ac4ImsEncoder::encode_frame_pcm_7_0_acpl2(&[L, R,
+> C, Ls, Rs, Lb, Rb])` emits an IMS v2 frame with `7_X_codec_mode =
+> ASPX_ACPL_2 (3)` and channel_mode prefix `0b1111000` (7 b — Table 85
+> channel_mode 5, 7.0 (3/4/0)). The new
+> `encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra` reuses the same
+> 1ch ACPL / ASPX emitters as the 5_X ACPL_2 path but lays out the 7_X
+> channel element's distinct framing: 2-bit `7_X_codec_mode` (vs the 5_X
+> 3-bit field), `companding_control(5)` (sync-on 2-bit wire shape), 2-bit
+> `coding_config = 0` (Cfg0), `b_2ch_mode + two_channel_data() (L/R) +
+> two_channel_data() (Ls/Rs)`, a trailing centre `mono_data(0)` moved out
+> of the coding_config switch, and an `aspx_data_2ch() + aspx_data_2ch() +
+> aspx_data_1ch()` envelope trailer before the two `acpl_data_1ch()`
+> parameter sets (Pseudocode 117 D0/D1). The ASPX_ACPL_1-only joint-MDCT
+> residual layer and the SIMPLE/ASPX additional-channel block are skipped
+> for ACPL_2. Decoder round-trip: 7.0 ACPL_2 → 7-channel S16 interleaved
+> PCM (1920 samples × 7 ch × 2 bytes); the decoder resolves
+> `seven_x_mode == AspxAcpl2`, both `two_channel_data` pairs, the Cfg0
+> centre, and both `acpl_data_1ch_pair` entries, then synthesises
+> `[L, R, C, Ls, Rs]` (slots 0..4) via `acpl_synth::run_acpl_5x_pair_pcm`
+> (the back pair Lb/Rb stays silent per the Table 202 ACPL_2 mapping).
+> Total tests 714 (was 708). The 7.1 (LFE) ASPX_ACPL_2 path, the 7_X
+> ASPX_ACPL_1 path (PARTIAL config + joint-MDCT residual), real per-band
+> `(alpha, beta)` extraction, real ASPX envelope coding, and back-pair
+> Lb/Rb carriage remain deferred.
 
 ## Specs
 
