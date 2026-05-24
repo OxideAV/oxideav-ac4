@@ -1266,6 +1266,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra(
 ///       aspx_config();                       // 15 b — Table 50
 ///       acpl_config_1ch(FULL);               //  3 b — Table 59
 ///   }
+///   if (b_has_lfe) mono_data(1);             // LFE (7.1) — Table 21
 ///   companding_control(5);                   // sync = 1, on = 1 — Table 49
 ///   coding_config = 0;                        //  2 b
 ///   b_2ch_mode;                               //  1 b
@@ -1291,17 +1292,30 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra(
 /// `acpl_data_1ch()` parameter sets — the second `two_channel_data()`
 /// keeps the body well-formed for the walker.
 ///
+/// When `coeffs_lfe` + `max_sfb_lfe` are both `Some`, an LFE
+/// `mono_data(b_lfe = 1)` element (Table 21 + `sf_info_lfe()` Table 35)
+/// is emitted between the I-frame config block and `companding_control(5)`
+/// — exactly where the decoder's
+/// [`crate::mch::parse_7x_audio_data_outer`] reads `if (b_has_lfe)
+/// mono_data(1);` (§4.2.6.14 Table 33). This is the 7.1 (3/4/0.1) path:
+/// the caller must drive the TOC channel_mode prefix to 8 channels so the
+/// decoder dispatches `channels == 8` through
+/// `parse_7x_audio_data_outer(b_has_lfe = true)`. With both `None` the
+/// body is the round-107 7.0 (3/4/0) ASPX_ACPL_2 form.
+///
 /// Returns the substream bytes sized to `pad_target_bytes`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_7_x_acpl2_body_from_pcm_spectra(
     transform_length: u32,
     max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
     b_iframe: bool,
     coeffs_l: &[f32],
     coeffs_r: &[f32],
     coeffs_ls: &[f32],
     coeffs_rs: &[f32],
     coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
     aspx_cfg: &aspx::AspxConfig,
     acpl_num_param_bands_id: u8,
     acpl_quant_mode: crate::acpl::AcplQuantMode,
@@ -1324,7 +1338,13 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra(
         write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
     }
 
-    // (No LFE for 7.0.)
+    // LFE: mono_data(b_lfe = 1) when present (7.1 / channel_mode 6). The
+    // decoder's parse_7x_audio_data_outer reads this immediately after the
+    // I-frame config block and before companding_control(5) — §4.2.6.14
+    // Table 33 `if (b_has_lfe) mono_data(1);`.
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
 
     // companding_control(5): sync = 1, on = 1 — same 2-bit wire shape as
     // the 5_X companding_control(2/3) sync-on case (the `num_chan`
@@ -1777,12 +1797,14 @@ mod tests {
         let body = build_7_x_acpl2_body_from_pcm_spectra(
             tl,
             16,
+            None, // 7.0 — no LFE
             true,
             &zeros, // L
             &zeros, // R
             &zeros, // Ls
             &zeros, // Rs
             &zeros, // C
+            None,   // 7.0 — no LFE
             &cfg,
             3,
             crate::acpl::AcplQuantMode::Fine,
@@ -1805,5 +1827,65 @@ mod tests {
         // ASPX_ACPL_2 has no joint-MDCT residual layer.
         assert!(tools.acpl_1_residual_pair[0].is_none());
         assert!(tools.acpl_1_residual_pair[1].is_none());
+        // No LFE for the 7.0 path.
+        assert!(tools.lfe_mono_data.is_none());
+    }
+
+    /// The 7.1 (3/4/0.1) ASPX_ACPL_2 body builder — with
+    /// `coeffs_lfe`/`max_sfb_lfe` set — emits a leading `mono_data(1)`
+    /// element the decoder's `parse_7x_audio_data_outer(b_has_lfe = true)`
+    /// resolves into `tools.lfe_mono_data`, in addition to the full
+    /// round-107 7.0 body (both stereo pairs, centre mono, ACPL pair).
+    #[test]
+    fn build_7_x_acpl2_body_with_lfe_decoder_resolves_lfe() {
+        let tl = 1920u32;
+        let half = tl as usize / 2;
+        let zeros = vec![0.0f32; half];
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let body = build_7_x_acpl2_body_from_pcm_spectra(
+            tl,
+            16,
+            Some(7), // LFE max_sfb (n_msfbl_bits = 3 cap at tl = 1920)
+            true,
+            &zeros,       // L
+            &zeros,       // R
+            &zeros,       // Ls
+            &zeros,       // Rs
+            &zeros,       // C
+            Some(&zeros), // LFE coeffs
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            4096,
+        );
+        let mut br = BitReader::new(&body[2..]);
+        let mut tools = crate::asf::SubstreamTools::default();
+        // b_has_lfe = true mirrors the channels == 8 dispatch path.
+        crate::mch::parse_7x_audio_data_outer(&mut br, &mut tools, true, true, tl).unwrap();
+        assert_eq!(
+            tools.seven_x_mode,
+            Some(crate::mch::SevenXCodecMode::AspxAcpl2)
+        );
+        assert!(tools.seven_x_b_has_lfe);
+        // LFE element resolved.
+        assert!(tools.lfe_mono_data.is_some());
+        // ...followed by the full 7.0 ACPL_2 body.
+        assert!(tools.acpl_config_1ch_full.is_some());
+        assert_eq!(tools.two_channel_data.len(), 2);
+        assert!(tools.cfg0_centre_mono.is_some());
+        assert!(tools.acpl_data_1ch_pair[0].is_some());
+        assert!(tools.acpl_data_1ch_pair[1].is_some());
+        assert!(tools.acpl_1_residual_pair[0].is_none());
     }
 }

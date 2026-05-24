@@ -400,7 +400,29 @@ framework but usable standalone.
 > Total tests 714 (was 708). The 7.1 (LFE) ASPX_ACPL_2 path, the 7_X
 > ASPX_ACPL_1 path (PARTIAL config + joint-MDCT residual), real per-band
 > `(alpha, beta)` extraction, real ASPX envelope coding, and back-pair
-> Lb/Rb carriage remain deferred.
+> Lb/Rb carriage remain deferred. Round 114 closes the first of those
+> deferred items — the **7.1 (3/4/0.1) SIMPLE/ASPX_ACPL_2 multichannel
+> encoder path** per §4.2.6.14 Table 33 row `case ASPX_ACPL_2:` with
+> `b_has_lfe = 1` + §4.2.6.5 Table 21 (`mono_data(b_lfe)`) + §4.2.8
+> Table 35 (`sf_info_lfe()`). `Ac4ImsEncoder::encode_frame_pcm_7_1_acpl2(&[L,
+> R, C, Ls, Rs, Lb, Rb, LFE])` emits the round-107 7.0 ASPX_ACPL_2 body
+> plus a leading `mono_data(b_lfe = 1)` element between the I-frame config
+> block and `companding_control(5)` — exactly where the decoder's
+> `parse_7x_audio_data_outer(b_has_lfe = true)` reads
+> `if (b_has_lfe) mono_data(1);`. The channel_mode prefix is forced to
+> `0b1111001` (7 b — Table 88 channel_mode 6) so the decoder dispatches
+> `channels == 8`. `build_7_x_acpl2_body_from_pcm_spectra` gained
+> `max_sfb_lfe: Option<u32>` + `coeffs_lfe: Option<&[f32]>` and reuses the
+> shared round-80 `write_lfe_mono_data` emitter (`max_sfb_lfe` capped to
+> `n_msfbl_bits = 3` → 7 sfb at `tl = 1920`). Decoder round-trip: 7.1
+> ACPL_2 → 8-channel S16 interleaved PCM (1920 samples × 8 ch × 2 bytes);
+> the LFE spectrum IMDCT's into slot 7 via the round-80 LFE render, the
+> `[L, R, C, Ls, Rs]` slots 0..4 synthesis is unchanged, and the back pair
+> Lb/Rb (slots 5/6) stays silent per the Table 202 ACPL_2 mapping. A 60 Hz
+> LFE tone round-trips to a non-silent reconstructed LFE channel. Total
+> tests 721 (was 714). The 7_X ASPX_ACPL_1 path (PARTIAL config +
+> joint-MDCT residual), real per-band `(alpha, beta)` extraction, real
+> ASPX envelope coding, and back-pair Lb/Rb carriage remain deferred.
 
 ## Specs
 
