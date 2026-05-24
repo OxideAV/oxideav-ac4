@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 118 — 7.0 / 7.1 (3/4/0(.1)) SIMPLE/ASPX_ACPL_1 multichannel
+  encoder path** per ETSI TS 103 190-1 §4.2.6.14 Table 33 row
+  `case ASPX_ACPL_1:` (+ `b_has_lfe = 1` for 7.1 — §4.2.6.5 Table 21
+  `mono_data(b_lfe)` + §4.2.8 Table 35 `sf_info_lfe()`). The 7_X
+  (immersive) counterpart to the round-103 5_X ASPX_ACPL_1 encoder and the
+  encoder side of the decoder's round-27 `parse_7x_audio_data_outer`
+  ASPX_ACPL_1 branch (which already reads the joint-MDCT residual layer).
+  Closes the first deferred follow-up from round 114.
+  - `Ac4ImsEncoder::encode_frame_pcm_7_0_acpl1(&[L, R, C, Ls, Rs, Lb, Rb])`
+    + `..._with_max_sfb(&[..], max_sfb, max_sfb_master)` — emit IMS v2
+    frames in `7_X_codec_mode = ASPX_ACPL_1 (2)`. Channel_mode prefix
+    forced to `0b1111000` (7 b — Table 85 channel_mode 5, 7.0 (3/4/0)) so
+    the decoder dispatches `channels == 7` through
+    `parse_7x_audio_data_outer(b_has_lfe = false)`. `max_sfb` defaults to
+    40; `max_sfb_master` (residual band bound) defaults to 20.
+  - `Ac4ImsEncoder::encode_frame_pcm_7_1_acpl1(&[L, R, C, Ls, Rs, Lb, Rb,
+    LFE])` + `..._with_max_sfb(&[..], max_sfb, max_sfb_master, max_sfb_lfe)`
+    — the LFE counterpart: identical body plus a leading
+    `mono_data(b_lfe = 1)` between the I-frame config block and
+    `companding_control(5)`, exactly where
+    `parse_7x_audio_data_outer(b_has_lfe = true)` reads
+    `if (b_has_lfe) mono_data(1);`. Channel_mode prefix forced to
+    `0b1111001` (7 b — Table 88 channel_mode 6, 7.1) → `channels == 8`.
+    `max_sfb_lfe` defaults to 7 (LFE-spec cap at `tl = 1920`,
+    `n_msfbl_bits = 3`).
+  - New `encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra` — the 7_X
+    ASPX_ACPL_2 body (round 107/114) with three structural differences,
+    the same three that separate the 5_X ACPL_1 path from the 5_X ACPL_2
+    path: (1) `7_X_codec_mode = 2` (vs 3); (2) `acpl_config_1ch` is
+    PARTIAL via the shared `write_acpl_config_1ch_partial` emitter (6 b —
+    carries `acpl_qmf_band_minus1`, so `acpl_data_1ch()` start_band
+    resolves from `qmf_band` via `sb_to_pb`); (3) an explicit joint-MDCT
+    residual layer via the shared `write_acpl_1_residual_layer` emitter
+    (`max_sfb_master + 2× chparam_info + 2× sf_data(ASF)`) carrying the
+    Ls/Rs surround pair (sSMP,3 / sSMP,4 per Table 181) after the two
+    `two_channel_data()` pairs and before the trailing Cfg0 centre
+    `mono_data(0)`. The SIMPLE/ASPX additional-channel block is skipped
+    (the decoder only walks it for SIMPLE/Aspx modes). Reuses the
+    round-80 `write_lfe_mono_data` emitter for the 7.1 LFE element.
+  - Decoder round-trip verified: 7.0 ACPL_1 → 7-channel S16 interleaved
+    PCM (1920 × 7 × 2); 7.1 ACPL_1 → 8-channel S16 (with LFE slot 7). The
+    decoder resolves `seven_x_mode == AspxAcpl1`, the PARTIAL config
+    (non-zero `qmf_band`), both `two_channel_data` pairs, the residual
+    pair + `max_sfb_master`, the Cfg0 centre, and both
+    `acpl_data_1ch_pair[0/1]`. The LFE spectrum IMDCT's into slot 7 (round
+    80 render); `[L, R, C, Ls, Rs]` slots 0..4 synthesise via
+    `acpl_synth::run_acpl_5x_pair_pcm`; the back pair Lb/Rb (slots 5/6)
+    stays silent per the Table 202 mapping.
+  - 8 new integration tests in `tests/round118_7_x_acpl1_encoder.rs`
+    (7-channel + 8-channel layout, sequence-counter roll, 7.0 + 7.1
+    full-body decoder resolution, LFE-slot-non-silent for a 60 Hz LFE
+    tone, silence round-trip, small-residual-budget round-trip recovering
+    the clamped `max_sfb_master`).
+  - Total test count: 729 (was 721) — 0 ignored, 0 failed.
+  - Follow-ups (deferred): real per-band `(alpha, beta)` extraction
+    replacing the zero-delta scaffold; real ASPX envelope coding; real
+    Table-181 SAP-derived residual content (the residual `sf_data`
+    currently codes the raw Ls/Rs spectra); back-pair Lb/Rb carriage
+    (currently silent on the ACPL paths).
+
 - **Round 114 — 7.1 (3/4/0.1) SIMPLE/ASPX_ACPL_2 multichannel encoder
   path** per ETSI TS 103 190-1 §4.2.6.14 Table 33 row `case ASPX_ACPL_2:`
   with `b_has_lfe = 1` + §4.2.6.5 Table 21 (`mono_data(b_lfe)`) + §4.2.8

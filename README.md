@@ -423,6 +423,28 @@ framework but usable standalone.
 > tests 721 (was 714). The 7_X ASPX_ACPL_1 path (PARTIAL config +
 > joint-MDCT residual), real per-band `(alpha, beta)` extraction, real
 > ASPX envelope coding, and back-pair Lb/Rb carriage remain deferred.
+> Round 118 closes the first of those — the **7.0 / 7.1 (3/4/0(.1))
+> SIMPLE/ASPX_ACPL_1 multichannel encoder path** per §4.2.6.14 Table 33 row
+> `case ASPX_ACPL_1:` (the 7_X analogue of the round-103 5_X ACPL_1 path).
+> `Ac4ImsEncoder::encode_frame_pcm_7_0_acpl1(&[L, R, C, Ls, Rs, Lb, Rb])`
+> and `encode_frame_pcm_7_1_acpl1(&[.., LFE])` emit IMS v2 frames with
+> `7_X_codec_mode = ASPX_ACPL_1 (2)`. New
+> `encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra` is the round-107/114
+> 7_X ACPL_2 body with the three ACPL_1 differences: `7_X_codec_mode = 2`
+> (not 3), `acpl_config_1ch` PARTIAL (`write_acpl_config_1ch_partial`,
+> carries `acpl_qmf_band_minus1` → `acpl_data_1ch()` start_band via
+> `sb_to_pb`), and an explicit joint-MDCT residual layer
+> (`write_acpl_1_residual_layer`: `max_sfb_master + 2× chparam_info +
+> 2× sf_data(ASF)` for the Ls/Rs surround pair sSMP,3 / sSMP,4 per Table
+> 181) after the two `two_channel_data()` pairs and before the trailing
+> Cfg0 centre `mono_data(0)`. The 7.1 form prepends the round-80
+> `write_lfe_mono_data` LFE element. Decoder round-trip: 7.0 ACPL_1 →
+> 7-channel S16 PCM; 7.1 ACPL_1 → 8-channel S16 (LFE IMDCT'd into slot 7);
+> `[L, R, C, Ls, Rs]` synthesise via `acpl_synth::run_acpl_5x_pair_pcm`,
+> Lb/Rb (slots 5/6) silent per Table 202. Total tests 729 (was 721). Real
+> per-band `(alpha, beta)` extraction, real ASPX envelope coding, real
+> Table-181 SAP-derived residual content, and back-pair Lb/Rb carriage
+> remain deferred.
 
 ## Specs
 

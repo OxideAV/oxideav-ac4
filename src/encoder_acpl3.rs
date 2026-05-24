@@ -1390,6 +1390,183 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra(
 }
 
 // ====================================================================
+// 7_X ASPX_ACPL_1 emitter — §4.2.6.14 Table 33 row `case ASPX_ACPL_1:`
+// (round 118)
+// ====================================================================
+
+/// Build a 7.0 / 7.1 SIMPLE/ASPX_ACPL_1 substream body per §4.2.6.14
+/// Table 33 row `case ASPX_ACPL_1:` that the decoder's
+/// [`crate::mch::parse_7x_audio_data_outer`] (with `mode = AspxAcpl1`)
+/// walks end-to-end. The 7_X (immersive) counterpart to the round-103
+/// 5_X ASPX_ACPL_1 path and the encoder side of the decoder's round-27
+/// `parse_7x_audio_data_outer` ASPX_ACPL_1 branch (which already reads
+/// the joint-MDCT residual layer at §4.2.6.14 Table 33).
+///
+/// Structurally this is the round-107/114 7_X ASPX_ACPL_2 body with three
+/// differences (the same three that separate the 5_X ACPL_1 path from the
+/// 5_X ACPL_2 path):
+///
+/// 1. `7_X_codec_mode` is **2** (ASPX_ACPL_1) rather than 3 (ASPX_ACPL_2).
+/// 2. `acpl_config_1ch` is **PARTIAL** (Table 59, 6 b — carries the 3-bit
+///    `acpl_qmf_band_minus1` field FULL omits), so the `acpl_data_1ch()`
+///    start_band resolves from `qmf_band` via [`crate::acpl::sb_to_pb`].
+/// 3. The body carries an explicit **joint-MDCT residual layer**
+///    (`max_sfb_master + 2× chparam_info + 2× sf_data(ASF)`) transmitting
+///    the Ls/Rs surround pair (sSMP,3 / sSMP,4 per Table 181) after the two
+///    `two_channel_data()` pairs and before the trailing Cfg0 centre
+///    `mono_data(0)` — exactly where the decoder's residual-layer walk
+///    sits (`if (mode == ASPX_ACPL_1) { … }`).
+///
+/// Body layout (Table 33, `coding_config = 0`):
+///
+/// ```text
+///   7_X_codec_mode = ASPX_ACPL_1 (2)        // 2 b
+///   if (b_iframe) {
+///       aspx_config();                       // 15 b — Table 50
+///       acpl_config_1ch(PARTIAL);            //  6 b — Table 59
+///   }
+///   if (b_has_lfe) mono_data(1);             // LFE (7.1) — Table 21
+///   companding_control(5);                   // sync = 1, on = 1 — Table 49
+///   coding_config = 0;                        //  2 b
+///   b_2ch_mode;                               //  1 b
+///   two_channel_data();                       // L/R carriers — Table 26
+///   two_channel_data();                       // Ls/Rs carriers — Table 26
+///   // (additional-channel block SKIPPED for ASPX_ACPL_1)
+///   max_sfb_master;                           // joint-MDCT residual layer
+///   chparam_info(); chparam_info();           // residual ch0 / ch1
+///   sf_data(ASF); sf_data(ASF);               // residual sSMP,3 / sSMP,4
+///   mono_data(0);                             // centre (Cfg0) — Table 21
+///   if (b_iframe) {
+///       aspx_data_2ch();                     // Table 52 — L/R envelope
+///       aspx_data_2ch();                     // Table 52 — Ls/Rs envelope
+///       aspx_data_1ch();                     // Table 51 — centre envelope
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[0]
+///       acpl_data_1ch();                     // -> acpl_data_1ch_pair[1]
+///   }
+/// ```
+///
+/// `coeffs_l` / `coeffs_r` are the forward-MDCT L/R carrier spectra
+/// (first `two_channel_data`); `coeffs_ls` / `coeffs_rs` are the surround
+/// carriers — carried *both* by the second `two_channel_data()` (keeps the
+/// walker well-formed) *and* by the joint-MDCT residual pair (the
+/// surround content the decoder reconstructs). `coeffs_c` is the centre
+/// coded via the trailing Cfg0 `mono_data(0)`.
+///
+/// When `coeffs_lfe` + `max_sfb_lfe` are both `Some`, an LFE
+/// `mono_data(b_lfe = 1)` element (Table 21 + `sf_info_lfe()` Table 35) is
+/// emitted between the I-frame config block and `companding_control(5)` —
+/// exactly where the decoder's `parse_7x_audio_data_outer(b_has_lfe =
+/// true)` reads `if (b_has_lfe) mono_data(1);`. This is the 7.1 (3/4/0.1)
+/// path: the caller must drive the TOC channel_mode prefix to 8 channels
+/// so the decoder dispatches `channels == 8`. With both `None` the body is
+/// the 7.0 (3/4/0) form (`channels == 7`).
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl1_body_from_pcm_spectra(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_codec_mode = ASPX_ACPL_1 (2) — 2 bits.
+    bw.write_u32(2, 2);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_1ch(PARTIAL) (6 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+
+    // LFE: mono_data(b_lfe = 1) when present (7.1 / channel_mode 6) — read
+    // by parse_7x_audio_data_outer immediately after the I-frame config
+    // block and before companding_control(5).
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(5): sync = 1, on = 1 — same 2-bit wire shape as
+    // the 5_X / 7_X ACPL_2 sync-on case.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (2 b) — Cfg0.
+    bw.write_u32(0, 2);
+
+    // Cfg0: b_2ch_mode (1 b) + two_channel_data (L/R) + two_channel_data
+    // (Ls/Rs).
+    bw.write_bit(false); // b_2ch_mode = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
+
+    // (Additional-channel block SKIPPED for ASPX_ACPL_1 — the decoder only
+    // walks it for SIMPLE / Aspx modes.)
+
+    // ASPX_ACPL_1-only joint-MDCT residual layer: Ls/Rs surround residual.
+    // The decoder derives n_side from the largest signalled transform
+    // length across the channel data — which is `transform_length` (the
+    // long-frame two_channel_data() pairs all signal transform_length_0 ==
+    // transform_length), so we pass the same value.
+    write_acpl_1_residual_layer(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+    );
+
+    // Trailing Cfg0 mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    // I-frame ASPX + A-CPL trailers: aspx_data_2ch + aspx_data_2ch +
+    // aspx_data_1ch + acpl_data_1ch × 2.
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        // PARTIAL acpl_config_1ch carries a qmf_band → resolve start_band.
+        let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+        let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+// ====================================================================
 // Tests
 // ====================================================================
 
