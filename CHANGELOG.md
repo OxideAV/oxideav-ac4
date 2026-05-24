@@ -9,6 +9,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 125 — 7.0 (3/4/0) SIMPLE/Cfg3Five multichannel encoder
+  path** per ETSI TS 103 190-1 §4.2.6.14 Table 33 + §4.2.7.5 Table 29
+  (`five_channel_data()`) + §4.2.7.4 Table 26 (additional-channel
+  `two_channel_data()`). The non-LFE immersive counterpart of
+  round-91's 7.1 SIMPLE encoder (the 7_X analogue of round 74's 5.0 vs
+  round 80's 5.1).
+  - `Ac4ImsEncoder::with_7_0()` — flips the TOC channel_mode prefix to
+    `0b1111000` (7 b — Table 85 channel_mode 5, 7.0 (3/4/0) → 7
+    channels). The decoder's `walk_ac4_substream` then dispatches
+    `channels == 7` through `parse_7x_audio_data_outer(b_has_lfe =
+    false)`.
+  - `Ac4ImsEncoder::encode_frame_pcm_7_0(&[L, R, C, Ls, Rs, Lb, Rb])`
+    + `..._with_max_sfb(&[..], max_sfb, max_sfb_add)` — emit IMS v2
+    frames in `7_X_codec_mode = SIMPLE (0)` + `coding_config =
+    Cfg3Five (3)`. The five front/surround channels share the
+    Cfg3Five `five_channel_data()` body (the same shape as round-74
+    5.0 / round-80 5.1 / round-91 7.1); the immersive back pair
+    Lb/Rb rides a trailing identity-SAP `two_channel_data()`
+    (`b_use_sap_add_ch = 0`, `sap_mode = 0` on the shared
+    `chparam_info`) so the decoder's
+    `dispatch_7x_additional_channel_pair` routes Lb/Rb directly into
+    output slots 5/6 (Table 183 row "3/4/0.x" identity path).
+    `max_sfb` defaults to 40; `max_sfb_add` defaults to 40.
+  - New `encoder_asf::build_7_0_simple_asf_body_from_pcm_spectra` —
+    emits the substream body bytes. Body layout: `7_X_codec_mode =
+    SIMPLE (0)` (2 b) + `coding_config = 3` (2 b) +
+    `five_channel_data()` (shared sf_info + 5x sf_data per Table 29)
+    + `b_use_sap_add_ch = 0` (1 b) + `two_channel_data()` (Lb/Rb per
+    Table 26). The body is structurally the round-91 7.1 body with
+    the leading `mono_data(b_lfe = 1)` element omitted (the walker's
+    `if (b_has_lfe) mono_data(1);` branch is gated off for
+    channel_mode 5). No companding (SIMPLE), no ASPX trailers
+    (SIMPLE), no ACPL pair (SIMPLE), no trailing `mono_data(0)`
+    (Cfg3Five — the 7.X trailing-mono gate is `coding_config in
+    {0, 2}` only).
+  - Decoder round-trip verified: 7.0 → 7-channel S16 interleaved PCM
+    (1920 × 7 × 2). The 7.0 walker resolves `seven_x_mode == Simple`,
+    `seven_x_b_has_lfe == false`, `lfe_mono_data == None`,
+    `five_channel_data` populated with five non-empty
+    `scaled_spec_per_channel` entries, identity-SAP
+    `seven_x_additional_channel_data` populated with two non-empty
+    `scaled_spec_per_channel` entries for the Lb/Rb pair. Slots 0..4
+    synthesise via `dispatch_5x_cfg3_simple_aspx` (round 39); slots
+    5/6 via `dispatch_7x_additional_channel_pair` (round 39/40
+    identity-SAP path).
+  - Per-channel spectral SNR on the 220/440/660/880/1100/1320/1540 Hz
+    independent-tone 7.0 fixture: L=24.5 / R=24.8 / C=25.0 / Ls=23.4 /
+    Rs=27.4 / Lb=25.4 / Rb=26.0 dB — all above the ≥ 20 dB floor,
+    matching the round-74 / 80 / 91 SNR numbers exactly (the encoder
+    reuses the same per-channel forward pipeline).
+  - 8 new integration tests in `tests/round125_7_0_multichannel.rs`
+    (7-channel layout, TOC declares 7 channels, sequence-counter roll,
+    `with_7_0()` builder smoke-test, substream-walker confirms
+    `b_has_lfe = false` + no LFE + additional pair populated,
+    independent-tones round-trip, silence round-trip, per-channel
+    spectral SNR ≥ 20 dB). The test helper wraps the encoder's
+    `raw_ac4_frame()` payload in an Annex G `0xAC40 + frame_size`
+    sync header so the decoder's `find_sync_frame` latches onto the
+    genuine sync word rather than an incidental `0xAC40` byte pair in
+    the body (a hazard round 91's fixture happened to dodge by data
+    luck).
+  - Total test count: 737 (was 729) — 0 ignored, 0 failed.
+  - Follow-ups (deferred, unchanged from round 118): real per-band
+    `(alpha, beta)` extraction replacing the zero-delta scaffold;
+    real ASPX envelope coding; real Table-181 SAP-derived residual
+    content; back-pair Lb/Rb carriage on the ACPL paths (currently
+    silent on the 7_X ACPL_1 / ACPL_2 paths since those modes carry
+    no SIMPLE/ASPX additional-channel block).
+
 - **Round 118 — 7.0 / 7.1 (3/4/0(.1)) SIMPLE/ASPX_ACPL_1 multichannel
   encoder path** per ETSI TS 103 190-1 §4.2.6.14 Table 33 row
   `case ASPX_ACPL_1:` (+ `b_has_lfe = 1` for 7.1 — §4.2.6.5 Table 21

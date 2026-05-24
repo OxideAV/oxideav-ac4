@@ -70,8 +70,8 @@ use oxideav_core::bits::BitWriter;
 
 use crate::encoder_asf::{
     average_per_sfb_correlation, build_5_0_simple_asf_body_from_pcm_spectra,
-    build_5_1_simple_asf_body_from_pcm_spectra, build_7_1_simple_asf_body_from_pcm_spectra,
-    build_mono_simple_asf_body_from_pcm_spectrum,
+    build_5_1_simple_asf_body_from_pcm_spectra, build_7_0_simple_asf_body_from_pcm_spectra,
+    build_7_1_simple_asf_body_from_pcm_spectra, build_mono_simple_asf_body_from_pcm_spectrum,
     build_stereo_simple_asf_joint_body_from_pcm_spectra,
     build_stereo_simple_asf_split_body_from_pcm_spectra,
 };
@@ -176,6 +176,22 @@ impl Ac4ImsEncoder {
     pub fn with_5_1(mut self) -> Self {
         self.channel_mode_value = 0b1110;
         self.channel_mode_bits = 4;
+        self
+    }
+
+    /// 7.0 (3/4/0) channel mode (`0b1111000`, 7 b) per ETSI TS 103 190-1
+    /// §4.3.3.7.1 Table 88 — channel_mode value `1111000` → ch_mode 5 → 7
+    /// channels with layout `L, C, R, Ls, Rs, Lb, Rb`. Drives the decoder's
+    /// `7_X_channel_element()` walker for `channels == 7` (no `b_has_lfe`
+    /// — that branch is gated on channel_mode 6 / 7.1) per §4.2.6.14
+    /// Table 33. The decoder's internal coding order for the inner
+    /// `five_channel_data()` is `[L, R, C, Ls, Rs]` per Table 180 (the
+    /// inner SCE order differs from the surface Table 88 listing's `L, C,
+    /// R` ordering — the decoder treats the inner five_channel_data slots
+    /// as L/R/C/Ls/Rs).
+    pub fn with_7_0(mut self) -> Self {
+        self.channel_mode_value = 0b1111000;
+        self.channel_mode_bits = 7;
         self
     }
 
@@ -1049,6 +1065,140 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
                 &coeffs_per_channel[5],
+            ],
+            pad_target_bytes,
+        );
+
+        // 5. Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        // sequence_counter wraps at 1024.
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // Restore caller's channel_mode setting.
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Encode one IMS v2 7.0 (3/4/0) frame from float PCM input per ETSI
+    /// TS 103 190-1 §4.2.6.14 Table 33 + §4.2.7.5 Table 29
+    /// (`five_channel_data()`) + §4.2.7.4 Table 26 (`two_channel_data()`).
+    /// The non-LFE immersive counterpart of
+    /// [`Self::encode_frame_pcm_7_1`] — same `7_X_codec_mode = SIMPLE` +
+    /// `coding_config = Cfg3Five` body shape, but the walker's
+    /// `if (b_has_lfe) mono_data(1);` branch is omitted (`b_has_lfe =
+    /// false` for channel_mode 5 / 7.0).
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb]` order — the inner
+    /// `five_channel_data()` (Table 180) carries the front/surround pair
+    /// `L/R/C/Ls/Rs` and the SIMPLE/ASPX additional-channel block carries
+    /// the immersive back pair `Lb/Rb` via a trailing
+    /// `two_channel_data()` per Table 26. The encoder uses identity SAP
+    /// (`b_use_sap_add_ch = 0`, `sap_mode = 0` on every `chparam_info`)
+    /// so no joint-MDCT mixing happens at decode time: every output
+    /// channel comes straight from its own `sf_data(ASF)` body.
+    ///
+    /// The encoder forces the 7.0 channel_mode prefix (`0b1111000`, 7 b —
+    /// Table 88 channel_mode 5) so the decoder's `walk_ac4_substream`
+    /// dispatches `channels == 7` through
+    /// `parse_7x_audio_data_outer(b_has_lfe = false)`. The five
+    /// front/surround channels share the same Cfg3Five
+    /// `five_channel_data()` body as the 5.0 / 5.1 / 7.1 paths; the
+    /// additional pair (Lb, Rb) rides the trailing `two_channel_data()`
+    /// which the decoder's `dispatch_7x_additional_channel_pair` (Table
+    /// 183 row "3/4/0.x" identity path) routes into output slots 5 / 6.
+    ///
+    /// `max_sfb` defaults to 40 (matching the round-49 mono / round-74
+    /// 5.0 / round-80 5.1 / round-91 7.1 default); `max_sfb_add`
+    /// defaults to 40 (same width as the 7.0 non-additional channels).
+    /// Use [`Self::encode_frame_pcm_7_0_with_max_sfb`] for wider coverage.
+    pub fn encode_frame_pcm_7_0(&mut self, frames: &[&[f32]; 7]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_with_max_sfb(frames, 40, 40)
+    }
+
+    /// Encode one IMS v2 7.0 (3/4/0) frame from arbitrary float PCM input
+    /// at caller-specified `max_sfb` (five-channel front/surround SCEs)
+    /// and `max_sfb_add` (additional Lb/Rb pair). See
+    /// [`Self::encode_frame_pcm_7_0`] for the rest of the contract.
+    pub fn encode_frame_pcm_7_0_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 7],
+        max_sfb: u32,
+        max_sfb_add: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_0: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        // Cap max_sfb at the non-LFE max_sfb width's max and at the actual
+        // num_sfb_48 cap. Same cap applies to both the inner
+        // five_channel_data and the additional two_channel_data — they
+        // share the n_msfb_bits width.
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        let max_sfb_add = max_sfb_add.min(n_msfb_cap);
+
+        // Force 7.0 (3/4/0) channel_mode (prefix '1111000', 7 bits —
+        // Table 88 channel_mode 5). The body builder requires the TOC to
+        // declare 7 channels so the decoder's `walk_ac4_substream`
+        // dispatch routes through `parse_7x_audio_data_outer(b_has_lfe =
+        // false)`.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1111000;
+        self.channel_mode_bits = 7;
+
+        // 1. Forward MDCT analysis per channel (separate state for
+        //    independent 50% TDAC overlap continuity). Seven channels
+        //    here so the multi-channel state vector needs to grow.
+        while self.mdct_states_multi.len() < 7 {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(7);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // 2-4. Build the 7.0 SIMPLE/Cfg3Five body. Pad budget is ~7× the
+        //      mono budget since we carry seven spectra independently.
+        //      Capped at 32767 — the 15-bit `audio_size_value` field
+        //      saturates there (extending via `b_more_bits` is permitted
+        //      by §4.3.4.1 but not needed for the default max_sfb path).
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 12288,
+            41..=50 => 24576,
+            _ => 32767,
+        };
+        let body = build_7_0_simple_asf_body_from_pcm_spectra(
+            frame_len,
+            max_sfb,
+            max_sfb_add,
+            &[
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[2],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
             ],
             pad_target_bytes,
         );

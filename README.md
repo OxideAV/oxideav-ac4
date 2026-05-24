@@ -444,7 +444,32 @@ framework but usable standalone.
 > Lb/Rb (slots 5/6) silent per Table 202. Total tests 729 (was 721). Real
 > per-band `(alpha, beta)` extraction, real ASPX envelope coding, real
 > Table-181 SAP-derived residual content, and back-pair Lb/Rb carriage
-> remain deferred.
+> remain deferred. Round 125 lands the **7.0 (3/4/0) SIMPLE/Cfg3Five
+> multichannel encoder path** per ETSI TS 103 190-1 §4.2.6.14 Table 33 +
+> §4.2.7.5 Table 29 (`five_channel_data()`) + §4.2.7.4 Table 26
+> (additional-channel `two_channel_data()`) — the non-LFE immersive
+> counterpart of round-91's 7.1 encoder (the 7_X analogue of round 74's
+> 5.0 vs round 80's 5.1). `Ac4ImsEncoder::with_7_0()` flips the TOC
+> channel_mode prefix to `0b1111000` (7 b — Table 85 channel_mode 5,
+> 7.0 (3/4/0) → 7 channels), and
+> `encode_frame_pcm_7_0(&[L, R, C, Ls, Rs, Lb, Rb])` (+
+> `..._with_max_sfb(.., max_sfb, max_sfb_add)`) emits a SIMPLE/Cfg3Five
+> 7_X channel-element body whose inner `five_channel_data()` reuses the
+> round-80 5.1 forward pipeline for the L/R/C/Ls/Rs front/surround pair
+> and whose trailing identity-SAP `two_channel_data()` (`b_use_sap_add_ch
+> = 0`) carries the immersive Lb/Rb pair. The body is structurally the
+> round-91 7.1 body with the leading `mono_data(b_lfe = 1)` element
+> omitted (the walker's `if (b_has_lfe) mono_data(1);` branch is gated
+> off for channel_mode 5). New `encoder_asf::build_7_0_simple_asf_body_from_pcm_spectra`
+> emits the body bytes; decoder round-trip: 7.0 → 7-channel S16
+> interleaved PCM (1920 samples × 7 ch × 2 bytes). The 7.0 walker
+> resolves `seven_x_mode == Simple`, `seven_x_b_has_lfe == false`,
+> `five_channel_data` populated, identity-SAP additional-channel pair
+> populated (slots 5/6 = Lb/Rb routed via
+> `dispatch_7x_additional_channel_pair`). Per-channel spectral SNR on
+> the 220/440/660/880/1100/1320/1540 Hz independent-tone 7.0 fixture:
+> L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 / Lb=25.4 / Rb=26.0 dB —
+> all above the ≥ 20 dB floor. Total tests 737 (was 729).
 
 ## Specs
 
