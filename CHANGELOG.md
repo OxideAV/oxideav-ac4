@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 132 — 5.0 SIMPLE/ASPX_ACPL_1 encoder with real per-parameter-
+  band β extraction** per ETSI TS 103 190-1 §5.7.7.5 Pseudocode 116 +
+  §5.7.7.6.1 Pseudocode 117. Extends the round-128 real-α path: β was
+  pinned to 0 (pure level-only surround image); round 132 derives a real
+  per-band β magnitude from the surround/carrier energy residual that
+  remains after α removes the level component.
+  - Per Pseudocode 116 with the decorrelator output `y` ⊥ `x0` and
+    `E[y²] ≈ E[x0²]`: `E[Ls²] = 0.5·E[x0²]·((1-α)² + β²)`. Solving for
+    the magnitude gives `β = √max(0, 2·E[Ls²]/E[x0²] − (1-α)²)`, where
+    `α` is the *dequantised* value the decoder reconstructs (so β closes
+    the balance against the actual `(1 − α_dq)`).
+  - New `encoder_acpl3` helpers: `compute_per_band_energies` (per-band
+    `Σ x²` for carrier + surround), `analytic_beta_per_band` (the
+    energy-residual β estimator), `quantise_beta_magnitude` (nearest
+    `beta_q` index against the Table 204 / 206 column-0 grid),
+    `write_acpl_beta_f0_value` / `write_acpl_beta_df_value` (ACPL BETA
+    F0 + DF codebook emitters, Tables A.40 / A.41), and the optional-β
+    `write_acpl_data_1ch_real_alpha_beta` body writer.
+  - New build function
+    `build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta` + encoder
+    entry points `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_real_alpha_beta`
+    (+ `..._with_max_sfb`). The on-wire body structure is unchanged from
+    the round-128 path — the decoder resolves `FiveXCodecMode::AspxAcpl1`,
+    both `acpl_data_1ch_pair[0/1]` populated, and the β layer now carries
+    real magnitudes.
+  - Public extractor/validator entry points `extract_alpha_q_per_band`,
+    `extract_beta_q_per_band`, and `write_acpl_data_1ch_real_alpha_beta_bytes`
+    for round-trip testing.
+  - β / β3 / γ otherwise stay at the round-95 / 100 / 103 / 128 scaffold
+    for non-ACPL_1 paths. Total tests 755 (was 743).
+  - **Followup (round 128 latent bug, not introduced here):** the ACPL
+    ALPHA F0/DF writer (`write_acpl_alpha_f0_value`/`_df_value`) clamps a
+    negative `alpha_q` to lane 0, writing the wrong codeword and
+    desyncing the rest of the `acpl_data_1ch` element. It only round-trips
+    correctly for `alpha_q ≥ 0`. The round-132 β coding contract is
+    verified byte-exact via the isolated `acpl_data_1ch` round-trip test;
+    the full-substream PCM path inherits the round-128 α-writer's
+    in-range limitation. Both the α-writer sign/offset fix and real β
+    extraction for the 7_X / ACPL_2 / ACPL_3 paths remain deferred.
+
 - **Round 128 — 5.0 SIMPLE/ASPX_ACPL_1 encoder with real per-parameter-
   band α extraction** per ETSI TS 103 190-1 §5.7.7.5 Pseudocode 116 +
   §5.7.7.6.1 Pseudocode 117. Replaces the round-103 zero-delta scaffold

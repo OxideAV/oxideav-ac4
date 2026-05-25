@@ -1386,6 +1386,241 @@ fn quantise_alpha(alpha: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
     (best_lane as i32) - cb_off
 }
 
+/// Emit a standalone `acpl_data_1ch()` element (§4.2.13.3 Table 61) with
+/// real per-band α and β indices, returning the byte buffer. Intended
+/// for round-trip validation against [`crate::acpl::parse_acpl_data_1ch`]
+/// — the production encoder embeds this element inside the full substream
+/// body via [`build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta`].
+///
+/// `alpha_q_per_band` / `beta_q_per_band` are indexed by parameter band;
+/// entries below `start_band` are ignored (the element only codes bands
+/// `start_band..num_bands`).
+pub fn write_acpl_data_1ch_real_alpha_beta_bytes(
+    num_bands: u32,
+    start_band: u32,
+    quant_mode: crate::acpl::AcplQuantMode,
+    alpha_q_per_band: &[i32],
+    beta_q_per_band: &[i32],
+) -> Vec<u8> {
+    let mut bw = BitWriter::new();
+    write_acpl_data_1ch_real_alpha_beta(
+        &mut bw,
+        num_bands,
+        start_band,
+        quant_mode,
+        alpha_q_per_band,
+        Some(beta_q_per_band),
+    );
+    bw.finish()
+}
+
+/// Public entry point that lets callers extract the per-parameter-band
+/// β magnitudes the encoder would emit for a given (carrier, surround)
+/// MDCT pair plus the already-quantised α values. Intended for tests
+/// and validators that need to inspect the extractor's intermediate
+/// state — the production encoder calls the internals directly through
+/// [`build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta`].
+///
+/// Returns one β_q per parameter band; entries below `start_pb` or
+/// where the carrier energy is zero are 0.
+pub fn extract_beta_q_per_band(
+    coeffs_carrier: &[f32],
+    coeffs_surround: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    alpha_q: &[i32],
+    qm: crate::acpl::AcplQuantMode,
+) -> Vec<i32> {
+    let (e_c, e_s) = compute_per_band_energies(
+        coeffs_carrier,
+        coeffs_surround,
+        transform_length,
+        num_param_bands,
+        start_pb,
+    );
+    let alpha_dq: Vec<f32> = alpha_q
+        .iter()
+        .map(|&q| crate::acpl_synth::dequantize_alpha_index(qm, q).0)
+        .collect();
+    let beta = analytic_beta_per_band(&e_c, &e_s, &alpha_dq, qm);
+    beta.iter()
+        .map(|&b| quantise_beta_magnitude(b, qm))
+        .collect()
+}
+
+/// Public entry point that returns the per-parameter-band α_q the
+/// encoder would emit for a given (carrier, surround) MDCT pair.
+pub fn extract_alpha_q_per_band(
+    coeffs_carrier: &[f32],
+    coeffs_surround: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    qm: crate::acpl::AcplQuantMode,
+) -> Vec<i32> {
+    let (num, den) = compute_per_band_correlations(
+        coeffs_carrier,
+        coeffs_surround,
+        transform_length,
+        num_param_bands,
+        start_pb,
+    );
+    let alpha = analytic_alpha_per_band(&num, &den, qm);
+    alpha.iter().map(|&a| quantise_alpha(a, qm)).collect()
+}
+
+/// Compute per-parameter-band carrier and surround energies
+/// `(E_c = Σ x_carrier², E_s = Σ x_surround²)` across one MDCT frame.
+///
+/// Used by the β extractor to estimate the energy of the decorrelated
+/// residual that `acpl_beta_dq` must reconstruct. Entries below
+/// `start_pb` are returned as `(0.0, 0.0)`.
+fn compute_per_band_energies(
+    coeffs_carrier: &[f32],
+    coeffs_surround: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = num_param_bands as usize;
+    let mut e_c = vec![0.0f32; n];
+    let mut e_s = vec![0.0f32; n];
+    let len = coeffs_carrier.len().min(coeffs_surround.len());
+    for bin in 0..len {
+        let pb = mdct_bin_to_param_band(bin as u32, transform_length, num_param_bands) as usize;
+        if (pb as u32) < start_pb {
+            continue;
+        }
+        let xc = coeffs_carrier[bin];
+        let xs = coeffs_surround[bin];
+        e_c[pb] += xc * xc;
+        e_s[pb] += xs * xs;
+    }
+    (e_c, e_s)
+}
+
+/// Compute the analytic per-band β magnitude that closes the
+/// energy-balance for the Pseudocode 116 surround reconstruction.
+///
+/// Given `x0 = L` (carrier) and `y` = decorrelated(L) (energy-preserving
+/// and ⊥ x0 in the long-term sense), the Pseudocode 116 surround output is
+///
+/// ```text
+///   z1 = 0.5 · (x0·(1 − α) − y·β)
+/// ```
+///
+/// Per Pseudocode 117 the Ls reconstruction at the decoder is
+/// `Ls_recon = √2 · z1`. Squaring and taking expectations under
+/// `E[x0 · y] = 0` and `E[y²] ≈ E[x0²]`:
+///
+/// ```text
+///   E[Ls²] = 0.25 · 2 · ( E[x0²] · (1-α)² + E[y²] · β² )
+///          = 0.5 · E[x0²] · ( (1-α)² + β² )
+/// ```
+///
+/// Solving for β² and clamping to `[0, BETA_DQ_MAX²]`:
+///
+/// ```text
+///   β² = max(0, 2·E[Ls²]/E[x0²] − (1 − α)²)
+/// ```
+///
+/// Returns the **non-negative** β per band (entries below `start_pb`
+/// or with zero carrier energy → 0.0). The encoder writes the F0
+/// magnitude into the ACPL BETA F0 codebook (unsigned `cb_off = 0`)
+/// and chains sign-less DF deltas thereafter — the round-132 entry
+/// point therefore produces β_q ∈ {0..=max_q} for every band, leaving
+/// the decoder's `dequantize_beta_index` magnitude-only mapping
+/// (§5.7.7.7 Table 204 / 206) producing the matching positive β.
+fn analytic_beta_per_band(
+    energy_c: &[f32],
+    energy_s: &[f32],
+    alpha_dq: &[f32],
+    qm: crate::acpl::AcplQuantMode,
+) -> Vec<f32> {
+    // β table magnitude bounds: column-0 (ibeta = 0) goes up to row-N.
+    // Fine: 4.0 (row 8). Coarse: 4.0 (row 4). Per Table 204 / 206.
+    let max_abs: f32 = match qm {
+        crate::acpl::AcplQuantMode::Fine => 4.0,
+        crate::acpl::AcplQuantMode::Coarse => 4.0,
+    };
+    let n = energy_c.len().min(energy_s.len()).min(alpha_dq.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let ec = energy_c[i];
+        let es = energy_s[i];
+        if ec <= 0.0 || !ec.is_finite() {
+            out.push(0.0);
+            continue;
+        }
+        let one_minus_a = 1.0 - alpha_dq[i];
+        let beta_sq = 2.0 * es / ec - one_minus_a * one_minus_a;
+        let beta = if beta_sq <= 0.0 || !beta_sq.is_finite() {
+            0.0
+        } else {
+            beta_sq.sqrt()
+        };
+        out.push(beta.clamp(0.0, max_abs));
+    }
+    out
+}
+
+/// Quantise a non-negative analytic β magnitude to the spec's nearest
+/// `beta_q` index (`0..=max_q`). The β dequantisation table is
+/// 2-dimensional (`[beta_q][ibeta]` per Table 204 / 206) — for the
+/// round-132 F0-only encoder we pick `ibeta = 0` (the column matched
+/// by the `IBETA_*` row at `alpha_q = 0`, i.e. column 0 carries the
+/// maximum magnitudes 0.0 / 0.2375 / 0.55 / 0.9375 / 1.4 / 1.9375 /
+/// 2.55 / 3.2375 / 4.0 fine, or 0.0 / 0.55 / 1.4 / 2.55 / 4.0 coarse).
+/// This keeps the F0-only path's quantisation deterministic and matches
+/// the decoder's column-0 lookup when no α delta-table mismatch occurs.
+fn quantise_beta_magnitude(beta_mag: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
+    let table: &[f32] = match qm {
+        crate::acpl::AcplQuantMode::Fine => {
+            &[0.0, 0.2375, 0.55, 0.9375, 1.4, 1.9375, 2.55, 3.2375, 4.0]
+        }
+        crate::acpl::AcplQuantMode::Coarse => &[0.0, 0.55, 1.4, 2.55, 4.0],
+    };
+    let mut best_lane = 0usize;
+    let mut best_err = f32::INFINITY;
+    for (lane, &v) in table.iter().enumerate() {
+        let err = (v - beta_mag).abs();
+        if err < best_err {
+            best_err = err;
+            best_lane = lane;
+        }
+    }
+    best_lane as i32
+}
+
+/// Write the ACPL BETA F0 codeword for a recovered non-negative
+/// `beta_q` index per §A.3 Table A.41 (Fine) / Table A.40 (Coarse).
+/// The F0 codebook is addressed by `symbol_index = beta_q + cb_off`
+/// with `cb_off = 0` (per [`acpl_hcb_arrays`]) so the wire index is
+/// directly `beta_q`.
+fn write_acpl_beta_f0_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, beta_q: i32) {
+    let (len, cw, cb_off) = acpl_hcb_arrays(
+        crate::acpl::AcplDataType::Beta,
+        qm,
+        crate::acpl::AcplHcbType::F0,
+    );
+    let idx = (beta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write the ACPL BETA DF codeword for a recovered band-to-band delta
+/// `delta_q = beta_q[pb] - beta_q[pb-1]`. Per Table A.41 / A.40 the DF
+/// codebook is addressed by `symbol_index = delta_q + cb_off`.
+fn write_acpl_beta_df_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, delta_q: i32) {
+    let (len, cw, cb_off) = acpl_hcb_arrays(
+        crate::acpl::AcplDataType::Beta,
+        qm,
+        crate::acpl::AcplHcbType::Df,
+    );
+    let idx = (delta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
 /// Write the ACPL ALPHA F0 codeword for a recovered `alpha_q` index per
 /// §A.3 Table A.35 (Fine) / Table A.34 (Coarse). The Huffman table is
 /// addressed by `symbol_index = alpha_q + cb_off` (cb_off = 0 for the F0
@@ -1438,6 +1673,35 @@ fn write_acpl_data_1ch_real_alpha(
     quant_mode: crate::acpl::AcplQuantMode,
     alpha_q_per_band: &[i32],
 ) {
+    write_acpl_data_1ch_real_alpha_beta(
+        bw,
+        num_bands,
+        start_band,
+        quant_mode,
+        alpha_q_per_band,
+        None,
+    );
+}
+
+/// Emit an `acpl_data_1ch()` body per §4.2.13.3 Table 61 with real per-
+/// band α and (optionally) real per-band β. When `beta_q_per_band` is
+/// `None` the β layer falls back to the zero-delta scaffold (identical
+/// behaviour to [`write_acpl_data_1ch_real_alpha`]).
+///
+/// The β codebook (Tables A.40 / A.41) addresses F0 by `symbol_index =
+/// beta_q` (cb_off = 0) so the F0 codeword carries the non-negative
+/// magnitude directly. The DF codebook supports signed deltas; here we
+/// chain a forward `delta_q = beta_q[pb] − beta_q[pb-1]` which the
+/// decoder reverses via `acpl_synth::differential_decode`'s DIFF_FREQ
+/// branch.
+fn write_acpl_data_1ch_real_alpha_beta(
+    bw: &mut BitWriter,
+    num_bands: u32,
+    start_band: u32,
+    quant_mode: crate::acpl::AcplQuantMode,
+    alpha_q_per_band: &[i32],
+    beta_q_per_band: Option<&[i32]>,
+) {
     // acpl_framing_data(): smooth interp (1 b) + num_param_sets_cod = 0 (1 b).
     bw.write_bit(false);
     bw.write_bit(false);
@@ -1458,13 +1722,29 @@ fn write_acpl_data_1ch_real_alpha(
         prev_q = a_q;
     }
 
-    // acpl_ec_data(BETA): zero-delta F0 + DF.
+    // acpl_ec_data(BETA): diff_type = 0, then F0 + (n - 1) × DF.
     bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
-    if num_bands > start_band {
-        write_acpl_f0_zero(bw, crate::acpl::AcplDataType::Beta, quant_mode);
-    }
-    for _ in (start_band + 1)..num_bands {
-        write_acpl_df_zero(bw, crate::acpl::AcplDataType::Beta, quant_mode);
+    if let Some(beta_q) = beta_q_per_band {
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in start_band..num_bands {
+            let b_q = beta_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_beta_f0_value(bw, quant_mode, b_q);
+                first = false;
+            } else {
+                let delta = b_q - prev_q;
+                write_acpl_beta_df_value(bw, quant_mode, delta);
+            }
+            prev_q = b_q;
+        }
+    } else {
+        if num_bands > start_band {
+            write_acpl_f0_zero(bw, crate::acpl::AcplDataType::Beta, quant_mode);
+        }
+        for _ in (start_band + 1)..num_bands {
+            write_acpl_df_zero(bw, crate::acpl::AcplDataType::Beta, quant_mode);
+        }
     }
 }
 
@@ -1583,6 +1863,178 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha(
             start_band,
             acpl_quant_mode,
             &alpha_r_q,
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+// ====================================================================
+// Round 132 — real per-parameter-band α + β extractor (ASPX_ACPL_1)
+// ====================================================================
+
+/// Build a 5_X SIMPLE/ASPX_ACPL_1 substream body identical to
+/// [`build_5_x_acpl1_body_from_pcm_spectra_real_alpha`] but with real
+/// per-parameter-band β magnitudes additionally extracted from the
+/// surround-vs-carrier energy residual after α removes the level-only
+/// component.
+///
+/// Per Pseudocode 116 with `y` ⊥ `x0` and `E[y²] ≈ E[x0²]`:
+///
+/// ```text
+///   E[Ls²] = 0.5 · E[x0²] · ( (1 − α)² + β² )
+///   ⇒  β = √max(0, 2·E[Ls²]/E[x0²] − (1 − α)²)
+/// ```
+///
+/// The encoder emits the resulting non-negative β_q via the BETA F0 +
+/// DF codebooks (Tables A.40 / A.41 — F0 cb_off = 0 carries the
+/// magnitude directly). The decoder reverses this via
+/// `acpl_synth::differential_decode` (DIFF_FREQ) and
+/// `dequantize_beta_index` (column-0 of the Table 204 / 206 grid for
+/// the magnitude lookup).
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+    let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+
+    // α — same MDCT-energy correlation step as the round-128 path.
+    let (num_l, den_l) = compute_per_band_correlations(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    let (num_r, den_r) = compute_per_band_correlations(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    let alpha_l_real = analytic_alpha_per_band(&num_l, &den_l, acpl_quant_mode);
+    let alpha_r_real = analytic_alpha_per_band(&num_r, &den_r, acpl_quant_mode);
+    let alpha_l_q: Vec<i32> = alpha_l_real
+        .iter()
+        .map(|&a| quantise_alpha(a, acpl_quant_mode))
+        .collect();
+    let alpha_r_q: Vec<i32> = alpha_r_real
+        .iter()
+        .map(|&a| quantise_alpha(a, acpl_quant_mode))
+        .collect();
+
+    // β — energy residual after α removes the level-only component.
+    let (e_c_l, e_s_l) = compute_per_band_energies(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    let (e_c_r, e_s_r) = compute_per_band_energies(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    // Use the *dequantised* α (the value the decoder will see) so that
+    // β closes the energy balance against the actually-reconstructed
+    // (1 − α_dq), not the analytic α.
+    let alpha_l_dq: Vec<f32> = alpha_l_q
+        .iter()
+        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
+        .collect();
+    let alpha_r_dq: Vec<f32> = alpha_r_q
+        .iter()
+        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
+        .collect();
+    let beta_l_real = analytic_beta_per_band(&e_c_l, &e_s_l, &alpha_l_dq, acpl_quant_mode);
+    let beta_r_real = analytic_beta_per_band(&e_c_r, &e_s_r, &alpha_r_dq, acpl_quant_mode);
+    let beta_l_q: Vec<i32> = beta_l_real
+        .iter()
+        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
+        .collect();
+    let beta_r_q: Vec<i32> = beta_r_real
+        .iter()
+        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
+        .collect();
+    eprintln!("DBG2 alpha_l_q={alpha_l_q:?} beta_l_q={beta_l_q:?}");
+
+    let mut bw = BitWriter::new();
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_1 (2) — 3 bits.
+    bw.write_u32(2, 3);
+
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+    write_companding_control_2ch_sync_on(&mut bw);
+    bw.write_bit(false); // coding_config = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_acpl_1_residual_layer(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+    );
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_l_q,
+            Some(&beta_l_q),
+        );
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_r_q,
+            Some(&beta_r_q),
         );
     }
 
@@ -2432,5 +2884,97 @@ mod tests {
         assert!(tools.acpl_data_1ch_pair[0].is_some());
         assert!(tools.acpl_data_1ch_pair[1].is_some());
         assert!(tools.acpl_1_residual_pair[0].is_none());
+    }
+
+    /// Direct unit test of `analytic_beta_per_band` + `quantise_beta_magnitude`:
+    /// when carrier energy is non-zero and the surround energy exceeds
+    /// `0.5·E[carrier²]·(1-α)²`, the analytic β must be positive and
+    /// the quantised index non-zero.
+    #[test]
+    fn analytic_beta_positive_when_surround_energy_exceeds_alpha_model() {
+        let qm = crate::acpl::AcplQuantMode::Fine;
+        // 7 param bands. Bands 0..3 are "noise"; band 4 carries data.
+        let e_c = vec![0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let e_s = vec![0.0f32, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0]; // 2·E_s/E_c = 5.0
+        let alpha_dq = vec![0.0f32; 7]; // (1 − α)² = 1
+        let beta = analytic_beta_per_band(&e_c, &e_s, &alpha_dq, qm);
+        // β² = 5.0 − 1.0 = 4.0 → β = 2.0.
+        assert!(
+            (beta[4] - 2.0).abs() < 1e-5,
+            "expected β=2.0 at band 4, got {}",
+            beta[4]
+        );
+        let q = quantise_beta_magnitude(beta[4], qm);
+        // BETA_DQ_FINE column-0 lane closest to 2.0 is row 5 (1.9375)
+        // or row 6 (2.55) — 5 is closer.
+        assert_eq!(q, 5, "expected beta_q lane 5 (=1.9375), got {q}");
+    }
+
+    /// When the surround energy exactly matches `0.5·E[c²]·(1-α)²`,
+    /// the residual is zero → β = 0 → quantised index is 0.
+    #[test]
+    fn analytic_beta_zero_when_alpha_fully_explains_surround() {
+        let qm = crate::acpl::AcplQuantMode::Fine;
+        let e_c = vec![1.0f32; 1];
+        // For α = 0.5: (1-α)² = 0.25, so E_s = 0.5·1·0.25 = 0.125
+        // gives exact match → β = 0.
+        let alpha_dq = vec![0.5f32; 1];
+        let e_s = vec![0.125f32; 1];
+        let beta = analytic_beta_per_band(&e_c, &e_s, &alpha_dq, qm);
+        assert!((beta[0]).abs() < 1e-5, "expected β=0, got {}", beta[0]);
+        assert_eq!(quantise_beta_magnitude(beta[0], qm), 0);
+    }
+
+    /// Zero carrier energy short-circuits to β = 0 (we can't extract
+    /// β where the carrier doesn't exist).
+    #[test]
+    fn analytic_beta_zero_when_carrier_silent() {
+        let qm = crate::acpl::AcplQuantMode::Fine;
+        let e_c = vec![0.0f32; 1];
+        let e_s = vec![1.0f32; 1];
+        let alpha_dq = vec![0.0f32; 1];
+        let beta = analytic_beta_per_band(&e_c, &e_s, &alpha_dq, qm);
+        assert_eq!(beta[0], 0.0);
+    }
+
+    /// β F0 + DF round-trip through the ACPL BETA codebooks: a per-band
+    /// sequence `[5, 5, 3, 0, 0, 0]` writes to F0(5) + DF(0,-2,-3,0,0)
+    /// and the parser's `decode_delta` returns the same values.
+    #[test]
+    fn write_beta_f0_df_round_trips() {
+        use crate::acpl::{get_acpl_hcb, AcplDataType, AcplHcbType, AcplQuantMode};
+        let qm = AcplQuantMode::Fine;
+        let beta_seq = [5i32, 5, 3, 0, 0, 0];
+        let mut bw = BitWriter::new();
+        let mut prev = 0i32;
+        for (i, &b) in beta_seq.iter().enumerate() {
+            if i == 0 {
+                write_acpl_beta_f0_value(&mut bw, qm, b);
+            } else {
+                write_acpl_beta_df_value(&mut bw, qm, b - prev);
+            }
+            prev = b;
+        }
+        let bytes = bw.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let hcb_f0 = get_acpl_hcb(AcplDataType::Beta, qm, AcplHcbType::F0);
+        let hcb_df = get_acpl_hcb(AcplDataType::Beta, qm, AcplHcbType::Df);
+        let mut got = vec![hcb_f0.decode_delta(&mut br).unwrap()];
+        for _ in 1..beta_seq.len() {
+            got.push(hcb_df.decode_delta(&mut br).unwrap());
+        }
+        // Differential decode: cumulative sum.
+        let mut absvals = Vec::with_capacity(got.len());
+        let mut acc = 0;
+        for (i, &v) in got.iter().enumerate() {
+            if i == 0 {
+                acc = v;
+            } else {
+                acc += v;
+            }
+            absvals.push(acc);
+        }
+        assert_eq!(absvals, beta_seq);
     }
 }

@@ -490,6 +490,23 @@ framework but usable standalone.
 > populated, joint-MDCT residual layer walked,
 > `[L, R, C, Ls, Rs]` synthesised via
 > `acpl_synth::run_acpl_5x_pair_pcm`. Total tests 743 (was 737).
+> Round 132 adds the first **real per-parameter-band β extraction** in
+> the ACPL_1 5.0 encoder per ETSI TS 103 190-1 §5.7.7.5 Pseudocode 116 +
+> §5.7.7.6.1 Pseudocode 117 — replaces the round-95/100/103/128 zero-β
+> scaffold for the ACPL_1 path. With the decorrelator output `y` ⊥ `x0`
+> and `E[y²] ≈ E[x0²]`, the surround energy balance is
+> `E[Ls²] = 0.5·E[x0²]·((1−α)² + β²)`, so the per-band β magnitude is
+> `β = √max(0, 2·E[Ls²]/E[x0²] − (1−α_dq)²)`. New
+> `encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta`
+> + helper chain (`compute_per_band_energies`, `analytic_beta_per_band`,
+> `quantise_beta_magnitude` against Tables 204/206, `write_acpl_beta_f0_value`
+> / `write_acpl_beta_df_value` per Tables A.40/A.41) and the new
+> `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_real_alpha_beta` entry
+> point. The on-wire body structure is unchanged; the β coding contract
+> round-trips byte-exact through `acpl::parse_acpl_data_1ch`. Total tests
+> 755 (was 743). Real β extraction for the 7_X / ACPL_2 / ACPL_3 paths,
+> real γ extraction, and the round-128 ALPHA-writer negative-`alpha_q`
+> desync fix remain deferred.
 
 ## Specs
 
