@@ -1985,7 +1985,6 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
         .iter()
         .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
         .collect();
-    eprintln!("DBG2 alpha_l_q={alpha_l_q:?} beta_l_q={beta_l_q:?}");
 
     let mut bw = BitWriter::new();
     let audio_size = pad_target_bytes as u32;
@@ -2373,6 +2372,185 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra(
         let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+// ====================================================================
+// Round 135 — real per-parameter-band α + β extractor (7_X ASPX_ACPL_1)
+// ====================================================================
+
+/// Build a 7.0 / 7.1 SIMPLE/ASPX_ACPL_1 substream body identical in wire
+/// layout to [`build_7_x_acpl1_body_from_pcm_spectra`] but with **real
+/// per-parameter-band α + β** carried by the two trailing
+/// `acpl_data_1ch()` parameter sets, exactly as the round-132 5_X path
+/// ([`build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta`]) does for
+/// the 5.0 immersive element.
+///
+/// This is the round-132 followup: the 7_X immersive ASPX_ACPL_1 path
+/// previously emitted both `acpl_data_1ch()` sets at the round-118
+/// zero-delta scaffold ([`write_acpl_data_1ch_minimal`]); here each set
+/// instead carries the analytic α (from the L/Ls and R/Rs MDCT-energy
+/// correlation, §5.7.7.5 Pseudocode 116) and the analytic β magnitude
+/// that closes the surround/carrier energy balance after α removes the
+/// level-only component (§5.7.7.6.1 Pseudocode 117):
+///
+/// ```text
+///   E[Ls²] = 0.5 · E[L²] · ( (1 − α)² + β² )
+///   ⇒  β = √max(0, 2·E[Ls²]/E[L²] − (1 − α)²)
+/// ```
+///
+/// The decoder's [`crate::mch::parse_7x_audio_data_outer`] (with `mode =
+/// AspxAcpl1`) walks the same body; the recovered α/β feed the §5.7.7.6.1
+/// `ACplModule(alpha, beta, …)` reconstruction of the Ls/Rs surround pair.
+/// β / β3 / γ for non-ACPL_1 paths stay at their respective scaffolds.
+///
+/// All five structural differences versus the 7_X ACPL_2 walker (2-bit
+/// `7_X_codec_mode`, optional LFE `mono_data(1)`, two `two_channel_data()`
+/// pairs, the joint-MDCT residual layer, the trailing centre `mono_data`)
+/// are unchanged from [`build_7_x_acpl1_body_from_pcm_spectra`].
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+    let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+
+    // α + β extraction — identical primitives to the round-128 / 132 5_X
+    // path. D0 module models (L → Ls); D1 module models (R → Rs).
+    let alpha_l_q = extract_alpha_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let alpha_r_q = extract_alpha_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let beta_l_q = extract_beta_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_l_q,
+        acpl_quant_mode,
+    );
+    let beta_r_q = extract_beta_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_r_q,
+        acpl_quant_mode,
+    );
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_codec_mode = ASPX_ACPL_1 (2) — 2 bits.
+    bw.write_u32(2, 2);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_1ch(PARTIAL) (6 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+
+    // LFE: mono_data(b_lfe = 1) when present (7.1 / channel_mode 6).
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(5): sync = 1, on = 1.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (2 b) — Cfg0.
+    bw.write_u32(0, 2);
+
+    // Cfg0: b_2ch_mode (1 b) + two_channel_data (L/R) + two_channel_data (Ls/Rs).
+    bw.write_bit(false); // b_2ch_mode = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
+
+    // ASPX_ACPL_1-only joint-MDCT residual layer: Ls/Rs surround residual.
+    write_acpl_1_residual_layer(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+    );
+
+    // Trailing Cfg0 mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    // I-frame ASPX + A-CPL trailers: aspx_data_2ch + aspx_data_2ch +
+    // aspx_data_1ch + acpl_data_1ch × 2 (now carrying real α + β).
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_l_q,
+            Some(&beta_l_q),
+        );
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_r_q,
+            Some(&beta_r_q),
+        );
     }
 
     bw.align_to_byte();

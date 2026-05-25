@@ -506,7 +506,18 @@ framework but usable standalone.
 > round-trips byte-exact through `acpl::parse_acpl_data_1ch`. Total tests
 > 755 (was 743). Real β extraction for the 7_X / ACPL_2 / ACPL_3 paths,
 > real γ extraction, and the round-128 ALPHA-writer negative-`alpha_q`
-> desync fix remain deferred.
+> desync fix remain deferred. Round 135 extends the **real per-band α + β
+> extraction to the 7_X (7.0 immersive) ASPX_ACPL_1 path** — the round-132
+> followup. New `encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta`
+> (the real-α+β upgrade of the round-118 zero-delta 7_X builder, reusing the
+> `extract_alpha_q_per_band` / `extract_beta_q_per_band` primitives) and the
+> `Ac4ImsEncoder::encode_frame_pcm_7_0_acpl1_real_alpha_beta` entry point;
+> both trailing `acpl_data_1ch()` sets now carry real α + β. The on-wire
+> body structure is unchanged — decoder resolves `SevenXCodecMode::AspxAcpl1`
+> (`b_has_lfe = false`), both `acpl_data_1ch_pair[0/1]` populated, joint-MDCT
+> residual layer walked. Total tests 760 (was 755). Real β extraction for
+> the 7.1-LFE / ACPL_2 / ACPL_3 paths and the round-128 ALPHA-writer
+> negative-`alpha_q` desync fix remain deferred.
 
 ## Specs
 
