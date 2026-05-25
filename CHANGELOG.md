@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 128 — 5.0 SIMPLE/ASPX_ACPL_1 encoder with real per-parameter-
+  band α extraction** per ETSI TS 103 190-1 §5.7.7.5 Pseudocode 116 +
+  §5.7.7.6.1 Pseudocode 117. Replaces the round-103 zero-delta scaffold
+  for the α coefficient family in the ACPL_1 path (β / β3 / γ stay at
+  the round-95 / 100 / 103 zero-delta scaffold — β3 / γ only fire in
+  ASPX_ACPL_3 anyway).
+  - Per Pseudocode 116, above `acpl_qmf_band`: `z0 = 0.5·(x0·(1+α) +
+    y·β)`, `z1 = 0.5·(x0·(1-α) - y·β)` (then `z1 *= √2` per
+    Pseudocode 117). With β = 0 the surround reconstruction is a pure
+    level-only image: `Ls_recon = 0.5/√2 · L · (1 − α)`. Solving for α
+    that minimises `(Ls − 0.5/√2·L·(1−α))²` per parameter band gives
+    `α = 1 − 2·√2 · ⟨L, Ls⟩ / ⟨L, L⟩`.
+  - New `encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_real_alpha`
+    — mirrors `build_5_x_acpl1_body_from_pcm_spectra` (round 103) but
+    with real α emitted via the ACPL ALPHA F0 + DF codebooks (Tables
+    A.35 / A.34). Helper functions:
+    - `mdct_bin_to_param_band` — maps MDCT bin → QMF subband `sb = bin
+      · 64 / transform_length` → parameter band via
+      `acpl::sb_to_pb` (§5.7.7.2 Table 197).
+    - `compute_per_band_correlations` — computes `(Σ x·y, Σ x²)` per
+      parameter band over the MDCT carrier vs. surround spectra,
+      skipping bands below `start_pb` (the PARTIAL `acpl_qmf_band`
+      maps to a `start_pb > 0`; bands below are M/S-recovered by the
+      synth and α has no effect there).
+    - `analytic_alpha_per_band` — closed-form α with clamp to ±2.0.
+    - `quantise_alpha` — nearest-neighbour to `ALPHA_DQ_FINE` (Table
+      203) / `ALPHA_DQ_COARSE` (Table 205); returns the signed
+      `alpha_q` in `-N/2..=+N/2`.
+    - `write_acpl_alpha_f0_value` / `write_acpl_alpha_df_value` —
+      emit ALPHA F0 (first band) + ALPHA DF (subsequent bands using
+      `delta_q = alpha_q[pb] - alpha_q[pb-1]`) codewords per the
+      `acpl_hcb_arrays` table family.
+    - `write_acpl_data_1ch_real_alpha` — full `acpl_data_1ch()` body
+      with real α + zero-delta β (β / β3 / γ fall back to
+      `write_acpl_*_zero` from round 95).
+  - New encoder entry points:
+    - `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_real_alpha(&[L, R, C, Ls, Rs])`
+    - `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_real_alpha_with_max_sfb(.., max_sfb, max_sfb_master)`
+  - The on-wire body structure is identical to the round-103 path: the
+    decoder resolves `FiveXCodecMode::AspxAcpl1`, parses both
+    `acpl_data_1ch_pair[0/1]` slots, walks the joint-MDCT residual
+    layer, and synthesises `[L, R, C, Ls, Rs]` via
+    `acpl_synth::run_acpl_5x_pair_pcm`. The only difference is that
+    the α huffman values now carry per-band non-zero deltas chosen by
+    the encoder rather than the structural zero scaffold.
+  - 6 new integration tests in
+    `tests/round128_5_x_acpl1_real_alpha.rs`: end-to-end round-trip,
+    decoder mode resolution, non-zero α emission when surround
+    differs from carrier, silence round-trip, symmetric scaling
+    yields a positive α in both pairs, encoder determinism.
+  - Total test count: 743 (was 737) — 0 ignored, 0 failed.
+  - Follow-ups (deferred): real per-band β / β3 / γ extraction
+    (β = 0 simplification is spec-defensible for "level-only"
+    encoding); real ASPX envelope coding; real Table-181 SAP-derived
+    residual content; same real-α uplift for the ACPL_2 / ACPL_3 5_X
+    paths and the 7_X ACPL_1 / ACPL_2 paths; back-pair Lb/Rb
+    carriage on the ACPL paths; DT-mode (DIFF_TIME) coding using
+    cross-frame state.
+
 - **Round 125 — 7.0 (3/4/0) SIMPLE/Cfg3Five multichannel encoder
   path** per ETSI TS 103 190-1 §4.2.6.14 Table 33 + §4.2.7.5 Table 29
   (`five_channel_data()`) + §4.2.7.4 Table 26 (additional-channel

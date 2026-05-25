@@ -469,7 +469,27 @@ framework but usable standalone.
 > `dispatch_7x_additional_channel_pair`). Per-channel spectral SNR on
 > the 220/440/660/880/1100/1320/1540 Hz independent-tone 7.0 fixture:
 > L=24.5 / R=24.8 / C=25.0 / Ls=23.4 / Rs=27.4 / Lb=25.4 / Rb=26.0 dB —
-> all above the ≥ 20 dB floor. Total tests 737 (was 729).
+> all above the ≥ 20 dB floor. Total tests 737 (was 729). Round 128
+> lands the first **real per-parameter-band α extraction** in the
+> ACPL_1 5.0 encoder per ETSI TS 103 190-1 §5.7.7.5 Pseudocode 116 +
+> §5.7.7.6.1 Pseudocode 117 — replaces the round-103 zero-delta α
+> scaffold (β / β3 / γ stay at the round-95 / 100 / 103 scaffold; β3 /
+> γ only fire in ASPX_ACPL_3 anyway). With β = 0 the surround
+> reconstruction is `Ls_recon = 0.5/√2 · L · (1 − α)`; solving for α
+> per parameter band gives the closed form `α = 1 − 2·√2 · ⟨L, Ls⟩ /
+> ⟨L, L⟩`. New `encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_real_alpha`
+> + helper chain (`compute_per_band_correlations` mapping MDCT bins →
+> QMF subbands → A-CPL parameter bands via §5.7.7.2 Table 197,
+> `analytic_alpha_per_band` + `quantise_alpha` against Tables 203 /
+> 205, then `write_acpl_alpha_f0_value` / `write_acpl_alpha_df_value`
+> emit the ALPHA F0 + DF codewords per Tables A.35 / A.34); new
+> `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_real_alpha` entry point
+> alongside the round-103 zero-delta variant. The on-wire body
+> structure is unchanged — decoder resolves
+> `FiveXCodecMode::AspxAcpl1`, both `acpl_data_1ch_pair[0/1]`
+> populated, joint-MDCT residual layer walked,
+> `[L, R, C, Ls, Rs]` synthesised via
+> `acpl_synth::run_acpl_5x_pair_pcm`. Total tests 743 (was 737).
 
 ## Specs
 
