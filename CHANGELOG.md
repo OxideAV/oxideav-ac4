@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 139 — 7.1-with-LFE (3/4/0.1) SIMPLE/ASPX_ACPL_1 encoder
+  with real per-parameter-band α + β extraction** per ETSI TS 103 190-1
+  §4.2.6.14 Table 33 row `case ASPX_ACPL_1:` with `b_has_lfe = 1` +
+  §5.7.7.5 Pseudocode 116 + §5.7.7.6.1 Pseudocode 117. The LFE
+  counterpart of the round-135 7.0 immersive real-α+β path.
+  - New `Ac4ImsEncoder::encode_frame_pcm_7_1_acpl1_real_alpha_beta`
+    (+ `..._with_max_sfb`) reuses the round-135
+    `encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta`
+    builder with the LFE `coeffs_lfe` + `max_sfb_lfe` slots populated,
+    emitting a leading `mono_data(b_lfe = 1)` element (Table 21 +
+    `sf_info_lfe()` Table 35) between the I-frame config block and
+    `companding_control(5)` — exactly where the decoder's
+    `parse_7x_audio_data_outer(b_has_lfe = true)` reads
+    `if (b_has_lfe) mono_data(1);`.
+  - The on-wire body structure matches the existing round-118 7.1
+    ACPL_1 path. Decoder resolves `SevenXCodecMode::AspxAcpl1` with
+    `b_has_lfe = true`, both `acpl_data_1ch_pair[0/1]` populated (now
+    carrying real α + β), joint-MDCT residual layer walked, LFE
+    IMDCT'd into slot 7. A 60 Hz LFE tone round-trips to a non-silent
+    reconstructed LFE channel.
+  - +6 tests (total 766, was 760).
+
 - **Round 132 — 5.0 SIMPLE/ASPX_ACPL_1 encoder with real per-parameter-
   band β extraction** per ETSI TS 103 190-1 §5.7.7.5 Pseudocode 116 +
   §5.7.7.6.1 Pseudocode 117. Extends the round-128 real-α path: β was

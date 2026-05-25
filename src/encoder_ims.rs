@@ -2739,6 +2739,150 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Encode one IMS v2 frame containing a 7.1 (3/4/0.1) SIMPLE/ASPX_ACPL_1
+    /// multichannel substream per ETSI TS 103 190-1 §4.2.6.14 Table 33 row
+    /// `case ASPX_ACPL_1:` with `b_has_lfe = 1`, with **real per-parameter-band
+    /// α + β extraction** carried by the two trailing `acpl_data_1ch()`
+    /// parameter sets (round 139 — the LFE counterpart of the round-135
+    /// 7.0 immersive real-α+β path,
+    /// [`Self::encode_frame_pcm_7_0_acpl1_real_alpha_beta`]).
+    ///
+    /// The round-118 7.1 ASPX_ACPL_1 encoder emitted both `acpl_data_1ch()`
+    /// parameter sets at the zero-delta scaffold; this entry point upgrades
+    /// them to carry the analytic α (from the L/Ls and R/Rs MDCT-energy
+    /// correlation, §5.7.7.5 Pseudocode 116) plus the β magnitude that
+    /// closes the surround/carrier energy balance after α removes the
+    /// level-only component (§5.7.7.6.1 Pseudocode 117):
+    ///
+    /// ```text
+    ///   E[Ls²] = 0.5 · E[L²] · ( (1 − α)² + β² )
+    ///   ⇒  β = √max(0, 2·E[Ls²]/E[L²] − (1 − α)²)
+    /// ```
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb, LFE]` order — the 7.1
+    /// (3/4/0.1) surface layout, identical to
+    /// [`Self::encode_frame_pcm_7_1_acpl1`]. The leading `mono_data(b_lfe = 1)`
+    /// element (Table 21 + `sf_info_lfe()` Table 35) is emitted between the
+    /// I-frame config block and `companding_control(5)`. The on-wire body
+    /// structure is otherwise identical — decoder resolves
+    /// `SevenXCodecMode::AspxAcpl1` with `b_has_lfe = true`, both
+    /// `acpl_data_1ch_pair[0/1]` populated (now carrying real α + β),
+    /// joint-MDCT residual layer walked, LFE IMDCT'd into slot 7.
+    pub fn encode_frame_pcm_7_1_acpl1_real_alpha_beta(&mut self, frames: &[&[f32]; 8]) -> Vec<u8> {
+        self.encode_frame_pcm_7_1_acpl1_real_alpha_beta_with_max_sfb(frames, 40, 20, 7)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_1_acpl1_real_alpha_beta`]. `max_sfb`
+    /// governs the five front/surround carrier SCEs and the centre mono;
+    /// `max_sfb_master` governs the joint-MDCT surround residual layer;
+    /// `max_sfb_lfe` governs the LFE `mono_data(1)` (clamped to the
+    /// `n_msfbl_bits` cap).
+    pub fn encode_frame_pcm_7_1_acpl1_real_alpha_beta_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 8],
+        max_sfb: u32,
+        max_sfb_master: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_1_acpl1_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, n_msfbl_bits) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        assert!(
+            n_msfbl_bits > 0,
+            "encode_frame_pcm_7_1_acpl1_real_alpha_beta: tl = {frame_len} not permitted for LFE"
+        );
+        let n_msfbl_cap = (1u32 << n_msfbl_bits) - 1;
+        let max_sfb_lfe = max_sfb_lfe.min(n_msfbl_cap);
+
+        // Force 7.1 (3/4/0.1) channel_mode prefix '1111001', 7 b →
+        // channel_mode 6 (Table 88). The decoder routes channels == 8
+        // through parse_7x_audio_data_outer(b_has_lfe = true).
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1111001;
+        self.channel_mode_bits = 7;
+
+        let n_channels = 8;
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+        let acpl_qmf_band_minus1: u8 = 0;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 12288,
+            41..=50 => 24576,
+            _ => 32767,
+        };
+
+        let body = crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
+            frame_len,
+            max_sfb,
+            max_sfb_master,
+            Some(max_sfb_lfe),
+            self.b_iframe_global,
+            &coeffs_per_channel[0],
+            &coeffs_per_channel[1],
+            &coeffs_per_channel[3],
+            &coeffs_per_channel[4],
+            &coeffs_per_channel[2],
+            Some(&coeffs_per_channel[7]),
+            &aspx_cfg,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+            pad_target_bytes,
+        );
+
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a mono SIMPLE/ASF substream
     /// whose injected tone falls on the spectral pair nearest the
     /// requested frequency. With `tl = 1920` at 48 kHz the bin spacing

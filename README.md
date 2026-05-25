@@ -515,9 +515,25 @@ framework but usable standalone.
 > both trailing `acpl_data_1ch()` sets now carry real α + β. The on-wire
 > body structure is unchanged — decoder resolves `SevenXCodecMode::AspxAcpl1`
 > (`b_has_lfe = false`), both `acpl_data_1ch_pair[0/1]` populated, joint-MDCT
-> residual layer walked. Total tests 760 (was 755). Real β extraction for
-> the 7.1-LFE / ACPL_2 / ACPL_3 paths and the round-128 ALPHA-writer
-> negative-`alpha_q` desync fix remain deferred.
+> residual layer walked. Total tests 760 (was 755). Round 139 extends the
+> **real per-band α + β extraction to the 7.1-with-LFE (3/4/0.1)
+> ASPX_ACPL_1 path** — the round-135 LFE follow-up. New
+> `Ac4ImsEncoder::encode_frame_pcm_7_1_acpl1_real_alpha_beta` (and the
+> `_with_max_sfb` form) reuses the round-135
+> `build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta` builder with the
+> LFE `coeffs_lfe` + `max_sfb_lfe` slots populated, emitting a leading
+> `mono_data(b_lfe = 1)` element (Table 21 + `sf_info_lfe()` Table 35)
+> between the I-frame config block and `companding_control(5)` exactly
+> where the decoder's `parse_7x_audio_data_outer(b_has_lfe = true)` reads
+> `if (b_has_lfe) mono_data(1);`. The on-wire body structure matches the
+> existing round-118 7.1 ACPL_1 path — decoder resolves
+> `SevenXCodecMode::AspxAcpl1` with `b_has_lfe = true`, both
+> `acpl_data_1ch_pair[0/1]` populated (now carrying real α + β),
+> joint-MDCT residual layer walked, LFE IMDCT'd into slot 7. A 60 Hz
+> LFE tone round-trips to a non-silent reconstructed LFE channel. Total
+> tests 766 (was 760). Real β extraction for the ACPL_2 / ACPL_3 paths
+> and the round-128 ALPHA-writer negative-`alpha_q` desync fix remain
+> deferred.
 
 ## Specs
 
