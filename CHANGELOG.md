@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 144 — 5_X SIMPLE/ASPX_ACPL_2 encoder with real per-parameter-
+  band α + β extraction** per ETSI TS 103 190-1 §4.2.6.6 Table 25 row
+  `case ASPX_ACPL_2:` + §5.7.7.5 Pseudocode 116 + §5.7.7.6.1 Pseudocode
+  117. The ACPL_2 counterpart to the round-132 5_X ACPL_1 real α+β path.
+  - New `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl2_real_alpha_beta`
+    (+ `..._with_max_sfb`) accepts a 5-channel `[L, R, C, Ls, Rs]` input
+    and produces a 5_X ASPX_ACPL_2 frame whose two trailing
+    `acpl_data_1ch()` elements carry per-parameter-band α + β indices
+    extracted from the (L, Ls) and (R, Rs) MDCT energy ratios.
+  - The on-wire body layout is the round-100
+    `build_5_x_acpl2_body_from_pcm_spectra` layout (no joint-MDCT
+    residual layer — ACPL_2 reconstructs the surround from L/R + the two
+    `acpl_data_1ch()` parameter sets at decode time); the Ls/Rs spectra
+    are consumed only by the α + β extractors and are not transmitted.
+  - New `encoder_acpl3::build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta`
+    builder reuses the round-128 / 132 shared α + β analytic primitives
+    (`compute_per_band_correlations` / `analytic_alpha_per_band` /
+    `compute_per_band_energies` / `analytic_beta_per_band` /
+    `quantise_alpha` / `quantise_beta_magnitude`) and the
+    `write_acpl_data_1ch_real_alpha_beta` writer with `start_band = 0`
+    (acpl_config_1ch(FULL) carries no qmf_band) so every parameter band
+    participates in the α + β coding.
+  - β analytic derivation per Pseudocode 116 with `y` ⊥ `x0` and
+    `E[y²] ≈ E[x0²]`: `E[Ls²] = 0.5 · E[L²] · ((1 − α)² + β²)` ⇒
+    `β = √max(0, 2·E[Ls²]/E[L²] − (1 − α_dq)²)`.
+  - Total tests 773 (was 766): 7 new round-144 tests covering 5-channel
+    AudioFrame round-trip, decoder mode resolution, on-wire body
+    divergence from the round-100 scaffold for non-trivial surround,
+    direct `extract_beta_q_per_band` non-zero gate, silence round-trip,
+    encoder determinism, and structural pair0/pair1 population.
+  - Deferred: real β extraction for ACPL_3 paths; real ASPX envelope
+    coding; the round-128 ALPHA F0 writer-side `alpha_q` desync
+    (deferred since r132) which currently obscures per-band on-wire α/β
+    recovery through the full PCM→MDCT→writer→parser→synth chain when
+    the analytic α quantises to a non-center lane.
+
 - **Round 139 — 7.1-with-LFE (3/4/0.1) SIMPLE/ASPX_ACPL_1 encoder
   with real per-parameter-band α + β extraction** per ETSI TS 103 190-1
   §4.2.6.14 Table 33 row `case ASPX_ACPL_1:` with `b_has_lfe = 1` +

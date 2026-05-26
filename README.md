@@ -533,7 +533,28 @@ framework but usable standalone.
 > LFE tone round-trips to a non-silent reconstructed LFE channel. Total
 > tests 766 (was 760). Real β extraction for the ACPL_2 / ACPL_3 paths
 > and the round-128 ALPHA-writer negative-`alpha_q` desync fix remain
-> deferred.
+> deferred. Round 144 closes the ACPL_2 5.0 half of the deferred list
+> with the **5_X SIMPLE/ASPX_ACPL_2 encoder with real per-parameter-band
+> α + β extraction** per §4.2.6.6 Table 25 row `case ASPX_ACPL_2:` +
+> §5.7.7.5 Pseudocode 116 + §5.7.7.6.1 Pseudocode 117. New
+> `Ac4ImsEncoder::encode_frame_pcm_5_0_acpl2_real_alpha_beta` (and the
+> `_with_max_sfb` form) accepts a 5-channel `[L, R, C, Ls, Rs]` input and
+> produces a 5_X ASPX_ACPL_2 frame whose two trailing `acpl_data_1ch()`
+> elements carry real per-band α + β indices extracted from the (L, Ls)
+> and (R, Rs) MDCT energy ratios via the round-128 / 132 shared analytic
+> primitives. The on-wire body layout matches the round-100
+> `build_5_x_acpl2_body_from_pcm_spectra` schedule (no joint-MDCT
+> residual layer — ACPL_2 reconstructs the surround from L/R + the two
+> `acpl_data_1ch()` parameter sets at decode time); the Ls/Rs spectra
+> are consumed only by the α + β extractors and are not transmitted.
+> `acpl_config_1ch(FULL)` carries no `qmf_band` → `start_band = 0` so
+> every parameter band participates in the α + β coding (in contrast to
+> the ACPL_1 PARTIAL mode whose `acpl_qmf_band` masks the low bands).
+> Total tests 773 (was 766). Real β extraction for the ACPL_3 paths and
+> the round-128 ALPHA-writer negative-`alpha_q` desync fix (which
+> currently obscures per-band on-wire α/β recovery through the full
+> PCM→MDCT→writer→parser→synth chain when the analytic α quantises to a
+> non-center lane) remain deferred.
 
 ## Specs
 

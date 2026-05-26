@@ -1667,6 +1667,155 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Encode one IMS v2 frame containing a 5.0 SIMPLE/ASPX_ACPL_2
+    /// multichannel substream with **real per-parameter-band α + β
+    /// extraction** carried by the two trailing `acpl_data_1ch()` elements
+    /// (round 144 — the ACPL_2 5.0 counterpart to the round-132 ACPL_1 5.0
+    /// real α + β path).
+    ///
+    /// Per ETSI TS 103 190-1 §5.7.7.5 Pseudocode 116 + §5.7.7.6.1
+    /// Pseudocode 117, the A-CPL surround reconstruction carries the
+    /// level component via α and a decorrelated residual via β:
+    ///
+    /// ```text
+    ///   α   = 1 − 2·√2 · ⟨x_carrier, x_surround⟩ / ⟨x_carrier, x_carrier⟩
+    ///   E[Ls²] = 0.5 · E[L²] · ( (1 − α)² + β² )
+    ///   ⇒  β = √max(0, 2·E[Ls²]/E[L²] − (1 − α_dq)²)
+    /// ```
+    ///
+    /// Unlike the ACPL_1 paths, ACPL_2 does **not** transmit the Ls/Rs
+    /// surround pair on the wire — the decoder reconstructs the surround
+    /// purely from the L/R carriers + the two `acpl_data_1ch()` parameter
+    /// sets. This entry point therefore still emits the round-100
+    /// ASPX_ACPL_2 body layout (no joint-MDCT residual layer, no
+    /// `acpl_config_1ch(PARTIAL)` qmf_band field), but extracts the α + β
+    /// indices from the caller's full 5-channel `[L, R, C, Ls, Rs]` input
+    /// rather than pinning them at the zero-codebook scaffold.
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs]` order; β3 / γ stay at the
+    /// scaffold. The `acpl_config_1ch(FULL)` carries no `qmf_band` →
+    /// `start_band = 0` so every parameter band participates in the α + β
+    /// coding (in contrast to the ACPL_1 PARTIAL mode whose
+    /// `acpl_qmf_band` masks the low bands).
+    ///
+    /// **Note (round-128 ALPHA F0 writer-side `alpha_q` desync —
+    /// deferred follow-up since round 132).** The shared
+    /// `write_acpl_alpha_f0_value` writer treats the signed `alpha_q ∈
+    /// [-N/2..+N/2]` returned by `quantise_alpha` as a raw F0 symbol
+    /// index without re-centering it against the table's shortest
+    /// codeword. The decoder's `dequantize_alpha_index` re-centers via
+    /// `lane = alpha_q + N/2`, so non-trivial α values do not round-trip
+    /// bit-exact through the full PCM→MDCT→writer→parser→synth chain
+    /// when the analytic α resolves to a non-center quantisation lane.
+    /// The on-wire β codewords for ACPL_2 are wired correctly per
+    /// §A.3 Table A.40 / A.41 (β uses unsigned-magnitude F0 with
+    /// `cb_off = 0`, no re-centering needed); the round-100 zero-α/β
+    /// scaffold is structurally superseded by this entry point. Once
+    /// the writer-side desync lands as a follow-up commit the on-wire β
+    /// recovery will be bit-exact end-to-end.
+    pub fn encode_frame_pcm_5_0_acpl2_real_alpha_beta(&mut self, frames: &[&[f32]; 5]) -> Vec<u8> {
+        self.encode_frame_pcm_5_0_acpl2_real_alpha_beta_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_0_acpl2_real_alpha_beta`].
+    pub fn encode_frame_pcm_5_0_acpl2_real_alpha_beta_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_0_acpl2_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force 5.0 channel_mode prefix '1101', 4 b → channel_mode 3.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1101;
+        self.channel_mode_bits = 4;
+
+        // Forward MDCT analysis per carrier channel (L, R, C, Ls, Rs — 5
+        // states). The Ls/Rs spectra feed the α + β extractors only — they
+        // are not emitted on the ACPL_2 wire (the decoder reconstructs the
+        // surround from L/R + the two acpl_data_1ch parameter sets).
+        let n_channels = 5;
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // ASPX config: matches the round-95 / 100 / 103 ASPX_ACPL config.
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0, // num_noise_sbgroups = 1
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // ACPL: num_param_bands_id = 3 → 7 param bands; quant_mode Fine.
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let body = crate::encoder_acpl3::build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
+            frame_len,
+            max_sfb,
+            self.b_iframe_global,
+            &coeffs_per_channel[0],
+            &coeffs_per_channel[1],
+            &coeffs_per_channel[2],
+            &coeffs_per_channel[3],
+            &coeffs_per_channel[4],
+            &aspx_cfg,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            pad_target_bytes,
+        );
+
+        // Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a 5.0 SIMPLE/ASPX_ACPL_1
     /// multichannel substream per ETSI TS 103 190-1 §4.2.6.6 Table 25 row
     /// `case ASPX_ACPL_1:` (Pseudocode 117).
