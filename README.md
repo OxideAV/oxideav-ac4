@@ -554,7 +554,38 @@ framework but usable standalone.
 > the round-128 ALPHA-writer negative-`alpha_q` desync fix (which
 > currently obscures per-band on-wire α/β recovery through the full
 > PCM→MDCT→writer→parser→synth chain when the analytic α quantises to a
-> non-center lane) remain deferred.
+> non-center lane) remain deferred. Round 174 closes the desync fix at
+> the codebook contract level: ALPHA / BETA3 **F0** `cb_off` corrected
+> per §A.3 Tables A.34 / A.35 / A.46 / A.47. Pre-fix `cb_off = 0`
+> conflicted with the §5.7.7.7 Pseudocode 121 differential-decoder /
+> [`acpl_synth::dequantize_alpha_index`] signed-lane contract; the
+> ALPHA F0 codebooks (17-entry Coarse / 33-entry Fine) are symmetric
+> around the centre with a 1-bit peak at the `alpha_q = 0` lane, so
+> `cb_off = N/2` (8 Coarse / 16 Fine) is the right offset to read
+> back signed `alpha_q ∈ [-N/2, +N/2]` directly from `decode_delta`.
+> The fix lands in both [`acpl::get_acpl_hcb`] (decoder side) and the
+> encoder's local [`encoder_acpl3::acpl_hcb_arrays`] mirror, plus the
+> symmetric BETA3 F0 codebooks (`cb_off = 4` Coarse / `8` Fine — the
+> §5.7.7.7 `dequantize_beta3` multiplies the signed lane by
+> `beta3_delta(qm)` directly so they share ALPHA's signed convention).
+> BETA F0 stays at `cb_off = 0` (unsigned magnitude — Table 204 / 206
+> stores positive entries only and `dequantize_beta_index` takes
+> `unsigned_abs` then re-applies the sign carried in by the differential
+> accumulator). Three new unit tests
+> ([`alpha_f0_signed_lanes_round_trip_fine_and_coarse`],
+> [`beta3_f0_signed_lanes_round_trip_fine_and_coarse`],
+> [`alpha_f0_zero_alpha_picks_one_bit_peak`]) sweep every signed lane
+> through encode → `decode_delta` and confirm the writer now picks the
+> 1-bit symmetric peak for `alpha_q = 0` (down from 10 / 12 bits
+> pre-fix). The round-128 family
+> (`encode_5_0_acpl1_real_alpha_emits_nonzero_alpha_when_surround_differs`,
+> `..._symmetric_scaling_yields_matching_alpha`) is re-shaped to assert
+> on encoder byte-stream divergence rather than the decoder's recovered
+> `alpha_q` — bit-position drift through the full 5_X SIMPLE/ASPX_ACPL_1
+> walker on non-silence input is independent of the F0 cb_off bug and
+> still pending separate investigation (it manifests as a misalignment
+> upstream of `parse_acpl_data_1ch`, not in the ACPL F0 codeword
+> itself). Total tests 776 (was 773).
 
 ## Specs
 

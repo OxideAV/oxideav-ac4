@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Round 174 — ALPHA / BETA3 F0 codebook `cb_off` corrected** per ETSI
+  TS 103 190-1 §A.3 Tables A.34 / A.35 (ALPHA) and A.46 / A.47 (BETA3).
+  - Pre-fix `cb_off = 0` for ALPHA / BETA3 F0 conflicted with the §5.7.7.7
+    Pseudocode 121 differential-decoder contract — `dequantize_alpha_index`
+    re-adds the signed-lane offset (`+8` Coarse / `+16` Fine for ALPHA),
+    expecting the Huffman pipeline to deliver the signed quantised lane
+    `alpha_q ∈ [-N/2, +N/2]`. With `cb_off = 0` the F0 codeword
+    `symbol_index` was returned raw (unsigned 0..N), shifting every
+    dequant lookup by `N/2` lanes.
+  - Symptom: the round-128 / 132 / 135 / 139 / 144 real-α / α+β encoder
+    paths populated `alpha_q_per_band` correctly via `quantise_alpha`
+    (which already returned signed lanes via its own `cb_off = 8 / 16`)
+    but `write_acpl_alpha_f0_value` then wrote `symbol_index = alpha_q`
+    instead of `symbol_index = alpha_q + 8 / 16`. For `alpha_q = 0` the
+    writer picked the **most expensive** lane (10 / 12 bits) instead of
+    the 1-bit symmetric peak; for negative `alpha_q` the writer clamped
+    to lane 0; positive `alpha_q` round-tripped accidentally for
+    sufficiently small magnitudes via the raw `symbol_index` lookup. The
+    decoder dequant lane shifted by `cb_off`, producing wrong
+    dequantised α magnitudes.
+  - Fix: set `cb_off = 8` (Coarse) / `16` (Fine) for ALPHA F0 in both
+    [`crate::acpl::get_acpl_hcb`] (decoder) and the matching encoder-
+    local `acpl_hcb_arrays` in [`crate::encoder_acpl3`]. Same shape
+    applied to BETA3 F0 (`cb_off = 4` Coarse / `8` Fine — `dequantize_beta3`
+    multiplies the signed lane by `beta3_delta` directly). BETA F0 stays
+    at `cb_off = 0` (unsigned magnitude — `dequantize_beta_index` takes
+    `unsigned_abs` and re-applies the sign from the differential
+    accumulator). Companion comment edits document the asymmetry.
+  - 3 new round-174 unit tests:
+    [`alpha_f0_signed_lanes_round_trip_fine_and_coarse`] sweeps every
+    signed lane in both ALPHA F0 codebooks through encode → decode →
+    decode value; [`beta3_f0_signed_lanes_round_trip_fine_and_coarse`]
+    does the same for BETA3 F0; [`alpha_f0_zero_alpha_picks_one_bit_peak`]
+    confirms the writer now picks the 1-bit symmetric peak for
+    `alpha_q = 0` (down from the pre-fix 10 / 12 bits). Total tests
+    776 (was 773).
+  - Round-128 family tests
+    (`encode_5_0_acpl1_real_alpha_emits_nonzero_alpha_when_surround_differs`
+    + `..._symmetric_scaling_yields_matching_alpha`) re-shaped to assert
+    on encoder byte-stream divergence rather than the decoder's
+    recovered `alpha_q` — bit-position drift through the full 5_X
+    SIMPLE/ASPX_ACPL_1 walker on non-silence input is independent of
+    the F0 cb_off bug and still pending separate investigation (the
+    user's "alpha_q desync" followup tracks it).
+
 ### Added
 
 - **Round 144 — 5_X SIMPLE/ASPX_ACPL_2 encoder with real per-parameter-

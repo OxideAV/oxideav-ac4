@@ -92,9 +92,14 @@ pub enum AcplInterpolationType {
 /// Pulled from [`crate::acpl_huffman`]. Decoded values are
 /// `symbol_index - cb_off` (per §4.2.13.7 Table 65, every Huffman call
 /// in `acpl_huff_data()` goes through `huff_decode_diff` regardless of
-/// F0 vs DF vs DT — for the F0 codebooks where `cb_off = 0` this is a
-/// no-op; for the GAMMA F0 codebooks `cb_off` is non-zero (10 / 20)
-/// and the offset matters).
+/// F0 vs DF vs DT). For the symmetric codebooks (ALPHA / BETA3 / GAMMA
+/// F0 and every DF / DT) `cb_off = (len - 1) / 2` so the decoded value
+/// is the signed quantised lane `q ∈ [-N/2, +N/2]`. The BETA F0
+/// codebooks are *asymmetric* (monotonically increasing length) and
+/// carry an unsigned magnitude — `cb_off = 0` and the sign is recovered
+/// by the differential decoder (DF / DT may push the running value
+/// negative; [`crate::acpl_synth::dequantize_beta_index`] then takes
+/// `unsigned_abs` and re-applies the sign).
 #[derive(Debug, Clone, Copy)]
 pub struct AcplHcb {
     pub name: &'static str,
@@ -141,17 +146,24 @@ pub fn get_acpl_hcb(dt: AcplDataType, qm: AcplQuantMode, ht: AcplHcbType) -> Acp
     use AcplQuantMode::*;
     match (dt, qm, ht) {
         // ALPHA — Tables A.34..A.39
+        // ALPHA F0 codebooks are symmetric around the center index — Coarse
+        // peaks (len=1) at idx 8 of 17 entries, Fine peaks at idx 16 of 33
+        // entries. The `decode_delta` contract returns `symbol_index -
+        // cb_off`, so the F0 codeword's signed quantised lane is
+        // `alpha_q ∈ [-N/2, +N/2]` with `cb_off = N/2`. The dequantisation
+        // tables (`ALPHA_DQ_*`, indexed by `alpha_q + cb_off`) are addressed
+        // in the same signed space (see `dequantize_alpha_index`).
         (Alpha, Coarse, F0) => AcplHcb {
             name: "ACPL_HCB_ALPHA_COARSE_F0",
             len: ACPL_HCB_ALPHA_COARSE_F0_LEN,
             cw: ACPL_HCB_ALPHA_COARSE_F0_CW,
-            cb_off: 0,
+            cb_off: 8,
         },
         (Alpha, Fine, F0) => AcplHcb {
             name: "ACPL_HCB_ALPHA_FINE_F0",
             len: ACPL_HCB_ALPHA_FINE_F0_LEN,
             cw: ACPL_HCB_ALPHA_FINE_F0_CW,
-            cb_off: 0,
+            cb_off: 16,
         },
         (Alpha, Coarse, Df) => AcplHcb {
             name: "ACPL_HCB_ALPHA_COARSE_DF",
@@ -215,17 +227,22 @@ pub fn get_acpl_hcb(dt: AcplDataType, qm: AcplQuantMode, ht: AcplHcbType) -> Acp
             cb_off: 8,
         },
         // BETA3 — Tables A.46..A.51
+        // BETA3 F0 codebooks are signed: 9 entries Coarse (peak around
+        // idx 3-4 → signed `beta3_q ∈ [-4, +4]`) and 17 entries Fine
+        // (peak around idx 8 → `beta3_q ∈ [-8, +8]`). `dequantize_beta3`
+        // multiplies the signed `beta3_q` by `beta3_delta(qm)` directly,
+        // so the same `cb_off = N/2` convention as ALPHA / DF / DT applies.
         (Beta3, Coarse, F0) => AcplHcb {
             name: "ACPL_HCB_BETA3_COARSE_F0",
             len: ACPL_HCB_BETA3_COARSE_F0_LEN,
             cw: ACPL_HCB_BETA3_COARSE_F0_CW,
-            cb_off: 0,
+            cb_off: 4,
         },
         (Beta3, Fine, F0) => AcplHcb {
             name: "ACPL_HCB_BETA3_FINE_F0",
             len: ACPL_HCB_BETA3_FINE_F0_LEN,
             cw: ACPL_HCB_BETA3_FINE_F0_CW,
-            cb_off: 0,
+            cb_off: 8,
         },
         (Beta3, Coarse, Df) => AcplHcb {
             name: "ACPL_HCB_BETA3_COARSE_DF",
@@ -780,18 +797,22 @@ mod tests {
     }
 
     /// Encode one Huffman codeword for ALPHA_COARSE_F0 at index = 8
-    /// (cb_off = 0 → recovered delta = 8). Index 8 has the shortest
-    /// codeword in that table (len=1, cw=0).
+    /// (cb_off = 8 → recovered `alpha_q` = 0). Index 8 has the shortest
+    /// codeword in that table (len=1, cw=0) and the codebook is
+    /// symmetric around it, so the wire codeword reads back as the
+    /// signed quantised lane `alpha_q = symbol_index - cb_off`.
     #[test]
     fn alpha_coarse_f0_decodes_zero_delta() {
         let hcb = get_acpl_hcb(AcplDataType::Alpha, AcplQuantMode::Coarse, AcplHcbType::F0);
-        // Spec table A.34: cb_off = 0; index 8 is "shortest" (len=1, cw=0).
+        // Spec table A.34: symmetric 17-entry codebook with the peak
+        // (len=1, cw=0) at index 8 — that's the `alpha_q = 0` lane.
+        assert_eq!(hcb.cb_off, 8);
         let mut bw = BitWriter::new();
         bw.write_u32(0, 1);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
-        assert_eq!(hcb.decode_delta(&mut br).unwrap(), 8);
+        assert_eq!(hcb.decode_delta(&mut br).unwrap(), 0);
     }
 
     /// Encode the cb_off=16 delta-zero codeword for ALPHA_COARSE_DF
@@ -808,6 +829,113 @@ mod tests {
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
         assert_eq!(hcb.decode_delta(&mut br).unwrap(), 0);
+    }
+
+    /// Round 174 — the ALPHA F0 codebooks (both Fine and Coarse) round-trip
+    /// signed lanes `alpha_q ∈ [-N/2, +N/2]` exactly: encode the codeword at
+    /// `symbol_index = alpha_q + cb_off` then `decode_delta` must return
+    /// `alpha_q`. Covers every lane in both codebooks; verifies the
+    /// `cb_off` fix at the contract level (see commit message for the
+    /// latent-bug context — pre-fix `cb_off = 0` round-tripped only the
+    /// `alpha_q == 0` lane correctly, every signed lane was either lost
+    /// (negative → clamped to 0) or shifted (positive → preserved as raw
+    /// `symbol_index`, breaking the dequant LUT).
+    #[test]
+    fn alpha_f0_signed_lanes_round_trip_fine_and_coarse() {
+        // Fine: 33-entry table, signed lanes -16..=+16.
+        let hcb = get_acpl_hcb(AcplDataType::Alpha, AcplQuantMode::Fine, AcplHcbType::F0);
+        assert_eq!(hcb.cb_off, 16);
+        for alpha_q in -16i32..=16i32 {
+            let idx = (alpha_q + hcb.cb_off) as usize;
+            let mut bw = BitWriter::new();
+            bw.write_u32(hcb.cw[idx], hcb.len[idx] as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = hcb.decode_delta(&mut br).unwrap();
+            assert_eq!(
+                got, alpha_q,
+                "ALPHA_FINE F0 alpha_q={alpha_q} did not round-trip (got {got})"
+            );
+        }
+        // Coarse: 17-entry table, signed lanes -8..=+8.
+        let hcb = get_acpl_hcb(AcplDataType::Alpha, AcplQuantMode::Coarse, AcplHcbType::F0);
+        assert_eq!(hcb.cb_off, 8);
+        for alpha_q in -8i32..=8i32 {
+            let idx = (alpha_q + hcb.cb_off) as usize;
+            let mut bw = BitWriter::new();
+            bw.write_u32(hcb.cw[idx], hcb.len[idx] as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = hcb.decode_delta(&mut br).unwrap();
+            assert_eq!(
+                got, alpha_q,
+                "ALPHA_COARSE F0 alpha_q={alpha_q} did not round-trip (got {got})"
+            );
+        }
+    }
+
+    /// Round 174 — BETA3 F0 codebooks (Fine and Coarse) round-trip signed
+    /// lanes `beta3_q ∈ [-N/2, +N/2]`. The §5.7.7.7 dequantiser
+    /// `dequantize_beta3` multiplies the recovered `beta3_q` by
+    /// `beta3_delta(qm)` directly (signed), so the F0 codeword must also
+    /// carry the signed lane — same contract as ALPHA / DF / DT.
+    #[test]
+    fn beta3_f0_signed_lanes_round_trip_fine_and_coarse() {
+        // Fine: 17-entry table, signed lanes -8..=+8.
+        let hcb = get_acpl_hcb(AcplDataType::Beta3, AcplQuantMode::Fine, AcplHcbType::F0);
+        assert_eq!(hcb.cb_off, 8);
+        for beta3_q in -8i32..=8i32 {
+            let idx = (beta3_q + hcb.cb_off) as usize;
+            let mut bw = BitWriter::new();
+            bw.write_u32(hcb.cw[idx], hcb.len[idx] as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = hcb.decode_delta(&mut br).unwrap();
+            assert_eq!(
+                got, beta3_q,
+                "BETA3_FINE F0 beta3_q={beta3_q} did not round-trip (got {got})"
+            );
+        }
+        // Coarse: 9-entry table, signed lanes -4..=+4.
+        let hcb = get_acpl_hcb(AcplDataType::Beta3, AcplQuantMode::Coarse, AcplHcbType::F0);
+        assert_eq!(hcb.cb_off, 4);
+        for beta3_q in -4i32..=4i32 {
+            let idx = (beta3_q + hcb.cb_off) as usize;
+            let mut bw = BitWriter::new();
+            bw.write_u32(hcb.cw[idx], hcb.len[idx] as u32);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let got = hcb.decode_delta(&mut br).unwrap();
+            assert_eq!(
+                got, beta3_q,
+                "BETA3_COARSE F0 beta3_q={beta3_q} did not round-trip (got {got})"
+            );
+        }
+    }
+
+    /// Round 174 — `alpha_q == 0` now resolves to the 1-bit peak codeword.
+    /// Pre-fix (`cb_off = 0`) the writer mapped `alpha_q = 0 → symbol_index
+    /// = 0`, which is the **most expensive** lane in the table (10 / 12
+    /// bits depending on Fine vs Coarse). Post-fix the writer picks
+    /// `symbol_index = cb_off = N/2`, the symmetric peak — a single bit.
+    #[test]
+    fn alpha_f0_zero_alpha_picks_one_bit_peak() {
+        let hcb = get_acpl_hcb(AcplDataType::Alpha, AcplQuantMode::Coarse, AcplHcbType::F0);
+        let idx = hcb.cb_off as usize;
+        assert_eq!(
+            hcb.len[idx], 1,
+            "alpha_q = 0 must address the 1-bit peak entry in COARSE F0"
+        );
+        let hcb = get_acpl_hcb(AcplDataType::Alpha, AcplQuantMode::Fine, AcplHcbType::F0);
+        let idx = hcb.cb_off as usize;
+        assert_eq!(
+            hcb.len[idx], 1,
+            "alpha_q = 0 must address the 1-bit peak entry in FINE F0"
+        );
     }
 
     /// GAMMA_FINE_DT cb_off = 40. Index 40 has the shortest codeword
@@ -915,7 +1043,8 @@ mod tests {
     fn huff_data_freq_alpha_round_trips() {
         let hcb_f0 = get_acpl_hcb(AcplDataType::Alpha, AcplQuantMode::Coarse, AcplHcbType::F0);
         let hcb_df = get_acpl_hcb(AcplDataType::Alpha, AcplQuantMode::Coarse, AcplHcbType::Df);
-        // F0 cb_off = 0, want delta = 8 → encode index 8 (len=1, cw=0).
+        // F0 cb_off = 8 (symmetric Coarse 17-entry codebook); want
+        // alpha_q = 0 → encode index 8 (len=1, cw=0).
         // DF cb_off = 16, want delta 0, +1, -1 → indexes 16, 17, 15.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 1); // diff_type = 0 → DIFF_FREQ
@@ -930,7 +1059,11 @@ mod tests {
         let p = parse_acpl_huff_data(&mut br, AcplDataType::Alpha, 4, 0, AcplQuantMode::Coarse)
             .unwrap();
         assert!(!p.direction_time);
-        assert_eq!(p.values, vec![8, 0, 1, -1]);
+        // alpha_q = 0 (signed F0 lane) then 3 DF deltas accumulate:
+        // 0 + 0 = 0, then +1 → 1, then -1 → 0 (post-accumulation lives
+        // in `differential_decode`; here we only verify the raw decoded
+        // huffman values: [F0_alpha_q, DF_delta, DF_delta, DF_delta]).
+        assert_eq!(p.values, vec![0, 0, 1, -1]);
     }
 
     /// Round-trip: TIME direction (DT only) for BETA. Encode 3 bands.

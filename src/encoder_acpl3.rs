@@ -200,9 +200,12 @@ fn acpl_hcb_arrays(
     use crate::acpl::AcplQuantMode::*;
     use acpl_huffman::*;
     match (dt, qm, ht) {
-        // ALPHA
-        (Alpha, Coarse, F0) => (ACPL_HCB_ALPHA_COARSE_F0_LEN, ACPL_HCB_ALPHA_COARSE_F0_CW, 0),
-        (Alpha, Fine, F0) => (ACPL_HCB_ALPHA_FINE_F0_LEN, ACPL_HCB_ALPHA_FINE_F0_CW, 0),
+        // ALPHA — F0 codebooks are symmetric (Coarse 17 entries / Fine 33
+        // entries) so the signed `alpha_q ∈ [-N/2, +N/2]` lives at
+        // `symbol_index = alpha_q + cb_off` with `cb_off = N/2`. Must
+        // match [`crate::acpl::get_acpl_hcb`] for round-trip parity.
+        (Alpha, Coarse, F0) => (ACPL_HCB_ALPHA_COARSE_F0_LEN, ACPL_HCB_ALPHA_COARSE_F0_CW, 8),
+        (Alpha, Fine, F0) => (ACPL_HCB_ALPHA_FINE_F0_LEN, ACPL_HCB_ALPHA_FINE_F0_CW, 16),
         (Alpha, Coarse, Df) => (
             ACPL_HCB_ALPHA_COARSE_DF_LEN,
             ACPL_HCB_ALPHA_COARSE_DF_CW,
@@ -222,9 +225,12 @@ fn acpl_hcb_arrays(
         (Beta, Fine, Df) => (ACPL_HCB_BETA_FINE_DF_LEN, ACPL_HCB_BETA_FINE_DF_CW, 8),
         (Beta, Coarse, Dt) => (ACPL_HCB_BETA_COARSE_DT_LEN, ACPL_HCB_BETA_COARSE_DT_CW, 4),
         (Beta, Fine, Dt) => (ACPL_HCB_BETA_FINE_DT_LEN, ACPL_HCB_BETA_FINE_DT_CW, 8),
-        // BETA3
-        (Beta3, Coarse, F0) => (ACPL_HCB_BETA3_COARSE_F0_LEN, ACPL_HCB_BETA3_COARSE_F0_CW, 0),
-        (Beta3, Fine, F0) => (ACPL_HCB_BETA3_FINE_F0_LEN, ACPL_HCB_BETA3_FINE_F0_CW, 0),
+        // BETA3 — F0 codebooks are symmetric (Coarse 9 / Fine 17) so the
+        // signed `beta3_q ∈ [-N/2, +N/2]` lives at `symbol_index =
+        // beta3_q + cb_off` with `cb_off = N/2`. Must match
+        // [`crate::acpl::get_acpl_hcb`] for round-trip parity.
+        (Beta3, Coarse, F0) => (ACPL_HCB_BETA3_COARSE_F0_LEN, ACPL_HCB_BETA3_COARSE_F0_CW, 4),
+        (Beta3, Fine, F0) => (ACPL_HCB_BETA3_FINE_F0_LEN, ACPL_HCB_BETA3_FINE_F0_CW, 8),
         (Beta3, Coarse, Df) => (ACPL_HCB_BETA3_COARSE_DF_LEN, ACPL_HCB_BETA3_COARSE_DF_CW, 8),
         (Beta3, Fine, Df) => (ACPL_HCB_BETA3_FINE_DF_LEN, ACPL_HCB_BETA3_FINE_DF_CW, 16),
         (Beta3, Coarse, Dt) => (ACPL_HCB_BETA3_COARSE_DT_LEN, ACPL_HCB_BETA3_COARSE_DT_CW, 8),
@@ -1787,8 +1793,10 @@ fn write_acpl_beta_df_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, 
 
 /// Write the ACPL ALPHA F0 codeword for a recovered `alpha_q` index per
 /// §A.3 Table A.35 (Fine) / Table A.34 (Coarse). The Huffman table is
-/// addressed by `symbol_index = alpha_q + cb_off` (cb_off = 0 for the F0
-/// codebooks per [`acpl_hcb_arrays`]).
+/// addressed by `symbol_index = alpha_q + cb_off` (cb_off = 8 Coarse /
+/// 16 Fine for the ALPHA F0 codebooks per [`acpl_hcb_arrays`] — the
+/// codebooks are symmetric around the centre index so `alpha_q`
+/// carries its sign).
 fn write_acpl_alpha_f0_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, alpha_q: i32) {
     let (len, cw, cb_off) = acpl_hcb_arrays(
         crate::acpl::AcplDataType::Alpha,

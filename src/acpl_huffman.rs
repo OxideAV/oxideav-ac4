@@ -377,19 +377,22 @@ mod tests {
     /// All 24 tables paired up so we can sweep them with one helper.
     fn all_acpl_tables() -> Vec<AcplTableRow> {
         vec![
+            // ALPHA F0 codebooks are symmetric (peak at the centre index)
+            // so the `cb_off` matches `get_acpl_hcb`'s signed-lane
+            // convention (cb_off = (len - 1) / 2 = 8 Coarse / 16 Fine).
             (
                 "ACPL_HCB_ALPHA_COARSE_F0",
                 ACPL_HCB_ALPHA_COARSE_F0_LEN,
                 ACPL_HCB_ALPHA_COARSE_F0_CW,
                 17,
-                0,
+                8,
             ),
             (
                 "ACPL_HCB_ALPHA_FINE_F0",
                 ACPL_HCB_ALPHA_FINE_F0_LEN,
                 ACPL_HCB_ALPHA_FINE_F0_CW,
                 33,
-                0,
+                16,
             ),
             (
                 "ACPL_HCB_ALPHA_COARSE_DF",
@@ -461,19 +464,22 @@ mod tests {
                 17,
                 8,
             ),
+            // BETA3 F0 codebooks are symmetric so the `cb_off` matches
+            // `get_acpl_hcb`'s signed-lane convention (cb_off = (len - 1)
+            // / 2 = 4 Coarse / 8 Fine).
             (
                 "ACPL_HCB_BETA3_COARSE_F0",
                 ACPL_HCB_BETA3_COARSE_F0_LEN,
                 ACPL_HCB_BETA3_COARSE_F0_CW,
                 9,
-                0,
+                4,
             ),
             (
                 "ACPL_HCB_BETA3_FINE_F0",
                 ACPL_HCB_BETA3_FINE_F0_LEN,
                 ACPL_HCB_BETA3_FINE_F0_CW,
                 17,
-                0,
+                8,
             ),
             (
                 "ACPL_HCB_BETA3_COARSE_DF",
