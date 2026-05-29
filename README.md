@@ -609,7 +609,24 @@ framework but usable standalone.
 > joint-MDCT residual-layer alignment issue between
 > [`encoder_acpl3::write_acpl_1_residual_layer`] and the decoder's
 > `parse_aspx_acpl_1_2_inner_body` residual-pair walker — tracked
-> as the remaining follow-up.
+> as the remaining follow-up. Round 187 pins that follow-up with four
+> end-to-end characterisation tests (silence / L-only / Ls-only /
+> combined) that sweep
+> [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_real_alpha_beta`]
+> and assert each pair slot's recovered
+> `acpl_data_1ch_pair[0/1].framing.num_param_sets` so the next round
+> can iterate on the residual / α-β writers without regressing the
+> aligned silence / L-only / Ls-only paths. The diagnostic narrative
+> in `tests/round187_acpl1_residual_desync_characterization.rs`
+> triangulates the drift surface: writer→parser pairs for
+> [`encoder_acpl3::write_acpl_data_1ch_real_alpha_beta_bytes`] ↔
+> [`acpl::parse_acpl_data_1ch`] are bit-exact in isolation (already
+> pinned by `round181_alpha_desync_fix::standalone_*`), so the
+> remaining drift sits upstream of pair0 — either in
+> `write_acpl_1_residual_layer` vs the inline residual walk inside
+> `parse_aspx_acpl_1_2_inner_body`'s ASPX_ACPL_1 branch, or in
+> `write_two_channel_data` vs `parse_two_channel_data` — when L and
+> Ls are simultaneously non-trivial. Total tests 784 (was 780).
 
 ## Specs
 

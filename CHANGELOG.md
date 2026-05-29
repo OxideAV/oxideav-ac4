@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 187 — characterisation tests pinning the remaining
+  5_X ASPX_ACPL_1 residual / α-β-writer desync the r181 follow-up
+  flagged.** Four end-to-end pinning tests in
+  `tests/round187_acpl1_residual_desync_characterization.rs` sweep
+  the encoder's `encode_frame_pcm_5_0_acpl1_real_alpha_beta` across
+  four input combinations and assert the decoder's recovered
+  `acpl_data_1ch_pair[0/1].framing.num_param_sets` so the next round
+  can iterate on the residual-layer / α-β writers without regressing
+  the aligned silence / L-only / Ls-only paths.
+  - Silence (all-zero PCM) → both pair slots resolve
+    `num_param_sets = 1`.
+  - L-carrier-only (`Ls = Rs = 0`) → both pair slots resolve
+    `num_param_sets = 1`; the `write_two_channel_data` carrier writer
+    is exercised non-trivially while α / β stay quantised to 0
+    (correlation `Σ L · Ls = 0` ⇒ α extractor returns 0; surround
+    energy `E[Ls²] = 0` ⇒ β extractor returns 0).
+  - Ls-residual-only (`L = R = 0`) → both pair slots still resolve
+    `num_param_sets = 1`; the `write_acpl_1_residual_layer` joint-MDCT
+    residual writer is exercised non-trivially with `max_sfb_master`
+    non-zero band budget but α / β stay 0 because carrier energy is 0.
+  - Combined L-carrier + Ls-residual (`L = 0.5`, `Ls = 0.05`) →
+    pair0 still resolves `num_param_sets = 1`, but pair1 drifts to
+    `num_param_sets = 2`. The pin captures this as the **currently
+    expected** behaviour so the next round's residual-layer fix can
+    flip the assertion back to 1 once aligned.
+  - Diagnostic narrative in the test file's module doc-comment
+    triangulates the bug surface: the writer→parser pairs for
+    `write_acpl_data_1ch_real_alpha_beta` ↔ `parse_acpl_data_1ch`
+    are bit-exact in isolation (pinned by
+    `round181_alpha_desync_fix::standalone_*`); back-to-back
+    invocations into the same `BitWriter` without byte alignment
+    between them also round-trip cleanly. The drift therefore sits
+    upstream of pair0 — either in the joint-MDCT residual writer
+    (`write_acpl_1_residual_layer`) vs the inline residual walk
+    inside `parse_aspx_acpl_1_2_inner_body`'s ASPX_ACPL_1 branch, or
+    in the `two_channel_data()` L/R carrier writer vs
+    `parse_two_channel_data` — when L and Ls are simultaneously
+    non-trivial. Total tests 784 (was 780).
+
 ### Fixed
 
 - **Round 181 — A-CPL `acpl_huff_data()` Pseudocode-121 indexing +
