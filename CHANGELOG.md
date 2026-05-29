@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Round 181 — A-CPL `acpl_huff_data()` Pseudocode-121 indexing +
+  `aspx_data_2ch()` SIGNAL band count.** Closes the user's "alpha_q
+  desync" follow-up the round-174 ALPHA / BETA3 F0 `cb_off` fix
+  deferred. Two distinct layers were involved.
+  - **Layer 1 — §4.2.13.7 Table 65 / §5.7.7.7 Pseudocode 121 parser
+    indexing.** Pre-r181 [`crate::acpl::parse_acpl_huff_data`] packed
+    the `(num_param_bands - start_band)` Huffman-decoded values into
+    a vector starting at index 0. Per the spec the same array is the
+    input to Pseudocode 121's `for (i = 0; i < num_bands; i++)`
+    accumulation — so positions `[0..start_band)` are zero (the
+    encoder did not transmit those bands) and the F0 codeword lands at
+    `values[start_band]`. The packed-from-0 layout silently shifted
+    the §5.7.7.7 DIFF_FREQ accumulation by `start_band` parameter
+    bands for the 5_X SIMPLE/ASPX_ACPL_1 PARTIAL path
+    (`acpl_qmf_band > 0`, `start_band > 0`). The r181 fix rewrites
+    [`crate::acpl::parse_acpl_huff_data`] to return a length-
+    `num_param_bands` vector indexed by full param-band number — the
+    spec-aligned `acpl_<SET>[ps][i]` shape Pseudocode 121 reads. The
+    `[`AcplHuffParam`] doc comment now spells out the new indexing
+    contract.
+  - **Layer 2 — §4.2.12.4 Table 52 `aspx_data_2ch()` SIGNAL band
+    count.** Per ETSI TS 103 190-1 §4.3.10.4.9 (Table 124 NOTE 3)
+    `aspx_ec_data(SIGNAL, …)` reads `num_sbg_sig_lowres` SIGNAL bands
+    when the corresponding `aspx_freq_res[env]` bit was emitted as 0
+    and `num_sbg_sig_highres` when it was 1 or absent (when
+    `freq_res_mode != Signalled` the encoder writes no in-band
+    `aspx_freq_res` bit and the decoder's
+    `freq_res.get(env).copied().unwrap_or(true)` fallback selects
+    high-res). Pre-r181 [`crate::encoder_acpl3::write_aspx_data_2ch_minimal`]
+    hard-coded `num_sbg_sig_lowres` regardless — so for the
+    encoder's default `freq_res_mode = DurationDependent` config
+    (20-band high-res vs 10-band low-res, no in-band freq_res bit)
+    the writer emitted 10 SIGNAL F0+DF codewords per channel while
+    the parser read 20. The 20-vs-10 mismatch buried every
+    subsequent `acpl_data_1ch()` α / β codeword in trailing
+    zero-padding, recovered as length-`num_param_bands` all-zero
+    rows. r181 keys the SIGNAL band count off `cfg.signals_freq_res()`
+    matching the writer's own freq_res-bit gate.
+  - 4 new round-181 unit / integration tests in
+    `tests/round181_alpha_desync_fix.rs`:
+    [`standalone_alpha_writer_round_trips_through_parser`] (Layer 1,
+    standalone writer→parser→`differential_decode`),
+    [`parser_values_are_indexed_by_full_param_band_number`] (Layer 1,
+    structural — confirms `values[0..start_band) == 0` and
+    `values[start_band..]` carries the F0 + DF accumulation),
+    [`end_to_end_acpl2_asymmetric_surround_recovers_nonzero_alpha`]
+    (Layer 2 — encode 5.0 ASPX_ACPL_2 with asymmetric L/Ls energy,
+    decode, assert `acpl_data_1ch_pair[0/1].alpha1[0].values`
+    carries non-zero entries),
+    [`end_to_end_acpl2_silence_still_round_trips`] (Layer 2 regression
+    guard — silence input still yields all-zero α/β). Total tests
+    780 (was 776).
+  - The r132 `acpl_data_1ch_real_alpha_beta_round_trips_byte_exact`
+    test is re-shaped to apply the spec-aligned Pseudocode 121 DIFF_FREQ
+    accumulation directly on the parser's length-`num_param_bands`
+    output (instead of cumulating the pre-r181 packed
+    `(num_bands - start_band)`-length slice).
+  - The 5_X SIMPLE/ASPX_ACPL_1 PARTIAL end-to-end path retains a
+    separate joint-MDCT residual-layer alignment issue (the residual
+    sf_data writer and the decoder's `decode_asf_long_mono_body_with_max_sfb`
+    appear to read different total bit counts on non-trivial inputs)
+    that the r181 ACPL_2 end-to-end tests do not exercise. Tracking
+    as the remaining "alpha_q desync" follow-up — the structural
+    Layer 1 + Layer 2 fixes are independent of it and land here.
+
 - **Round 174 — ALPHA / BETA3 F0 codebook `cb_off` corrected** per ETSI
   TS 103 190-1 §A.3 Tables A.34 / A.35 (ALPHA) and A.46 / A.47 (BETA3).
   - Pre-fix `cb_off = 0` for ALPHA / BETA3 F0 conflicted with the §5.7.7.7

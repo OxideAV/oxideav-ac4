@@ -515,13 +515,39 @@ pub fn parse_acpl_framing_data(br: &mut BitReader<'_>) -> Result<AcplFramingData
 // §4.2.13.7 — acpl_huff_data
 // =====================================================================
 
-/// One A-CPL Huffman parameter set: per-band recovered values from
-/// `acpl_huff_data()` (§4.2.13.7 Table 65).
+/// One A-CPL Huffman parameter set: per-parameter-band recovered Huffman
+/// values from `acpl_huff_data()` (§4.2.13.7 Table 65).
+///
+/// The layout is spec-aligned with Pseudocode 121 §5.7.7.7: `values[pb]`
+/// is the Huffman symbol the spec calls `acpl_<SET>[ps][pb]` and lives
+/// in the full param-band index space `[0 .. num_param_bands)`.
+/// Positions `[0 .. start_band)` are zero — those param bands were not
+/// transmitted by the encoder (they sit below `acpl_qmf_band`), and the
+/// spec's Pseudocode 121 then carries zero deltas through the
+/// `DIFF_FREQ` accumulation so that the recovered `acpl_<SET>_q[pb]`
+/// for `pb in 0..start_band` stays at the running `q_prev[pb]` (or zero
+/// at the start of the stream). Position `start_band` carries the F0
+/// codebook value, positions `(start_band+1)..num_param_bands` carry
+/// the DF (or DT) deltas, all spec-indexed.
+///
+/// Round 181 note: pre-r181 the parser packed the Huffman values into
+/// a `(num_param_bands - start_band)`-length vector starting at index
+/// 0, which silently shifted the §5.7.7.7 Pseudocode 121 accumulation
+/// by `start_band` parameter bands. For `start_band == 0` (the mono /
+/// centre / FULL `acpl_config_1ch` / Cfg3Five paths) the packed and
+/// spec-aligned layouts coincide; for `start_band > 0` (PARTIAL config
+/// in ASPX_ACPL_1) the packed layout produced an off-by-`start_band`
+/// drift in the recovered `alpha_q[pb]` row. The r181 fix aligns the
+/// parser output with Pseudocode 121's `acpl_<SET>[ps][pb]` indexing —
+/// see the `r181_standalone_alpha_writer_round_trips_through_parser`
+/// integration test for the reproduction case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcplHuffParam {
-    /// Per-band recovered deltas (`a_huff_data[start..data_bands]`).
-    /// First entry is the F0 / DT seed, subsequent are DF or DT
-    /// deltas depending on `direction_time`.
+    /// Spec-indexed per-parameter-band Huffman values. Length is
+    /// `num_param_bands`. Positions `[0 .. start_band)` are zero, the
+    /// F0 codeword lands at `values[start_band]`, and DF (or DT)
+    /// deltas occupy `[start_band+1 .. num_param_bands)` (or
+    /// `[start_band .. num_param_bands)` for DIFF_TIME).
     pub values: Vec<i32>,
     /// `false = DIFF_FREQ` (F0 + DF), `true = DIFF_TIME` (DT only).
     pub direction_time: bool,
@@ -536,7 +562,10 @@ pub struct AcplHuffParam {
 /// values for `start_band .. data_bands`) runs.
 ///
 /// `data_bands` is the *upper bound* (exclusive). Per the spec the
-/// loops index `i` from `start_band` to `data_bands` exclusive.
+/// loops index `i` from `start_band` to `data_bands` exclusive — the
+/// returned `AcplHuffParam.values` is a `data_bands`-length vector
+/// with the spec-correct indexing (positions `[0..start_band)` are
+/// zero — see [`AcplHuffParam`] for the rationale).
 pub fn parse_acpl_huff_data(
     br: &mut BitReader<'_>,
     data_type: AcplDataType,
@@ -550,24 +579,28 @@ pub fn parse_acpl_huff_data(
         ));
     }
     let diff_type = br.read_bit()?;
-    let mut values: Vec<i32> = Vec::with_capacity((data_bands - start_band) as usize);
+    // Spec-aligned layout per §5.7.7.7 Pseudocode 121: the recovered
+    // Huffman vector `acpl_<SET>[ps][i]` is indexed by param band in
+    // `[0 .. data_bands)`. Bands below `start_band` are zero (the
+    // encoder did not transmit them).
+    let mut values: Vec<i32> = vec![0; data_bands as usize];
     if !diff_type {
         // DIFF_FREQ
         if data_bands > start_band {
             let hcb_f0 = get_acpl_hcb(data_type, quant_mode, AcplHcbType::F0);
-            values.push(hcb_f0.decode_delta(br)?);
+            values[start_band as usize] = hcb_f0.decode_delta(br)?;
         }
         if data_bands > start_band + 1 {
             let hcb_df = get_acpl_hcb(data_type, quant_mode, AcplHcbType::Df);
-            for _ in (start_band + 1)..data_bands {
-                values.push(hcb_df.decode_delta(br)?);
+            for i in (start_band + 1)..data_bands {
+                values[i as usize] = hcb_df.decode_delta(br)?;
             }
         }
     } else {
         // DIFF_TIME
         let hcb_dt = get_acpl_hcb(data_type, quant_mode, AcplHcbType::Dt);
-        for _ in start_band..data_bands {
-            values.push(hcb_dt.decode_delta(br)?);
+        for i in start_band..data_bands {
+            values[i as usize] = hcb_dt.decode_delta(br)?;
         }
     }
     Ok(AcplHuffParam {

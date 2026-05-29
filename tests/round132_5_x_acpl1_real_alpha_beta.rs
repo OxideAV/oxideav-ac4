@@ -186,37 +186,35 @@ fn acpl_data_1ch_real_alpha_beta_round_trips_byte_exact() {
     assert_eq!(parsed.alpha1.len(), 1);
     assert_eq!(parsed.beta1.len(), 1);
 
-    // The parser returns the raw F0 + DF symbols (DIFF_FREQ direction).
-    // Reconstruct the absolute per-band indices by cumulative sum and
-    // compare to the encoder's bands start_band..num_bands.
-    let recover = |vals: &[i32]| -> Vec<i32> {
-        let mut out = Vec::with_capacity(vals.len());
-        let mut acc = 0;
-        for (i, &v) in vals.iter().enumerate() {
-            if i == 0 {
-                acc = v;
-            } else {
-                acc += v;
+    // Round 181 (spec-aligned Pseudocode 121 layout): the parser
+    // returns `AcplHuffParam.values` indexed by full param-band number
+    // `pb in 0..num_bands`. Positions `[0..start_band)` are zero, the
+    // F0 codeword's signed `alpha_q[start_band]` lands at
+    // `values[start_band]`, and DF deltas occupy
+    // `[start_band+1..num_bands)`. Apply Pseudocode 121's DIFF_FREQ
+    // accumulation across the full `num_bands` array and compare to the
+    // encoder's per-band input directly.
+    let pseudocode_121_diff_freq = |vals: &[i32]| -> Vec<i32> {
+        let mut row = vec![0i32; vals.len()];
+        if !vals.is_empty() {
+            row[0] = vals[0];
+            for i in 1..vals.len() {
+                row[i] = row[i - 1] + vals[i];
             }
-            out.push(acc);
         }
-        out
+        row
     };
-    let alpha_recovered = recover(&parsed.alpha1[0].values);
-    let beta_recovered = recover(&parsed.beta1[0].values);
-    let alpha_expected: Vec<i32> = (start_band..num_bands)
-        .map(|pb| alpha_q[pb as usize])
-        .collect();
-    let beta_expected: Vec<i32> = (start_band..num_bands)
-        .map(|pb| beta_q[pb as usize])
-        .collect();
+    let alpha_recovered = pseudocode_121_diff_freq(&parsed.alpha1[0].values);
+    let beta_recovered = pseudocode_121_diff_freq(&parsed.beta1[0].values);
     assert_eq!(
-        alpha_recovered, alpha_expected,
-        "α indices must round-trip byte-exact"
+        alpha_recovered,
+        alpha_q.to_vec(),
+        "α indices must round-trip byte-exact at spec param-band indexing"
     );
     assert_eq!(
-        beta_recovered, beta_expected,
-        "β indices must round-trip byte-exact (round-128 scaffold only carried β = 0)"
+        beta_recovered,
+        beta_q.to_vec(),
+        "β indices must round-trip byte-exact at spec param-band indexing"
     );
     // Confirm β actually carries non-zero values (vs the round-128 path).
     assert!(

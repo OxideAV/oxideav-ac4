@@ -510,9 +510,30 @@ fn write_aspx_data_2ch_minimal(
     // tic_present = 0 (no time-interleaved-coding).
     bw.write_bit(false);
 
-    // num_env=1, low-res freq_res → use num_sbg_sig_lowres.
-    // Per Table 57 NOTE / freq_res = 0 → low-res SIGNAL bands.
-    let num_sbg_sig = counts.num_sbg_sig_lowres;
+    // SIGNAL ec_data band count — per ETSI TS 103 190-1 §4.3.10.4.9
+    // (Table 124 NOTE 3) the SIGNAL ec_data walks `num_sbg_sig_highres`
+    // bands when the `aspx_freq_res[env]` bit is absent or set to 1,
+    // and `num_sbg_sig_lowres` only when an explicit
+    // `aspx_freq_res = 0` was emitted (the parser's
+    // `freq_res.get(env).copied().unwrap_or(true)` fallback selects
+    // the high-resolution count). The 2ch emitter above writes
+    // `aspx_freq_res[0] = 0` only when `cfg.signals_freq_res()` is
+    // true — so the SIGNAL ec_data band count follows that gate.
+    //
+    // Pre-r181 the 2ch emitter hard-coded `num_sbg_sig_lowres`
+    // regardless of `signals_freq_res()`, which for the encoder's
+    // default `DurationDependent` config caused a walker desync that
+    // buried every subsequent ACPL_1 / ACPL_2 `acpl_data_1ch()` α / β
+    // codeword in trailing zero-padding and silently produced
+    // all-zero recovered indices (the issue the user's "alpha_q
+    // desync" follow-up tracked).
+    let num_sbg_sig = if cfg.signals_freq_res() {
+        // freq_res bit emitted as 0 above → low-res selection on both channels.
+        counts.num_sbg_sig_lowres
+    } else {
+        // No freq_res bit emitted → parser defaults to high-res.
+        counts.num_sbg_sig_highres
+    };
     let num_sbg_noise = counts.num_sbg_noise;
 
     // ch0 SIGNAL: FREQ direction → F0 + (num_sbg_sig - 1) × DF.

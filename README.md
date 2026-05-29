@@ -585,7 +585,31 @@ framework but usable standalone.
 > walker on non-silence input is independent of the F0 cb_off bug and
 > still pending separate investigation (it manifests as a misalignment
 > upstream of `parse_acpl_data_1ch`, not in the ACPL F0 codeword
-> itself). Total tests 776 (was 773).
+> itself). Total tests 776 (was 773). Round 181 closes the deferred
+> "alpha_q desync" follow-up at two distinct spec-alignment layers.
+> Layer 1: [`acpl::parse_acpl_huff_data`] now returns a
+> spec-indexed length-`num_param_bands` vector matching §5.7.7.7
+> Pseudocode 121's `acpl_<SET>[ps][i]` shape (positions
+> `[0..start_band)` are zero, F0 lands at `values[start_band]`,
+> DF deltas occupy `[start_band+1..num_param_bands)`); pre-r181's
+> packed `(num_bands - start_band)`-length layout silently shifted
+> the DIFF_FREQ accumulation for the PARTIAL `acpl_config_1ch` path.
+> Layer 2: [`encoder_acpl3::write_aspx_data_2ch_minimal`] now keys
+> the SIGNAL ec_data band count off `cfg.signals_freq_res()` per
+> §4.3.10.4.9 (Table 124 NOTE 3) — when the encoder doesn't emit an
+> in-band `aspx_freq_res` bit, the parser's high-res fallback
+> selects `num_sbg_sig_highres` and the writer must match
+> (pre-r181 it hard-coded `num_sbg_sig_lowres`, causing a 20-vs-10
+> SIGNAL desync that buried every subsequent `acpl_data_1ch()`
+> α/β codeword in trailing zero-padding). End-to-end 5.0 ASPX_ACPL_2
+> asymmetric L/Ls input now recovers a non-zero per-band `alpha_q`
+> row on `acpl_data_1ch_pair[0/1]` through the full PCM →
+> MDCT → encode → AC-4 walker → `differential_decode` chain. Total
+> tests 780 (was 776). The ASPX_ACPL_1 path retains a separate
+> joint-MDCT residual-layer alignment issue between
+> [`encoder_acpl3::write_acpl_1_residual_layer`] and the decoder's
+> `parse_aspx_acpl_1_2_inner_body` residual-pair walker — tracked
+> as the remaining follow-up.
 
 ## Specs
 
