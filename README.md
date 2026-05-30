@@ -651,6 +651,34 @@ framework but usable standalone.
 > `acpl1_full_round_trips_with_aligned_pair_lengths` and asserts
 > `pair1.num_param_sets = 1`. Total tests 784 (unchanged from r187 —
 > r190 fixed the third pin in place rather than adding new ones).
+> Round 193 lifts the round-95 5_X ASPX_ACPL_3 encoder's β1 / β2
+> parameter sets out of the zero-delta scaffold: a new
+> [`encoder_acpl3::extract_beta_q_per_band_carrier_energy`] extracts
+> per-parameter-band β_q from a single carrier's MDCT energy
+> distribution (β proportional to `√E[x²]` keeps the wet/dry balance
+> bounded), and a sibling
+> [`encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_beta`]
+> drops it into the existing `acpl_data_2ch()` body in place of the
+> two zero-delta `acpl_huff_data()` codewords (α1 / α2 / β3 / γ1..γ6
+> stay at the round-95 minimum-bit-cost defaults). Caller-facing
+> [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_beta`]
+> / `encode_frame_pcm_5_1_acpl3_real_beta` wrap the new builder with
+> the same channel-mode forcing and TOC framing as their round-95
+> counterparts. With α1 = α2 = 0 and β3 = 0 the §5.7.7.6.2
+> Pseudocode 119 `ACplModule2` for the first parameter set reduces to
+> `z0 = 0.5·(x0·g1 + x1·g2 + y0·β1)`,
+> `z1 = 0.5·(x0·g1 + x1·g2 − y0·β1)` (and analogously `(z2, z3)`
+> with β2), so non-zero β1 / β2 injects the decorrelator output that
+> gives the Ls / Rs outputs their decorrelated spaciousness. Seven
+> integration tests in `tests/round193_5_x_acpl3_real_beta.rs` pin:
+> round-trip to 5- / 6-channel `AudioFrame` for 5.0 / 5.1; silent
+> input → all-zero β_q indices; tonal carrier + non-zero
+> `beta_scale` → at least one non-zero β_q lane; `beta_scale = 0.0`
+> is byte-for-byte identical to the round-95 scaffold (strict-superset
+> invariant); silent inputs at any `beta_scale` are scaffold-identical;
+> non-silent tonal inputs at `beta_scale > 0` diverge from the
+> scaffold (different β1 / β2 codeword bit-positions) while keeping
+> the padded substream length identical. Total tests 791 (was 784).
 
 ## Specs
 

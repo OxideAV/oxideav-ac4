@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 193 — real per-parameter-band β1 / β2 extraction in the
+  5_X SIMPLE/ASPX_ACPL_3 encoder.** The round-95 ASPX_ACPL_3 path
+  emits all 11 ACPL parameter sets as zero-delta Huffman codewords:
+  with α = β = β3 = γ = 0 the §5.7.7.6.2 Pseudocode 118 / 119
+  synthesis collapses to a trivial mix that produces silent surround
+  outputs from non-silent carrier inputs (structurally correct but
+  perceptually inert). This round adds three encoder surface entries
+  that lift β1 / β2 out of the zero-delta scaffold while keeping
+  α1 / α2 / β3 / γ1..γ6 at the round-95 minimum-bit-cost defaults.
+  - [`crate::encoder_acpl3::extract_beta_q_per_band_carrier_energy`]
+    — extracts per-parameter-band β_q from a single carrier's MDCT
+    energy distribution. The β parameter in ACplModule2 is the gain
+    applied to the decorrelator output; setting it proportional to
+    `√E[x²]` keeps the wet/dry balance bounded so the surround
+    reconstruction tracks the carrier RMS per band.
+  - [`crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_beta`]
+    — drop-in replacement for `build_5_x_acpl3_body_from_pcm_spectra`
+    that runs the carrier-energy extractor over the L / R inputs and
+    emits real β1 / β2 codewords. Mirrors the round-95 wire layout
+    everywhere else so the decoder walks the same Table 25 body.
+  - [`crate::encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_beta`]
+    and `encode_frame_pcm_5_1_acpl3_real_beta` — caller-facing entry
+    points that wrap the new builder with the same channel-mode
+    forcing, MDCT analysis and TOC framing the existing
+    `encode_frame_pcm_5_0_acpl3` / `encode_frame_pcm_5_1_acpl3` use.
+  - With α1 = α2 = 0 and β3 = 0 the ACplModule2 synthesis at
+    parameter band `pb` reduces to
+    `z0 = 0.5·(x0·g1 + x1·g2 + y0·β1)`,
+    `z1 = 0.5·(x0·g1 + x1·g2 − y0·β1)`,
+    and analogously `(z2, z3)` with β2 driving the second
+    ACplModule2. Non-zero β1 / β2 inject the decorrelator output `y`
+    that gives the Ls / Rs outputs their decorrelated spaciousness.
+  - `tests/round193_5_x_acpl3_real_beta.rs` (7 tests) pins: round-trip
+    to 5- / 6-channel `AudioFrame` for 5.0 / 5.1; silent input →
+    all-zero β_q indices; tonal carrier + non-zero `beta_scale` →
+    at least one non-zero β_q lane; `beta_scale = 0.0` is
+    byte-for-byte identical to the round-95 scaffold; silent inputs
+    at any `beta_scale` are scaffold-identical (carrier-energy
+    extractor short-circuits to 0); non-silent tonal inputs at
+    `beta_scale > 0` diverge from the round-95 scaffold (different
+    β1 / β2 codeword bit-positions) while keeping the padded
+    substream length identical.
+  - Total tests 791 (+7 over r190).
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.5...v0.0.6) - 2026-05-30
 
 ### Other

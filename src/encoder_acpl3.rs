@@ -626,6 +626,82 @@ fn write_acpl_data_2ch_minimal(
     }
 }
 
+/// Emit an `acpl_data_2ch()` body per §4.2.13.4 Table 62 with the
+/// `acpl_beta_1_dq` / `acpl_beta_2_dq` entropy layers carrying real
+/// per-parameter-band magnitudes; the remaining nine parameter sets
+/// (`alpha_1`, `alpha_2`, `beta_3`, `gamma_1..6`) keep the zero-delta
+/// scaffold from [`write_acpl_data_2ch_minimal`].
+///
+/// Each β layer is coded as `diff_type = 0` (DIFF_FREQ) + one F0
+/// codeword + `(num_bands − 1)` DF codewords. Per [`acpl_hcb_arrays`]
+/// the BETA F0 codebook is addressed by `symbol_index = beta_q` (cb_off
+/// = 0) so the F0 codeword carries the non-negative magnitude directly.
+/// The DF codebook uses `symbol_index = delta_q + cb_off` and supports
+/// signed band-to-band deltas which the decoder reverses via
+/// [`crate::acpl_synth::differential_decode`]'s DIFF_FREQ branch.
+///
+/// `beta1_q_per_band` / `beta2_q_per_band` must each contain at least
+/// `num_bands` entries; trailing positions outside the slice are coded
+/// as `0`. The α / β3 / γ slots remain at zero-delta to preserve the
+/// round-95 wire-bit layout invariants.
+fn write_acpl_data_2ch_real_beta(
+    bw: &mut BitWriter,
+    num_bands: u32,
+    quant_mode_0: crate::acpl::AcplQuantMode,
+    quant_mode_1: crate::acpl::AcplQuantMode,
+    beta1_q_per_band: &[i32],
+    beta2_q_per_band: &[i32],
+) {
+    // acpl_framing_data(): smooth interp (1 b) + num_param_sets_cod = 0 (1 b).
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    // Helper: emit one zero-delta `acpl_huff_data()` FREQ-mode block
+    // (matches `write_acpl_data_2ch_minimal`'s inner closure).
+    let emit_zero =
+        |bw: &mut BitWriter, dt: crate::acpl::AcplDataType, qm: crate::acpl::AcplQuantMode| {
+            bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+            if num_bands >= 1 {
+                write_acpl_f0_zero(bw, dt, qm);
+            }
+            for _ in 1..num_bands {
+                write_acpl_df_zero(bw, dt, qm);
+            }
+        };
+
+    // Helper: emit one real-β `acpl_huff_data()` FREQ-mode block. F0
+    // carries `beta_q[0]`; DFs carry `delta_q[pb] = beta_q[pb] − beta_q[pb-1]`.
+    let emit_real_beta = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, beta_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let b_q = beta_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_beta_f0_value(bw, qm, b_q);
+                first = false;
+            } else {
+                let delta = b_q - prev_q;
+                write_acpl_beta_df_value(bw, qm, delta);
+            }
+            prev_q = b_q;
+        }
+    };
+
+    // alpha1, alpha2 — zero-delta (ALPHA codebook family, quant_mode_0).
+    emit_zero(bw, crate::acpl::AcplDataType::Alpha, quant_mode_0);
+    emit_zero(bw, crate::acpl::AcplDataType::Alpha, quant_mode_0);
+    // beta1, beta2 — REAL per-band, BETA codebook family, quant_mode_0.
+    emit_real_beta(bw, quant_mode_0, beta1_q_per_band);
+    emit_real_beta(bw, quant_mode_0, beta2_q_per_band);
+    // beta3 — zero-delta (BETA3 codebook family, quant_mode_0).
+    emit_zero(bw, crate::acpl::AcplDataType::Beta3, quant_mode_0);
+    // gamma1..6 — zero-delta (GAMMA codebook family, quant_mode_1).
+    for _ in 0..6 {
+        emit_zero(bw, crate::acpl::AcplDataType::Gamma, quant_mode_1);
+    }
+}
+
 // ====================================================================
 // Top-level body builder: `5_X_channel_element` ASPX_ACPL_3
 // ====================================================================
@@ -697,6 +773,123 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra(
         // a panic at encoding time since the cfg comes from the caller.
         write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
         write_acpl_data_2ch_minimal(&mut bw, acpl_num_bands, acpl_qm0, acpl_qm1);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+/// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
+/// [`build_5_x_acpl3_body_from_pcm_spectra`] but with the β1 / β2
+/// entropy layers carrying real per-parameter-band magnitudes derived
+/// from the L / R carrier energies. α1 / α2 / β3 / γ1..γ6 stay at the
+/// round-95 zero-delta scaffold.
+///
+/// `beta_scale` controls the encoder's wet/dry balance for the surround
+/// reconstruction (`β = β_scale · √E[x²]`); see
+/// [`extract_beta_q_per_band_carrier_energy`] for the rationale and
+/// recommended range. `beta_scale = 0.0` reproduces the round-95
+/// zero-delta scaffold byte-for-byte at the β1 / β2 positions.
+///
+/// The decoder walks the same Table 25 ASPX_ACPL_3 body and applies the
+/// recovered β1 / β2 to the ACplModule2 mix (Pseudocode 119). With α1 =
+/// α2 = 0 and β3 = 0 the synthesis at parameter band `pb` reduces to:
+///
+/// ```text
+///   z0[ts][sb] = 0.5 · ( x0[ts][sb]·g1 + x1[ts][sb]·g2 + y0[ts][sb]·β1 )
+///   z1[ts][sb] = 0.5 · ( x0[ts][sb]·g1 + x1[ts][sb]·g2 − y0[ts][sb]·β1 )
+/// ```
+///
+/// (and analogously for `(z2, z3)` with β2 driving the second
+/// ACplModule2 instance). Non-zero β1 / β2 therefore drive the
+/// decorrelator injection that gives the Ls / Rs outputs their
+/// decorrelated spaciousness.
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_beta(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    beta_scale: f32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+
+    // Extract per-band β_q from the L and R carrier energy distributions.
+    // start_pb = 0 for ACPL_3 because the ACPL_3 path codes all
+    // parameter bands across the QMF range (no PARTIAL `acpl_qmf_band`
+    // cutoff — that's ACPL_1 only).
+    let beta1_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_l,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let beta2_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_3 (4) — 3 bits.
+    bw.write_u32(4, 3);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_2ch() (4 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_2ch(&mut bw, acpl_num_param_bands_id, acpl_qm0, acpl_qm1);
+    }
+
+    // LFE: mono_data(b_lfe=1) when present.
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(2): sync=1, on=1, no avg.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // stereo_data(): split-MDCT L/R carriers.
+    write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // I-frame: aspx_data_2ch() + acpl_data_2ch() with real β1 / β2.
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_acpl_data_2ch_real_beta(
+            &mut bw,
+            acpl_num_bands,
+            acpl_qm0,
+            acpl_qm1,
+            &beta1_q,
+            &beta2_q,
+        );
     }
 
     bw.align_to_byte();
@@ -1661,6 +1854,66 @@ pub fn extract_alpha_q_per_band(
     );
     let alpha = analytic_alpha_per_band(&num, &den, qm);
     alpha.iter().map(|&a| quantise_alpha(a, qm)).collect()
+}
+
+/// Extract a per-parameter-band β_q sequence from a single carrier's
+/// MDCT energy distribution, suitable for the ASPX_ACPL_3 path where
+/// only the L / R / C carriers are available at encode time and no
+/// surround reference exists for the analytic `β² = max(0, 2·E[Ls²]/
+/// E[L²] − (1−α)²)` extractor above.
+///
+/// The β parameter in ACplModule2 (§5.7.7.6.2 Pseudocode 119) is the
+/// gain applied to the decorrelator output `y`. The decoder writes
+///
+/// ```text
+///   z0 = 0.5·(x0·g1 + x1·g2 + y·β)
+///   z1 = 0.5·(x0·g1 + x1·g2 − y·β)
+/// ```
+///
+/// with `E[y²] ≈ E[x0²]` after the upstream `Transform()` call. Setting
+/// β proportional to the per-band carrier RMS keeps the surround
+/// reconstruction's wet/dry balance bounded — a band carrying more
+/// energy gets a proportionally louder decorrelator injection so the
+/// surround channels remain perceptually consistent with the dry
+/// front-channel mix.
+///
+/// The scale chosen here — `β = scale · √E[x0²]` clipped to the β
+/// codebook's column-0 magnitude range — is an encoder choice (not a
+/// spec mandate); the decoder reverses the BETA codebook lookup and
+/// applies whatever magnitude was written. With `scale = 0.0` this
+/// returns all-zero β_q (matching the round-95 zero-delta scaffold);
+/// `scale = 1.0` saturates a band carrying unit-RMS energy to the
+/// codebook's mid-range lane (~1.4 fine / 1.4 coarse).
+///
+/// `scale` should typically be small (≤ 0.5) to keep β within the
+/// quantiser's perceptually-useful lower half. Returns one β_q per
+/// parameter band; entries below `start_pb` are 0.
+pub fn extract_beta_q_per_band_carrier_energy(
+    coeffs_carrier: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    scale: f32,
+    qm: crate::acpl::AcplQuantMode,
+) -> Vec<i32> {
+    let (e_c, _e_zero) = compute_per_band_energies(
+        coeffs_carrier,
+        coeffs_carrier,
+        transform_length,
+        num_param_bands,
+        start_pb,
+    );
+    e_c.iter()
+        .map(|&e| {
+            if e <= 0.0 || !e.is_finite() {
+                0
+            } else {
+                let rms = e.sqrt();
+                let beta_mag = (scale * rms).max(0.0);
+                quantise_beta_magnitude(beta_mag, qm)
+            }
+        })
+        .collect()
 }
 
 /// Compute per-parameter-band carrier and surround energies
