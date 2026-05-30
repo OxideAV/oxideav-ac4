@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.5...v0.0.6) - 2026-05-30
+
+### Other
+
+- ac4 r190: close ASPX_ACPL_1 desync — fix aspx_framing() FIXFIX prefix
+- ac4 round 187 — pin ACPL_1 residual / α-β desync follow-up
+- round 181 — close r128 alpha_q desync at parser indexing + aspx_data_2ch SIGNAL band count
+- round 174 — fix ALPHA / BETA3 F0 cb_off (latent #1121 desync)
+- round 144 — real per-band α + β extraction for 5_X ASPX_ACPL_2
+- round 139 — 7.1-with-LFE ACPL_1 real per-band α + β
+- round 135 — real per-band α + β extraction for 7_X ASPX_ACPL_1
+- round 132 — real per-band β extraction in ACPL_1 5.0 encoder
+- round 128 — real per-band α extraction in ACPL_1 5.0 encoder
+- round 125 — 7.0 (3/4/0) SIMPLE/Cfg3Five multichannel encoder
+- round 118 — 7.0/7.1 SIMPLE/ASPX_ACPL_1 multichannel encoder
+- Round 114: 7.1 (3/4/0.1) SIMPLE/ASPX_ACPL_2 multichannel encoder (LFE)
+- Round 107: 7.0 SIMPLE/ASPX_ACPL_2 multichannel encoder
+- round 103 — 5_X SIMPLE/ASPX_ACPL_1 multichannel encoder path
+- round 100 — 5_X SIMPLE/ASPX_ACPL_2 multichannel encoder path
+- ac4 round 95: 5_X SIMPLE/ASPX_ACPL_3 multichannel encoder path
+- ac4 round 91: 7.1 (3/4/0.1) SIMPLE/Cfg3Five encoder (7 SCE + LFE)
+- ac4 round 80: 5.1 SIMPLE/Cfg3Five encoder (5 SCE + LFE) + decoder LFE PCM render
+- ac4 round 74: 5.0 SIMPLE/Cfg3Five multichannel forward analysis (5 SCE)
+- ac4 round 52: joint M/S CPE (Path B, b_enable_mdct_stereo_proc=1)
+- ac4 round 51: stereo SIMPLE/ASF split-MDCT (Path A: 2x SCE) encoder
+
 ### Fixed
 
 - **Round 190 — close the 5_X ASPX_ACPL_1 desync the r187 tests
