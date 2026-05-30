@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Round 190 — close the 5_X ASPX_ACPL_1 desync the r187 tests
+  pinned.** Two minimal A-SPX writers
+  ([`crate::encoder_acpl3::write_aspx_data_2ch_minimal`] and
+  [`write_aspx_data_1ch_minimal`]) emitted `aspx_int_class = FIXFIX`
+  as the wrong prefix code: `0b11` (2 bits) instead of `0b0` (1 bit)
+  per ETSI TS 103 190-1 Table 126. The decoder's
+  [`crate::aspx::AspxIntClass::read`] correctly walks the prefix —
+  `0` → FixFix, `10` → FixVar, `110` / `111` → VarFix / VarVar — so
+  the writer's `11` start signalled the parser to read the VarFix /
+  VarVar branch instead. For our config that put the parser in the
+  VarFix branch with `b_iframe = 1`: it then read
+  `var_bord_left` (2 b), `num_rel_left` (2 b — `num_aspx_timeslots
+  = 15 > 8` makes Note-1 fields 2-bit wide), and `tsg_ptr` (2 b).
+  Net: parser consumed **9 bits** in the framing where the writer
+  only emitted **3 bits**, a 6-bit upstream drift that the
+  silence / L-only / Ls-only test paths masked (α / β quantised to 0
+  ⇒ the `acpl_data_1ch` body shape was constant minimum-cost on each
+  side and the `num_param_sets_cod` bit positions on both sides
+  sampled `0` within the long run of zero codewords). With non-zero
+  α / β the codewords shift, the pair-1 `num_param_sets_cod` bit
+  position lands on a `1`, and pair1 reads `num_param_sets = 2` —
+  the r187 symptom. Fix is one line per writer: emit
+  `bw.write_bit(false)` for the FIXFIX prefix, matching Table 126.
+  - The r187 test #4 (`acpl1_combined_l_and_ls_pair1_currently_misaligns`)
+    was renamed to `acpl1_full_round_trips_with_aligned_pair_lengths`
+    and its assertion flipped from `assert_eq!(n1, 2)` (pinned
+    misalignment) to `assert_eq!(n1, 1)` (post-fix). All four
+    combinations now round-trip with
+    `pair0.num_param_sets = pair1.num_param_sets = 1`.
+  - Total tests 784 (unchanged from r187 — r190 fixed the third pin
+    in place rather than adding new ones; the bit-level diagnosis is
+    carried in the test file's module doc-comment instead).
+
 ### Added
 
 - **Round 187 — characterisation tests pinning the remaining

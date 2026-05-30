@@ -453,8 +453,8 @@ fn write_stereo_split_data(
 
 /// Emit a minimum-viable `aspx_data_2ch()` body per Table 52 with:
 /// * `xover_subband_offset = 0` (3 b)
-/// * Channel-0 `aspx_framing()`: `int_class = FIXFIX` (`11`, 2 b),
-///   `tmp_num_env = 0` (1 or 2 b per `num_env_bits_fixfix`),
+/// * Channel-0 `aspx_framing()`: `int_class = FIXFIX` (prefix `0`, 1 b
+///   per Table 126), `tmp_num_env = 0` (1 or 2 b per `num_env_bits_fixfix`),
 ///   `aspx_freq_res[0] = 0` (1 b, only when `freq_res_mode == Signalled`).
 /// * `aspx_balance = 1` (1 b) — channel-1 reuses channel-0's framing.
 /// * `aspx_delta_dir(0)`: 1 SIGNAL-env-direction bit + 1 NOISE bit (FREQ).
@@ -475,8 +475,9 @@ fn write_aspx_data_2ch_minimal(
     bw.write_u32(xover, 3);
 
     // Channel-0 aspx_framing: FIXFIX, num_env = 1 (tmp_num_env = 0).
-    // int_class bits per AspxIntClass::read: '11' for FIXFIX, 2 b.
-    bw.write_u32(0b11, 2);
+    // int_class bits per AspxIntClass::read: prefix '0' for FIXFIX
+    // (Table 126), 1 b.
+    bw.write_bit(false);
     let envbits = cfg.fixfix_tmp_num_env_bits();
     bw.write_u32(0, envbits); // tmp_num_env = 0 → num_env = 1
     if cfg.signals_freq_res() {
@@ -866,8 +867,9 @@ fn write_aspx_data_1ch_minimal(
     let xover: u32 = 0;
     bw.write_u32(xover, 3);
 
-    // aspx_framing(0): FIXFIX (int_class '11', 2 b), tmp_num_env = 0.
-    bw.write_u32(0b11, 2);
+    // aspx_framing(0): FIXFIX (int_class prefix '0', 1 b per Table 126),
+    // tmp_num_env = 0.
+    bw.write_bit(false);
     let envbits = cfg.fixfix_tmp_num_env_bits();
     bw.write_u32(0, envbits); // tmp_num_env = 0 → num_env = 1
     if cfg.signals_freq_res() {

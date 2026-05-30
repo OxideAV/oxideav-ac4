@@ -1,5 +1,5 @@
-//! Round 187 — characterise the remaining 5_X ASPX_ACPL_1 desync the
-//! r181 follow-up flagged.
+//! Round 187 (characterisation) + Round 190 (root-cause fix) — close
+//! the remaining 5_X ASPX_ACPL_1 desync the r181 follow-up flagged.
 //!
 //! ### Background
 //!
@@ -15,64 +15,46 @@
 //! residual layer (`max_sfb_master + 2× chparam_info + 2× sf_data(ASF)`,
 //! carrying the Ls / Rs surround residual spectra coded as sSMP,3 /
 //! sSMP,4 per Table 181) between the L/R carriers and the centre
-//! `mono_data(0)`. The r181 notes flag a remaining alignment issue
-//! between [`encoder_acpl3::write_acpl_1_residual_layer`] and the
-//! decoder's `parse_aspx_acpl_1_2_inner_body` residual-pair walker,
-//! tracked as the follow-up.
+//! `mono_data(0)`. Round 187 *characterised* the remaining issue by
+//! triangulating around it: silence, L-carrier-only and Ls-residual-only
+//! all round-tripped cleanly with `pair1.num_param_sets = 1`, but the
+//! "both L and Ls non-zero" combination drifted into
+//! `pair1.num_param_sets = 2`.
 //!
-//! ### What this round measures
+//! ### Round 190 — root cause: `aspx_framing()` FIXFIX prefix
 //!
-//! These tests sweep the encoder's `encode_frame_pcm_5_0_acpl1_real_alpha_beta`
-//! across input combinations and assert the **structural** shape of the
-//! decoder's recovered `acpl_data_1ch_pair[0/1]`. They confirm:
+//! The drift is **not** in the residual layer at all. It's in
+//! `write_aspx_data_2ch_minimal` / `write_aspx_data_1ch_minimal`, which
+//! emitted `aspx_int_class = FIXFIX` as the wrong prefix code: `0b11`
+//! (2 bits) instead of `0b0` (1 bit) per ETSI TS 103 190-1 Table 126.
+//! The parser's `AspxIntClass::read` correctly treats the first `1` as
+//! "not-FixFix", reads another `1` ("not-FixVar"), then walks the
+//! following bit as `VarFix` / `VarVar` selection — landing on
+//! `VarFix` with `b_iframe = 1`, which then reads `var_bord_left` (2
+//! bits), `num_rel_left` (2 bits per Note 1 since `num_aspx_timeslots
+//! = 15 > 8`), and `tsg_ptr` (2 bits). Net: parser consumes **9 bits**
+//! in the framing where the writer only emitted **3 bits**.
 //!
-//!   1. **Silence** round-trips cleanly — both pair slots resolve a
-//!      single parameter set with `direction_time = false` (DIFF_FREQ)
-//!      and all-zero α / β values.
-//!   2. **L-carrier-only** (Ls = 0) round-trips cleanly — the α / β
-//!      extractor produces all-zero rows because there's no surround
-//!      energy, so the `write_acpl_data_1ch_real_alpha_beta` body is
-//!      bit-for-bit identical to the silence body and the parser stays
-//!      aligned.
-//!   3. **Ls-residual-only** (L = 0) round-trips cleanly — α / β are
-//!      all-zero again because `L · Ls = 0` ⇒ correlation = 0. The
-//!      residual writer is exercised with non-trivial Ls / Rs spectra
-//!      and the parser still resolves both pair slots with
-//!      `num_param_sets = 1`.
-//!   4. **Both L and Ls non-zero** triggers the remaining desync — α
-//!      quantises to a non-zero lane in some bands AND the residual
-//!      layer carries non-zero Ls / Rs spectra. The decoder still
-//!      resolves `acpl_data_1ch_pair[0]` cleanly but
-//!      `acpl_data_1ch_pair[1]` reads with `num_param_sets = 2`, an
-//!      off-by-bit-stream drift consistent with the writer emitting a
-//!      different bit count than the parser consumes upstream of the
-//!      pair-1 framing.
+//! In the silence / L-only / Ls-only paths the encoder happened to
+//! quantise α / β to zero, so the `acpl_data_1ch` body shape on the wire
+//! was the constant minimum-cost shape and the 6-bit upstream drift
+//! was masked by a long run of zero codewords on each side — the
+//! `num_param_sets_cod` bit positions on both sides ended up sampling
+//! `0`. With non-zero α / β the codewords shift in time, the pair-1
+//! `num_param_sets_cod` position lands on a `1`, and the symptom in
+//! r187 appeared.
 //!
-//! The tests below capture that pattern as **pinned expectations** so
-//! the next round can iterate on the residual / α-β writers without
-//! accidentally regressing the silence / L-only / Ls-only paths.
+//! Fix is two writers, one line each: write `bw.write_bit(false)`
+//! (1 bit) for the FIXFIX `aspx_int_class` prefix in both
+//! `write_aspx_data_2ch_minimal` and `write_aspx_data_1ch_minimal`,
+//! matching the prefix code in `AspxIntClass::read`.
 //!
-//! ### Where the bug is NOT
+//! ### What this file pins
 //!
-//! Multiple narrower writer→parser round-trips already pass:
-//!
-//!   * [`encoder_acpl3::write_acpl_data_1ch_real_alpha_beta_bytes`] →
-//!     [`acpl::parse_acpl_data_1ch`] cycles for arbitrary signed
-//!     `alpha_q[pb]` / unsigned `beta_q[pb]` PARTIAL-mode arrays (pinned
-//!     by `round181_alpha_desync_fix::standalone_alpha_writer_round_trips_through_parser`
-//!     and `standalone_alpha_beta_writer_round_trips_through_parser`).
-//!   * Back-to-back `write_acpl_data_1ch_real_alpha_beta` invocations
-//!     into the same `BitWriter` (no byte alignment between calls) round
-//!     trip cleanly through `parse_acpl_data_1ch` twice.
-//!
-//! That points the residual desync at the writer→parser pair operating
-//! on the **joint-MDCT residual layer** itself
-//! ([`encoder_acpl3::write_acpl_1_residual_layer`] vs the inline
-//! `decode_asf_long_mono_body_with_max_sfb` walk inside
-//! `parse_aspx_acpl_1_2_inner_body`'s ASPX_ACPL_1 branch) — or at the
-//! `two_channel_data()` L/R carrier writer (`write_two_channel_data`)
-//! vs the matching `parse_two_channel_data` — when the L / Ls spectra
-//! are simultaneously non-trivial. The α / β path itself is bit-exact.
+//! All four combinations round-trip cleanly with both pair slots reading
+//! `num_param_sets = 1`. The "both" case (test #4) was the r187 pinned
+//! misalignment — r190 flipped its assertion to the post-fix expectation
+//! and renamed it.
 
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
@@ -182,37 +164,25 @@ fn acpl1_ls_residual_only_round_trips_with_aligned_pair_lengths() {
 /// Combined L-carrier + Ls-residual input — both carriers are non-zero
 /// so the α extractor's correlation lands on a non-zero quantisation
 /// lane in some bands AND the residual layer carries non-trivial Ls
-/// spectra. Pre-r187 this triggered an upstream bit-stream drift the
+/// spectra. Pre-r190 this triggered an upstream bit-stream drift the
 /// parser absorbed as `pair1.framing.num_param_sets_cod = 1` (i.e.
-/// `pair1.alpha1.len() == 2` instead of 1). The test pins the current
-/// state so the next round can validate the residual-layer / α-β
-/// writer alignment without regressing the silence / L-only / Ls-only
-/// paths above.
-///
-/// Once the residual desync is closed, the assertion below must flip
-/// to `assert_eq!(n1, 1)` and this test should be renamed
-/// `acpl1_full_round_trips_with_aligned_pair_lengths`.
+/// `pair1.alpha1.len() == 2` instead of 1). r190 fixed the
+/// `aspx_framing()` FIXFIX prefix in the two minimal writers (1 bit
+/// `0` per Table 126, not 2 bits `11`); the desync is now closed for
+/// every combination tested here.
 #[test]
-fn acpl1_combined_l_and_ls_pair1_currently_misaligns() {
+fn acpl1_full_round_trips_with_aligned_pair_lengths() {
     let l = make_tone(220.0, 0.5);
     let r = make_tone(440.0, 0.5);
     let c = make_tone(660.0, 0.3);
     let ls = make_tone(880.0, 0.05);
     let rs = make_tone(1100.0, 0.05);
     let (n0, n1) = pair_num_param_sets([&l, &r, &c, &ls, &rs]);
+    assert_eq!(n0, 1, "L+Ls full case → pair0 num_param_sets = 1");
     assert_eq!(
-        n0, 1,
-        "pair0 num_param_sets = 1 (the bit drift sits after pair0; pair0 \
-         itself still aligns to the writer's emission)"
-    );
-    // PINNED EXPECTATION: pair1 misaligns to num_param_sets = 2.
-    //
-    // This is the residue from the r181 follow-up. When fixed the
-    // assertion below must flip back to `assert_eq!(n1, 1)`.
-    assert_eq!(
-        n1, 2,
-        "pair1 num_param_sets currently reads 2 (the desync absorbs the \
-         drifted bit as `nps_cod = 1`); flip back to 1 once the residual \
-         desync is closed"
+        n1, 1,
+        "L+Ls full case → pair1 num_param_sets = 1 (r190 fixed the \
+         aspx_framing() FIXFIX prefix; the upstream desync that drove \
+         pair1 to nps_cod = 1 is closed)"
     );
 }

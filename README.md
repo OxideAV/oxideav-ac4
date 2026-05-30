@@ -627,6 +627,30 @@ framework but usable standalone.
 > `parse_aspx_acpl_1_2_inner_body`'s ASPX_ACPL_1 branch, or in
 > `write_two_channel_data` vs `parse_two_channel_data` — when L and
 > Ls are simultaneously non-trivial. Total tests 784 (was 780).
+> Round 190 closes the desync at the root cause: the two minimal
+> A-SPX writers
+> ([`encoder_acpl3::write_aspx_data_2ch_minimal`] and
+> [`encoder_acpl3::write_aspx_data_1ch_minimal`]) emitted
+> `aspx_int_class = FIXFIX` as the wrong prefix code: `0b11` (2 bits)
+> instead of `0b0` (1 bit) per ETSI TS 103 190-1 Table 126. The
+> decoder's [`aspx::AspxIntClass::read`] walks the prefix correctly
+> (`0` → FixFix, `10` → FixVar, `110` / `111` → VarFix / VarVar), so
+> the writer's `11` start drove the parser into the VarFix branch
+> with `b_iframe = 1` and Note-1 2-bit width
+> (`num_aspx_timeslots = 15 > 8`): `var_bord_left` (2 b) +
+> `num_rel_left` (2 b) + `tsg_ptr` (2 b) — parser consumed **9 bits**
+> in framing where the writer emitted only **3**. The 6-bit drift was
+> masked in the silence / L-only / Ls-only paths (α / β quantised to
+> 0 ⇒ constant minimum-cost `acpl_data_1ch` bodies whose
+> `num_param_sets_cod` bit positions sampled `0` on both sides), but
+> with non-zero α / β the codewords shifted and the pair-1
+> `num_param_sets_cod` bit position landed on a `1` (the r187 pinned
+> failure mode). Fix is one-line per writer: emit
+> `bw.write_bit(false)` for the FIXFIX prefix. The r187 pinned-broken
+> test (`acpl1_combined_l_and_ls_pair1_currently_misaligns`) is now
+> `acpl1_full_round_trips_with_aligned_pair_lengths` and asserts
+> `pair1.num_param_sets = 1`. Total tests 784 (unchanged from r187 —
+> r190 fixed the third pin in place rather than adding new ones).
 
 ## Specs
 
