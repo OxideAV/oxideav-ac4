@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 196 — real per-parameter-band α1 / α2 extraction in the
+  5_X SIMPLE/ASPX_ACPL_3 encoder.** Layered on top of the round-193
+  real β1 / β2 path: the two ACplModule2 instances in ACPL_3 share
+  the (L, R) carrier pair as their (x0, x1) input, so without a
+  per-side surround reference at encode time α₁ / α₂ are driven by
+  the same L↔R cross-correlation extractor — `α[pb] = α_scale ·
+  ρ(L, R)[pb]` with `ρ = E[L·R] / √(E[L²]·E[R²])` — clamped to the
+  ALPHA_DQ table magnitude bound (±2.0 Fine / ±2.0 Coarse).
+  - [`crate::encoder_acpl3::extract_alpha_q_per_band_carrier_correlation`]
+    — extracts per-band α_q from the L / R MDCT spectra. The α
+    parameter modulates the front/back dry-mix balance in
+    ACplModule2 (Pseudocode 119): higher α → more dry energy on the
+    front pair, lower α → more on the surround pair. Mono-like
+    (highly-correlated) bands push α toward +1; decorrelated bands
+    stay near α = 0.
+  - [`crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta`]
+    — drop-in replacement for the r193
+    `build_5_x_acpl3_body_from_pcm_spectra_real_beta` that lifts
+    α1 / α2 from the zero-delta scaffold in addition to β1 / β2.
+    β3 / γ1..γ6 still zero-delta. With `α_scale = β_scale = 0.0` the
+    output is byte-for-byte identical to the round-95
+    `build_5_x_acpl3_body_from_pcm_spectra` scaffold.
+  - [`crate::encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_alpha_beta`]
+    and `encode_frame_pcm_5_1_acpl3_real_alpha_beta` — caller-facing
+    entry points wrapping the new builder with the same channel-mode
+    forcing / MDCT analysis / TOC framing as the existing real-β
+    paths.
+  - `tests/round196_5_x_acpl3_real_alpha_beta.rs` (4 tests) pins:
+    round-trip to 5-channel `AudioFrame`; perfect L = R correlation
+    (ρ = +1) quantises to `α_q = +8` (lane 24 = 1.0); perfect
+    anti-correlation L = -R (ρ = -1) quantises to `α_q = -8`;
+    `α_scale = β_scale = 0.0` is byte-for-byte identical to the
+    round-95 scaffold.
+  - Total tests 795 (+4 over r193).
+
 - **Round 193 — real per-parameter-band β1 / β2 extraction in the
   5_X SIMPLE/ASPX_ACPL_3 encoder.** The round-95 ASPX_ACPL_3 path
   emits all 11 ACPL parameter sets as zero-delta Huffman codewords:

@@ -679,6 +679,31 @@ framework but usable standalone.
 > non-silent tonal inputs at `beta_scale > 0` diverge from the
 > scaffold (different β1 / β2 codeword bit-positions) while keeping
 > the padded substream length identical. Total tests 791 (was 784).
+> Round 196 layers real per-band α1 / α2 on top of r193: a new
+> [`encoder_acpl3::extract_alpha_q_per_band_carrier_correlation`]
+> drives α from the per-band L↔R normalised cross-correlation
+> `ρ(L, R) = E[L·R] / √(E[L²]·E[R²])` (`α[pb] = α_scale · ρ`),
+> clamped to ALPHA_DQ ±2.0. The two ACplModule2 instances in
+> ACPL_3 share the (L, R) carrier pair as their (x0, x1) input, so
+> without a per-side surround reference α₁ and α₂ both receive the
+> same correlation-policy output; the (L, Ls) ↔ (R, Rs) asymmetry
+> stays carried by β1 ≠ β2 (from `√E[L²]` vs `√E[R²]`) and the two
+> independent decorrelator outputs y0 / y1. A sibling
+> [`encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta`]
+> drops both the α and β extractors into the `acpl_data_2ch()` body;
+> β3 / γ1..γ6 stay zero-delta. Caller-facing
+> [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_alpha_beta`]
+> / `encode_frame_pcm_5_1_acpl3_real_alpha_beta` wrap the new builder
+> with the same channel-mode forcing and TOC framing. Mono-like
+> (highly-correlated) bands push α toward +1, biasing more dry energy
+> to the front pair; decorrelated bands stay near α = 0 and split the
+> dry mix evenly. Four integration tests in
+> `tests/round196_5_x_acpl3_real_alpha_beta.rs` pin: round-trip to a
+> 5-channel `AudioFrame`; perfect L = R correlation quantises to
+> `α_q = +8` (lane 24 = 1.0) at α_scale = 1; perfect anti-correlation
+> L = -R quantises to `α_q = −8`; `α_scale = β_scale = 0.0` is
+> byte-for-byte identical to the round-95 scaffold. Total tests 795
+> (was 791).
 
 ## Specs
 
