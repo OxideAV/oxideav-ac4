@@ -2797,6 +2797,278 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Encode one IMS v2 frame containing a 7.0 (3/4/0) SIMPLE/ASPX_ACPL_2
+    /// multichannel substream per ETSI TS 103 190-1 §4.2.6.14 Table 33 row
+    /// `case ASPX_ACPL_2:` with **real per-parameter-band α + β extraction**
+    /// (round 202). The 7_X (immersive) counterpart to the round-144 5.0
+    /// ACPL_2 real-α-β path
+    /// ([`Self::encode_frame_pcm_5_0_acpl2_real_alpha_beta`]) and the
+    /// real-α-β upgrade of the round-107 7.0 ACPL_2 zero-delta path
+    /// ([`Self::encode_frame_pcm_7_0_acpl2`]).
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb]` order — the 7.0 (3/4/0)
+    /// surface layout. The L/R pair feeds the first `two_channel_data()`
+    /// carriers and drives the A-CPL Ls/Rs surround reconstruction via
+    /// [`crate::acpl_synth::run_acpl_5x_pair_pcm`] at decode time; the
+    /// Ls/Rs pair rides the second `two_channel_data()` *and* feeds the
+    /// α + β extractors (D0 module models (L → Ls); D1 module models
+    /// (R → Rs)). `acpl_config_1ch(FULL)` carries no `qmf_band` →
+    /// `start_band = 0` so every parameter band participates. The centre
+    /// `C` is the trailing Cfg0 `mono_data(0)`. The back pair `Lb, Rb`
+    /// is accepted for layout completeness but not carried by the
+    /// ASPX_ACPL_2 body (the decoder's 7_X ACPL_2 dispatch populates
+    /// slots 0..4 — slots 5/6 stay silent), matching the round-107
+    /// documented Table 202 channel mapping.
+    ///
+    /// The encoder forces the 7.0 channel_mode prefix (`0b1111000`, 7 b —
+    /// Table 85 channel_mode 5) so the decoder's `walk_ac4_substream`
+    /// dispatches `channels == 7` through
+    /// `parse_7x_audio_data_outer(b_has_lfe = false)` with
+    /// `7_X_codec_mode = AspxAcpl2`.
+    ///
+    /// `max_sfb` defaults to 40.
+    pub fn encode_frame_pcm_7_0_acpl2_real_alpha_beta(&mut self, frames: &[&[f32]; 7]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_acpl2_real_alpha_beta_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_0_acpl2_real_alpha_beta`].
+    pub fn encode_frame_pcm_7_0_acpl2_real_alpha_beta_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 7],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_0_acpl2_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force 7.0 (3/4/0) channel_mode prefix '1111000', 7 b →
+        // channel_mode 5 (Table 85).
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1111000;
+        self.channel_mode_bits = 7;
+
+        // Forward MDCT analysis per channel — seven SCE states (L, R, C,
+        // Ls, Rs, Lb, Rb). The first five feed the ASPX_ACPL_2 body;
+        // Ls / Rs additionally feed the α + β extractors. The back pair
+        // is analysed for state continuity but its spectra are not
+        // carried by the ACPL_2 path.
+        let n_channels = 7;
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // ASPX config: matches the round-95 / 100 / 103 / 107 ASPX_ACPL
+        // config exactly.
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0, // num_noise_sbgroups = 1
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // ACPL: num_param_bands_id = 3 → 7 param bands; quant_mode Fine.
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 12288,
+            41..=50 => 24576,
+            _ => 32767,
+        };
+
+        let body = crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
+            frame_len,
+            max_sfb,
+            None, // 7.0 — no LFE
+            self.b_iframe_global,
+            &coeffs_per_channel[0],
+            &coeffs_per_channel[1],
+            &coeffs_per_channel[3],
+            &coeffs_per_channel[4],
+            &coeffs_per_channel[2],
+            None, // 7.0 — no LFE
+            &aspx_cfg,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            pad_target_bytes,
+        );
+
+        // Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Encode one IMS v2 frame containing a 7.1 (3/4/0.1) SIMPLE/ASPX_ACPL_2
+    /// multichannel substream per ETSI TS 103 190-1 §4.2.6.14 Table 33 row
+    /// `case ASPX_ACPL_2:` with `b_has_lfe = 1` and **real per-parameter-band
+    /// α + β extraction** (round 202). The LFE counterpart of
+    /// [`Self::encode_frame_pcm_7_0_acpl2_real_alpha_beta`] — it emits the
+    /// identical 7_X ASPX_ACPL_2 real-α-β body plus a leading
+    /// `mono_data(b_lfe = 1)` element between the I-frame config block and
+    /// `companding_control(5)`, exactly where the decoder's
+    /// `parse_7x_audio_data_outer(b_has_lfe = true)` reads
+    /// `if (b_has_lfe) mono_data(1);`.
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb, LFE]` order. See
+    /// [`Self::encode_frame_pcm_7_0_acpl2_real_alpha_beta`] for the channel
+    /// routing contract; the LFE is the leading `mono_data(1)`.
+    ///
+    /// The encoder forces the 7.1 channel_mode prefix (`0b1111001`, 7 b —
+    /// Table 88 channel_mode 6) so the decoder dispatches `channels == 8`
+    /// through `parse_7x_audio_data_outer(b_has_lfe = true)` with
+    /// `7_X_codec_mode = AspxAcpl2`.
+    ///
+    /// `max_sfb` defaults to 40; `max_sfb_lfe` defaults to 7 (the LFE-spec
+    /// cap at `tl = 1920`, `n_msfbl_bits = 3`).
+    pub fn encode_frame_pcm_7_1_acpl2_real_alpha_beta(&mut self, frames: &[&[f32]; 8]) -> Vec<u8> {
+        self.encode_frame_pcm_7_1_acpl2_real_alpha_beta_with_max_sfb(frames, 40, 7)
+    }
+
+    /// `max_sfb` / `max_sfb_lfe`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_1_acpl2_real_alpha_beta`].
+    pub fn encode_frame_pcm_7_1_acpl2_real_alpha_beta_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 8],
+        max_sfb: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_1_acpl2_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, n_msfbl_bits) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        assert!(
+            n_msfbl_bits > 0,
+            "encode_frame_pcm_7_1_acpl2_real_alpha_beta: tl = {frame_len} not permitted for LFE"
+        );
+        let n_msfbl_cap = (1u32 << n_msfbl_bits) - 1;
+        let max_sfb_lfe = max_sfb_lfe.min(n_msfbl_cap);
+
+        // Force 7.1 (3/4/0.1) channel_mode prefix '1111001', 7 b →
+        // channel_mode 6 (Table 88).
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1111001;
+        self.channel_mode_bits = 7;
+
+        // Forward MDCT analysis per channel — eight SCE states (L, R, C,
+        // Ls, Rs, Lb, Rb, LFE).
+        let n_channels = 8;
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // ASPX config: matches the round-95 / 100 / 103 / 107 / 114 ASPX_ACPL
+        // config exactly.
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0, // num_noise_sbgroups = 1
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // ACPL: num_param_bands_id = 3 → 7 param bands; quant_mode Fine.
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 12288,
+            41..=50 => 24576,
+            _ => 32767,
+        };
+
+        let body = crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
+            frame_len,
+            max_sfb,
+            Some(max_sfb_lfe),
+            self.b_iframe_global,
+            &coeffs_per_channel[0],
+            &coeffs_per_channel[1],
+            &coeffs_per_channel[3],
+            &coeffs_per_channel[4],
+            &coeffs_per_channel[2],
+            Some(&coeffs_per_channel[7]),
+            &aspx_cfg,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            pad_target_bytes,
+        );
+
+        // Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a 7.0 (3/4/0) SIMPLE/ASPX_ACPL_1
     /// multichannel substream per ETSI TS 103 190-1 §4.2.6.14 Table 33 row
     /// `case ASPX_ACPL_1:` (round 118). The 7_X (immersive) counterpart to

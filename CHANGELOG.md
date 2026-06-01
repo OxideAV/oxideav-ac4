@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 202 — real per-parameter-band α + β extraction in the
+  7.0 / 7.1 SIMPLE/ASPX_ACPL_2 multichannel encoder.** The 7_X
+  (immersive) counterpart to the round-144 5.0 ACPL_2 real-α-β
+  path and the real-α-β upgrade of the round-107 / 114 zero-delta
+  7_X ACPL_2 encoder. ACPL_2 does not transmit the Ls/Rs surround
+  pair on the wire — the decoder reconstructs the surround from
+  the L/R carriers + the two `acpl_data_1ch()` parameter sets per
+  §5.7.7.5 Pseudocode 116 + §5.7.7.6.1 Pseudocode 117:
+  `z0 = 0.5·(x0·(1+α) + y·β)`, `z1 = 0.5·(x0·(1−α) − y·β)`.
+  - [`crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta`]
+    — real-α-β upgrade of
+    [`build_7_x_acpl2_body_from_pcm_spectra`]; identical body
+    schedule (2-bit `7_X_codec_mode = 3`, optional LFE
+    `mono_data(b_lfe = 1)`, two `two_channel_data()` pairs, no
+    joint-MDCT residual layer, trailing centre `mono_data(0)`,
+    `aspx_data_2ch + aspx_data_2ch + aspx_data_1ch` envelope
+    trailer) with the two trailing `acpl_data_1ch_minimal` writers
+    replaced by `write_acpl_data_1ch_real_alpha_beta`. D0 module
+    models (L → Ls); D1 module models (R → Rs). `acpl_config_1ch
+    (FULL)` carries no `qmf_band` → `start_band = 0` so every
+    parameter band participates.
+  - [`crate::encoder_ims::Ac4ImsEncoder::encode_frame_pcm_7_0_acpl2_real_alpha_beta`]
+    + `_with_max_sfb` — accepts `[L, R, C, Ls, Rs, Lb, Rb]`,
+    forces the 7.0 channel_mode prefix (`0b1111000`, 7 b — Table
+    85 channel_mode 5), emits a 7-channel S16 PCM round-trip.
+  - [`crate::encoder_ims::Ac4ImsEncoder::encode_frame_pcm_7_1_acpl2_real_alpha_beta`]
+    + `_with_max_sfb` — accepts `[L, R, C, Ls, Rs, Lb, Rb, LFE]`,
+    forces the 7.1 channel_mode prefix (`0b1111001`, 7 b — Table
+    88 channel_mode 6), emits an 8-channel S16 PCM round-trip
+    with the LFE element written via the round-80
+    `write_lfe_mono_data` shared emitter.
+  - `tests/round202_7_x_acpl2_real_alpha_beta.rs` (10 tests) pins:
+    7.0 / 7.1 `AudioFrame` round-trip; decoder resolves
+    `SevenXCodecMode::AspxAcpl2` with both
+    `acpl_data_1ch_pair[0/1]` populated; loud-surround vs
+    silence-surround inputs produce materially different bytes;
+    silence input round-trips with β_q = 0 in every band; encoder
+    is bit-deterministic for matched inputs and fresh state;
+    direct body-builder probe diverges from the round-107
+    zero-delta scaffold byte stream when the caller's Ls/Rs
+    spectra are non-trivial.
+  - The back pair Lb / Rb is accepted for layout completeness but
+    not carried by the ASPX_ACPL_2 body (the decoder's 7_X ACPL_2
+    dispatch populates slots 0..4 + the LFE slot 7 — slots 5/6
+    stay silent), matching the round-107 documented Table 202
+    channel mapping plus the round-80 LFE PCM render at decode
+    time.
+  - Real β extraction for the 7_X ACPL_3 paths, real γ extraction,
+    real ASPX envelope coding, real Table-181 SAP-derived residual
+    content (for the ACPL_1 paths), and back-pair Lb/Rb carriage
+    remain deferred.
+
 - **Round 196 — real per-parameter-band α1 / α2 extraction in the
   5_X SIMPLE/ASPX_ACPL_3 encoder.** Layered on top of the round-193
   real β1 / β2 path: the two ACplModule2 instances in ACPL_3 share

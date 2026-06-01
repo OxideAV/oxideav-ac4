@@ -2985,6 +2985,183 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra(
 }
 
 // ====================================================================
+// 7_X ASPX_ACPL_2 emitter — real per-band α + β (round 202)
+// ====================================================================
+
+/// Build a 7.0 / 7.1 SIMPLE/ASPX_ACPL_2 substream body per §4.2.6.14
+/// Table 33 row `case ASPX_ACPL_2:` with **real per-parameter-band α + β**
+/// extracted from the (L, Ls) and (R, Rs) MDCT pairs. The 7_X (immersive)
+/// counterpart to the round-144 5_X path
+/// ([`build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta`]) and the
+/// real-α-β upgrade of the round-107 / 114 zero-delta 7_X ACPL_2 builder
+/// ([`build_7_x_acpl2_body_from_pcm_spectra`]).
+///
+/// ACPL_2 does **not** transmit the Ls/Rs surround pair on the wire — the
+/// decoder reconstructs the surround from the L/R carriers + the two
+/// `acpl_data_1ch()` parameter sets per ETSI TS 103 190-1 §5.7.7.5
+/// Pseudocode 116 + §5.7.7.6.1 Pseudocode 117:
+///
+/// ```text
+///   z0 = 0.5 · (x0·(1+α) + y·β)        // recovers L  carrier
+///   z1 = 0.5 · (x0·(1−α) − y·β)        // recovers Ls (then ·√2)
+/// ```
+///
+/// The encoder accepts the caller's full L / R / C / Ls / Rs (+ optional
+/// LFE) spectra; the Ls / Rs spectra feed the α + β extractors only and
+/// are not emitted on the ACPL_2 wire. D0 module models (L → Ls); D1
+/// module models (R → Rs). `acpl_config_1ch(FULL)` carries no `qmf_band`
+/// → `start_band = 0` so every parameter band participates (in contrast
+/// to the ACPL_1 PARTIAL mode whose `acpl_qmf_band` masks the low bands).
+///
+/// All five structural differences versus the round-118 7_X ACPL_1
+/// walker (2-bit `7_X_codec_mode = 3`, optional LFE `mono_data(1)`, two
+/// `two_channel_data()` pairs, **no** joint-MDCT residual layer, trailing
+/// centre `mono_data`) are unchanged from
+/// [`build_7_x_acpl2_body_from_pcm_spectra`]. The only difference: each
+/// trailing `acpl_data_1ch()` now carries the analytic α + β indices
+/// rather than the zero-delta scaffold.
+///
+/// When `coeffs_lfe` + `max_sfb_lfe` are both `Some`, an LFE
+/// `mono_data(b_lfe = 1)` element (Table 21 + `sf_info_lfe()` Table 35)
+/// is emitted between the I-frame config block and `companding_control(5)`,
+/// exactly where the decoder's `parse_7x_audio_data_outer(b_has_lfe =
+/// true)` reads `if (b_has_lfe) mono_data(1);` (§4.2.6.14 Table 33). This
+/// is the 7.1 (3/4/0.1) path; with both `None` the body is the 7.0
+/// (3/4/0) form.
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    // acpl_config_1ch(FULL) carries no qmf_band → start_band = 0.
+    let start_band = 0u32;
+
+    // α + β extraction — identical primitives to the round-144 5_X ACPL_2
+    // path. D0 module models (L → Ls); D1 module models (R → Rs).
+    let alpha_l_q = extract_alpha_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let alpha_r_q = extract_alpha_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let beta_l_q = extract_beta_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_l_q,
+        acpl_quant_mode,
+    );
+    let beta_r_q = extract_beta_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_r_q,
+        acpl_quant_mode,
+    );
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_codec_mode = ASPX_ACPL_2 (3) — 2 bits.
+    bw.write_u32(3, 2);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_1ch(FULL) (3 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
+    }
+
+    // LFE: mono_data(b_lfe = 1) when present (7.1 / channel_mode 6).
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(5): sync = 1, on = 1.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (2 b) — Cfg0.
+    bw.write_u32(0, 2);
+
+    // Cfg0: b_2ch_mode (1 b) + two_channel_data (L/R) + two_channel_data (Ls/Rs).
+    bw.write_bit(false); // b_2ch_mode = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
+
+    // (Additional-channel block SKIPPED for ASPX_ACPL_2.)
+    // (ASPX_ACPL_1 residual layer SKIPPED for ACPL_2.)
+
+    // Trailing Cfg0 mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    // I-frame ASPX + A-CPL trailers: aspx_data_2ch + aspx_data_2ch +
+    // aspx_data_1ch + acpl_data_1ch × 2 (now carrying real α + β).
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_l_q,
+            Some(&beta_l_q),
+        );
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_r_q,
+            Some(&beta_r_q),
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+// ====================================================================
 // 7_X ASPX_ACPL_1 emitter — §4.2.6.14 Table 33 row `case ASPX_ACPL_1:`
 // (round 118)
 // ====================================================================

@@ -703,7 +703,57 @@ framework but usable standalone.
 > `α_q = +8` (lane 24 = 1.0) at α_scale = 1; perfect anti-correlation
 > L = -R quantises to `α_q = −8`; `α_scale = β_scale = 0.0` is
 > byte-for-byte identical to the round-95 scaffold. Total tests 795
-> (was 791).
+> (was 791). Round 202 closes the ACPL_2 half of the deferred 7_X list
+> with the **7.0 / 7.1 (3/4/0(.1)) SIMPLE/ASPX_ACPL_2 multichannel
+> encoder with real per-parameter-band α + β extraction** per ETSI TS
+> 103 190-1 §4.2.6.14 Table 33 row `case ASPX_ACPL_2:` + §5.7.7.5
+> Pseudocode 116 + §5.7.7.6.1 Pseudocode 117 — the 7_X (immersive)
+> counterpart to the round-144 5.0 ACPL_2 real-α-β path and the
+> real-α-β upgrade of the round-107 / 114 zero-delta 7_X ACPL_2
+> encoder. New
+> [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_7_0_acpl2_real_alpha_beta`]
+> and [`encode_frame_pcm_7_1_acpl2_real_alpha_beta`] (plus the
+> `_with_max_sfb` forms) accept a 7- / 8-channel `[L, R, C, Ls, Rs,
+> Lb, Rb (, LFE)]` input and produce a 7_X ASPX_ACPL_2 frame whose two
+> trailing `acpl_data_1ch()` elements carry the analytic α + β indices
+> extracted from the (L, Ls) and (R, Rs) MDCT pairs via the shared
+> [`encoder_acpl3::extract_alpha_q_per_band`] /
+> [`extract_beta_q_per_band`] primitives. New
+> [`encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta`]
+> mirrors the round-107 zero-delta `build_7_x_acpl2_body_from_pcm_spectra`
+> body schedule (2-bit `7_X_codec_mode = 3`, optional LFE
+> `mono_data(b_lfe = 1)`, two `two_channel_data()` pairs, **no**
+> joint-MDCT residual layer, trailing centre `mono_data(0)`,
+> `aspx_data_2ch + aspx_data_2ch + aspx_data_1ch` envelope trailer)
+> with the two trailing `acpl_data_1ch_minimal` writers replaced by
+> `write_acpl_data_1ch_real_alpha_beta`. `acpl_config_1ch(FULL)`
+> carries no `qmf_band` → `start_band = 0` so every parameter band
+> participates in α + β coding (in contrast to the ACPL_1 PARTIAL
+> mode whose `acpl_qmf_band` masks the low bands). D0 module models
+> (L → Ls); D1 module models (R → Rs); the Ls / Rs spectra feed the
+> α + β extractors only and are not emitted on the ACPL_2 wire. The
+> back pair Lb / Rb is accepted for layout completeness but not
+> carried by the ASPX_ACPL_2 body (the decoder's 7_X ACPL_2 dispatch
+> populates slots 0..4 + the LFE slot 7 — slots 5/6 stay silent),
+> matching the round-107 documented Table 202 channel mapping plus
+> the round-80 LFE PCM render at decode time. Decoder round-trip: 7.0
+> ACPL_2 → 7-channel S16 interleaved PCM (1920 samples × 7 ch × 2
+> bytes); 7.1 ACPL_2 → 8-channel S16 with LFE IMDCT'd into slot 7.
+> Ten integration tests in
+> `tests/round202_7_x_acpl2_real_alpha_beta.rs` pin: 7.0 / 7.1
+> round-trip to 7- / 8-channel `AudioFrame`; decoder resolves
+> `SevenXCodecMode::AspxAcpl2` with both `acpl_data_1ch_pair[0/1]`
+> populated; loud-surround vs silence-surround inputs produce
+> materially different bytes (the round-107 / 114 zero-delta scaffold
+> would emit identical α / β codewords regardless of surround input);
+> silence input round-trips with β_q = 0 in every band; encoder is
+> bit-deterministic for matched inputs and fresh state; direct
+> body-builder probe diverges from the round-107 zero-delta scaffold
+> byte stream when the caller's Ls/Rs spectra are non-trivial. Total
+> tests 805 (was 795). Real β extraction for the 7_X ACPL_3 paths,
+> real γ extraction, real ASPX envelope coding, real Table-181
+> SAP-derived residual content (for the ACPL_1 paths), and back-pair
+> Lb/Rb carriage remain deferred.
 
 ## Specs
 
