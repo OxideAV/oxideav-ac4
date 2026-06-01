@@ -750,10 +750,57 @@ framework but usable standalone.
 > bit-deterministic for matched inputs and fresh state; direct
 > body-builder probe diverges from the round-107 zero-delta scaffold
 > byte stream when the caller's Ls/Rs spectra are non-trivial. Total
-> tests 805 (was 795). Real β extraction for the 7_X ACPL_3 paths,
-> real γ extraction, real ASPX envelope coding, real Table-181
-> SAP-derived residual content (for the ACPL_1 paths), and back-pair
-> Lb/Rb carriage remain deferred.
+> tests 805 (was 795). Round 208 lands the **5_X SIMPLE/ASPX_ACPL_3
+> encoder's real per-band γ5 / γ6 extraction** — closing the centre-
+> channel reconstruction half of the long-standing "γ stays at the
+> zero-delta scaffold" deferral. In §5.7.7.6.2 Pseudocode 118 step 7
+> the centre output `z4` is built by the third `ACplModule2`
+> invocation with `(a = 1, b = 0, y = 0)`:
+> `z4 = 0.5 · (γ5·x0in + γ6·x1in)`. Step 11 scales `z4 *= √2` before
+> QMF synthesis; step 1 rescales the carriers
+> `x0in = (1 + √2)·L`, `x1in = (1 + √2)·R`. The centre reconstruction
+> (β3 = 0, ducker = 1) is therefore `C ≈ K · (γ5·L + γ6·R)` with
+> `K = √2·(1+√2)/2 = 1+√(1/2)`. New
+> [`encoder_acpl3::extract_gamma_5_6_q_per_band_centre_least_squares`]
+> solves the 2×2 normal equations per parameter band
+> (`[<L,L>, <L,R>; <L,R>, <R,R>]·[γ5; γ6] = [<L,C>/K; <R,C>/K]`)
+> for the (γ5, γ6) pair that minimises the MDCT-bin-wise residual
+> `Σ (C/K − γ5·L − γ6·R)²`. Bands with a degenerate Gram matrix (no
+> L or R energy, or perfectly collinear L = ±R within numerical
+> tolerance) keep γ5 = γ6 = 0. The quantiser uses the Table-208
+> linear `gamma_q = round(γ / gamma_delta)` mapping with the
+> symmetric `±cb_off` clamp (`cb_off = 20` Fine / `10` Coarse, table
+> magnitude bound ±2.0). γ1..γ4 + β3 stay at the round-95 scaffold —
+> those parameter sets drive the (L, R, Ls, Rs) sub-pipeline plus
+> the ACplModule3 cross-residual, and neither has a per-side
+> surround reference at encode time for the 5.0 / 5.1 PCM input
+> layouts. New
+> [`encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_gamma`]
+> is a drop-in replacement for the round-196 real-α-β builder with
+> additional `coeffs_c: Option<&[f32]>` + `gamma_scale: f32`
+> parameters. New
+> [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_alpha_beta_gamma`]
+> + `_5_1_` high-level entry points accept `[L, R, C]` (5.0) or
+> `[L, R, C, LFE]` (5.1) PCM. Eight integration tests in
+> `tests/round208_5_x_acpl3_real_gamma.rs` pin: 5.0 round-trip to a
+> 5-channel `AudioFrame`; 5.1 round-trip to a 6-channel
+> `AudioFrame`; silent-centre input produces γ5_q = γ6_q = 0 in
+> every band; `C = (L + R) / 2` produces non-zero γ_q in ≥1
+> tonally-active band (verifies the least-squares extractor selects
+> non-trivial γ); loud-centre vs silent-centre inputs produce
+> materially different bytes (the round-196 path would emit
+> identical γ codewords regardless of centre input);
+> `α/β/γ_scale = 0.0` matches the round-95 scaffold byte-for-byte;
+> `γ_scale = 0.0` reproduces the round-196 real-α-β bytes exactly;
+> encoder is bit-deterministic for matched inputs and fresh state.
+> Total tests 813 (was 805). Real γ1..γ4 extraction (the
+> (L,R,Ls,Rs) sub-pipeline mix parameters) requires per-side
+> surround references which the 5.0 / 5.1 PCM input layout does not
+> carry — these stay at the round-95 zero-delta scaffold pending a
+> 5.1+Ls+Rs PCM input layout. Real β extraction for the 7_X ACPL_3
+> paths, real ASPX envelope coding, real Table-181 SAP-derived
+> residual content (for the ACPL_1 paths), and back-pair Lb/Rb
+> carriage remain deferred.
 
 ## Specs
 
