@@ -2044,6 +2044,212 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Encode one IMS v2 5.0 frame in 5_X_codec_mode = ASPX_ACPL_3 with
+    /// **full** real per-parameter-band α₁ / α₂ / β₁ / β₂ / γ₁..γ₆
+    /// extraction (round 215) — the round-208 entry point
+    /// [`Self::encode_frame_pcm_5_0_acpl3_real_alpha_beta_gamma`] lifted
+    /// the centre γ₅ / γ₆ pair to real values; this entry point also
+    /// lifts γ₁ / γ₂ (driving the (L, Ls) pair via Pseudocode 118
+    /// step 5) and γ₃ / γ₄ (driving the (R, Rs) pair via Pseudocode 118
+    /// step 6), closing the README's long-standing "γ1..γ4 stay at the
+    /// round-95 zero-delta scaffold" deferral for the 5_X ACPL_3 path.
+    ///
+    /// The γ₁ / γ₂ pair comes from a per-band 2×2 least-squares fit of
+    /// the (L, Ls) output sum `(L + Ls/√2)/(1 + √2)` onto the (L, R)
+    /// carrier pair; γ₃ / γ₄ come from the symmetric fit on the
+    /// (R, Rs) pair (see
+    /// [`crate::encoder_acpl3::extract_gamma_1_2_q_per_band_surround_least_squares`]
+    /// and
+    /// [`crate::encoder_acpl3::extract_gamma_3_4_q_per_band_surround_least_squares`]).
+    /// Both sums are independent of the α / β decorrelator
+    /// contributions and equal a `(1 + √2) · (γ·L + γ'·R)` linear
+    /// combination, so the resulting 2×2 normal-equations system is
+    /// identical in shape to the round-208 γ₅ / γ₆ centre fit.
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs]` order. The L / R carriers
+    /// also feed the round-51 stereo `two_channel_data()` body the
+    /// ASPX_ACPL_3 path emits. β₃ stays at the round-95 zero-delta
+    /// scaffold — its analytic extraction requires a model for the
+    /// third decorrelator output `y₂` which is not observable at
+    /// encode time. The ASPX envelope layer also stays at the
+    /// minimum-bit-cost FIXFIX num_env=1 scaffold pending the
+    /// "real ASPX envelope coding" deferral elsewhere on the README.
+    ///
+    /// `alpha_scale` / `beta_scale` / `gamma_scale` control the
+    /// extractor magnitude (typically `1.0` for the analytic
+    /// least-squares solution; `0.0` reproduces the prior-round
+    /// scaffold byte-for-byte at the corresponding layer position).
+    /// In particular `α/β/γ_scale = 0.0` reproduces the round-95
+    /// zero-delta scaffold ([`Self::encode_frame_pcm_5_0_acpl3`])
+    /// byte-for-byte; `γ_scale = 0.0` reproduces the round-196
+    /// real-α-β bytes exactly.
+    pub fn encode_frame_pcm_5_0_acpl3_real_alpha_beta_full_gamma(
+        &mut self,
+        frames: &[&[f32]; 5],
+        alpha_scale: f32,
+        beta_scale: f32,
+        gamma_scale: f32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_5_x_acpl3_real_alpha_beta_full_gamma_with_max_sfb(
+            frames,
+            None,
+            40,
+            None,
+            alpha_scale,
+            beta_scale,
+            gamma_scale,
+        )
+    }
+
+    /// 5.1 counterpart to
+    /// [`Self::encode_frame_pcm_5_0_acpl3_real_alpha_beta_full_gamma`].
+    /// `frames` is in `[L, R, C, Ls, Rs, LFE]` order. The LFE channel
+    /// is coded as a leading `mono_data(b_lfe = 1)` element per Table
+    /// 21 — same path as
+    /// [`Self::encode_frame_pcm_5_1_acpl3_real_alpha_beta_gamma`].
+    pub fn encode_frame_pcm_5_1_acpl3_real_alpha_beta_full_gamma(
+        &mut self,
+        frames: &[&[f32]; 6],
+        alpha_scale: f32,
+        beta_scale: f32,
+        gamma_scale: f32,
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_5_x_acpl3_real_alpha_beta_full_gamma_with_max_sfb(
+            &surround,
+            Some(frames[5]),
+            40,
+            Some(7),
+            alpha_scale,
+            beta_scale,
+            gamma_scale,
+        )
+    }
+
+    /// Shared body for the real-α/β + full real-γ₁..γ₆ ACPL_3 entry
+    /// points. Mirrors
+    /// [`Self::encode_frame_pcm_5_x_acpl3_real_alpha_beta_gamma_with_max_sfb`]
+    /// but accepts a 5-channel `[L, R, C, Ls, Rs]` input and invokes
+    /// the
+    /// [`crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma`]
+    /// builder.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_frame_pcm_5_x_acpl3_real_alpha_beta_full_gamma_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_lfe: Option<u32>,
+        alpha_scale: f32,
+        beta_scale: f32,
+        gamma_scale: f32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl3_real_alpha_beta_full_gamma: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(lfe_buf) = lfe {
+            assert_eq!(
+                lfe_buf.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl3_real_alpha_beta_full_gamma: LFE input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        if lfe.is_some() {
+            self.channel_mode_value = 0b1110;
+            self.channel_mode_bits = 4;
+        } else {
+            self.channel_mode_value = 0b1101;
+            self.channel_mode_bits = 4;
+        }
+
+        let n_channels = if lfe.is_some() { 6 } else { 5 };
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+        let coeffs_lfe: Option<Vec<f32>> =
+            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
+
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_qm0 = crate::acpl::AcplQuantMode::Fine;
+        let acpl_qm1 = crate::acpl::AcplQuantMode::Fine;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let body =
+            crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma(
+                frame_len,
+                max_sfb,
+                max_sfb_lfe,
+                self.b_iframe_global,
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                Some(&coeffs_per_channel[2]),
+                Some(&coeffs_per_channel[3]),
+                Some(&coeffs_per_channel[4]),
+                coeffs_lfe.as_deref(),
+                &aspx_cfg,
+                acpl_num_param_bands_id,
+                acpl_qm0,
+                acpl_qm1,
+                alpha_scale,
+                beta_scale,
+                gamma_scale,
+                pad_target_bytes,
+            );
+
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 5.0 frame in 5_X_codec_mode = ASPX_ACPL_2 per
     /// ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case ASPX_ACPL_2:`
     /// (round 100). Symmetric counterpart to the decoder's round-25

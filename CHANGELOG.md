@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 215 — real per-parameter-band γ₁ / γ₂ / γ₃ / γ₄ extraction
+  in the 5_X SIMPLE/ASPX_ACPL_3 encoder.** Layered on top of the
+  round-208 real γ₅ / γ₆ (centre) + the round-196 real α₁ / α₂ +
+  real β₁ / β₂ path: the γ₁..γ₄ entropy layers — previously emitted
+  as the round-95 zero-delta scaffold codewords — now carry per-band
+  magnitudes derived from per-band 2×2 least-squares fits of the
+  (L, Ls) and (R, Rs) output channel pairs onto the (L, R) carrier
+  pair. In §5.7.7.6.2 Pseudocode 118 step 5 the (L, Ls) pair is
+  built by the first `ACplModule2` invocation with `(a = α₁,
+  b = β₁, y = y₀)`, and step 11 scales `Ls = √2·z1`. Forming
+  `(L + Ls/√2)` cancels the `y₀·β₁` decorrelator contribution
+  exactly, leaving `L + Ls/√2 = (γ₁·x0in + γ₂·x1in)` which expands
+  to `(1 + √2)·(γ₁·L + γ₂·R)` via the step-1 carrier rescaling. By
+  symmetry with step 6 the same fit shape gives `(γ₃, γ₄)` from
+  `(R + Rs/√2)/(1 + √2)`. New
+  [`encoder_acpl3::extract_gamma_1_2_q_per_band_surround_least_squares`]
+  and [`extract_gamma_3_4_q_per_band_surround_least_squares`]
+  solve the 2×2 normal equations
+  `[<L,L> <L,R>; <L,R> <R,R>]·[γ; γ'] = [<L,T>; <R,T>]` per
+  parameter band. Bands with a degenerate Gram matrix (no L or R
+  energy, or perfectly collinear L = ±R within numerical tolerance)
+  keep γ = γ' = 0. New
+  [`encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma`]
+  drops all six γ extractors into the `acpl_data_2ch()` body
+  alongside the round-208 γ₅ / γ₆ extractor; β₃ stays zero-delta.
+  Caller-facing
+  [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_alpha_beta_full_gamma`]
+  / `encode_frame_pcm_5_1_acpl3_real_alpha_beta_full_gamma` wrap
+  the new builder, accepting a 5- / 6-channel
+  `[L, R, C, Ls, Rs (, LFE)]` input (vs the round-208 3- / 4-channel
+  `[L, R, C (, LFE)]` input that could only drive the centre γ
+  layer). Nine integration tests in
+  `tests/round215_5_x_acpl3_real_full_gamma.rs` pin: 5.0 round-trip
+  to a 5-channel `AudioFrame`; 5.1 round-trip to a 6-channel
+  `AudioFrame`; silent surround (Ls = 0) yields γ₂_q = 0 in every
+  band when probed directly; silent surround (Rs = 0) yields γ₃_q
+  = 0 in every band; `α/β/γ_scale = 0.0` reproduces the round-95
+  zero-delta scaffold byte-for-byte; `γ_scale = 0.0` reproduces
+  the round-196 real-α-β bytes byte-for-byte; loud-surround vs
+  silent-surround inputs produce materially different bytes (the
+  round-208 path would emit identical γ₁..γ₄ codewords regardless
+  of surround input); the encoder is bit-deterministic for matched
+  inputs and fresh state. Total tests 822 (was 813). β₃ extraction
+  (requires modelling the unobservable decorrelator output `y₂`)
+  and real ASPX envelope coding remain deferred.
+
 - **Round 208 — real per-parameter-band γ5 / γ6 extraction in the
   5_X SIMPLE/ASPX_ACPL_3 encoder.** Layered on top of the round-196
   real α₁ / α₂ + real β₁ / β₂ path: the γ5 / γ6 entropy layers now

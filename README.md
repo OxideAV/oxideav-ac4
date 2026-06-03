@@ -800,7 +800,54 @@ framework but usable standalone.
 > 5.1+Ls+Rs PCM input layout. Real β extraction for the 7_X ACPL_3
 > paths, real ASPX envelope coding, real Table-181 SAP-derived
 > residual content (for the ACPL_1 paths), and back-pair Lb/Rb
-> carriage remain deferred.
+> carriage remain deferred. Round 215 closes the round-208 γ1..γ4
+> deferral by adding the **5_X SIMPLE/ASPX_ACPL_3 encoder's real
+> per-band γ1 / γ2 / γ3 / γ4 extraction** — the (L, Ls) and (R, Rs)
+> output-pair gammas — driven by a 5-channel `[L, R, C, Ls, Rs]`
+> (5.0) or 6-channel `[L, R, C, Ls, Rs, LFE]` (5.1) PCM input
+> layout. In §5.7.7.6.2 Pseudocode 118 step 5 the (L, Ls) pair is
+> built by the first `ACplModule2` invocation with `(a = α₁,
+> b = β₁, y = y₀)`: `z0 = 0.5·(1+α₁)·(γ₁·x0in + γ₂·x1in) +
+> 0.5·y₀·β₁` and `z1 = 0.5·(1−α₁)·(γ₁·x0in + γ₂·x1in) − 0.5·y₀·β₁`,
+> with step 11 scaling `Ls = √2·z1`. Forming `(L + Ls/√2)` cancels
+> the `y₀·β₁` decorrelator contribution exactly, leaving
+> `L + Ls/√2 = (γ₁·x0in + γ₂·x1in) = (1+√2)·(γ₁·L + γ₂·R)` via the
+> step-1 carrier rescaling `x0in / x1in = (1+√2)·L / R` —
+> independent of α₁ and β₁. By symmetry with step 6, the same fit
+> shape gives `(γ₃, γ₄)` from `(R + Rs/√2)/(1+√2)`. New
+> [`encoder_acpl3::extract_gamma_1_2_q_per_band_surround_least_squares`]
+> and [`extract_gamma_3_4_q_per_band_surround_least_squares`]
+> solve the 2×2 normal equations
+> `[<L,L> <L,R>; <L,R> <R,R>]·[γ; γ'] = [<L,T>; <R,T>]` per
+> parameter band (the same shape as the round-208 γ5 / γ6 centre
+> fit, just with a different per-band target). Bands with a
+> degenerate Gram matrix keep `γ = γ' = 0`. The quantiser reuses
+> the Table-208 linear `gamma_q = round(γ / gamma_delta)` mapping
+> with the symmetric `±cb_off` clamp. New
+> [`encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma`]
+> is a drop-in replacement for the round-208 real-α-β-γ5-γ6 builder
+> with additional `coeffs_ls: Option<&[f32]>` +
+> `coeffs_rs: Option<&[f32]>` parameters and a
+> `write_acpl_data_2ch_real_alpha_beta_full_gamma` helper that
+> emits all six γ entropy layers (γ1..γ6) as REAL codewords (β3
+> stays zero-delta). New
+> [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_alpha_beta_full_gamma`]
+> and `_5_1_` high-level entry points accept `[L, R, C, Ls, Rs]`
+> (5.0) or `[L, R, C, Ls, Rs, LFE]` (5.1) PCM. Nine integration
+> tests in `tests/round215_5_x_acpl3_real_full_gamma.rs` pin: 5.0
+> round-trip to a 5-channel `AudioFrame`; 5.1 round-trip to a
+> 6-channel `AudioFrame`; silent Ls (Ls = 0) → γ2_q = 0 in every
+> band when probed directly; silent Rs (Rs = 0) → γ3_q = 0 in every
+> band; `α/β/γ_scale = 0.0` matches the round-95 zero-delta
+> scaffold byte-for-byte; `γ_scale = 0.0` reproduces the round-196
+> real-α-β bytes exactly; loud-surround vs silent-surround inputs
+> produce materially different bytes (the round-208 path would emit
+> identical γ1..γ4 codewords regardless of surround input);
+> deterministic for matched inputs and fresh state. Total tests
+> 822 (was 813). β3 extraction (requires modelling the
+> unobservable third decorrelator output `y₂`), real ASPX envelope
+> coding, real Table-181 SAP-derived residual content (for the
+> ACPL_1 paths), and back-pair Lb/Rb carriage remain deferred.
 
 ## Specs
 

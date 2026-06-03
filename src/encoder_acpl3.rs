@@ -925,6 +925,128 @@ fn write_acpl_data_2ch_real_alpha_beta_gamma(
     emit_real_gamma(bw, quant_mode_1, gamma6_q_per_band);
 }
 
+/// Body of `acpl_data_2ch()` (Pseudocode 117 / §5.7.7.6.2 + Table 62)
+/// for the 5_X SIMPLE/ASPX_ACPL_3 path with **all** of α₁ / α₂ / β₁ /
+/// β₂ / γ₁ / γ₂ / γ₃ / γ₄ / γ₅ / γ₆ emitted as REAL per-parameter-band
+/// codewords. β₃ stays at the zero-delta scaffold (its analytic
+/// extraction requires per-side surround references plus a model for
+/// the third decorrelator output `y₂`, neither of which is observable
+/// at encode time for the 5.x PCM input layout).
+///
+/// The γ₁ / γ₂ (L, Ls) and γ₃ / γ₄ (R, Rs) per-band magnitudes come
+/// from
+/// [`extract_gamma_1_2_q_per_band_surround_least_squares`] and
+/// [`extract_gamma_3_4_q_per_band_surround_least_squares`]; γ₅ / γ₆
+/// (centre) come from
+/// [`extract_gamma_5_6_q_per_band_centre_least_squares`].
+///
+/// Each `*_q_per_band` slice must contain at least `num_bands` entries;
+/// trailing positions outside the slice are coded as `0`.
+#[allow(clippy::too_many_arguments)]
+fn write_acpl_data_2ch_real_alpha_beta_full_gamma(
+    bw: &mut BitWriter,
+    num_bands: u32,
+    quant_mode_0: crate::acpl::AcplQuantMode,
+    quant_mode_1: crate::acpl::AcplQuantMode,
+    alpha1_q_per_band: &[i32],
+    alpha2_q_per_band: &[i32],
+    beta1_q_per_band: &[i32],
+    beta2_q_per_band: &[i32],
+    gamma1_q_per_band: &[i32],
+    gamma2_q_per_band: &[i32],
+    gamma3_q_per_band: &[i32],
+    gamma4_q_per_band: &[i32],
+    gamma5_q_per_band: &[i32],
+    gamma6_q_per_band: &[i32],
+) {
+    // acpl_framing_data(): smooth interp (1 b) + num_param_sets_cod = 0 (1 b).
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    // Helper: emit one zero-delta `acpl_huff_data()` FREQ-mode block.
+    let emit_zero =
+        |bw: &mut BitWriter, dt: crate::acpl::AcplDataType, qm: crate::acpl::AcplQuantMode| {
+            bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+            if num_bands >= 1 {
+                write_acpl_f0_zero(bw, dt, qm);
+            }
+            for _ in 1..num_bands {
+                write_acpl_df_zero(bw, dt, qm);
+            }
+        };
+
+    // Helper: emit one real-α `acpl_huff_data()` FREQ-mode block.
+    let emit_real_alpha = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, alpha_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let a_q = alpha_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_alpha_f0_value(bw, qm, a_q);
+                first = false;
+            } else {
+                let delta = a_q - prev_q;
+                write_acpl_alpha_df_value(bw, qm, delta);
+            }
+            prev_q = a_q;
+        }
+    };
+
+    // Helper: emit one real-β `acpl_huff_data()` FREQ-mode block.
+    let emit_real_beta = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, beta_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let b_q = beta_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_beta_f0_value(bw, qm, b_q);
+                first = false;
+            } else {
+                let delta = b_q - prev_q;
+                write_acpl_beta_df_value(bw, qm, delta);
+            }
+            prev_q = b_q;
+        }
+    };
+
+    // Helper: emit one real-γ `acpl_huff_data()` FREQ-mode block.
+    let emit_real_gamma = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, gamma_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let g_q = gamma_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_gamma_f0_value(bw, qm, g_q);
+                first = false;
+            } else {
+                let delta = g_q - prev_q;
+                write_acpl_gamma_df_value(bw, qm, delta);
+            }
+            prev_q = g_q;
+        }
+    };
+
+    // alpha1, alpha2 — REAL (ALPHA family, quant_mode_0).
+    emit_real_alpha(bw, quant_mode_0, alpha1_q_per_band);
+    emit_real_alpha(bw, quant_mode_0, alpha2_q_per_band);
+    // beta1, beta2 — REAL (BETA family, quant_mode_0).
+    emit_real_beta(bw, quant_mode_0, beta1_q_per_band);
+    emit_real_beta(bw, quant_mode_0, beta2_q_per_band);
+    // beta3 — zero-delta (BETA3 family, quant_mode_0).
+    emit_zero(bw, crate::acpl::AcplDataType::Beta3, quant_mode_0);
+    // gamma1..gamma4 — REAL (GAMMA family, quant_mode_1).
+    emit_real_gamma(bw, quant_mode_1, gamma1_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma2_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma3_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma4_q_per_band);
+    // gamma5, gamma6 — REAL (GAMMA family, quant_mode_1).
+    emit_real_gamma(bw, quant_mode_1, gamma5_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma6_q_per_band);
+}
+
 // ====================================================================
 // Top-level body builder: `5_X_channel_element` ASPX_ACPL_3
 // ====================================================================
@@ -1413,6 +1535,208 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_gamma(
             &alpha_q,
             &beta1_q,
             &beta2_q,
+            &g5_q,
+            &g6_q,
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+/// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_gamma`] but
+/// with the γ₁ / γ₂ / γ₃ / γ₄ entropy layers ALSO carrying real
+/// per-parameter-band magnitudes derived from per-band 2×2
+/// least-squares fits of the (L, Ls) and (R, Rs) output channel pairs
+/// onto the (L, R) carrier pair (Pseudocode 118 step 5 / step 6 +
+/// step 11).
+///
+/// Per [`extract_gamma_1_2_q_per_band_surround_least_squares`] the
+/// `(L + Ls/√2)` sum is independent of the (α₁, β₁) decorrelator
+/// contribution and equals `(1 + √2) · (γ₁·L + γ₂·R)`; by symmetry
+/// the `(R + Rs/√2)` sum equals `(1 + √2) · (γ₃·L + γ₄·R)`. Each pair
+/// solves the same 2×2 normal-equations system as the round-208
+/// γ₅ / γ₆ centre fit but with the per-side surround pair as the
+/// target.
+///
+/// β₃ stays at the round-95 zero-delta scaffold — its analytic
+/// extraction requires per-side surround references plus a model for
+/// the third decorrelator output `y₂`, neither of which is observable
+/// at encode time for the 5.x PCM input layout.
+///
+/// `gamma_scale` controls the magnitude of the recovered γ values
+/// (applied uniformly to γ₁..γ₆): `gamma_scale = 1.0` reproduces the
+/// analytic least-squares solution (clamped to the Table-208 ±2.0
+/// magnitude bound); `gamma_scale = 0.0` reproduces the round-95
+/// zero-delta scaffold byte-for-byte at the γ₁..γ₆ positions.
+///
+/// With `alpha_scale = beta_scale = gamma_scale = 0.0` this entry point
+/// reproduces the round-95 zero-delta scaffold
+/// ([`build_5_x_acpl3_body_from_pcm_spectra`]) byte-for-byte.
+///
+/// `coeffs_c` / `coeffs_ls` / `coeffs_rs` are the centre / surround-
+/// left / surround-right MDCT spectra used by the γ extractors; if
+/// `None` the corresponding γ layer falls back to the zero-delta
+/// scaffold.
+///
+/// The decoder walks the same Table 25 ASPX_ACPL_3 body and applies
+/// the recovered γ matrices through all three ACplModule2 invocations
+/// (Pseudocode 118 steps 5 / 6 / 7), so the (L, Ls), (R, Rs) and
+/// centre output channels can now all carry input-derived γ-shaped
+/// dry mix in place of the previous-round zero-γ silence.
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+
+    let alpha_q = extract_alpha_q_per_band_carrier_correlation(
+        coeffs_l,
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        alpha_scale,
+        acpl_qm0,
+    );
+    let beta1_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_l,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let beta2_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let (g1_q, g2_q) = if let Some(coeffs_ls_buf) = coeffs_ls {
+        extract_gamma_1_2_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_ls_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g3_q, g4_q) = if let Some(coeffs_rs_buf) = coeffs_rs {
+        extract_gamma_3_4_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_rs_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g5_q, g6_q) = if let Some(coeffs_c_buf) = coeffs_c {
+        extract_gamma_5_6_q_per_band_centre_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_c_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_3 (4) — 3 bits.
+    bw.write_u32(4, 3);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_2ch() (4 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_2ch(&mut bw, acpl_num_param_bands_id, acpl_qm0, acpl_qm1);
+    }
+
+    // LFE: mono_data(b_lfe=1) when present.
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(2): sync=1, on=1, no avg.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // stereo_data(): split-MDCT L/R carriers.
+    write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // I-frame: aspx_data_2ch() + acpl_data_2ch() with real α/β/γ1..6.
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_acpl_data_2ch_real_alpha_beta_full_gamma(
+            &mut bw,
+            acpl_num_bands,
+            acpl_qm0,
+            acpl_qm1,
+            &alpha_q,
+            &alpha_q,
+            &beta1_q,
+            &beta2_q,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
             &g5_q,
             &g6_q,
         );
@@ -2657,6 +2981,220 @@ pub fn extract_gamma_5_6_q_per_band_centre_least_squares(
         g6_q[pb] = quantise_gamma(g6, qm);
     }
     (g5_q, g6_q)
+}
+
+/// Shared per-band 2×2 least-squares fit solver for the γ pair that
+/// reproduces an output channel pair `(out_front, out_back)` from the
+/// (L, R) carrier pair through Pseudocode 118 step 5 / step 6 / step 11.
+///
+/// Given the Pseudocode 119 module-2 outputs at step 5 / 6 with
+/// `(a = α, b = β, y)`:
+///
+/// ```text
+///   z0 = 0.5·(1+α)·(g·x0in + g'·x1in) + 0.5·y·β
+///   z1 = 0.5·(1−α)·(g·x0in + g'·x1in) − 0.5·y·β
+/// ```
+///
+/// step 11 scales `z1 *= √2` before QMF synthesis. Forming the sum
+/// `(front + back/√2)` cancels the decorrelator term `y·β` entirely
+/// (the `+0.5·y·β` and `−0.5·y·β` contributions add to 0):
+///
+/// ```text
+///   front + back/√2 = (g·x0in + g'·x1in)
+/// ```
+///
+/// and step 1 expands `x0in / x1in = (1 + √2) · L / R`, giving
+///
+/// ```text
+///   front + back/√2 = (1 + √2) · (g · L + g' · R)
+/// ```
+///
+/// — i.e. `(front + back/√2) / (1 + √2) ≈ g · L + g' · R`, independent
+/// of α and β. The per-band least-squares fit solves
+///
+/// ```text
+///   min_{g, g'}  Σ_bin ( T[bin] − g · L[bin] − g' · R[bin] )²
+/// ```
+///
+/// with `T = (front + back/√2) / (1 + √2)`, via the 2×2 normal equations
+///
+/// ```text
+///   [ <L,L>  <L,R> ] [g ]   [ <L,T> ]
+///   [ <L,R>  <R,R> ] [g'] = [ <R,T> ]
+/// ```
+///
+/// where the inner products are summed over the MDCT bins that
+/// [`mdct_bin_to_param_band`] maps to parameter band `pb`. Bands where
+/// the 2×2 system is singular (zero L or R energy, or perfectly
+/// collinear L = ±R within numerical tolerance) return `(0, 0)`.
+///
+/// Returns one `(g_q, g'_q)` pair per parameter band. Entries below
+/// `start_pb` are `(0, 0)`. The non-empty bands are scaled by
+/// `gamma_scale` and quantised through [`quantise_gamma`] (Table-208
+/// linear, symmetric `±cb_off` clamp).
+#[allow(clippy::too_many_arguments)]
+fn extract_gamma_pair_q_per_band_surround_least_squares(
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_front: &[f32],
+    coeffs_back: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    gamma_scale: f32,
+    qm: crate::acpl::AcplQuantMode,
+) -> (Vec<i32>, Vec<i32>) {
+    let n = num_param_bands as usize;
+    let mut e_ll = vec![0.0f32; n];
+    let mut e_rr = vec![0.0f32; n];
+    let mut e_lr = vec![0.0f32; n];
+    let mut e_lt = vec![0.0f32; n];
+    let mut e_rt = vec![0.0f32; n];
+    // K = 1 + √2 from Pseudocode 118 step 1 carrier rescaling.
+    let k = 1.0 + (2.0f32).sqrt();
+    let inv_k = 1.0 / k;
+    // T = (front + back / √2) · inv_k.
+    let inv_sqrt2 = 1.0 / (2.0f32).sqrt();
+    let len = coeffs_l
+        .len()
+        .min(coeffs_r.len())
+        .min(coeffs_front.len())
+        .min(coeffs_back.len());
+    for bin in 0..len {
+        let pb = mdct_bin_to_param_band(bin as u32, transform_length, num_param_bands) as usize;
+        if (pb as u32) < start_pb {
+            continue;
+        }
+        let xl = coeffs_l[bin];
+        let xr = coeffs_r[bin];
+        let t = (coeffs_front[bin] + coeffs_back[bin] * inv_sqrt2) * inv_k;
+        e_ll[pb] += xl * xl;
+        e_rr[pb] += xr * xr;
+        e_lr[pb] += xl * xr;
+        e_lt[pb] += xl * t;
+        e_rt[pb] += xr * t;
+    }
+    let mut g_q = vec![0i32; n];
+    let mut gp_q = vec![0i32; n];
+    for pb in 0..n {
+        if (pb as u32) < start_pb {
+            continue;
+        }
+        let a = e_ll[pb];
+        let b = e_lr[pb];
+        let c = e_rr[pb];
+        let det = a * c - b * b;
+        if !det.is_finite() || det.abs() <= f32::EPSILON * (a.abs() + c.abs() + 1.0) {
+            continue;
+        }
+        // Inverse of [[a, b], [b, c]] is (1/det) · [[c, -b], [-b, a]].
+        let g_raw = (c * e_lt[pb] - b * e_rt[pb]) / det;
+        let gp_raw = (-b * e_lt[pb] + a * e_rt[pb]) / det;
+        let g = gamma_scale * g_raw;
+        let gp = gamma_scale * gp_raw;
+        if !g.is_finite() || !gp.is_finite() {
+            continue;
+        }
+        g_q[pb] = quantise_gamma(g, qm);
+        gp_q[pb] = quantise_gamma(gp, qm);
+    }
+    (g_q, gp_q)
+}
+
+/// Compute the per-parameter-band gamma pair `(γ1, γ2)` that minimises
+/// the (L, Ls) output-pair reconstruction error for ASPX_ACPL_3 step 5
+/// of §5.7.7.6.2 Pseudocode 118 + Pseudocode 119:
+///
+/// ```text
+///   z0 = 0.5·(1+α₁)·(γ₁·x0in + γ₂·x1in) + 0.5·y₀·β₁         → L
+///   z1 = 0.5·(1−α₁)·(γ₁·x0in + γ₂·x1in) − 0.5·y₀·β₁
+///   Ls = √2 · z1                                              (step 11)
+///   x0in = (1 + √2)·L_orig, x1in = (1 + √2)·R_orig            (step 1)
+/// ```
+///
+/// Forming `(L + Ls/√2)` cancels the decorrelator-driven `y₀·β₁`
+/// contributions exactly, leaving
+///
+/// ```text
+///   L + Ls/√2 = (γ₁·x0in + γ₂·x1in) = (1 + √2) · (γ₁·L_orig + γ₂·R_orig)
+/// ```
+///
+/// independent of α₁ and β₁. The per-band least-squares fit returns
+/// the `(γ₁, γ₂)` pair that minimises the MDCT-bin-wise residual.
+///
+/// `coeffs_ls` is the surround-left MDCT spectrum; `coeffs_l` / `coeffs_r`
+/// are the carrier MDCT spectra (the L / R inputs the encoder is also
+/// emitting on the `two_channel_data()` body). Entries below `start_pb`
+/// are `(0, 0)`. Bands with a degenerate Gram matrix (no L or R energy,
+/// or perfectly collinear L = ±R within numerical tolerance) return
+/// `(0, 0)`.
+///
+/// `gamma_scale = 1.0` reproduces the analytic least-squares solution
+/// (clamped to the Table-208 ±2.0 magnitude bound); `gamma_scale = 0.0`
+/// returns all-zero `(γ₁_q, γ₂_q)`.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_gamma_1_2_q_per_band_surround_least_squares(
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    gamma_scale: f32,
+    qm: crate::acpl::AcplQuantMode,
+) -> (Vec<i32>, Vec<i32>) {
+    extract_gamma_pair_q_per_band_surround_least_squares(
+        coeffs_l,
+        coeffs_r,
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        num_param_bands,
+        start_pb,
+        gamma_scale,
+        qm,
+    )
+}
+
+/// Compute the per-parameter-band gamma pair `(γ3, γ4)` that minimises
+/// the (R, Rs) output-pair reconstruction error for ASPX_ACPL_3 step 6
+/// of §5.7.7.6.2 Pseudocode 118 + Pseudocode 119. By symmetry with the
+/// γ1 / γ2 derivation above (substituting Ls → Rs and z0 → z2 / z1 → z3
+/// per Pseudocode 118 step 6):
+///
+/// ```text
+///   R + Rs/√2 = (γ₃·x0in + γ₄·x1in) = (1 + √2) · (γ₃·L_orig + γ₄·R_orig)
+/// ```
+///
+/// independent of α₂ and β₂.
+///
+/// `coeffs_rs` is the surround-right MDCT spectrum; `coeffs_l` /
+/// `coeffs_r` are the carrier MDCT spectra. Returns one `(γ₃_q, γ₄_q)`
+/// pair per parameter band with the same fallback / scaling /
+/// quantisation behaviour as
+/// [`extract_gamma_1_2_q_per_band_surround_least_squares`].
+#[allow(clippy::too_many_arguments)]
+pub fn extract_gamma_3_4_q_per_band_surround_least_squares(
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_rs: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    gamma_scale: f32,
+    qm: crate::acpl::AcplQuantMode,
+) -> (Vec<i32>, Vec<i32>) {
+    extract_gamma_pair_q_per_band_surround_least_squares(
+        coeffs_l,
+        coeffs_r,
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        num_param_bands,
+        start_pb,
+        gamma_scale,
+        qm,
+    )
 }
 
 /// Compute per-parameter-band carrier and surround energies
