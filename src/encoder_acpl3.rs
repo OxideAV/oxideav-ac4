@@ -181,6 +181,261 @@ fn write_aspx_noise_df_zero(bw: &mut BitWriter, stereo: aspx::AspxStereoMode) {
 }
 
 // ====================================================================
+// ASPX HCB value-emitting helpers (round 219)
+// ====================================================================
+//
+// The `write_aspx_*_f0` / `write_aspx_*_df_zero` writers above pick the
+// **minimum-bit-cost** codeword (the shortest entry in the Huffman
+// table, breaking ties on the lowest table index). They are the right
+// choice for the round-95 "zero-delta scaffold" — the goal there is to
+// emit a structurally-valid `aspx_data_*()` body with the smallest
+// possible bit footprint so the surrounding `ac4_substream()` walker
+// stays well-formed and the trailing ACPL parameter pair lands where the
+// decoder expects it.
+//
+// They are **not** the right choice for real envelope coding. The
+// minimum-bit F0 codeword for `ASPX_HCB_ENV_LEVEL_15_F0` lands on symbol
+// index 30 (LEN = 4 bits, the first occurrence of the table-wide
+// minimum), which the decoder dequantises through Pseudocode 80
+// (`acc += delta * d`) plus Pseudocode 82 (`scf = n_subbands *
+// 2^(qscf/a)`) into an envelope ~64·2^15 — an unintentionally loud
+// HF replica. Real envelope coding needs the encoder to (a) compute
+// per-`(sbg, atsg)` quantised envelope indices from input band energies,
+// (b) FREQ-direction-delta-decode them across `sbg` against an
+// accumulator that starts at 0 (Pseudocode 80), so the on-wire stream is
+// F0 followed by `(num_sbg - 1)` × DF DPCM deltas, and (c) write each
+// codebook value through the matching Huffman table.
+//
+// These value-emitting helpers are the encoder-side primitives for that
+// real envelope coding path: each takes an integer index `v` (F0) or
+// `delta_q` (DF) and writes the matching `(cw, len)` from the codebook
+// selected by `(quant_mode, stereo_mode)` (SIGNAL) or `stereo_mode`
+// alone (NOISE). The helpers clamp their inputs to the codebook's
+// addressable range (`0..codebook_length` for F0, `-cb_off..=+cb_off`
+// for DF — both inclusive on both ends since the F0 max symbol index is
+// `codebook_length - 1` and the DF table is symmetric about `cb_off`).
+//
+// Round 219 ships the helpers + unit tests; the existing minimum-bit
+// writers in `write_aspx_data_2ch_minimal` / `write_aspx_data_1ch_minimal`
+// stay in place. A subsequent round will route them through a new
+// `write_aspx_data_2ch_real_envelope()` builder that consumes per-sbg
+// envelope indices computed from the input MDCT spectra (the inverse
+// of Pseudocode 82's `n_subbands * 2^(q/a)` form).
+
+/// Codebook addressing parameters: `(len, cw, cb_off)` triple. For
+/// `*_F0` tables `cb_off` is 0 (symbol index == decoded value); for
+/// `*_DF` / `*_DT` tables it's the per-table cb_off the decoder uses
+/// to recover `delta = symbol_index - cb_off`.
+type AspxHcbArrays = (&'static [u8], &'static [u32], i32);
+
+/// Return the `(LEN, CW, cb_off)` triple for the ASPX SIGNAL Huffman
+/// codebook keyed by `(quant_mode, stereo_mode, hcb_type)`. The cb_off
+/// values mirror the Annex A.2 Tables A.16..=A.27 headers (and match
+/// the decoder constants in `aspx::ASPX_HCB_ENV_*`).
+fn aspx_sig_hcb_arrays(
+    quant: aspx::AspxQuantStep,
+    stereo: aspx::AspxStereoMode,
+    hcb: aspx::AspxHcbType,
+) -> AspxHcbArrays {
+    use aspx::AspxHcbType::*;
+    use aspx::AspxQuantStep::*;
+    use aspx::AspxStereoMode::*;
+    match (quant, stereo, hcb) {
+        // 15 / Fine (1.5 dB step)
+        (Fine, Level, F0) => (
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_15_F0_LEN,
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_15_F0_CW,
+            0,
+        ),
+        (Fine, Level, Df) => (
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DF_LEN,
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DF_CW,
+            70,
+        ),
+        (Fine, Level, Dt) => (
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DT_LEN,
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_15_DT_CW,
+            70,
+        ),
+        (Fine, Balance, F0) => (
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_15_F0_LEN,
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_15_F0_CW,
+            0,
+        ),
+        (Fine, Balance, Df) => (
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DF_LEN,
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DF_CW,
+            24,
+        ),
+        (Fine, Balance, Dt) => (
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DT_LEN,
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_15_DT_CW,
+            24,
+        ),
+        // 30 / Coarse (3 dB step)
+        (Coarse, Level, F0) => (
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_30_F0_LEN,
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_30_F0_CW,
+            0,
+        ),
+        (Coarse, Level, Df) => (
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DF_LEN,
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DF_CW,
+            35,
+        ),
+        (Coarse, Level, Dt) => (
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DT_LEN,
+            aspx_huffman::ASPX_HCB_ENV_LEVEL_30_DT_CW,
+            35,
+        ),
+        (Coarse, Balance, F0) => (
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_30_F0_LEN,
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_30_F0_CW,
+            0,
+        ),
+        (Coarse, Balance, Df) => (
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DF_LEN,
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DF_CW,
+            12,
+        ),
+        (Coarse, Balance, Dt) => (
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DT_LEN,
+            aspx_huffman::ASPX_HCB_ENV_BALANCE_30_DT_CW,
+            12,
+        ),
+    }
+}
+
+/// Return the `(LEN, CW, cb_off)` triple for the ASPX NOISE Huffman
+/// codebook keyed by `(stereo_mode, hcb_type)`. NOISE codebooks don't
+/// depend on `quant_mode` (per ETSI TS 103 190-1 §A.2 NOTE the NOISE
+/// envelope is always coded at the Fine step).
+fn aspx_noise_hcb_arrays(stereo: aspx::AspxStereoMode, hcb: aspx::AspxHcbType) -> AspxHcbArrays {
+    use aspx::AspxHcbType::*;
+    use aspx::AspxStereoMode::*;
+    match (stereo, hcb) {
+        (Level, F0) => (
+            aspx_huffman::ASPX_HCB_NOISE_LEVEL_F0_LEN,
+            aspx_huffman::ASPX_HCB_NOISE_LEVEL_F0_CW,
+            0,
+        ),
+        (Level, Df) => (
+            aspx_huffman::ASPX_HCB_NOISE_LEVEL_DF_LEN,
+            aspx_huffman::ASPX_HCB_NOISE_LEVEL_DF_CW,
+            29,
+        ),
+        (Level, Dt) => (
+            aspx_huffman::ASPX_HCB_NOISE_LEVEL_DT_LEN,
+            aspx_huffman::ASPX_HCB_NOISE_LEVEL_DT_CW,
+            29,
+        ),
+        (Balance, F0) => (
+            aspx_huffman::ASPX_HCB_NOISE_BALANCE_F0_LEN,
+            aspx_huffman::ASPX_HCB_NOISE_BALANCE_F0_CW,
+            0,
+        ),
+        (Balance, Df) => (
+            aspx_huffman::ASPX_HCB_NOISE_BALANCE_DF_LEN,
+            aspx_huffman::ASPX_HCB_NOISE_BALANCE_DF_CW,
+            12,
+        ),
+        (Balance, Dt) => (
+            aspx_huffman::ASPX_HCB_NOISE_BALANCE_DT_LEN,
+            aspx_huffman::ASPX_HCB_NOISE_BALANCE_DT_CW,
+            12,
+        ),
+    }
+}
+
+/// Write an ASPX SIGNAL F0 codeword that decodes to the unsigned
+/// integer index `v` per ETSI TS 103 190-1 §A.2 Tables A.16 / A.19 /
+/// A.22 / A.25. F0 codebooks have `cb_off = 0`, so the decoder
+/// recovers `symbol_index == v` directly via
+/// [`aspx::AspxHcb::decode_delta`].
+///
+/// `v` is clamped to the addressable range `0..codebook_length` (i.e.
+/// `0..71` for Fine/Level, `0..25` for Fine/Balance, `0..36` for
+/// Coarse/Level, `0..13` for Coarse/Balance). Values outside the range
+/// silently saturate to the codebook's last entry. This matches the
+/// decoder's clamp semantics in `parse_aspx_huff_data()` and keeps the
+/// encoder safe against an over-aggressive envelope-energy quantiser.
+pub fn write_aspx_sig_f0_value(
+    bw: &mut BitWriter,
+    quant: aspx::AspxQuantStep,
+    stereo: aspx::AspxStereoMode,
+    v: i32,
+) {
+    let (len, cw, _cb_off) = aspx_sig_hcb_arrays(quant, stereo, aspx::AspxHcbType::F0);
+    let idx = v.clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write an ASPX SIGNAL DF codeword that decodes to the signed delta
+/// `delta_q` per ETSI TS 103 190-1 §A.2 Tables A.17 / A.20 / A.23 /
+/// A.26. The decoder recovers `delta = symbol_index - cb_off`, so the
+/// encoder writes `cw[delta_q + cb_off]` with the matching `len[]`.
+///
+/// `delta_q` is clamped to the codebook's symmetric range
+/// `-cb_off..=cb_off` (which exactly matches `0..codebook_length`
+/// after the offset is applied), so values outside the range saturate
+/// to the extreme entries. The DF codebooks all happen to be symmetric
+/// `2·cb_off + 1` wide.
+pub fn write_aspx_sig_df_value(
+    bw: &mut BitWriter,
+    quant: aspx::AspxQuantStep,
+    stereo: aspx::AspxStereoMode,
+    delta_q: i32,
+) {
+    let (len, cw, cb_off) = aspx_sig_hcb_arrays(quant, stereo, aspx::AspxHcbType::Df);
+    let idx = (delta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write an ASPX SIGNAL DT codeword that decodes to the signed
+/// time-delta `delta_q` per ETSI TS 103 190-1 §A.2 Tables A.18 / A.21 /
+/// A.24 / A.27. Same shape as [`write_aspx_sig_df_value`] but routed
+/// through the `Dt` codebook variants — used when the caller has
+/// signalled `aspx_sig_delta_dir[env] == TIME` (Pseudocode 80's TIME
+/// branch).
+pub fn write_aspx_sig_dt_value(
+    bw: &mut BitWriter,
+    quant: aspx::AspxQuantStep,
+    stereo: aspx::AspxStereoMode,
+    delta_q: i32,
+) {
+    let (len, cw, cb_off) = aspx_sig_hcb_arrays(quant, stereo, aspx::AspxHcbType::Dt);
+    let idx = (delta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write an ASPX NOISE F0 codeword that decodes to the unsigned
+/// integer index `v` per ETSI TS 103 190-1 §A.2 Tables A.28 / A.31.
+/// NOISE codebooks share the F0 / Df / Dt shape of the SIGNAL paths;
+/// the only differences are the codebook contents and the absence of
+/// a per-envelope `quant_mode` selector (NOISE is always 1.5 dB step).
+pub fn write_aspx_noise_f0_value(bw: &mut BitWriter, stereo: aspx::AspxStereoMode, v: i32) {
+    let (len, cw, _cb_off) = aspx_noise_hcb_arrays(stereo, aspx::AspxHcbType::F0);
+    let idx = v.clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write an ASPX NOISE DF codeword that decodes to the signed delta
+/// `delta_q` per ETSI TS 103 190-1 §A.2 Tables A.29 / A.32.
+pub fn write_aspx_noise_df_value(bw: &mut BitWriter, stereo: aspx::AspxStereoMode, delta_q: i32) {
+    let (len, cw, cb_off) = aspx_noise_hcb_arrays(stereo, aspx::AspxHcbType::Df);
+    let idx = (delta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write an ASPX NOISE DT codeword that decodes to the signed
+/// time-delta `delta_q` per ETSI TS 103 190-1 §A.2 Tables A.30 / A.33.
+pub fn write_aspx_noise_dt_value(bw: &mut BitWriter, stereo: aspx::AspxStereoMode, delta_q: i32) {
+    let (len, cw, cb_off) = aspx_noise_hcb_arrays(stereo, aspx::AspxHcbType::Dt);
+    let idx = (delta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+// ====================================================================
 // ACPL HCB minimum-cost codeword helpers
 // ====================================================================
 

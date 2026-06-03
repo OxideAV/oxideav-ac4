@@ -848,6 +848,42 @@ framework but usable standalone.
 > unobservable third decorrelator output `y₂`), real ASPX envelope
 > coding, real Table-181 SAP-derived residual content (for the
 > ACPL_1 paths), and back-pair Lb/Rb carriage remain deferred.
+> Round 219 begins closing the "real ASPX envelope coding" deferral
+> by landing the encoder's value-emitting ASPX-Huffman primitives —
+> the six [`encoder_acpl3::write_aspx_sig_f0_value`] /
+> `write_aspx_sig_df_value` / `write_aspx_sig_dt_value` /
+> `write_aspx_noise_f0_value` / `write_aspx_noise_df_value` /
+> `write_aspx_noise_dt_value` helpers — that the existing scaffold's
+> `pick_min_len_cw` / `pick_zero_delta_cw` writers can be swapped
+> for in a follow-up round. Each takes an integer index `v` (F0) or
+> signed `delta_q` (DF / DT) and writes the matching `(cw, len)`
+> from the codebook selected by `(quant_mode, stereo_mode)` for
+> SIGNAL paths or `stereo_mode` alone for NOISE paths; values
+> outside `[0, codebook_length)` (F0) or `[-cb_off, +cb_off]`
+> (DF / DT) clamp to the codebook's extreme entries rather than
+> panicking, matching the decoder's parser semantics. The four
+> SIGNAL codebooks (`LEVEL_15` / `BALANCE_15` / `LEVEL_30` /
+> `BALANCE_30`) and the two NOISE codebooks (`LEVEL` / `BALANCE`)
+> are all dispatched via a new `aspx_sig_hcb_arrays()` /
+> `aspx_noise_hcb_arrays()` `(LEN, CW, cb_off)` triple lookup,
+> mirroring the existing `acpl_hcb_arrays()` shape. Twelve
+> integration tests in `tests/round219_aspx_envelope_value_writers.rs`
+> pin: SIGNAL F0 / DF / DT round-trip against `parse_aspx_huff_data()`
+> for every `(quant_mode, stereo_mode)` × representative-value
+> combination; NOISE F0 / DF / DT round-trip across both stereo
+> modes; out-of-range F0 and DF values clamp to the codebook edge;
+> repeated writes are byte-deterministic; and a full F0 + DF
+> envelope round-trips through the higher-level `parse_aspx_ec_data()`
+> entry point with `num_sbg = 2` and `freq_res = highres`. Total
+> tests 834 (was 822). The existing minimum-bit-cost
+> `write_aspx_sig_f0` / `write_aspx_sig_df_zero` /
+> `write_aspx_noise_f0` / `write_aspx_noise_df_zero` writers stay
+> in place; no `write_aspx_data_*_minimal()` call site is touched.
+> A subsequent round will route the new helpers through a
+> `write_aspx_data_2ch_real_envelope()` builder that consumes per-
+> `(sbg, atsg)` envelope quant indices computed from the input MDCT
+> spectra (inverting Pseudocode 82's
+> `scf = n_subbands · 2^(qscf/a)` form).
 
 ## Specs
 
