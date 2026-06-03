@@ -884,6 +884,43 @@ framework but usable standalone.
 > `(sbg, atsg)` envelope quant indices computed from the input MDCT
 > spectra (inverting Pseudocode 82's
 > `scf = n_subbands · 2^(qscf/a)` form).
+> Round 226 lands that builder pair. Two new public emitters in
+> [`encoder_acpl3`] — `write_aspx_data_2ch_real_envelope()` (Table 52)
+> and `write_aspx_data_1ch_real_envelope()` (Table 51) — accept a
+> per-channel [`encoder_acpl3::AspxRealEnvelopeChannel`] payload
+> (`sig: &[i32]` + `noise: &[i32]`) carrying caller-supplied F0 +
+> signed DF quant indices and route them through the round-219
+> value-emitting helpers `write_aspx_sig_f0_value` /
+> `write_aspx_sig_df_value` / `write_aspx_noise_f0_value` /
+> `write_aspx_noise_df_value`. The framing skeleton mirrors the
+> existing `_minimal` writers — FIXFIX prefix `0`, `tmp_num_env = 0`
+> (→ `num_env = 1`), `aspx_balance = 1` for the 2ch variant (shared
+> channel-0 framing), SIGNAL + NOISE delta-direction bits = FREQ,
+> `aspx_hfgen_iwc_2ch`/`_1ch` trailer all zeros — and the SIGNAL
+> band count keys off `cfg.signals_freq_res()` (low-res when the
+> in-band `aspx_freq_res = 0` bit is emitted, otherwise the parser's
+> high-res fallback). Per-channel stereo-mode follows Table 52: ch0
+> = LEVEL, ch1 = BALANCE; the 1ch path uses LEVEL throughout. Caller
+> slices shorter than the derived SBG count zero-pad the trailing
+> envelope positions; F0 values outside `[0, codebook_length)` clamp
+> to the codebook edge; DF values outside `[-cb_off, +cb_off]`
+> saturate to the symmetric edge — matching the round-219 helper
+> semantics and the decoder's `decode_delta()` clamp surface. Eight
+> integration tests in `tests/round226_aspx_real_envelope_writers.rs`
+> pin: a 2ch deterministic F0 + DF envelope round-trips through
+> `parse_aspx_ec_data` to recover the caller's input per-channel; a
+> 1ch envelope round-trips through the same path with LEVEL-only
+> stereo_mode; short input slices zero-pad in place; the 2ch and 1ch
+> writers are byte-deterministic across repeated invocations; all-
+> zero inputs decode to all-zero envelopes; different per-channel
+> inputs produce different bytes; out-of-range DF saturates at the
+> codebook's `+cb_off` edge (Fine/Level DF cb_off = 70). Total tests
+> 842 (was 834). The minimum-bit-cost `write_aspx_data_*_minimal()`
+> family stays in place; existing call sites are untouched. A
+> follow-up round can chain the new builders with a per-(sbg, env)
+> envelope-extractor that quantises the input MDCT spectra into the
+> F0 + DF indices the new emitters accept (the inverse of
+> Pseudocode 82's `scf = n_subbands · 2^(qscf/a)` reconstruction).
 
 ## Specs
 

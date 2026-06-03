@@ -2217,6 +2217,259 @@ fn write_aspx_data_1ch_minimal(
     Ok(())
 }
 
+// ====================================================================
+// ASPX real-envelope writers (round 226)
+// ====================================================================
+
+/// Per-channel envelope quant-index payload consumed by
+/// [`write_aspx_data_2ch_real_envelope`] / [`write_aspx_data_1ch_real_envelope`].
+///
+/// Each slice carries the F0 codeword for parameter band 0 followed by
+/// `(num_sbg − 1)` signed DF deltas. The decoder's
+/// [`crate::aspx::parse_aspx_ec_data`] FREQ branch recovers the same
+/// vector — F0 directly via `decode_delta()` on the F0 codebook and the
+/// trailing entries as signed `symbol_index − cb_off` deltas on the DF
+/// codebook.
+///
+/// `sig` is the SIGNAL envelope (`aspx_ec_data(SIGNAL, …)`); `noise` is
+/// the NOISE envelope (`aspx_ec_data(NOISE, …)`). Slice lengths
+/// shorter than the SBG count are zero-padded; entries past the SBG
+/// count are ignored. F0 values outside `[0, codebook_length)` clamp
+/// to the codebook's extreme entries; DF values outside `[-cb_off,
+/// +cb_off]` saturate to the symmetric edge.
+#[derive(Debug, Clone, Default)]
+pub struct AspxRealEnvelopeChannel<'a> {
+    /// SIGNAL envelope quant indices for this channel — `[F0, DF1, DF2, …]`
+    /// (length should match `num_sbg_sig` for the active framing).
+    pub sig: &'a [i32],
+    /// NOISE envelope quant indices for this channel — `[F0, DF1, DF2, …]`
+    /// (length should match `num_sbg_noise`).
+    pub noise: &'a [i32],
+}
+
+/// Emit an `aspx_data_2ch()` body per ETSI TS 103 190-1 §4.2.12.4
+/// Table 52 with caller-provided real envelope quant indices, mirroring
+/// the [`write_aspx_data_2ch_minimal`] framing skeleton:
+///
+/// * `aspx_xover_subband_offset = 0` (3 b).
+/// * `aspx_framing(0)`: FIXFIX prefix `0` (1 b), `tmp_num_env = 0` →
+///   `num_env = 1`, optional `aspx_freq_res[0] = 0` (low-res selection
+///   only when `cfg.signals_freq_res()`).
+/// * `aspx_balance = 1` (1 b) — channel 1 reuses channel 0's framing.
+/// * `aspx_delta_dir(0)` + `aspx_delta_dir(1)`: SIGNAL + NOISE
+///   directions both 0 (FREQ).
+/// * `aspx_hfgen_iwc_2ch(balance = 1)`: per-SBG `tna_mode = 0` (2 b
+///   each), `ah_left = ah_right = fic_present = tic_present = 0`.
+/// * SIGNAL ec_data per channel (Level for ch0, Balance for ch1):
+///   one F0 codeword + `(num_sbg_sig − 1)` DF codewords routed
+///   through [`write_aspx_sig_f0_value`] / [`write_aspx_sig_df_value`].
+/// * NOISE ec_data per channel (Level for ch0, Balance for ch1):
+///   one F0 codeword + `(num_sbg_noise − 1)` DF codewords routed
+///   through [`write_aspx_noise_f0_value`] / [`write_aspx_noise_df_value`].
+///
+/// The body round-trips through [`crate::aspx::parse_aspx_ec_data`] —
+/// each per-channel SIGNAL / NOISE envelope decodes to a vector whose
+/// position-0 entry equals the caller's F0 input (clamped to the
+/// codebook range) and whose trailing entries equal the caller's DF
+/// inputs (clamped to the codebook's symmetric ±cb_off range).
+///
+/// The existing [`write_aspx_data_2ch_minimal`] writer is preserved
+/// unchanged; this real-envelope variant is a strict superset.
+pub fn write_aspx_data_2ch_real_envelope(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch0: AspxRealEnvelopeChannel<'_>,
+    ch1: AspxRealEnvelopeChannel<'_>,
+) -> Result<(), &'static str> {
+    let xover: u32 = 0;
+    bw.write_u32(xover, 3);
+
+    // aspx_framing(0): FIXFIX prefix `0` (1 b per Table 126),
+    // tmp_num_env = 0 → num_env = 1.
+    bw.write_bit(false);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(0, envbits);
+    if cfg.signals_freq_res() {
+        bw.write_bit(false); // aspx_freq_res[0] = 0 (low-res)
+    }
+    // aspx_balance = 1 → channel-1 reuses channel-0's framing.
+    bw.write_bit(true);
+    // aspx_delta_dir(0) + aspx_delta_dir(1): SIGNAL + NOISE both FREQ.
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    // aspx_hfgen_iwc_2ch(balance = 1): tna_mode[0][..num_sbg_noise]
+    // = 0 (2 b each); ah_left = ah_right = fic_present = tic_present = 0.
+    for _ in 0..counts.num_sbg_noise {
+        bw.write_u32(0, 2);
+    }
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    // SIGNAL band count: low-res when freq_res was emitted as 0,
+    // else high-res — matches parse_aspx_ec_data's
+    // `freq_res.get(env).copied().unwrap_or(true)` fallback.
+    let num_sbg_sig = if cfg.signals_freq_res() {
+        counts.num_sbg_sig_lowres
+    } else {
+        counts.num_sbg_sig_highres
+    };
+    let num_sbg_noise = counts.num_sbg_noise;
+
+    // Per Table 52: FIXFIX + num_env == 1 → qmode forced to Fine.
+    let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+
+    // ch0 SIGNAL: stereo_mode = LEVEL.
+    write_aspx_sig_envelope_values(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Level,
+        ch0.sig,
+        num_sbg_sig,
+    );
+    // ch1 SIGNAL: stereo_mode = BALANCE (aspx_balance = 1).
+    write_aspx_sig_envelope_values(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Balance,
+        ch1.sig,
+        num_sbg_sig,
+    );
+
+    // ch0 NOISE: stereo_mode = LEVEL. Per Table 52 NOISE qmode = Fine.
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, ch0.noise, num_sbg_noise);
+    // ch1 NOISE: stereo_mode = BALANCE.
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Balance, ch1.noise, num_sbg_noise);
+    Ok(())
+}
+
+/// Emit an `aspx_data_1ch()` body per ETSI TS 103 190-1 §4.2.12.3
+/// Table 51 with caller-provided real envelope quant indices, mirroring
+/// the [`write_aspx_data_1ch_minimal`] framing skeleton:
+///
+/// * `aspx_xover_subband_offset = 0` (3 b).
+/// * `aspx_framing(0)`: FIXFIX prefix `0` (1 b), `tmp_num_env = 0` →
+///   `num_env = 1`, optional `aspx_freq_res[0] = 0`.
+/// * `aspx_delta_dir(0)`: SIGNAL + NOISE both FREQ (2 × 1 b).
+/// * `aspx_hfgen_iwc_1ch()`: per-SBG `tna_mode = 0` (2 b each),
+///   `ah_present = fic_present = tic_present = 0`.
+/// * SIGNAL ec_data (Level): F0 + `(num_sbg_sig_highres − 1)` DF.
+/// * NOISE ec_data (Level): F0 + `(num_sbg_noise − 1)` DF.
+///
+/// The single-channel path uses the high-res SIGNAL band count (no
+/// in-band `aspx_freq_res` bit when `signals_freq_res()` is false —
+/// the parser's fallback selects high-res). When
+/// `cfg.signals_freq_res()` is true the writer emits an
+/// `aspx_freq_res[0] = 0` bit and uses the low-res count.
+pub fn write_aspx_data_1ch_real_envelope(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch: AspxRealEnvelopeChannel<'_>,
+) -> Result<(), &'static str> {
+    let xover: u32 = 0;
+    bw.write_u32(xover, 3);
+
+    // aspx_framing(0): FIXFIX, num_env = 1.
+    bw.write_bit(false);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(0, envbits);
+    if cfg.signals_freq_res() {
+        bw.write_bit(false);
+    }
+    // aspx_delta_dir(0): SIGNAL + NOISE both FREQ.
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    // aspx_hfgen_iwc_1ch(): tna_mode×num_sbg_noise + 3×1 b trailer.
+    for _ in 0..counts.num_sbg_noise {
+        bw.write_u32(0, 2);
+    }
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    let num_sbg_sig = if cfg.signals_freq_res() {
+        counts.num_sbg_sig_lowres
+    } else {
+        counts.num_sbg_sig_highres
+    };
+    let num_sbg_noise = counts.num_sbg_noise;
+
+    let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+
+    // SIGNAL ec_data (LEVEL).
+    write_aspx_sig_envelope_values(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Level,
+        ch.sig,
+        num_sbg_sig,
+    );
+    // NOISE ec_data (LEVEL, qmode Fine per Table 51).
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, ch.noise, num_sbg_noise);
+    Ok(())
+}
+
+/// Write a single ASPX SIGNAL envelope (one F0 + `(num_sbg − 1)` DF
+/// codewords) using the value-emitting helpers. Caller-supplied values
+/// shorter than `num_sbg` zero-pad the trailing entries.
+fn write_aspx_sig_envelope_values(
+    bw: &mut BitWriter,
+    quant: aspx::AspxQuantStep,
+    stereo: aspx::AspxStereoMode,
+    values: &[i32],
+    num_sbg: u32,
+) {
+    if num_sbg == 0 {
+        return;
+    }
+    let f0 = values.first().copied().unwrap_or(0);
+    write_aspx_sig_f0_value(bw, quant, stereo, f0);
+    for i in 1..num_sbg as usize {
+        let delta = values.get(i).copied().unwrap_or(0);
+        write_aspx_sig_df_value(bw, quant, stereo, delta);
+    }
+}
+
+/// Write a single ASPX NOISE envelope (one F0 + `(num_sbg − 1)` DF
+/// codewords) using the value-emitting helpers.
+fn write_aspx_noise_envelope_values(
+    bw: &mut BitWriter,
+    stereo: aspx::AspxStereoMode,
+    values: &[i32],
+    num_sbg: u32,
+) {
+    if num_sbg == 0 {
+        return;
+    }
+    let f0 = values.first().copied().unwrap_or(0);
+    write_aspx_noise_f0_value(bw, stereo, f0);
+    for i in 1..num_sbg as usize {
+        let delta = values.get(i).copied().unwrap_or(0);
+        write_aspx_noise_df_value(bw, stereo, delta);
+    }
+}
+
 /// Emit a minimum-viable `acpl_data_1ch()` body per §4.2.13.3 Table 61:
 ///
 /// ```text

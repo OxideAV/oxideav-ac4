@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 226 — `write_aspx_data_2ch_real_envelope()` and
+  `write_aspx_data_1ch_real_envelope()` builders.** Closes the second
+  step of the README's "real ASPX envelope coding" deferral. The
+  round-219 value-emitting ASPX-Huffman primitives
+  (`write_aspx_sig_f0_value` / `write_aspx_sig_df_value` /
+  `write_aspx_noise_f0_value` / `write_aspx_noise_df_value`) are now
+  driven by per-channel envelope builders that emit a full
+  ETSI TS 103 190-1 §4.2.12.4 Table 52 (`aspx_data_2ch()`) or
+  §4.2.12.3 Table 51 (`aspx_data_1ch()`) body with caller-supplied
+  F0 + signed DF quant indices.
+  - New public type
+    [`crate::encoder_acpl3::AspxRealEnvelopeChannel`] — `{ sig:
+    &[i32], noise: &[i32] }` per-channel envelope payload.
+  - [`crate::encoder_acpl3::write_aspx_data_2ch_real_envelope`] —
+    accepts `(cfg, ch0, ch1)` and writes the Table-52 body with
+    `aspx_xover_subband_offset = 0`, FIXFIX framing (`num_env = 1`,
+    optional `aspx_freq_res = 0`), `aspx_balance = 1` (shared
+    channel-0 framing), SIGNAL + NOISE delta-direction bits = FREQ,
+    `aspx_hfgen_iwc_2ch` all-zero trailer, then four `aspx_ec_data`
+    calls (ch0 SIGNAL LEVEL, ch1 SIGNAL BALANCE, ch0 NOISE LEVEL,
+    ch1 NOISE BALANCE). qmode is forced Fine on FIXFIX + `num_env
+    == 1` per Table 52.
+  - [`crate::encoder_acpl3::write_aspx_data_1ch_real_envelope`] —
+    accepts `(cfg, ch)` and writes the Table-51 body with two
+    `aspx_ec_data` calls (SIGNAL + NOISE, both LEVEL).
+  - The SIGNAL band count keys off `cfg.signals_freq_res()`: low-res
+    when the in-band `aspx_freq_res = 0` bit is emitted (Signalled
+    mode), otherwise the parser's `freq_res.get(env)
+    .copied().unwrap_or(true)` fallback selects high-res (matching
+    the r181 fix in `write_aspx_data_2ch_minimal`).
+  - Caller slices shorter than the derived SBG count zero-pad the
+    trailing envelope positions; F0 values outside `[0,
+    codebook_length)` clamp to the codebook edge; DF values outside
+    `[-cb_off, +cb_off]` saturate to the symmetric edge — matching
+    the round-219 helper semantics.
+  - Eight integration tests in
+    `tests/round226_aspx_real_envelope_writers.rs` cover:
+    deterministic 2ch envelope round-trips through
+    `parse_aspx_ec_data` recovering caller inputs per channel;
+    1ch envelope round-trip with LEVEL-only stereo_mode; short
+    input slices zero-pad in place; 2ch / 1ch byte determinism;
+    all-zero inputs decode to all-zero envelopes; different
+    per-channel inputs produce different bytes; out-of-range DF
+    saturates at the codebook's `+cb_off` edge (Fine/Level DF
+    cb_off = 70).
+  - The minimum-bit-cost `write_aspx_data_2ch_minimal` /
+    `write_aspx_data_1ch_minimal` writers stay in place; no
+    existing call site is touched, so every previous round's
+    byte-stream expectations remain valid.
+  - Total tests 842 (was 834). The remaining ASPX envelope-coding
+    work is the per-(sbg, env) envelope-index extractor that
+    inverts Pseudocode 82's `scf = n_subbands · 2^(qscf/a)`
+    reconstruction so the new builders can be chained with input
+    MDCT spectra. β3 extraction in the 5_X ACPL_3 path and real
+    Table-181 SAP-derived residual content for the ACPL_1 paths
+    remain deferred.
+
 - **Round 215 — real per-parameter-band γ₁ / γ₂ / γ₃ / γ₄ extraction
   in the 5_X SIMPLE/ASPX_ACPL_3 encoder.** Layered on top of the
   round-208 real γ₅ / γ₆ (centre) + the round-196 real α₁ / α₂ +
