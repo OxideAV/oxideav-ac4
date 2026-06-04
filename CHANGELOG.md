@@ -9,6 +9,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 234 — encoder-side ASPX envelope extractor (inverse of
+  Pseudocodes 80, 81, 82, 83).** Closes the round-226 deferral by
+  landing the per-`(sbg, env)` envelope-index extractor that inverts
+  Pseudocode 82's `scf = n_subbands · 2^(qscf/a)` reconstruction and
+  Pseudocode 83's `scf_noise = 2^(6 − qscf_noise)` reconstruction so
+  the round-226 `write_aspx_data_{1,2}ch_real_envelope` builders can
+  be chained with caller-supplied envelope-energy scale factors.
+  - [`crate::encoder_acpl3::quantize_sig_scf`] — `scf → qscf` for one
+    signal-envelope band per Pseudocode 82. `qmode_env = Fine` ⇒
+    `a = 2` (1.5 dB step), `Coarse` ⇒ `a = 1` (3 dB step);
+    `num_qmf_subbands` mirrors the dequantizer's `64`. Non-positive
+    `scf` clamps to a finite quant index instead of producing
+    `-inf` so the spec's `scf[0] = scf[1]` carry-through path and
+    callers passing 0 for silent bands stay well-defined.
+  - [`crate::encoder_acpl3::quantize_noise_scf`] — `scf → qscf` for
+    one noise-envelope band per Pseudocode 83 (`qscf = round(6 −
+    log2(scf))`).
+  - [`crate::encoder_acpl3::freq_dpcm_encode_qscf`] — invert the
+    FREQ-direction DPCM accumulator `qscf[sbg] = sum(values[0..=sbg])`
+    of Pseudocode 80 / 81. Returns `[F0, DF₁, DF₂, …]` where
+    `F0 = qscf[0]`, `DF[sbg ≥ 1] = qscf[sbg] − qscf[sbg − 1]`. Empty
+    input returns an empty vector.
+  - [`crate::encoder_acpl3::extract_aspx_sig_envelope_indices`] /
+    [`crate::encoder_acpl3::extract_aspx_noise_envelope_indices`] —
+    per-channel compositions `scf[] → qscf[] → [F0, DF₁, …]` ready
+    for the round-219 value-emitting helpers + the round-226 builder
+    pair.
+  - New public type
+    [`crate::encoder_acpl3::AspxEnvelopeScfChannel`] — `{ sig:
+    &[f32], noise: &[f32] }` per-channel envelope-energy payload.
+  - [`crate::encoder_acpl3::build_aspx_real_envelope_channel`] —
+    convenience wrapper that runs both extractors and returns owned
+    `(sig, noise)` `Vec<i32>` pairs callers wire into
+    `AspxRealEnvelopeChannel` by slice reference.
+  - Round-trip property: feeding caller `scf` slices through the
+    extractor, then the round-226 builder, then re-parsing the body
+    through `parse_aspx_ec_data` + the decoder's `delta_decode_sig` /
+    `delta_decode_noise` + `dequantize_sig_scf` /
+    `dequantize_noise_scf`, recovers the input `scf` vector within
+    the per-band rounding of `round(a · log2(scf / 64))` /
+    `round(6 − log2(scf))`.
+  - Fourteen integration tests in
+    `tests/round234_aspx_envelope_extractor.rs` cover: forward-inverse
+    identity at integer-quant grid points for both Fine and Coarse
+    signal step sizes; forward-inverse identity for Pseudocode 83
+    on the noise side; non-positive `scf` clamps to a finite quant
+    index; FREQ-DPCM encoder produces `[5, 2, −4, −4, 1]` for
+    `qscf = [5, 7, 3, −1, 0]` with the decoder's accumulator
+    recovering the input; empty / single-band inputs pass through;
+    end-to-end accumulator + Pseudocode-82 / 83 round-trip from
+    caller `scf` through extractor through Pseudocode-{82, 83};
+    `build_aspx_real_envelope_channel` matches direct calls; full
+    encoder→decoder loop wiring `build_aspx_real_envelope_channel`
+    into `write_aspx_data_2ch_real_envelope` recovers the input
+    `scf` vectors through the decoder's full pipeline; determinism
+    across repeated invocations; different inputs produce materially
+    different DPCM payloads; empty per-channel slices return empty
+    vectors.
+  - Total tests 856 (was 842). With this round the encoder now has
+    the complete `scf[] → on-wire bytes` chain for real ASPX
+    envelope coding; remaining envelope-coding work is the energy
+    estimator that turns input MDCT spectra into the per-`sbg`
+    `scf` vectors the extractor consumes (the inverse of Pseudocodes
+    90 + 91), plus driving the new extractor + builder pair from
+    the existing high-level encode entry points. β₃ extraction in
+    the 5_X ACPL_3 path and real Table-181 SAP-derived residual
+    content for the ACPL_1 paths remain deferred.
+
 - **Round 226 — `write_aspx_data_2ch_real_envelope()` and
   `write_aspx_data_1ch_real_envelope()` builders.** Closes the second
   step of the README's "real ASPX envelope coding" deferral. The

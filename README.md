@@ -921,6 +921,61 @@ framework but usable standalone.
 > envelope-extractor that quantises the input MDCT spectra into the
 > F0 + DF indices the new emitters accept (the inverse of
 > Pseudocode 82's `scf = n_subbands · 2^(qscf/a)` reconstruction).
+> Round 234 closes that follow-up by adding the **encoder-side ASPX
+> envelope extractor** — the inverse of ETSI TS 103 190-1 §5.7.6.3.4
+> Pseudocodes 80 / 81 (FREQ-direction DPCM accumulator) plus §5.7.6.3.5
+> Pseudocodes 82 (`scf = n_subbands · 2^(qscf/a)`) and 83
+> (`scf_noise = 2^(6 − qscf_noise)`). Five new public primitives in
+> [`encoder_acpl3`] —
+> [`encoder_acpl3::quantize_sig_scf`] (`Fine` ⇒ `a = 2`, `Coarse` ⇒
+> `a = 1`, `num_qmf_subbands = 64`),
+> [`encoder_acpl3::quantize_noise_scf`],
+> [`encoder_acpl3::freq_dpcm_encode_qscf`] (returns `[F0, DF₁, …]`
+> with `F0 = qscf[0]` and `DF[sbg ≥ 1] = qscf[sbg] − qscf[sbg − 1]`),
+> [`encoder_acpl3::extract_aspx_sig_envelope_indices`] and
+> [`encoder_acpl3::extract_aspx_noise_envelope_indices`] — together
+> compose the per-channel chain `scf[] → qscf[] → [F0, DF₁, …]` whose
+> output is exactly the `Vec<i32>` slice the round-226 builder pair
+> accepts on `AspxRealEnvelopeChannel::{sig, noise}`. A new public
+> type [`encoder_acpl3::AspxEnvelopeScfChannel`] (`{ sig: &[f32],
+> noise: &[f32] }`) plus
+> [`encoder_acpl3::build_aspx_real_envelope_channel`] runs both
+> extractors and returns owned `(Vec<i32>, Vec<i32>)` for direct
+> wiring. Non-positive `scf` clamps on the encoder side so the spec's
+> `scf[0] = scf[1]` carry-through path (Pseudocode 82 line) and
+> callers passing 0 for silent bands stay well-defined; the round-219
+> writers further saturate any quant index outside `[0,
+> codebook_length)` (F0) or `[-cb_off, +cb_off]` (DF) at the
+> codebook edge. The round-trip property is: feeding caller `scf`
+> slices through the extractor, then the round-226 builder, then
+> re-parsing the body through `parse_aspx_ec_data` plus the decoder's
+> `delta_decode_sig` / `delta_decode_noise` plus `dequantize_sig_scf`
+> / `dequantize_noise_scf`, recovers the input `scf` vectors within
+> the per-band rounding of `round(a · log2(scf / 64))` /
+> `round(6 − log2(scf))`. Fourteen integration tests in
+> `tests/round234_aspx_envelope_extractor.rs` pin: forward-inverse
+> identity at integer-quant grid points for both Fine and Coarse
+> signal step sizes; forward-inverse identity for Pseudocode 83 on
+> the noise side; non-positive `scf` clamps to a finite quant index;
+> FREQ-DPCM encoder produces `[5, 2, −4, −4, 1]` for `qscf = [5, 7,
+> 3, −1, 0]` with the decoder's accumulator recovering the input
+> exactly; empty / single-band inputs pass through; end-to-end
+> accumulator + Pseudocode-82 / 83 round-trip from caller `scf`
+> through extractor through Pseudocode-{82, 83};
+> `build_aspx_real_envelope_channel` matches direct calls
+> entry-for-entry; full encoder→decoder loop wiring
+> `build_aspx_real_envelope_channel` into
+> `write_aspx_data_2ch_real_envelope` recovers the per-channel
+> SIGNAL / NOISE `scf` vectors through the decoder's full pipeline;
+> determinism across repeated invocations; different inputs produce
+> materially different DPCM payloads; empty per-channel slices return
+> empty vectors. Total tests 856 (was 842). The encoder now has the
+> complete `scf[] → on-wire bytes` chain for real ASPX envelope
+> coding; remaining envelope-coding work is the energy estimator
+> that turns input MDCT spectra into the per-`sbg` `scf` vectors the
+> extractor consumes (the inverse of Pseudocodes 90 + 91), plus
+> driving the new extractor + builder pair from the existing
+> high-level encode entry points.
 
 ## Specs
 

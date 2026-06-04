@@ -2470,6 +2470,193 @@ fn write_aspx_noise_envelope_values(
     }
 }
 
+// ====================================================================
+// ASPX envelope-extractor (round 234)
+// ====================================================================
+//
+// The round-219 value-emitting helpers + the round-226 builder pair
+// (`write_aspx_data_{1,2}ch_real_envelope`) consume per-channel
+// `AspxRealEnvelopeChannel { sig: &[i32], noise: &[i32] }` payloads
+// whose entries are the FREQ-direction DPCM sequence
+// `[F0, DF₁, DF₂, …]` for one envelope (`atsg = 0`) — exactly the
+// per-`(sbg, atsg)` quant indices the decoder's
+// `delta_decode_sig` / `delta_decode_noise` would reconstruct.
+//
+// To close the loop and let the new builders be chained with input
+// MDCT spectra, the encoder needs the inverse of Pseudocodes 80, 81,
+// 82 and 83:
+//
+//   * Pseudocode 82 (signal, non-balance): `scf = n_subbands · 2^(qscf/a)`
+//     with `n_subbands = 64`, `a = 2` (Fine) / `1` (Coarse). Inverse:
+//     `qscf = round(a · log2(scf / n_subbands))`.
+//   * Pseudocode 83 (noise): `scf_noise = 2^(6 - qscf_noise)`. Inverse:
+//     `qscf_noise = round(6 - log2(scf_noise))`.
+//   * Pseudocode 80 / 81 (FREQ direction, `delta = 1`): forward
+//     `qscf[sbg] = sum(values[0..=sbg])` ⇒ inverse
+//     `values[0] = qscf[0]`, `values[sbg≥1] = qscf[sbg] − qscf[sbg−1]`.
+//
+// The DPCM step always emits the F0 entry as `qscf[0]` (no cb_off
+// applied — the F0 codebooks have `cb_off = 0`); the DF entries are
+// the signed first-difference of `qscf`. The round-219 helpers'
+// `[-cb_off, +cb_off]` symmetric clamp on the DF side and
+// `[0, codebook_length)` clamp on the F0 side are then applied by the
+// writer, so the extractor is allowed to produce values outside those
+// ranges — the writer saturates them at the codebook edge.
+
+/// Quantize a single signal-envelope `scf` value into the per-`(sbg,
+/// atsg)` `qscf` integer used by Pseudocode 80, inverting Pseudocode 82
+/// (`scf = n_subbands · 2^(qscf/a)`).
+///
+/// `qmode_env = Fine` ⇒ `a = 2` (1.5 dB step), `Coarse` ⇒ `a = 1`
+/// (3 dB step). `num_qmf_subbands` mirrors the decoder's constant
+/// `64` (the dequantizer's `n_subbands` parameter). Non-positive `scf`
+/// — including the spec's `scf[0][atsg] = scf[1][atsg]` carry-through
+/// path when `scf[1]` is negative — is clamped to a minimum positive
+/// value before the log so the result stays finite.
+///
+/// Refs ETSI TS 103 190-1 §5.7.6.3.5 Pseudocode 82.
+pub fn quantize_sig_scf(scf: f32, qmode_env: aspx::AspxQuantStep, num_qmf_subbands: u32) -> i32 {
+    let a: f32 = match qmode_env {
+        aspx::AspxQuantStep::Fine => 2.0,
+        aspx::AspxQuantStep::Coarse => 1.0,
+    };
+    let n_subbands = num_qmf_subbands as f32;
+    // The dequantizer's range is (0, ∞); a non-positive scf cannot be
+    // represented by the formula. Clamp on the encoder side to a tiny
+    // positive value so the log stays defined.
+    let scf_clamped = scf.max(f32::MIN_POSITIVE);
+    let ratio = (scf_clamped / n_subbands).max(f32::MIN_POSITIVE);
+    let q = a * ratio.log2();
+    q.round() as i32
+}
+
+/// Quantize a single noise-envelope `scf` value into the per-`(sbg,
+/// atsg)` `qscf` integer used by Pseudocode 81, inverting Pseudocode 83
+/// (`scf_noise = 2^(6 - qscf_noise)`).
+///
+/// Refs ETSI TS 103 190-1 §5.7.6.3.5 Pseudocode 83.
+pub fn quantize_noise_scf(scf: f32) -> i32 {
+    const NOISE_FLOOR_OFFSET: i32 = 6;
+    let scf_clamped = scf.max(f32::MIN_POSITIVE);
+    let q = (NOISE_FLOOR_OFFSET as f32) - scf_clamped.log2();
+    q.round() as i32
+}
+
+/// Convert a per-`sbg` `qscf` vector for a single envelope (`atsg = 0`)
+/// into the FREQ-direction DPCM sequence `[F0, DF₁, DF₂, …]` that the
+/// round-219 value-emitting helpers + round-226 builder pair consume.
+///
+/// Per Pseudocode 80 / 81 FREQ branch with `delta = 1`:
+/// `qscf[sbg] = sum(values[0..=sbg])` ⇒ `values[0] = qscf[0]`,
+/// `values[sbg ≥ 1] = qscf[sbg] − qscf[sbg − 1]`.
+///
+/// `qscf.len()` is the number of subband groups; the returned vector
+/// has the same length. Empty input returns an empty vector.
+pub fn freq_dpcm_encode_qscf(qscf: &[i32]) -> Vec<i32> {
+    if qscf.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(qscf.len());
+    out.push(qscf[0]);
+    for sbg in 1..qscf.len() {
+        out.push(qscf[sbg] - qscf[sbg - 1]);
+    }
+    out
+}
+
+/// Extract per-channel ASPX SIGNAL envelope quant indices from an input
+/// `scf_sig` vector (the per-`sbg` signal envelope-energy scale factors
+/// the decoder produces from Pseudocode 82) and pack them into the
+/// FREQ-direction DPCM `[F0, DF₁, …]` form the round-219 value-emitting
+/// helpers + round-226 builder accept on `AspxRealEnvelopeChannel::sig`.
+///
+/// `qmode_env` selects the 1.5 dB / 3 dB step on the inverse of
+/// Pseudocode 82; `num_qmf_subbands` mirrors the decoder's constant
+/// `64`.
+///
+/// Roundtrip property: feeding the output through the round-219
+/// helpers and round-226 builder, then parsing the body back through
+/// `parse_aspx_ec_data` + `delta_decode_sig` + `dequantize_sig_scf`,
+/// recovers `scf_sig` exactly up to the per-band rounding of
+/// `qscf = round(a · log2(scf / 64))`.
+///
+/// Refs ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80, §5.7.6.3.5
+/// Pseudocode 82.
+pub fn extract_aspx_sig_envelope_indices(
+    scf_sig: &[f32],
+    qmode_env: aspx::AspxQuantStep,
+    num_qmf_subbands: u32,
+) -> Vec<i32> {
+    let qscf: Vec<i32> = scf_sig
+        .iter()
+        .map(|&v| quantize_sig_scf(v, qmode_env, num_qmf_subbands))
+        .collect();
+    freq_dpcm_encode_qscf(&qscf)
+}
+
+/// Extract per-channel ASPX NOISE envelope quant indices from an input
+/// `scf_noise` vector (the per-`sbg` noise envelope-energy scale
+/// factors the decoder produces from Pseudocode 83) and pack them into
+/// the FREQ-direction DPCM `[F0, DF₁, …]` form the round-226 builder
+/// accepts on `AspxRealEnvelopeChannel::noise`.
+///
+/// Roundtrip property: feeding the output through the round-219
+/// helpers + round-226 builder, then parsing the body back through
+/// `parse_aspx_ec_data` + `delta_decode_noise` + `dequantize_noise_scf`,
+/// recovers `scf_noise` exactly up to the per-band rounding of
+/// `qscf_noise = round(6 - log2(scf_noise))`.
+///
+/// Refs ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 81, §5.7.6.3.5
+/// Pseudocode 83.
+pub fn extract_aspx_noise_envelope_indices(scf_noise: &[f32]) -> Vec<i32> {
+    let qscf: Vec<i32> = scf_noise.iter().map(|&v| quantize_noise_scf(v)).collect();
+    freq_dpcm_encode_qscf(&qscf)
+}
+
+/// Per-channel envelope-energy bundle consumed by
+/// [`build_aspx_real_envelope_channel`]: caller-supplied SIGNAL + NOISE
+/// `scf` slices (the dequantizer outputs at the decoder's
+/// Pseudocode-82 / 83 stage, one value per subband group).
+///
+/// Lengths shorter than the active SBG count zero-pad on the encoder
+/// side — the writer further zero-pads anything still missing past the
+/// extracted vector.
+#[derive(Debug, Clone, Default)]
+pub struct AspxEnvelopeScfChannel<'a> {
+    /// Signal envelope scale factors (one per signal subband group).
+    pub sig: &'a [f32],
+    /// Noise envelope scale factors (one per noise subband group).
+    pub noise: &'a [f32],
+}
+
+/// Build an [`AspxRealEnvelopeChannel`]-shaped quant-index payload from
+/// caller-supplied per-channel envelope `scf` slices by running the
+/// signal + noise extractors in sequence. Returns the owned `(sig,
+/// noise)` `Vec<i32>` pair; callers wire it into the round-226 builders
+/// by taking slice references:
+///
+/// ```text
+///   let (sig0, noise0) = build_aspx_real_envelope_channel(&ch0, qmode);
+///   write_aspx_data_1ch_real_envelope(
+///       &mut bw,
+///       &cfg,
+///       AspxRealEnvelopeChannel { sig: &sig0, noise: &noise0 },
+///   )?;
+/// ```
+///
+/// `num_qmf_subbands` is the dequantizer's `n_subbands` constant,
+/// `64` for AC-4. `qmode_env` selects the 1.5 dB / 3 dB step on the
+/// signal side; noise is always Pseudocode-83 (`2^(6 − qscf)`).
+pub fn build_aspx_real_envelope_channel(
+    ch: &AspxEnvelopeScfChannel<'_>,
+    qmode_env: aspx::AspxQuantStep,
+    num_qmf_subbands: u32,
+) -> (Vec<i32>, Vec<i32>) {
+    let sig = extract_aspx_sig_envelope_indices(ch.sig, qmode_env, num_qmf_subbands);
+    let noise = extract_aspx_noise_envelope_indices(ch.noise);
+    (sig, noise)
+}
+
 /// Emit a minimum-viable `acpl_data_1ch()` body per §4.2.13.3 Table 61:
 ///
 /// ```text
