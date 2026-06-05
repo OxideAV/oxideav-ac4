@@ -975,7 +975,57 @@ framework but usable standalone.
 > that turns input MDCT spectra into the per-`sbg` `scf` vectors the
 > extractor consumes (the inverse of Pseudocodes 90 + 91), plus
 > driving the new extractor + builder pair from the existing
-> high-level encode entry points.
+> high-level encode entry points. Round 240 closes the first half of
+> that follow-up by adding the **encoder-side HF QMF energy
+> aggregator** — the dual of ETSI TS 103 190-1 §5.7.6.4.2.1
+> Pseudocodes 90 + 91 that the decoder uses on the inverse path. The
+> aggregator [`encoder_acpl3::aggregate_qmf_to_sbg_atsg`] takes an HF
+> QMF matrix `q_high` shaped `[absolute_sb][ts]`, the SIGNAL or NOISE
+> subband-group borders (`sbg_sig` / `sbg_noise` per Pseudocode 91),
+> the ATS-envelope borders (`atsg_sig` / `atsg_noise` per Pseudocode
+> 90), the `num_ts_in_ats` ATS span and the A-SPX start subband
+> `sbx`, and returns the per-`[sbg][atsg]` matrix of average squared
+> magnitudes — i.e. the SBG-aggregated counterpart of the decoder's
+> per-QMF-subband `est_sig_sb`. Two thin per-side helpers
+> [`encoder_acpl3::extract_aspx_sig_envelope_scf_from_qmf`] and
+> [`encoder_acpl3::extract_aspx_noise_envelope_scf_from_qmf`] pick the
+> leading envelope (`atsg = 0`) column for single-envelope frames,
+> producing a per-`sbg` `Vec<f32>` ready to feed the round-234
+> [`encoder_acpl3::extract_aspx_sig_envelope_indices`] /
+> [`encoder_acpl3::extract_aspx_noise_envelope_indices`] extractors.
+> A new public type [`encoder_acpl3::AspxQmfEnvelopeChannel`] (`{
+> q_high: &[Vec<(f32, f32)>], sbg_sig_borders: &[u32],
+> sbg_noise_borders: &[u32] }`) plus
+> [`encoder_acpl3::build_aspx_real_envelope_channel_from_qmf`] runs
+> the aggregator + extractor pair end-to-end and returns owned `(sig,
+> noise) Vec<i32>` ready to drop into the round-226
+> `AspxRealEnvelopeChannel { sig: &[i32], noise: &[i32] }` slot.
+> Edge handling tracks the decoder's bounds-checked Pseudocode 90:
+> entries past the QMF matrix bounds contribute zero energy, empty /
+> single-entry borders return empty vectors, zero-span ATS or band
+> groups return `0.0` for the affected cell, and `sbg_borders[i] <
+> sbx` clamps upward to `sbx` so callers can pass spec-shaped
+> absolute borders verbatim. Fourteen integration tests in
+> `tests/round240_aspx_qmf_energy_aggregator.rs` pin: constant-energy
+> aggregation matches the per-cell mean; per-ATSG partitioning
+> recovers a [1.0, 9.0] split across two envelopes; per-SBG
+> partitioning recovers a [1.0, 16.0] split across two bands;
+> sub-`sbx` borders clamp upward; empty SBG / ATSG borders return
+> empty matrices; zero-span ATSG cells return 0.0; the SIGNAL +
+> NOISE per-side helpers emit per-`sbg` vectors mirroring the
+> aggregator; the QMF-driven convenience builder matches the manual
+> aggregator + extractor + builder chain entry-for-entry; an integer-
+> quant-grid input (`scf = 64` and `128` for Fine signal) hits the
+> expected `[F0 = 0, DF₁ = 2]` DPCM payload; QMF rows shorter than
+> `tsz` contribute partial energy without panicking; the QMF-driven
+> builder is deterministic across repeated invocations; different
+> QMF inputs produce different DPCM payloads. Total tests 870 (was
+> 856). The encoder now has the complete `q_high → scf → qscf →
+> DPCM → on-wire bytes` chain for real ASPX envelope coding;
+> remaining envelope-coding work is driving the new
+> aggregator + extractor + builder chain from the existing
+> high-level encode entry points (currently scaffolds emit
+> minimum-cost zero-delta envelopes).
 
 ## Specs
 

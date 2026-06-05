@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 240 — encoder-side HF QMF energy aggregator (dual of
+  Pseudocodes 90 + 91).** Closes the first half of the round-234
+  remaining-work note by landing the per-`(sbg, atsg)` energy
+  aggregator that converts an HF QMF matrix into the per-`sbg`
+  `scf` vector the round-234 envelope-index extractor consumes —
+  completing the encoder's `q_high → scf → qscf → DPCM →
+  on-wire bytes` chain for real ASPX envelope coding.
+  - [`crate::encoder_acpl3::aggregate_qmf_to_sbg_atsg`] — aggregate
+    an HF QMF matrix `q_high` (shape `[absolute_sb][ts]`) into a
+    `[sbg][atsg]` matrix of average squared magnitudes per
+    Pseudocode 90's per-subband energy reduction grouped by
+    Pseudocode 91's SBG borders. Tolerates QMF rows shorter than
+    `tsz` (entries past the bounds contribute zero), zero-span ATS
+    intervals and zero-span band groups (return `0.0`), and
+    `sbg_borders[i] < sbx` (clamps upward to `sbx` so callers can
+    pass spec-shaped absolute borders verbatim).
+  - [`crate::encoder_acpl3::extract_aspx_sig_envelope_scf_from_qmf`]
+    / [`crate::encoder_acpl3::extract_aspx_noise_envelope_scf_from_qmf`]
+    — per-side helpers that pick the leading envelope (`atsg = 0`)
+    column of the aggregator output, producing a per-`sbg` `Vec<f32>`
+    ready to feed the round-234 envelope-index extractor.
+  - New public type
+    [`crate::encoder_acpl3::AspxQmfEnvelopeChannel`] — `{ q_high:
+    &[Vec<(f32, f32)>], sbg_sig_borders: &[u32],
+    sbg_noise_borders: &[u32] }` per-channel bundle consumed by the
+    QMF-driven envelope builder.
+  - [`crate::encoder_acpl3::build_aspx_real_envelope_channel_from_qmf`]
+    — convenience builder that runs the QMF aggregator + the round-234
+    `extract_aspx_*_envelope_indices` extractors + the round-234
+    `build_aspx_real_envelope_channel` builder end-to-end and returns
+    owned `(sig, noise) Vec<i32>` ready to drop into the round-226
+    `AspxRealEnvelopeChannel { sig: &[i32], noise: &[i32] }` slot.
+  - Fourteen integration tests in
+    `tests/round240_aspx_qmf_energy_aggregator.rs` pin: constant-
+    energy aggregation matches the per-cell mean; per-ATSG
+    partitioning recovers a [1.0, 9.0] split; per-SBG partitioning
+    recovers a [1.0, 16.0] split; sub-`sbx` borders clamp upward;
+    empty SBG / ATSG borders return empty matrices; zero-span ATSG
+    cells return 0.0; the per-side helpers emit per-`sbg` vectors
+    mirroring the aggregator; the QMF-driven convenience builder
+    matches the manual aggregator + extractor + builder chain
+    entry-for-entry; an integer-quant-grid input (`scf = 64` and
+    `128` for Fine signal) hits the expected `[F0 = 0, DF₁ = 2]`
+    DPCM payload; short QMF rows contribute partial energy without
+    panicking; the QMF-driven builder is deterministic across
+    repeated invocations; different QMF inputs produce different
+    DPCM payloads. Total tests 870 (was 856).
+  - Refs ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocodes 90 + 91.
+
 - **Round 234 — encoder-side ASPX envelope extractor (inverse of
   Pseudocodes 80, 81, 82, 83).** Closes the round-226 deferral by
   landing the per-`(sbg, env)` envelope-index extractor that inverts

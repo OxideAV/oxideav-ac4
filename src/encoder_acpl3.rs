@@ -2657,6 +2657,221 @@ pub fn build_aspx_real_envelope_channel(
     (sig, noise)
 }
 
+// ====================================================================
+// ASPX QMF-energy aggregator (round 240) — encoder-side
+// ====================================================================
+//
+// The round-234 envelope extractor consumes per-`sbg` `scf_sig` /
+// `scf_noise` slices the caller supplies. The natural source of those
+// `scf` vectors is the HF QMF matrix `q_high` that the encoder's QMF
+// analysis bank produces, aggregated over the same `(sbg, atsg)`
+// borders the decoder uses on the inverse path.
+//
+// The decoder's [`crate::aspx::estimate_envelope_energy`] reduces
+// `q_high` to a per-QMF-subband `est_sig_sb[sb][atsg]` matrix. The
+// encoder needs the dual: aggregate `q_high` into the per-`sbg` /
+// per-`atsg` matrix that [`crate::aspx::dequantize_sig_scf`] would
+// produce on its inverse path — i.e. the average squared magnitude
+// across the QMF subbands that fall inside `[sbg_borders[sbg],
+// sbg_borders[sbg+1])` (absolute subband indices, NOT relative to
+// `sbx`) and across the time slots in `[atsg_borders[atsg] *
+// num_ts_in_ats, atsg_borders[atsg+1] * num_ts_in_ats)`. The result
+// is the SBG-aggregated counterpart of Pseudocode 90's `est_sig_sb`,
+// keyed `[sbg][atsg]`.
+//
+// The result is exactly the shape `extract_aspx_sig_envelope_indices`
+// / `extract_aspx_noise_envelope_indices` accept for a single envelope
+// (`atsg = 0`): the encoder picks `result[sbg][0]` per subband group
+// (or runs every `atsg` for multi-envelope frames; the round-219 /
+// round-226 builders only consume the leading envelope today).
+//
+// Refs ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocode 90 (per-QMF-subband
+// version) inverted with the `sbg_*` border list of Pseudocode 91.
+
+/// Aggregate an HF QMF matrix into per-`sbg`, per-`atsg` envelope
+/// energies that mirror the SBG-grouped scale factors a decoder would
+/// dequantise into. Returns `result[sbg][atsg]` keyed by SIGNAL or
+/// NOISE subband-group borders.
+///
+/// * `q_high` — HF QMF matrix, `[absolute_sb][ts]` complex
+///   (`(re, im)` pairs). Entries outside the matrix's bounds
+///   contribute zero energy.
+/// * `sbg_borders` — `[lo₀, lo₁, …, hi]` absolute subband borders
+///   (length `num_sbg + 1`). Pseudocode 91's `sbg_sig` / `sbg_noise`.
+/// * `atsg_borders` — `[a₀, a₁, …, aₙ]` ATS indices for the envelope
+///   borders (length `num_atsg + 1`). Pseudocode 90's `atsg_sig` /
+///   `atsg_noise`.
+/// * `num_ts_in_ats` — ATS span in QMF time slots (Pseudocode 90).
+/// * `sbx` — first QMF subband index covered by A-SPX (Pseudocode 90
+///   reference). The function uses `sbg_borders` as absolute indices
+///   but tolerates `sbg_borders[i] < sbx` by clamping to `sbx`, so
+///   callers can pass spec-shaped border lists verbatim.
+///
+/// Empty borders, zero-span groups and zero-span ATS intervals return
+/// `0.0` for the affected `(sbg, atsg)` cell — matching the decoder's
+/// no-op path on those edges.
+///
+/// Refs ETSI TS 103 190-1 §5.7.6.4.2.1 Pseudocodes 90 + 91.
+pub fn aggregate_qmf_to_sbg_atsg(
+    q_high: &[Vec<(f32, f32)>],
+    sbg_borders: &[u32],
+    atsg_borders: &[u32],
+    num_ts_in_ats: u32,
+    sbx: u32,
+) -> Vec<Vec<f32>> {
+    let num_sbg = sbg_borders.len().saturating_sub(1);
+    let num_atsg = atsg_borders.len().saturating_sub(1);
+    let mut result: Vec<Vec<f32>> = vec![vec![0.0_f32; num_atsg]; num_sbg];
+    if num_sbg == 0 || num_atsg == 0 {
+        return result;
+    }
+    for atsg in 0..num_atsg {
+        let tsa = atsg_borders[atsg] * num_ts_in_ats;
+        let tsz = atsg_borders[atsg + 1] * num_ts_in_ats;
+        let ts_span = tsz.saturating_sub(tsa) as f64;
+        if ts_span <= 0.0 {
+            continue;
+        }
+        for sbg in 0..num_sbg {
+            let lo = sbg_borders[sbg].max(sbx) as usize;
+            let hi = sbg_borders[sbg + 1].max(sbx) as usize;
+            if hi <= lo {
+                continue;
+            }
+            let band_span = (hi - lo) as f64;
+            let mut acc: f64 = 0.0;
+            for sb_abs in lo..hi {
+                if sb_abs >= q_high.len() {
+                    continue;
+                }
+                let row = &q_high[sb_abs];
+                for ts in tsa..tsz {
+                    let ts = ts as usize;
+                    if ts < row.len() {
+                        let (re, im) = row[ts];
+                        acc += (re as f64) * (re as f64) + (im as f64) * (im as f64);
+                    }
+                }
+            }
+            // Pseudocode 90 (non-interpolation branch): per-(sb, atsg) division
+            // by ts_span; SBG aggregation then divides by band_span. Combined,
+            // a per-(sbg, atsg) average squared magnitude.
+            result[sbg][atsg] = (acc / (band_span * ts_span)) as f32;
+        }
+    }
+    result
+}
+
+/// Extract a single-envelope (`atsg = 0`) `scf_sig` `Vec<f32>` from an
+/// HF QMF matrix by aggregating energies across the SIGNAL subband-
+/// group borders. The returned vector has length `num_sbg_sig` and is
+/// ready to feed [`extract_aspx_sig_envelope_indices`] or the
+/// `AspxEnvelopeScfChannel::sig` slot.
+///
+/// `num_ts_in_ats` mirrors the decoder's constant; `sbx` is the first
+/// A-SPX QMF subband index. Empty `sbg_sig_borders` returns an empty
+/// vector.
+pub fn extract_aspx_sig_envelope_scf_from_qmf(
+    q_high: &[Vec<(f32, f32)>],
+    sbg_sig_borders: &[u32],
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+    sbx: u32,
+) -> Vec<f32> {
+    if sbg_sig_borders.len() < 2 || aspx_frame_ts_count == 0 || num_ts_in_ats == 0 {
+        return Vec::new();
+    }
+    let atsg_borders = [0u32, aspx_frame_ts_count];
+    let agg = aggregate_qmf_to_sbg_atsg(q_high, sbg_sig_borders, &atsg_borders, num_ts_in_ats, sbx);
+    // One column for atsg = 0.
+    agg.into_iter()
+        .map(|row| row.first().copied().unwrap_or(0.0))
+        .collect()
+}
+
+/// Extract a single-envelope (`atsg = 0`) `scf_noise` `Vec<f32>` from
+/// an HF QMF matrix by aggregating energies across the NOISE
+/// subband-group borders. Returned shape matches the SIGNAL helper.
+pub fn extract_aspx_noise_envelope_scf_from_qmf(
+    q_high: &[Vec<(f32, f32)>],
+    sbg_noise_borders: &[u32],
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+    sbx: u32,
+) -> Vec<f32> {
+    if sbg_noise_borders.len() < 2 || aspx_frame_ts_count == 0 || num_ts_in_ats == 0 {
+        return Vec::new();
+    }
+    let atsg_borders = [0u32, aspx_frame_ts_count];
+    let agg =
+        aggregate_qmf_to_sbg_atsg(q_high, sbg_noise_borders, &atsg_borders, num_ts_in_ats, sbx);
+    agg.into_iter()
+        .map(|row| row.first().copied().unwrap_or(0.0))
+        .collect()
+}
+
+/// Per-channel HF QMF + SBG-border bundle consumed by
+/// [`build_aspx_real_envelope_channel_from_qmf`].
+///
+/// Each channel's HF QMF matrix is the encoder's QMF-analysis output
+/// over the high-frequency range; the SIGNAL / NOISE border lists are
+/// the absolute (`sbx`-rooted) subband borders that the decoder will
+/// consume on the inverse path (Pseudocode 91 `sbg_sig` /
+/// `sbg_noise`).
+#[derive(Debug, Clone)]
+pub struct AspxQmfEnvelopeChannel<'a> {
+    /// HF QMF matrix `[absolute_sb][ts]`.
+    pub q_high: &'a [Vec<(f32, f32)>],
+    /// SIGNAL subband-group borders (`sbg_sig`).
+    pub sbg_sig_borders: &'a [u32],
+    /// NOISE subband-group borders (`sbg_noise`).
+    pub sbg_noise_borders: &'a [u32],
+}
+
+/// Build an [`AspxRealEnvelopeChannel`]-shaped quant-index payload
+/// straight from an HF QMF matrix by chaining
+/// [`extract_aspx_sig_envelope_scf_from_qmf`] +
+/// [`extract_aspx_noise_envelope_scf_from_qmf`] into
+/// [`build_aspx_real_envelope_channel`].
+///
+/// Returns the owned `(sig, noise)` `Vec<i32>` pair the round-226
+/// builder pair accepts directly via slice references.
+///
+/// `num_ts_in_ats` mirrors the decoder's constant (Pseudocode 90);
+/// `aspx_frame_ts_count` is the number of ATSs covered by a single
+/// envelope (1 for the round-226 single-envelope path);
+/// `num_qmf_subbands` is the dequantizer's `n_subbands` constant
+/// (`64` for AC-4); `qmode_env` selects the 1.5 dB / 3 dB step on the
+/// signal side.
+pub fn build_aspx_real_envelope_channel_from_qmf(
+    ch: &AspxQmfEnvelopeChannel<'_>,
+    qmode_env: aspx::AspxQuantStep,
+    num_qmf_subbands: u32,
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+    sbx: u32,
+) -> (Vec<i32>, Vec<i32>) {
+    let sig_scf = extract_aspx_sig_envelope_scf_from_qmf(
+        ch.q_high,
+        ch.sbg_sig_borders,
+        num_ts_in_ats,
+        aspx_frame_ts_count,
+        sbx,
+    );
+    let noise_scf = extract_aspx_noise_envelope_scf_from_qmf(
+        ch.q_high,
+        ch.sbg_noise_borders,
+        num_ts_in_ats,
+        aspx_frame_ts_count,
+        sbx,
+    );
+    let scf_ch = AspxEnvelopeScfChannel {
+        sig: &sig_scf,
+        noise: &noise_scf,
+    };
+    build_aspx_real_envelope_channel(&scf_ch, qmode_env, num_qmf_subbands)
+}
+
 /// Emit a minimum-viable `acpl_data_1ch()` body per §4.2.13.3 Table 61:
 ///
 /// ```text
