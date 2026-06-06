@@ -816,6 +816,128 @@ pub fn write_section_data(bw: &mut BitWriter, sections: &AsfSections) {
     }
 }
 
+/// Encode the `chparam_info()` syntax element per ETSI TS 103 190-1
+/// §4.2.10.1 Table 47 — the dual of [`crate::asf::parse_chparam_info`].
+///
+/// The element starts with a 2-bit `sap_mode` selector
+/// ([`crate::asf::SapMode`]):
+///
+/// * `0` — `SapMode::None`: header-only emission. The two channels
+///   remain independent for the rest of the element.
+/// * `1` — `SapMode::MsUsed`: header followed by a per-`(group, sfb)`
+///   `ms_used[g][sfb]` bit array. The walker emits one bit per band
+///   per group, in group-major order, with `max_sfb_per_group[g]`
+///   bands in group `g`. For input rows that are shorter than
+///   `max_sfb_per_group[g]` (e.g. empty rows on a half-built
+///   `ChparamInfo`), the writer pads the tail with `false` bits so
+///   it stays total across the full per-group bound.
+/// * `2` — *reserved* (`SapMode::Reserved`): header-only emission,
+///   matching the parser's accept-and-skip handling for this code.
+/// * `3` — `SapMode::SapData`: header followed by a full
+///   `sap_data()` body (Table 48) via [`write_sap_data`].
+///
+/// `max_sfb_per_group[g]` carries the effective per-group bound
+/// (`get_max_sfb(g)` per Pseudocode 5), matching the parser's contract.
+///
+/// The encoder is bit-exact with the parser: feeding `write_chparam_info`
+/// output into [`crate::asf::parse_chparam_info`] with the same
+/// `max_sfb_per_group` recovers the original [`crate::asf::ChparamInfo`]
+/// for `SapMode::None`, `SapMode::MsUsed` and `SapMode::SapData`. The
+/// `SapMode::Reserved` header is also round-trip stable (sap_mode = 2
+/// in, sap_mode = 2 out, both header-only).
+pub fn write_chparam_info(
+    bw: &mut BitWriter,
+    info: &crate::asf::ChparamInfo,
+    max_sfb_per_group: &[u32],
+) {
+    let sap_mode = info.sap_mode & 0b11;
+    bw.write_u32(sap_mode, 2);
+    match crate::asf::SapMode::from_u32(sap_mode) {
+        crate::asf::SapMode::None | crate::asf::SapMode::Reserved => {}
+        crate::asf::SapMode::MsUsed => {
+            for (g, &m) in max_sfb_per_group.iter().enumerate() {
+                let row = info.ms_used.get(g);
+                for sfb in 0..m as usize {
+                    let bit = row.and_then(|r| r.get(sfb)).copied().unwrap_or(false);
+                    bw.write_bit(bit);
+                }
+            }
+        }
+        crate::asf::SapMode::SapData => {
+            if let Some(sd) = info.sap_data.as_ref() {
+                write_sap_data(bw, sd, max_sfb_per_group);
+            } else {
+                // Degenerate input: sap_mode == 3 with the sap_data
+                // slot left at its default. Emit a default body so
+                // the writer stays total and the parser walks the
+                // bytes as a sap_coeff_all = false all-false row.
+                let default = crate::asf::SapData::default();
+                write_sap_data(bw, &default, max_sfb_per_group);
+            }
+        }
+    }
+}
+
+/// Encode the `sap_data()` syntax element per ETSI TS 103 190-1
+/// §4.2.10.2 Table 48 — the dual of [`crate::asf::parse_sap_data`].
+///
+/// The body is:
+///
+/// * 1-bit `sap_coeff_all`.
+/// * If `sap_coeff_all == 0`: per-group sfb-pair flag bits — one bit
+///   per (sfb, sfb+1) pair. The reader copies the flag into both
+///   halves of the pair; the writer reads the even-indexed entry of
+///   each pair as the canonical value, so an asymmetric input
+///   (`row[sfb] != row[sfb+1]`) emits the even half and the next parse
+///   recovers a symmetric row.
+/// * If `num_window_groups != 1`: 1-bit `delta_code_time` selector.
+/// * Per-group, per-`pair` DPCM `dpcm_alpha_q[g][sfb]` deltas, walked
+///   in `sfb += 2` strides and only emitted when the pair's flag is
+///   set. Each delta is mapped to its HCB_SCALEFAC index
+///   (`raw = delta + 60`) and clamped into the codebook's
+///   `[0, 120]` index range — the same map the parser inverts.
+///
+/// As with [`write_scalefac_data`], deltas outside `[-60, +60]` clamp
+/// to the codebook's boundary entries; deltas exceeding ±60 emit at
+/// the boundary value (matching the existing scale-factor writer's
+/// single-step-per-sfb policy).
+pub fn write_sap_data(bw: &mut BitWriter, sd: &crate::asf::SapData, max_sfb_per_group: &[u32]) {
+    bw.write_bit(sd.sap_coeff_all);
+    let num_groups = max_sfb_per_group.len();
+    if !sd.sap_coeff_all {
+        for (g, &m) in max_sfb_per_group.iter().enumerate() {
+            let row = sd.sap_coeff_used.get(g);
+            let mut sfb = 0usize;
+            while sfb < m as usize {
+                let f = row.and_then(|r| r.get(sfb)).copied().unwrap_or(false);
+                bw.write_bit(f);
+                sfb += 2;
+            }
+        }
+    }
+    if num_groups != 1 {
+        bw.write_bit(sd.delta_code_time);
+    }
+    for (g, &m) in max_sfb_per_group.iter().enumerate() {
+        let pair_row = sd.sap_coeff_used.get(g);
+        let dpcm_row = sd.dpcm_alpha_q.get(g);
+        let mut sfb = 0usize;
+        while sfb < m as usize {
+            let pair_flag = if sd.sap_coeff_all {
+                true
+            } else {
+                pair_row.and_then(|r| r.get(sfb)).copied().unwrap_or(false)
+            };
+            if pair_flag {
+                let delta = dpcm_row.and_then(|r| r.get(sfb)).copied().unwrap_or(0);
+                let idx = (delta + 60).clamp(0, HCB_SCALEFAC_LEN.len() as i32 - 1) as usize;
+                bw.write_u32(HCB_SCALEFAC_CW[idx], HCB_SCALEFAC_LEN[idx] as u32);
+            }
+            sfb += 2;
+        }
+    }
+}
+
 /// Encode the spectral data for an arbitrary [`AsfSections`] layout.
 /// Each section covers a contiguous bin range derived from
 /// `sfb_offset[sect_start..sect_end]`. For HCB11 each `|q| >= 16`

@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 243 — encoder-side `chparam_info()` / `sap_data()` builders
+  (dual of `parse_chparam_info` / `parse_sap_data`, Table 47 / 48).**
+  Adds a reusable encoder helper covering all four `sap_mode` codes —
+  the parser's complement for §4.2.10.1 Table 47 (`chparam_info()`)
+  and §4.2.10.2 Table 48 (`sap_data()`). Until this round the
+  encoder's six chparam-emission sites in `encoder_asf.rs` open-coded
+  `bw.write_u32(0, 2)` for `sap_mode = 0` (identity SAP); now there
+  is a single builder that handles `sap_mode = 0` (header-only),
+  `sap_mode = 1` (header + per-`(group, sfb)` `ms_used[g][sfb]` bit
+  array), `sap_mode = 2` (reserved; header-only, mirroring the
+  parser's accept-and-skip behaviour) and `sap_mode = 3` (full
+  `sap_data()` body — `sap_coeff_all` bit, per-pair flag array when
+  `sap_coeff_all = 0`, `delta_code_time` when `num_window_groups != 1`,
+  per-pair HCB_SCALEFAC-coded `dpcm_alpha_q` deltas).
+  - [`crate::encoder_asf::write_chparam_info`] — emits the 2-bit
+    `sap_mode` selector and dispatches to the matching payload
+    branch. Half-built `ChparamInfo` inputs (rows shorter than
+    `max_sfb_per_group`) zero-fill the missing entries so the writer
+    stays total. A `sap_mode = 3` input with `sap_data = None`
+    emits a `SapData::default()` body that the parser walks
+    successfully.
+  - [`crate::encoder_asf::write_sap_data`] — emits the `sap_coeff_all`
+    bit, the per-pair flag array (skipped when `sap_coeff_all = 1`),
+    the conditional `delta_code_time` bit and the per-pair DPCM
+    deltas. The DPCM map is the same `delta + 60 → HCB_SCALEFAC
+    index` the round-49 [`crate::encoder_asf::write_scalefac_data`]
+    uses, with the same `[0, 120]` clamp policy.
+  - Round-trip is bit-exact with [`crate::asf::parse_chparam_info`]
+    and [`crate::asf::parse_sap_data`] across `sap_mode in {0, 1, 2,
+    3}`, including: single- and multi-group `ms_used` payloads;
+    `sap_coeff_all = 1` single-group and `sap_coeff_all = 0`
+    partial-pair multi-group bodies with `delta_code_time = 1`;
+    the parser's pair-flag copy semantic (one bit drives both halves
+    of `(sfb, sfb+1)`); asymmetric pair-flag input rows; and the
+    full `[-60, +60]` DPCM delta range. Out-of-range deltas clamp at
+    the codebook boundary (±60), matching the existing scale-factor
+    writer's policy.
+  - Thirteen integration tests in
+    `tests/round243_chparam_info_writer.rs` pin: `sap_mode = 0` emits
+    exactly 2 bits as a header-only element; `sap_mode = 2` (reserved)
+    is round-trip stable as a header-only emission; `sap_mode = 1`
+    single-group `ms_used` recovers entry-for-entry; `sap_mode = 1`
+    multi-group with 3 groups of (3, 4, 1) bands recovers the full
+    matrix; missing `ms_used` rows zero-fill on the wire; `sap_mode
+    = 3` `sap_coeff_all` body recovers the DPCM deltas at even-sfb
+    pair starts; `sap_mode = 3` partial-pair body with
+    `sap_coeff_all = 0` recovers both the flag array and the
+    selectively-emitted DPCM entries; `sap_mode = 3` multi-group
+    body with `delta_code_time = 1` recovers across two groups;
+    `sap_mode = 3` with `sap_data = None` emits a default body that
+    parses as a `sap_coeff_all = 0` all-false row; out-of-range DPCM
+    deltas clamp to ±60; a full sweep of every legal delta in `[-60,
+    +60]` round-trips exactly; `sap_mode = 0` drops a populated
+    `ms_used` / `sap_data` payload on emission; in-memory `sap_mode`
+    values with high bits set are masked to the on-wire 2-bit field.
+  - Total tests 883 (was 870). The encoder now has a single reusable
+    chparam-emission helper covering every legal `sap_mode`, ready
+    for the §4.2.10 SAP-mode decisioning work (M/S vs. independent
+    vs. joint-MDCT) to feed real per-band `ms_used[]` / per-pair
+    DPCM arrays into the existing 5_X / 7_X channel-element walkers
+    in place of today's hard-coded identity-SAP literals.
+
 - **Round 240 — encoder-side HF QMF energy aggregator (dual of
   Pseudocodes 90 + 91).** Closes the first half of the round-234
   remaining-work note by landing the per-`(sbg, atsg)` energy

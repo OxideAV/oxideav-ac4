@@ -1025,7 +1025,53 @@ framework but usable standalone.
 > remaining envelope-coding work is driving the new
 > aggregator + extractor + builder chain from the existing
 > high-level encode entry points (currently scaffolds emit
-> minimum-cost zero-delta envelopes).
+> minimum-cost zero-delta envelopes). Round 243 lands the
+> **encoder-side `chparam_info()` / `sap_data()` builders** —
+> dual of `parse_chparam_info` / `parse_sap_data` per ETSI TS
+> 103 190-1 §4.2.10.1 Table 47 + §4.2.10.2 Table 48. Before
+> this round the encoder open-coded `bw.write_u32(0, 2)` at
+> six sites in `encoder_asf.rs` for identity-SAP (`sap_mode =
+> 0`). [`encoder_asf::write_chparam_info`] now covers every
+> legal `sap_mode in {0, 1, 2, 3}`: `0` is the existing
+> identity emission, `1` walks per-`(group, sfb)` `ms_used[g
+> ][sfb]` bits in group-major order, `2` (reserved) emits the
+> 2-bit header on its own, mirroring the parser's
+> accept-and-skip behaviour, and `3` dispatches into
+> [`encoder_asf::write_sap_data`] which emits the
+> `sap_coeff_all` bit, the per-pair flag array when
+> `sap_coeff_all = 0`, the conditional `delta_code_time` bit
+> when `num_window_groups != 1`, and the per-pair
+> HCB_SCALEFAC-coded `dpcm_alpha_q` deltas (same `delta + 60
+> → HCB_SCALEFAC index` map the round-49 `write_scalefac_data`
+> uses, with the same `[0, 120]` clamp policy). Half-built
+> `ChparamInfo` inputs (rows shorter than `max_sfb_per_group`)
+> zero-fill the missing entries so the writer stays total; a
+> `sap_mode = 3` input with `sap_data = None` emits a
+> `SapData::default()` body that the parser walks as a
+> `sap_coeff_all = 0` all-false row. Thirteen integration
+> tests in `tests/round243_chparam_info_writer.rs` pin every
+> `sap_mode` code: header-only emissions (`sap_mode in {0,
+> 2}` produce exactly 2 bits); single- and multi-group
+> `ms_used` payloads recover entry-for-entry; missing
+> `ms_used` rows zero-fill on the wire; `sap_coeff_all = 1`
+> single-group bodies recover the DPCM deltas at even-sfb
+> pair starts; `sap_coeff_all = 0` partial-pair bodies
+> recover both the per-pair flag array and the selectively-
+> emitted DPCM entries; multi-group bodies with
+> `delta_code_time = 1` recover across two groups; the
+> `sap_data = None` degenerate input emits a default body
+> the parser walks; out-of-range DPCM deltas clamp to ±60;
+> a full sweep of every legal delta in `[-60, +60]`
+> round-trips exactly; `sap_mode = 0` drops a populated
+> payload on emission; and in-memory `sap_mode` values with
+> high bits set are masked to the on-wire 2-bit field.
+> Total tests 883 (was 870). The encoder now has a single
+> reusable chparam-emission helper for all four `sap_mode`
+> codes, ready for §4.2.10 SAP-mode decisioning (M/S vs.
+> independent vs. joint-MDCT) to feed real per-band
+> `ms_used[]` / per-pair DPCM arrays into the existing 5_X
+> / 7_X channel-element walkers in place of today's hard-coded
+> identity-SAP literals.
 
 ## Specs
 
