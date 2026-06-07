@@ -1071,7 +1071,50 @@ framework but usable standalone.
 > independent vs. joint-MDCT) to feed real per-band
 > `ms_used[]` / per-pair DPCM arrays into the existing 5_X
 > / 7_X channel-element walkers in place of today's hard-coded
-> identity-SAP literals.
+> identity-SAP literals. Round 246 lands the **encoder-side
+> Table-181 SAP residual extractor** — a closed-form
+> 2x2-per-sfb inverse of the §5.3.4.3.2 / Table 181
+> first-stage SAP matrix recovering joint-MDCT preliminary
+> spectra `(sSMP_A, sSMP_B, sSMP_3, sSMP_4)` from a target
+> preliminary set `(L, R, Ls, Rs)` plus a `chparam_info()`
+> pair. The forward path implemented in round 41
+> ([`asf::apply_sap_table_181`]) mixes the front-pair
+> carriers `(sSMP_A, sSMP_B)` with the joint-MDCT residual
+> `(sSMP_3, sSMP_4)` per Table 181's two independent 2x2
+> sub-systems; the new inverse
+> ([`asf::invert_sap_table_181`]) reverses each sub-system
+> using `det = a*d - b*c` and the closed-form
+> `[[d, -b], [-c, a]] / det`. The three SAP coefficient
+> families produced by [`asf::extract_sap_abcd`] all admit
+> non-singular determinants — identity `(1, 0, 0, 1)` gives
+> `det = 1`, M/S `(1, 1, 1, -1)` gives `det = -2`, and the
+> SAP-coded `(1 + g, 1, 1 - g, -1)` with `g = alpha_q * 0.1`
+> also gives `det = -2`. A future spec extension with a
+> singular row emits silence for that band instead of
+> panicking (matching the forward path's
+> graceful-degradation convention). Outside the SAP-coded
+> extent the forward pass leaves `(L, R) = (A, B)` and zeros
+> the surround pair; the inverse mirrors with
+> `A = L, B = R, s3 = s4 = 0` so the round-trip is symmetric
+> at the band boundary. Returns `None` when
+> `transform_length` lacks an entry in `sfb_offset_48`, same
+> failure mode as the forward path. Five new unit tests in
+> `src/asf.rs` pin: identity-row inverse recovers `(A = L,
+> B = R, s3 = Ls, s4 = Rs)` inside the SAP extent with
+> passthrough + zero-surround outside; M/S-row inverse
+> recovers the classic sum-and-difference `A = (L + Ls)/2,
+> s3 = (L - Ls)/2` over the SAP extent; forward-then-inverse
+> round-trip is bit-stable on the identity row and tight to
+> `1e-5` on the M/S row at f32; the unsupported-tl path
+> returns `None`. Total lib tests 662 (was 657); integration
+> tests unchanged (8 round91 7.X tests + 4 round95 5_X ACPL_3
+> tests still green). The IMS encoder's residual-layer
+> builder ([`encoder_acpl3::write_acpl_1_residual_layer`])
+> currently emits raw `sSMP,3 = Ls`, `sSMP,4 = Rs` matching
+> the identity `sap_mode = 0` it writes; the new inverse
+> opens the door to non-identity SAP modes producing the
+> correct residual spectra for real psychoacoustic-driven
+> joint-stereo decisions in subsequent rounds.
 
 ## Specs
 

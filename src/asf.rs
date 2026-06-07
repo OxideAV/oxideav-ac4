@@ -732,6 +732,123 @@ pub fn apply_sap_table_181(
     Some((l_spec, r_spec, ls_spec, rs_spec))
 }
 
+/// `(sSMP_A, sSMP_B, sSMP_3, sSMP_4)` — the four preliminary spectra
+/// that an encoder feeds back through [`apply_sap_table_181`] to
+/// reconstruct the desired `(L, R, Ls, Rs)`.
+pub type SapTable181EncodeOutput = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+/// Encoder-side dual of [`apply_sap_table_181`] — invert the §5.3.4.3.2
+/// / Table 181 first-stage SAP matrix to recover the joint-MDCT
+/// preliminary spectra `(sSMP_A, sSMP_B, sSMP_3, sSMP_4)` that produce
+/// the desired preliminary `(L, R, Ls, Rs)` when fed through the
+/// forward matrix with the same `chparam_info()` pair.
+///
+/// The forward matrix per Table 181 splits into two independent 2x2
+/// sub-systems — one for the (L, Ls) / (A, s3) pair driven by
+/// `chparam_pair[0]`'s `(a0, b0, c0, d0)`, and one for the (R, Rs) /
+/// (B, s4) pair driven by `chparam_pair[1]`'s `(a1, b1, c1, d1)`:
+///
+/// ```text
+///   [L ]   [a0  b0] [A ]        [R ]   [a1  b1] [B ]
+///   [Ls] = [c0  d0] [s3]   and  [Rs] = [c1  d1] [s4]
+/// ```
+///
+/// Inversion per sfb uses the closed-form 2x2 inverse:
+///
+/// ```text
+///   det = a*d - b*c
+///   [A ] = (1/det) * [ d  -b] [L ]
+///   [s3]             [-c   a] [Ls]
+/// ```
+///
+/// For the three SAP coefficient families produced by
+/// [`extract_sap_abcd`] the determinant is always non-zero:
+///
+/// * Identity `(a, b, c, d) = (1, 0, 0, 1)` — `det = 1`; the inverse
+///   reproduces the inputs (A = L, s3 = Ls).
+/// * M/S inverse `(1, 1, 1, -1)` — `det = -2`; A = (L + Ls)/2,
+///   s3 = (L - Ls)/2.
+/// * SAP-coded `(1 + g, 1, 1 - g, -1)` with `g = alpha_q * 0.1` —
+///   `det = -(1 + g) - (1 - g) = -2`; A = (L + Ls)/2,
+///   s3 = ((1 - g)*L - (1 + g)*Ls) / -2 = ((1 + g)*Ls - (1 - g)*L)/2.
+///
+/// Outside the SAP-coded extent the forward pass leaves the front pair
+/// at `(L, R) = (A, B)` and zeros the surround pair. The inverse here
+/// mirrors that convention: bins past `sfb_offset[max_sfb_master]`
+/// pass `A = L`, `B = R` and emit `s3 = 0`, `s4 = 0`. This matches
+/// what the decoder's [`apply_sap_table_181`] re-produces.
+///
+/// All input slices must be at least `n` long where `n = tl`. Outputs
+/// are returned in `(a_spec, b_spec, s3_spec, s4_spec)` order, each
+/// length `n`. Returns `None` if `tl` has no SFB table or if any
+/// per-channel slice is shorter than `n`, mirroring the forward path.
+pub fn invert_sap_table_181(
+    l_spec: &[f32],
+    r_spec: &[f32],
+    ls_spec: &[f32],
+    rs_spec: &[f32],
+    chparam_pair: &[ChparamInfo; 2],
+    max_sfb_master: u32,
+    tl: u32,
+) -> Option<SapTable181EncodeOutput> {
+    let n = tl as usize;
+    if n == 0 || l_spec.len() < n || r_spec.len() < n || ls_spec.len() < n || rs_spec.len() < n {
+        return None;
+    }
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    // Match the forward path's single-window-group convention at the
+    // dominant transform length.
+    let coeffs0 = extract_sap_abcd(&chparam_pair[0], &[max_sfb_master]);
+    let coeffs1 = extract_sap_abcd(&chparam_pair[1], &[max_sfb_master]);
+    let abcd0: &[(f32, f32, f32, f32)] = coeffs0.abcd.first().map(|v| v.as_slice()).unwrap_or(&[]);
+    let abcd1: &[(f32, f32, f32, f32)] = coeffs1.abcd.first().map(|v| v.as_slice()).unwrap_or(&[]);
+    let max_sfb = max_sfb_master as usize;
+    let mut a_spec = vec![0.0f32; n];
+    let mut b_spec = vec![0.0f32; n];
+    let mut s3_spec = vec![0.0f32; n];
+    let mut s4_spec = vec![0.0f32; n];
+    let usable0 = abcd0.len().min(max_sfb);
+    let usable1 = abcd1.len().min(max_sfb);
+    let usable = usable0.min(usable1);
+    for sfb in 0..usable {
+        let lo = sfbo[sfb] as usize;
+        let hi = sfbo[sfb + 1] as usize;
+        let hi = hi.min(n);
+        let (a0, b0, c0, d0) = abcd0[sfb];
+        let (a1, b1, c1, d1) = abcd1[sfb];
+        let det0 = a0 * d0 - b0 * c0;
+        let det1 = a1 * d1 - b1 * c1;
+        // Identity / M/S / SAP-coded families all yield non-zero det;
+        // a future spec extension that introduced a singular matrix
+        // would land here as silence, matching the forward path's
+        // graceful-degradation convention rather than panicking.
+        if det0 == 0.0 || det1 == 0.0 {
+            continue;
+        }
+        let inv0 = 1.0 / det0;
+        let inv1 = 1.0 / det1;
+        for k in lo..hi {
+            let l = l_spec[k];
+            let ls = ls_spec[k];
+            let r = r_spec[k];
+            let rs = rs_spec[k];
+            a_spec[k] = inv0 * (d0 * l - b0 * ls);
+            s3_spec[k] = inv0 * (-c0 * l + a0 * ls);
+            b_spec[k] = inv1 * (d1 * r - b1 * rs);
+            s4_spec[k] = inv1 * (-c1 * r + a1 * rs);
+        }
+    }
+    // Bins past the SAP-coded extent: the forward path leaves
+    // (L, R) = (A, B) and surrounds silent. The inverse mirrors:
+    // pass A = L, B = R; leave s3 = s4 = 0 (already zero-initialised).
+    let unmixed_start = sfbo.get(usable).copied().map(|v| v as usize).unwrap_or(n);
+    let unmixed_lo = unmixed_start.min(n);
+    if unmixed_lo < n {
+        a_spec[unmixed_lo..n].copy_from_slice(&l_spec[unmixed_lo..n]);
+        b_spec[unmixed_lo..n].copy_from_slice(&r_spec[unmixed_lo..n]);
+    }
+    Some((a_spec, b_spec, s3_spec, s4_spec))
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -4067,6 +4184,193 @@ mod tests {
         let pair = [cp.clone(), cp];
         let zero = vec![0.0f32; n];
         let out = apply_sap_table_181(&zero, &zero, &zero, &zero, &pair, 1, tl);
+        assert!(out.is_none());
+    }
+
+    /// Round 246: `invert_sap_table_181` with the identity chparam_info
+    /// pair (`sap_mode == 0`) recovers `(A = L, B = R, s3 = Ls,
+    /// s4 = Rs)` on the SAP-coded extent and passes `(A = L, B = R)`
+    /// through on the unmixed tail with `s3 = s4 = 0` — the encoder
+    /// dual of [`apply_sap_table_181_identity_passthrough`].
+    #[test]
+    fn invert_sap_table_181_identity_passthrough() {
+        let tl = 256u32;
+        let n = tl as usize;
+        let max_sfb_master = 4u32;
+        let l_spec: Vec<f32> = (0..n).map(|i| 0.10 + 1e-3 * i as f32).collect();
+        let r_spec: Vec<f32> = (0..n).map(|i| 0.20 + 1e-3 * i as f32).collect();
+        let ls_spec: Vec<f32> = (0..n).map(|i| 0.30 + 1e-3 * i as f32).collect();
+        let rs_spec: Vec<f32> = (0..n).map(|i| 0.40 + 1e-3 * i as f32).collect();
+        let cp_id = ChparamInfo {
+            sap_mode: 0,
+            ms_used: vec![],
+            sap_data: None,
+        };
+        let pair = [cp_id.clone(), cp_id];
+        let (a, b, s3, s4) = invert_sap_table_181(
+            &l_spec,
+            &r_spec,
+            &ls_spec,
+            &rs_spec,
+            &pair,
+            max_sfb_master,
+            tl,
+        )
+        .expect("identity inverse must produce outputs");
+        assert_eq!(a.len(), n);
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let sap_hi = sfbo[max_sfb_master as usize] as usize;
+        for k in 0..sap_hi {
+            // Identity (a, b, c, d) = (1, 0, 0, 1): inverse recovers
+            // (A = L, B = R, s3 = Ls, s4 = Rs) — equivalently the
+            // forward pass would re-mix to (L, R, Ls, Rs).
+            assert!((a[k] - l_spec[k]).abs() < 1e-6);
+            assert!((b[k] - r_spec[k]).abs() < 1e-6);
+            assert!((s3[k] - ls_spec[k]).abs() < 1e-6);
+            assert!((s4[k] - rs_spec[k]).abs() < 1e-6);
+        }
+        for k in sap_hi..n {
+            assert!((a[k] - l_spec[k]).abs() < 1e-6);
+            assert!((b[k] - r_spec[k]).abs() < 1e-6);
+            assert_eq!(s3[k], 0.0);
+            assert_eq!(s4[k], 0.0);
+        }
+    }
+
+    /// Round 246: `invert_sap_table_181` with the M/S `(1, 1, 1, -1)`
+    /// per-sfb matrix yields the classic sum-and-difference inversion
+    /// A = (L + Ls)/2, s3 = (L - Ls)/2 and similarly for the B/s4 side.
+    #[test]
+    fn invert_sap_table_181_ms_used_inverse() {
+        let tl = 256u32;
+        let n = tl as usize;
+        let max_sfb_master = 2u32;
+        // Constant spectra so the band-wise sums are easy to verify.
+        let l_spec = vec![4.0_f32; n]; // L = A + s3 = 1 + 3
+        let r_spec = vec![6.0_f32; n]; // R = B + s4 = 2 + 4
+        let ls_spec = vec![-2.0_f32; n]; // Ls = A - s3 = 1 - 3
+        let rs_spec = vec![-2.0_f32; n]; // Rs = B - s4 = 2 - 4
+        let cp = ChparamInfo {
+            sap_mode: 1,
+            ms_used: vec![vec![true, true]],
+            sap_data: None,
+        };
+        let pair = [cp.clone(), cp];
+        let (a, b, s3, s4) = invert_sap_table_181(
+            &l_spec,
+            &r_spec,
+            &ls_spec,
+            &rs_spec,
+            &pair,
+            max_sfb_master,
+            tl,
+        )
+        .unwrap();
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let sap_hi = sfbo[max_sfb_master as usize] as usize;
+        for k in 0..sap_hi {
+            // With det = -2: A = ((-1)*L - 1*Ls) / -2 = (L + Ls)/2;
+            // s3 = ((-1)*L + 1*Ls) / -2 = (L - Ls)/2.
+            assert!((a[k] - 1.0).abs() < 1e-6); // (4 + (-2))/2
+            assert!((s3[k] - 3.0).abs() < 1e-6); // (4 - (-2))/2
+            assert!((b[k] - 2.0).abs() < 1e-6); // (6 + (-2))/2
+            assert!((s4[k] - 4.0).abs() < 1e-6); // (6 - (-2))/2
+        }
+        // Outside the SAP-coded extent: front passthrough, surround
+        // silent.
+        for k in sap_hi..n {
+            assert!((a[k] - 4.0).abs() < 1e-6);
+            assert!((b[k] - 6.0).abs() < 1e-6);
+            assert_eq!(s3[k], 0.0);
+            assert_eq!(s4[k], 0.0);
+        }
+    }
+
+    /// Round 246: forward-and-inverse round-trip with the identity
+    /// chparam pair is bit-stable — `invert_sap_table_181` truly is
+    /// the dual of `apply_sap_table_181` on the identity row.
+    #[test]
+    fn sap_table_181_roundtrip_identity() {
+        let tl = 256u32;
+        let n = tl as usize;
+        let max_sfb_master = 4u32;
+        let a0: Vec<f32> = (0..n).map(|i| 0.11 + 1e-3 * i as f32).collect();
+        let b0: Vec<f32> = (0..n).map(|i| 0.22 + 1e-3 * i as f32).collect();
+        let s30: Vec<f32> = (0..n).map(|i| 0.33 + 1e-3 * i as f32).collect();
+        let s40: Vec<f32> = (0..n).map(|i| 0.44 + 1e-3 * i as f32).collect();
+        let cp_id = ChparamInfo {
+            sap_mode: 0,
+            ms_used: vec![],
+            sap_data: None,
+        };
+        let pair = [cp_id.clone(), cp_id];
+        let (l, r, ls, rs) =
+            apply_sap_table_181(&a0, &b0, &s30, &s40, &pair, max_sfb_master, tl).unwrap();
+        let (a_r, b_r, s3_r, s4_r) =
+            invert_sap_table_181(&l, &r, &ls, &rs, &pair, max_sfb_master, tl).unwrap();
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let sap_hi = sfbo[max_sfb_master as usize] as usize;
+        // Inside SAP extent the round-trip is bit-stable on the
+        // identity row.
+        for k in 0..sap_hi {
+            assert!((a_r[k] - a0[k]).abs() < 1e-6);
+            assert!((b_r[k] - b0[k]).abs() < 1e-6);
+            assert!((s3_r[k] - s30[k]).abs() < 1e-6);
+            assert!((s4_r[k] - s40[k]).abs() < 1e-6);
+        }
+        // Outside SAP extent the forward pass discards s3/s4 — the
+        // inverse therefore recovers a_r = l = a0, s3_r = 0.
+        for k in sap_hi..n {
+            assert!((a_r[k] - a0[k]).abs() < 1e-6);
+            assert!((b_r[k] - b0[k]).abs() < 1e-6);
+            assert_eq!(s3_r[k], 0.0);
+            assert_eq!(s4_r[k], 0.0);
+        }
+    }
+
+    /// Round 246: forward-and-inverse round-trip with the M/S row is
+    /// bit-stable inside the SAP-coded extent — verifies the
+    /// closed-form 2x2 inverse is numerically tight at f32.
+    #[test]
+    fn sap_table_181_roundtrip_ms_used() {
+        let tl = 256u32;
+        let n = tl as usize;
+        let max_sfb_master = 2u32;
+        let a0: Vec<f32> = (0..n).map(|i| 0.10 + 1e-3 * i as f32).collect();
+        let b0: Vec<f32> = (0..n).map(|i| 0.20 + 1e-3 * i as f32).collect();
+        let s30: Vec<f32> = (0..n).map(|i| 0.30 + 1e-3 * i as f32).collect();
+        let s40: Vec<f32> = (0..n).map(|i| 0.40 + 1e-3 * i as f32).collect();
+        let cp = ChparamInfo {
+            sap_mode: 1,
+            ms_used: vec![vec![true, true]],
+            sap_data: None,
+        };
+        let pair = [cp.clone(), cp];
+        let (l, r, ls, rs) =
+            apply_sap_table_181(&a0, &b0, &s30, &s40, &pair, max_sfb_master, tl).unwrap();
+        let (a_r, b_r, s3_r, s4_r) =
+            invert_sap_table_181(&l, &r, &ls, &rs, &pair, max_sfb_master, tl).unwrap();
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let sap_hi = sfbo[max_sfb_master as usize] as usize;
+        for k in 0..sap_hi {
+            assert!((a_r[k] - a0[k]).abs() < 1e-5);
+            assert!((b_r[k] - b0[k]).abs() < 1e-5);
+            assert!((s3_r[k] - s30[k]).abs() < 1e-5);
+            assert!((s4_r[k] - s40[k]).abs() < 1e-5);
+        }
+    }
+
+    /// Round 246: missing sfb table (e.g. `tl = 100`) makes the
+    /// inverse return `None` for the same reason the forward path
+    /// does — symmetry with [`apply_sap_table_181_missing_sfb_table_returns_none`].
+    #[test]
+    fn invert_sap_table_181_missing_sfb_table_returns_none() {
+        let tl = 100u32;
+        let n = tl as usize;
+        let cp = ChparamInfo::default();
+        let pair = [cp.clone(), cp];
+        let zero = vec![0.0f32; n];
+        let out = invert_sap_table_181(&zero, &zero, &zero, &zero, &pair, 1, tl);
         assert!(out.is_none());
     }
 

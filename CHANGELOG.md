@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 246 — encoder-side Table-181 SAP residual extractor
+  (`invert_sap_table_181`, dual of `apply_sap_table_181`).** An IMS
+  encoder that wants to populate the §4.2.6.6 ASPX_ACPL_1 residual
+  layer (Table 25 row `case ASPX_ACPL_1:`, two trailing
+  `sf_data(ASF)` bodies carrying `sSMP,3` / `sSMP,4`) now has a
+  closed-form 2x2-per-sfb inverse of the §5.3.4.3.2 / Table 181
+  first-stage SAP matrix that recovers the joint-MDCT preliminary
+  spectra `(sSMP_A, sSMP_B, sSMP_3, sSMP_4)` from a target
+  `(L, R, Ls, Rs)` preliminary set and a `chparam_info()` pair.
+  - [`crate::asf::invert_sap_table_181`] / new public type alias
+    [`crate::asf::SapTable181EncodeOutput`]. Inversion splits the
+    Table-181 5x5 matrix into the two independent 2x2 sub-systems
+    `(L, Ls)` ↔ `(A, s3)` driven by `chparam_pair[0]` and
+    `(R, Rs)` ↔ `(B, s4)` driven by `chparam_pair[1]`. Per sfb the
+    inverse uses `det = a*d - b*c` and the closed-form
+    `[[d, -b], [-c, a]] / det`.
+  - For the three SAP coefficient families produced by
+    [`crate::asf::extract_sap_abcd`] the determinant is always
+    non-singular: identity row gives `det = 1`, M/S row
+    `(1, 1, 1, -1)` gives `det = -2`, and the SAP-coded row
+    `(1 + g, 1, 1 - g, -1)` with `g = alpha_q * 0.1` also gives
+    `det = -2`. The implementation tolerates a hypothetical
+    `det == 0` band (e.g. a future spec extension) by emitting
+    silence for that band instead of panicking, mirroring the
+    forward path's graceful-degradation convention.
+  - Outside the SAP-coded extent (bins past
+    `sfb_offset[max_sfb_master]`) the forward pass leaves the front
+    pair at `(L, R) = (A, B)` and zeros the surround pair; the
+    inverse mirrors this — `A = L`, `B = R`, `s3 = s4 = 0` — so
+    the round-trip is symmetric at the band boundary. Returns
+    `None` when the transform_length has no entry in
+    `sfb_offset_48`, matching the forward path's failure mode.
+  - Five new unit tests in `src/asf.rs` cover identity-row
+    inverse, M/S-row inverse, forward-then-inverse round-trip on
+    both the identity and M/S rows, and the unsupported-tl `None`
+    return. All 5 pass; the existing crate test suite remains
+    green (662 lib tests pass at this commit).
+
 - **Round 243 — encoder-side `chparam_info()` / `sap_data()` builders
   (dual of `parse_chparam_info` / `parse_sap_data`, Table 47 / 48).**
   Adds a reusable encoder helper covering all four `sap_mode` codes —
