@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 257 — SAP-aware ASPX_ACPL_1 residual-layer writer
+  (`write_acpl_1_residual_layer_sap` + body-builder wrapper
+  `build_5_x_acpl1_body_from_pcm_spectra_sap`).** Pairs the round-246
+  Table-181 inverse with the existing round-243
+  [`crate::encoder_asf::write_chparam_info`] emitter so the IMS
+  encoder's §4.2.6.6 Table-25 `case ASPX_ACPL_1:` residual layer can
+  now express any of the three SAP coefficient families produced by
+  [`crate::asf::extract_sap_abcd`] — identity (`sap_mode = 0`), M/S
+  (`sap_mode = 1`) and SAP-coded `alpha_q` (`sap_mode = 3`) — rather
+  than being hard-pinned to the identity row by the round-103
+  [`write_acpl_1_residual_layer`].
+  - The new private helper `write_acpl_1_residual_layer_sap` takes
+    `(coeffs_l, coeffs_r, coeffs_ls, coeffs_rs)` *preliminary*
+    spectra plus an `Option<&[ChparamInfo; 2]>` and (1) emits the
+    `chparam_info()` pair via `write_chparam_info` with
+    `max_sfb_per_group = [max_sfb_master]`, (2) recovers the
+    joint-MDCT residual `(sSMP,3, sSMP,4)` via
+    [`crate::asf::invert_sap_table_181`] driven by the same chparam
+    pair, and (3) writes the two `sf_data(ASF)` bodies for the
+    recovered residual spectra bounded by `max_sfb_master`. When
+    `chparam_pair = None` (or both rows carry `sap_mode = 0`) the
+    body is bit-for-bit equivalent to
+    `write_acpl_1_residual_layer(... coeffs_ls, coeffs_rs)` — the
+    identity-row inverse reduces to `s3 = ls, s4 = rs`. The inverse's
+    surround-silent convention past `max_sfb_master` is preserved.
+  - The new public body builder
+    `build_5_x_acpl1_body_from_pcm_spectra_sap` mirrors the round-103
+    `build_5_x_acpl1_body_from_pcm_spectra` API with the extra
+    `chparam_pair: Option<&[ChparamInfo; 2]>` slot wedged in between
+    the surround spectra and the ASPX config. The legacy
+    identity-only builder is unchanged.
+  - Five new tests in `encoder_acpl3::tests`:
+    `write_acpl_1_residual_layer_sap_none_matches_legacy` pins the
+    bit-equivalence of the SAP-aware path with `chparam_pair = None`
+    against the legacy emitter on identical Ls/Rs preliminaries;
+    `write_acpl_1_residual_layer_sap_identity_explicit_matches_default`
+    pins explicit identity rows == default `None`;
+    `write_acpl_1_residual_layer_sap_ms_row_roundtrips_through_decoder`
+    feeds the body through `parse_chparam_info` and asserts the
+    decoder recovers `sap_mode = 1` with the right `ms_used` rows
+    on both chparam slots; `build_5_x_acpl1_body_sap_none_matches_legacy`
+    is the body-builder analogue of the bit-equivalence test;
+    `build_5_x_acpl1_body_sap_ms_decoder_recovers_chparam` feeds the
+    full body through `parse_5x_audio_data_outer` and asserts
+    `tools.acpl_1_residual_chparam[0..1]` recover the original
+    chparam pair with all `max_sfb_master` ms_used bands present.
+    Total lib tests 667 (was 662); existing integration suites
+    remain green.
+  - The downstream decoder pipeline that consumes this is already
+    wired up: round-30 `decoder.rs` (lines 2661-2705) reads the
+    persisted `tools.acpl_1_residual_chparam` and feeds it through
+    `apply_sap_table_181` to re-mix the L/R/Ls/Rs preliminary
+    spectra before IMDCT, so an encoder building a body via the
+    new SAP-aware path produces a stream that round-trips through
+    the existing decoder without further changes.
+
 - **Round 246 — encoder-side Table-181 SAP residual extractor
   (`invert_sap_table_181`, dual of `apply_sap_table_181`).** An IMS
   encoder that wants to populate the §4.2.6.6 ASPX_ACPL_1 residual

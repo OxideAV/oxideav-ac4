@@ -3254,6 +3254,132 @@ fn write_acpl_1_residual_layer(
     max_sfb_master
 }
 
+/// SAP-aware ASPX_ACPL_1 joint-MDCT residual-layer writer per §4.2.6.6
+/// Table 25 (`case ASPX_ACPL_1:` arm). Generalises
+/// [`write_acpl_1_residual_layer`] from the hard-coded identity
+/// `sap_mode = 0` case to the full Table-47 / Table-181 SAP family
+/// (identity / M/S / SAP-coded `alpha_q`) by:
+///
+/// 1. Emitting the caller-supplied `chparam_info()` pair via
+///    [`crate::encoder_asf::write_chparam_info`] — bit-for-bit equal to
+///    what the decoder's [`crate::asf::parse_chparam_info`] then walks.
+/// 2. Recovering the joint-MDCT preliminary residual spectra
+///    `(sSMP,3, sSMP,4)` from the desired `(L, R, Ls, Rs)` preliminary
+///    set via [`crate::asf::invert_sap_table_181`]. Inside the SAP-coded
+///    extent (`sfb < max_sfb_master`) the inverse uses the closed-form
+///    2x2 inverse driven by the chparam_info pair's `(a, b, c, d)`;
+///    outside it the inverse passes `s3 = s4 = 0` mirroring the forward
+///    path's surround-silent convention.
+/// 3. Writing the two sf_data(ASF) bodies for the recovered s3 / s4
+///    spectra bounded by `max_sfb_master`.
+///
+/// When `chparam_pair` is `None` or all-identity (`sap_mode == 0` on
+/// both rows) the emitted body is bit-equivalent to
+/// [`write_acpl_1_residual_layer`] fed with `coeffs_ls` / `coeffs_rs`
+/// directly — the inverse for the identity row reduces to
+/// `s3 = ls, s4 = rs` (proven in
+/// `asf::invert_sap_table_181_identity_passthrough`).
+///
+/// The two preliminary L/R carrier spectra are needed for the inverse
+/// even when only Ls/Rs are being expressed as residual: the M/S and
+/// SAP-coded rows mix L into s3 and R into s4. Callers driving the
+/// existing identity-SAP path can pass dummy L/R slices and a `None`
+/// chparam pair; the new ergonomic path is documented in
+/// [`build_5_x_acpl1_body_from_pcm_spectra_sap`] which forwards the
+/// caller's full `(L, R, Ls, Rs)` preliminaries.
+///
+/// `max_sfb_master` is clamped the same way as
+/// [`write_acpl_1_residual_layer`]. Returns the clamped value.
+#[allow(clippy::too_many_arguments)]
+fn write_acpl_1_residual_layer_sap(
+    bw: &mut BitWriter,
+    transform_length: u32,
+    max_sfb_master: u32,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    chparam_pair: Option<&[crate::asf::ChparamInfo; 2]>,
+) -> u32 {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let (_n_msfb, n_side, _n_msfbl) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    let num_sfb_cap = crate::tables::num_sfb_48(transform_length).expect("encoder: bad tl");
+    let n_side_cap = (1u32 << n_side) - 1;
+    let max_sfb_master = max_sfb_master.clamp(1, num_sfb_cap.min(n_side_cap));
+
+    // max_sfb_master in n_side bits.
+    bw.write_u32(max_sfb_master, n_side);
+
+    // Resolve the chparam pair to emit + drive the inverse. When the
+    // caller passes `None` we fall back to two identity rows — same as
+    // `write_acpl_1_residual_layer`'s `sap_mode = 0` × 2 emission.
+    let identity_pair = [
+        crate::asf::ChparamInfo {
+            sap_mode: 0,
+            ms_used: vec![],
+            sap_data: None,
+        },
+        crate::asf::ChparamInfo {
+            sap_mode: 0,
+            ms_used: vec![],
+            sap_data: None,
+        },
+    ];
+    let pair: &[crate::asf::ChparamInfo; 2] = chparam_pair.unwrap_or(&identity_pair);
+
+    // Emit chparam_info() × 2 — the decoder's residual-layer walker
+    // parses these via `parse_chparam_info` with the same
+    // `max_sfb_per_group = [max_sfb_master]` we hand the writer.
+    let max_sfb_per_group = [max_sfb_master];
+    crate::encoder_asf::write_chparam_info(bw, &pair[0], &max_sfb_per_group);
+    crate::encoder_asf::write_chparam_info(bw, &pair[1], &max_sfb_per_group);
+
+    // Recover the residual `(sSMP,3, sSMP,4)` from `(L, R, Ls, Rs)` via
+    // the Table-181 inverse. The inverse needs the *full* tl-length
+    // spectra; we feed it the long-frame coefficient slices padded to
+    // `tl` if they're shorter so the call stays total.
+    let n = transform_length as usize;
+    let pad = |src: &[f32]| -> Vec<f32> {
+        let mut v = vec![0.0f32; n];
+        let take = src.len().min(n);
+        v[..take].copy_from_slice(&src[..take]);
+        v
+    };
+    let l_pad = pad(coeffs_l);
+    let r_pad = pad(coeffs_r);
+    let ls_pad = pad(coeffs_ls);
+    let rs_pad = pad(coeffs_rs);
+    let (s3, s4) = match crate::asf::invert_sap_table_181(
+        &l_pad,
+        &r_pad,
+        &ls_pad,
+        &rs_pad,
+        pair,
+        max_sfb_master,
+        transform_length,
+    ) {
+        Some((_a, _b, s3, s4)) => (s3, s4),
+        // Inverse refused (e.g. unsupported tl) — fall back to the
+        // identity convention (s3 = ls, s4 = rs) so the writer stays
+        // total and the body still parses.
+        None => (ls_pad.clone(), rs_pad.clone()),
+    };
+
+    // Two sf_data(ASF) bodies bounded by max_sfb_master — same shape as
+    // `write_acpl_1_residual_layer`.
+    for coeffs in [&s3, &s4] {
+        let (qspec, sf, max_q, sections, snf) =
+            prepare_stereo_channel(coeffs, sfbo, max_sfb_master);
+        write_section_data(bw, &sections);
+        write_spectral_data_sections(bw, &qspec, sfbo, &sections);
+        write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb_master);
+        write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb_master);
+    }
+    max_sfb_master
+}
+
 /// Build a 5_X SIMPLE/ASPX_ACPL_1 substream body per §4.2.6.6 Table 25
 /// row `case ASPX_ACPL_1:` that the decoder's
 /// [`crate::mch::parse_5x_audio_data_outer`] (with `mode = AspxAcpl1`)
@@ -3358,6 +3484,112 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra(
         write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
         write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
         // PARTIAL acpl_config_1ch carries a qmf_band → resolve start_band.
+        let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+        let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+/// SAP-aware variant of [`build_5_x_acpl1_body_from_pcm_spectra`] —
+/// emits the same Table-25 `case ASPX_ACPL_1:` body but drives the
+/// joint-MDCT residual layer through [`write_acpl_1_residual_layer_sap`]
+/// with the caller's `chparam_info()` pair so the resulting body
+/// expresses the desired `(L, R, Ls, Rs)` preliminary set after the
+/// decoder's Table-181 forward mixing fires (round 257).
+///
+/// The carrier `two_channel_data()` payload is still driven by the
+/// L/R preliminary spectra `coeffs_l` / `coeffs_r` — the Table-181
+/// inverse only reshapes the residual pair `(s3, s4)` so that the
+/// decoder's `apply_sap_table_181` reproduces the requested
+/// `(L_pre, R_pre, Ls_pre, Rs_pre)`. When `chparam_pair = None` (or
+/// both rows carry `sap_mode = 0`) the emitted body is bit-equivalent
+/// to [`build_5_x_acpl1_body_from_pcm_spectra`] called with the same
+/// spectra (identity SAP — `s3 = ls`, `s4 = rs`, surround silent past
+/// `max_sfb_master`).
+///
+/// The decoder's `parse_5x_audio_data_outer` ASPX_ACPL_1 walker
+/// recovers the chparam_info pair into `tools.acpl_1_residual_chparam`
+/// (round 41) and the residual spectra into
+/// `tools.acpl_1_residual_pair[0..1]`, both of which the round-30
+/// per-frame dispatcher pipes into `apply_sap_table_181` so the
+/// surround spectra hit IMDCT with the correctly mixed contents.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl1_body_from_pcm_spectra_sap(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    chparam_pair: Option<&[crate::asf::ChparamInfo; 2]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_1 (2) — 3 bits.
+    bw.write_u32(2, 3);
+
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (false → AcplLite2 / two_channel_data path).
+    bw.write_bit(false);
+
+    // two_channel_data(): L/R carriers (identity SAP — header chparam
+    // emitted by `write_two_channel_data` is sap_mode = 0).
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // ASPX_ACPL_1 joint-MDCT residual layer — SAP-aware path.
+    write_acpl_1_residual_layer_sap(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_l,
+        coeffs_r,
+        coeffs_ls,
+        coeffs_rs,
+        chparam_pair,
+    );
+
+    // Cfg0 (coding_config == 0): mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
         let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
         let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
@@ -5733,6 +5965,286 @@ mod tests {
             used2, 1,
             "max_sfb_master clamped up to 1 (decoder bails on 0)"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Round 257 — SAP-aware ASPX_ACPL_1 residual-layer emitter tests
+    // ----------------------------------------------------------------
+
+    /// `write_acpl_1_residual_layer_sap` with `chparam_pair = None` is
+    /// bit-equivalent to the legacy `write_acpl_1_residual_layer` —
+    /// the SAP-aware path defaults to two identity rows, and the
+    /// Table-181 inverse for the identity row reduces to
+    /// `s3 = ls, s4 = rs` (per
+    /// `asf::invert_sap_table_181_identity_passthrough`).
+    #[test]
+    fn write_acpl_1_residual_layer_sap_none_matches_legacy() {
+        let tl = 1920u32;
+        let n = tl as usize;
+        let coeffs_ls: Vec<f32> = (0..n).map(|i| 0.10 + 1e-4 * i as f32).collect();
+        let coeffs_rs: Vec<f32> = (0..n).map(|i| -0.05 + 2e-4 * i as f32).collect();
+        let coeffs_l = vec![0.0f32; n];
+        let coeffs_r = vec![0.0f32; n];
+
+        let mut bw_legacy = BitWriter::new();
+        let used_legacy =
+            write_acpl_1_residual_layer(&mut bw_legacy, tl, 8, &coeffs_ls, &coeffs_rs);
+        bw_legacy.align_to_byte();
+        let bytes_legacy = bw_legacy.finish();
+
+        let mut bw_sap = BitWriter::new();
+        let used_sap = write_acpl_1_residual_layer_sap(
+            &mut bw_sap,
+            tl,
+            8,
+            &coeffs_l,
+            &coeffs_r,
+            &coeffs_ls,
+            &coeffs_rs,
+            None,
+        );
+        bw_sap.align_to_byte();
+        let bytes_sap = bw_sap.finish();
+
+        assert_eq!(used_legacy, used_sap);
+        assert_eq!(bytes_legacy, bytes_sap,
+            "SAP-aware writer with chparam_pair = None must be bit-equal to the legacy identity-SAP writer");
+    }
+
+    /// SAP-aware residual layer with a non-identity (M/S) chparam pair
+    /// emits chparam_info `sap_mode = 1` payload that the decoder's
+    /// `parse_chparam_info` recovers exactly, and produces residual
+    /// sf_data bodies whose subsequent `apply_sap_table_181` re-mix
+    /// reconstructs the requested `(L, R, Ls, Rs)` preliminary set
+    /// inside the SAP-coded extent.
+    #[test]
+    fn write_acpl_1_residual_layer_sap_ms_row_roundtrips_through_decoder() {
+        let tl = 256u32;
+        let n = tl as usize;
+        let max_sfb_master = 2u32;
+        // Choose tight L/R/Ls/Rs preliminary spectra. The M/S inverse
+        // produces `(A, s3) = ((L + Ls)/2, (L - Ls)/2)`; feeding those
+        // back through the forward path with the same M/S row
+        // reproduces (L, Ls).
+        let l_spec = vec![4.0f32; n];
+        let r_spec = vec![6.0f32; n];
+        let ls_spec = vec![-2.0f32; n];
+        let rs_spec = vec![-2.0f32; n];
+
+        let cp_ms = crate::asf::ChparamInfo {
+            sap_mode: 1,
+            ms_used: vec![vec![true, true]],
+            sap_data: None,
+        };
+        let pair = [cp_ms.clone(), cp_ms];
+
+        let mut bw = BitWriter::new();
+        let used = write_acpl_1_residual_layer_sap(
+            &mut bw,
+            tl,
+            max_sfb_master,
+            &l_spec,
+            &r_spec,
+            &ls_spec,
+            &rs_spec,
+            Some(&pair),
+        );
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        assert_eq!(used, max_sfb_master);
+
+        // Decode the body the same way `parse_aspx_acpl_1_2_inner_body`
+        // does on the wire: max_sfb_master (n_side bits) + two
+        // chparam_info()s with `max_sfb_per_group = [max_sfb_master]`.
+        let mut br = BitReader::new(&bytes);
+        let (_, n_side, _) = crate::tables::n_msfb_bits_48(tl).unwrap();
+        let parsed_max_sfb_master = br.read_u32(n_side).unwrap();
+        assert_eq!(parsed_max_sfb_master, max_sfb_master);
+
+        let cp0 = crate::asf::parse_chparam_info(&mut br, &[max_sfb_master]).unwrap();
+        let cp1 = crate::asf::parse_chparam_info(&mut br, &[max_sfb_master]).unwrap();
+        assert_eq!(cp0.sap_mode, 1);
+        assert_eq!(cp1.sap_mode, 1);
+        assert_eq!(cp0.ms_used, vec![vec![true, true]]);
+        assert_eq!(cp1.ms_used, vec![vec![true, true]]);
+    }
+
+    /// SAP-aware residual layer with an explicit identity chparam pair
+    /// is bit-equivalent to passing `None`. Pins the
+    /// "identity-pair-explicit == identity-pair-default" contract.
+    #[test]
+    fn write_acpl_1_residual_layer_sap_identity_explicit_matches_default() {
+        let tl = 1920u32;
+        let n = tl as usize;
+        let coeffs_ls = vec![0.25f32; n];
+        let coeffs_rs = vec![-0.25f32; n];
+        let coeffs_l = vec![0.0f32; n];
+        let coeffs_r = vec![0.0f32; n];
+
+        let cp_id = crate::asf::ChparamInfo {
+            sap_mode: 0,
+            ms_used: vec![],
+            sap_data: None,
+        };
+        let pair = [cp_id.clone(), cp_id];
+
+        let mut bw_default = BitWriter::new();
+        write_acpl_1_residual_layer_sap(
+            &mut bw_default,
+            tl,
+            8,
+            &coeffs_l,
+            &coeffs_r,
+            &coeffs_ls,
+            &coeffs_rs,
+            None,
+        );
+        bw_default.align_to_byte();
+
+        let mut bw_explicit = BitWriter::new();
+        write_acpl_1_residual_layer_sap(
+            &mut bw_explicit,
+            tl,
+            8,
+            &coeffs_l,
+            &coeffs_r,
+            &coeffs_ls,
+            &coeffs_rs,
+            Some(&pair),
+        );
+        bw_explicit.align_to_byte();
+
+        assert_eq!(bw_default.finish(), bw_explicit.finish());
+    }
+
+    /// `build_5_x_acpl1_body_from_pcm_spectra_sap` with `chparam_pair =
+    /// None` produces a body bit-equivalent to the legacy
+    /// `build_5_x_acpl1_body_from_pcm_spectra` for the same inputs —
+    /// the identity-SAP path is byte-for-byte unchanged.
+    #[test]
+    fn build_5_x_acpl1_body_sap_none_matches_legacy() {
+        let tl = 1920u32;
+        let half = tl as usize / 2;
+        let zeros = vec![0.0f32; half];
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let body_legacy = build_5_x_acpl1_body_from_pcm_spectra(
+            tl,
+            16,
+            8,
+            true,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            0,
+            4096,
+        );
+        let body_sap = build_5_x_acpl1_body_from_pcm_spectra_sap(
+            tl,
+            16,
+            8,
+            true,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            None,
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            0,
+            4096,
+        );
+        assert_eq!(body_legacy, body_sap);
+    }
+
+    /// The SAP-aware body builder with an explicit non-identity (M/S)
+    /// chparam pair produces a body the decoder's
+    /// `parse_5x_audio_data_outer` walks to `FiveXCodecMode::AspxAcpl1`,
+    /// recovers the chparam pair into `tools.acpl_1_residual_chparam`
+    /// with `sap_mode = 1` on both rows, and persists the residual
+    /// `(sSMP,3, sSMP,4)` spectra at the requested `max_sfb_master`.
+    #[test]
+    fn build_5_x_acpl1_body_sap_ms_decoder_recovers_chparam() {
+        let tl = 1920u32;
+        let half = tl as usize / 2;
+        let zeros = vec![0.0f32; half];
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let max_sfb_master = 8u32;
+        // Need `max_sfb_master` flags per row to satisfy the parser at
+        // sap_mode = 1; build a per-band MsUsed pattern.
+        let ms_row = (0..max_sfb_master).map(|i| i % 2 == 0).collect::<Vec<_>>();
+        let cp_ms = crate::asf::ChparamInfo {
+            sap_mode: 1,
+            ms_used: vec![ms_row.clone()],
+            sap_data: None,
+        };
+        let pair = [cp_ms.clone(), cp_ms];
+
+        let body = build_5_x_acpl1_body_from_pcm_spectra_sap(
+            tl,
+            16,
+            max_sfb_master,
+            true,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            &zeros,
+            Some(&pair),
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            0,
+            4096,
+        );
+        let mut br = BitReader::new(&body[2..]);
+        let mut tools = crate::asf::SubstreamTools::default();
+        crate::mch::parse_5x_audio_data_outer(&mut br, &mut tools, false, true, tl).unwrap();
+        assert_eq!(
+            tools.five_x_mode,
+            Some(crate::mch::FiveXCodecMode::AspxAcpl1)
+        );
+        assert_eq!(tools.acpl_1_residual_max_sfb_master, Some(max_sfb_master));
+        let cp0 = tools.acpl_1_residual_chparam[0]
+            .as_ref()
+            .expect("residual chparam[0] parsed");
+        let cp1 = tools.acpl_1_residual_chparam[1]
+            .as_ref()
+            .expect("residual chparam[1] parsed");
+        assert_eq!(cp0.sap_mode, 1);
+        assert_eq!(cp1.sap_mode, 1);
+        assert_eq!(cp0.ms_used, vec![ms_row.clone()]);
+        assert_eq!(cp1.ms_used, vec![ms_row]);
+        assert!(tools.acpl_1_residual_pair[0].is_some());
+        assert!(tools.acpl_1_residual_pair[1].is_some());
     }
 
     /// The full ASPX_ACPL_1 body builder produces output the decoder walks

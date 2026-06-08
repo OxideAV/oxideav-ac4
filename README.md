@@ -1114,7 +1114,49 @@ framework but usable standalone.
 > the identity `sap_mode = 0` it writes; the new inverse
 > opens the door to non-identity SAP modes producing the
 > correct residual spectra for real psychoacoustic-driven
-> joint-stereo decisions in subsequent rounds.
+> joint-stereo decisions in subsequent rounds. Round 257
+> wires that door open: a new SAP-aware residual-layer
+> writer ([`encoder_acpl3::write_acpl_1_residual_layer_sap`])
+> pairs the round-246 inverse with the round-243
+> [`encoder_asf::write_chparam_info`] emitter so the IMS
+> encoder's §4.2.6.6 Table-25 `case ASPX_ACPL_1:` residual
+> layer can now express any of the three SAP coefficient
+> families produced by [`asf::extract_sap_abcd`] — identity,
+> M/S and SAP-coded `alpha_q` — driven by a caller-supplied
+> `chparam_info()` pair. The new path takes
+> `(coeffs_l, coeffs_r, coeffs_ls, coeffs_rs)` preliminary
+> spectra and an `Option<&[ChparamInfo; 2]>`: it emits the
+> chparam pair via `write_chparam_info` with
+> `max_sfb_per_group = [max_sfb_master]`, recovers the
+> residual `(sSMP,3, sSMP,4)` via `invert_sap_table_181`, and
+> writes the two `sf_data(ASF)` bodies. When
+> `chparam_pair = None` (or both rows carry `sap_mode = 0`)
+> the body is bit-equivalent to the legacy round-103
+> [`encoder_acpl3::write_acpl_1_residual_layer`] — the
+> identity-row inverse reduces to `s3 = ls, s4 = rs`. A new
+> public body builder
+> ([`encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_sap`])
+> wraps the SAP-aware path with the same shape as the legacy
+> [`encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra`]
+> plus the extra `chparam_pair` slot between the surround
+> spectra and the ASPX config. Five new tests in
+> `src/encoder_acpl3.rs` pin: bit-equivalence of the
+> SAP-aware writer with `chparam_pair = None` against the
+> legacy emitter; explicit-identity-rows == default `None`;
+> M/S-row body round-trips through `parse_chparam_info`
+> with the expected per-band `ms_used` recovered;
+> body-builder bit-equivalence with `chparam_pair = None`;
+> full body fed through `parse_5x_audio_data_outer`
+> recovers the chparam pair into
+> `tools.acpl_1_residual_chparam[0..1]` with `sap_mode = 1`
+> and the original per-band flags on both rows. Total lib
+> tests 667 (was 662); integration suites unchanged. The
+> decoder's round-30 pipeline already consumes
+> `tools.acpl_1_residual_chparam` through
+> `apply_sap_table_181` to re-mix the surround spectra
+> before IMDCT, so an encoder that drives the SAP-aware
+> path now produces a stream that round-trips end-to-end
+> through the existing decoder without further changes.
 
 ## Specs
 
