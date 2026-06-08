@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 260 — encoder-side `ChparamInfo` builders
+  (`crate::asf::build_chparam_info_ms_used` +
+  `crate::asf::build_chparam_info_sap_data_from_alpha_q`).** Encoder-
+  side duals of [`crate::asf::extract_sap_abcd`] (§5.3.4.3.2 /
+  Pseudocode 59) for the two non-trivial `SapMode` arms.
+  - `build_chparam_info_ms_used` wraps a per-(group, sfb) `ms_used`
+    flag matrix into a `ChparamInfo` with `sap_mode = 1`; feeding
+    the result into `extract_sap_abcd` reproduces the per-sfb
+    `(1, 1, 1, -1)` vs identity `(1, 0, 0, 1)` mix the input
+    describes, and a `write_chparam_info` → `parse_chparam_info`
+    round-trip recovers the same row.
+  - `build_chparam_info_sap_data_from_alpha_q` is the real
+    workhorse: starting from per-(group, sfb) `alpha_q` indices
+    (range `[-60, +60]` — the HCB_SCALEFAC raw-symbol offset of 60
+    is applied by the writer, not the builder) plus per-pair
+    `sap_coeff_used` flags, it computes the pair-major DPCM
+    `dpcm_alpha_q[g][sfb]` deltas Pseudocode 59 accumulates back
+    into `alpha_q[g][sfb]`. Odd sfbs leave the dpcm slot at zero
+    (decoder inherits from the pair-mate); even sfbs compute
+    `cur - prev` with the `code_delta` policy mirrored exactly
+    from `extract_sap_abcd` — `code_delta == 1` when `g > 0`,
+    `max_sfb_per_group[g] == max_sfb_per_group[g-1]`, and the
+    caller-supplied `delta_code_time` is set, with the reference
+    being `alpha_q[g-1][sfb]`; otherwise the reference is
+    `alpha_q[g][sfb-2]` for `sfb > 0` and zero for `sfb == 0`. The
+    fully-uniform "all set" matrix is detected and `sap_coeff_all`
+    is raised so the bitstream elides the per-pair flag array.
+    `delta_code_time` is normalised to `false` on single-group
+    payloads (Table 48 doesn't transmit the bit there).
+  - Round-trip guarantees pinned by five new unit tests in
+    `src/asf.rs`: `extract_sap_abcd` reproduces the original
+    `alpha_q` row on set bands and identity on cleared bands
+    (`build_chparam_info_sap_data_pair_major_round_trip` +
+    `..._unused_bands_pass_through`); the cross-group
+    `delta_code_time` path delivers the expected `dpcm_alpha_q`
+    deltas (`..._delta_code_time_cross_group`); single-group
+    `delta_code_time = true` input is normalised to `false` on
+    emit (`..._single_group_drops_delta_code_time`); and
+    `write_chparam_info` → `parse_chparam_info` recovers the same
+    SAP body which extracts to the original `alpha_q`
+    (`..._round_trips_through_bitstream`).
+  - Slots into the round-257 SAP-aware residual-layer writer: an
+    IMS encoder that runs a psychoacoustic decision per
+    parameter-band (M/S vs. alpha-driven SAP joint stereo) can now
+    materialise the `ChparamInfo` pair from its decision matrix
+    instead of hand-crafting the inner `SapData` body — the same
+    bytes the decoder's `parse_chparam_info` walks back into the
+    `apply_sap_table_181` pipeline. Total lib tests 674 (was 667);
+    integration suites unchanged.
+
 - **Round 257 — SAP-aware ASPX_ACPL_1 residual-layer writer
   (`write_acpl_1_residual_layer_sap` + body-builder wrapper
   `build_5_x_acpl1_body_from_pcm_spectra_sap`).** Pairs the round-246

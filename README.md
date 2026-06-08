@@ -1157,6 +1157,44 @@ framework but usable standalone.
 > before IMDCT, so an encoder that drives the SAP-aware
 > path now produces a stream that round-trips end-to-end
 > through the existing decoder without further changes.
+> Round 260 adds the **encoder-side `ChparamInfo` builders**
+> ([`asf::build_chparam_info_ms_used`] and
+> [`asf::build_chparam_info_sap_data_from_alpha_q`]) — the
+> two non-trivial-arm duals of [`asf::extract_sap_abcd`]
+> (§5.3.4.3.2 / Pseudocode 59). The MsUsed builder wraps a
+> per-(group, sfb) `ms_used` flag matrix into a
+> `ChparamInfo` with `sap_mode = 1`; the SapData builder
+> takes the desired per-(g, sfb) `alpha_q` indices in
+> `[-60, +60]` plus per-pair `sap_coeff_used` flags and
+> computes the pair-major DPCM `dpcm_alpha_q[g][sfb]`
+> deltas Pseudocode 59 accumulates back into `alpha_q` —
+> odd sfbs leave the dpcm slot at zero (decoder inherits
+> from the pair-mate); even sfbs compute `cur - prev` with
+> the same `code_delta` policy as the decoder
+> (`code_delta == 1` requires `g > 0`,
+> `max_sfb_per_group[g] == max_sfb_per_group[g-1]` and
+> caller-supplied `delta_code_time` set, with reference
+> `alpha_q[g-1][sfb]`; otherwise `alpha_q[g][sfb-2]` for
+> `sfb > 0` and zero for `sfb == 0`). A fully-uniform "all
+> set" matrix raises `sap_coeff_all` so the per-pair flag
+> array elides; `delta_code_time` is normalised to `false`
+> on single-group payloads (Table 48 doesn't transmit the
+> bit there). Five new unit tests in `src/asf.rs` pin:
+> `extract_sap_abcd` reproduces the original `alpha_q` row
+> on set bands and identity on cleared bands; the
+> cross-group `delta_code_time` path delivers the
+> expected `dpcm_alpha_q` deltas; the single-group
+> `delta_code_time = true` input is dropped to `false` on
+> emit; and `write_chparam_info` →
+> `parse_chparam_info` recovers the same SAP body which
+> extracts to the original `alpha_q`. Total lib tests 674
+> (was 667); integration suites unchanged. Slots into the
+> round-257 SAP-aware residual-layer writer — an IMS
+> encoder that runs a psychoacoustic decision per
+> parameter-band (M/S vs alpha-driven SAP joint stereo)
+> can now materialise the `ChparamInfo` pair from its
+> decision matrix instead of hand-crafting the inner
+> `SapData` body.
 
 ## Specs
 

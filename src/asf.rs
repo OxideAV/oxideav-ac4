@@ -849,6 +849,174 @@ pub fn invert_sap_table_181(
     Some((a_spec, b_spec, s3_spec, s4_spec))
 }
 
+// ====================================================================
+// Encoder-side ChparamInfo builders — duals of extract_sap_abcd
+// ====================================================================
+//
+// `extract_sap_abcd` is the decoder-side primitive: it takes a parsed
+// `ChparamInfo` and produces the per-(g, sfb) Table-181 `(a, b, c, d)`
+// matrix the §5.3.4.3.2 SAP layer applies to the carrier spectra.
+//
+// An IMS encoder needs the inverse: starting from a psychoacoustic
+// decision on which bands to code as M/S vs. SAP-driven joint stereo
+// (with per-band `alpha_q` indices in [-60, +60]), build a `ChparamInfo`
+// that round-trips through `extract_sap_abcd` to recover the same
+// matrix the encoder picked. The two builders below are the two
+// non-trivial `SapMode` arms (`SapMode::None` / `SapMode::Reserved`
+// are header-only and need no builder).
+
+/// Build a `ChparamInfo` with `sap_mode == 1` (`SapMode::MsUsed`) from
+/// a per-(group, sfb) `ms_used` flag matrix.
+///
+/// Encoder-side dual of [`extract_sap_abcd`] for the `SapMode::MsUsed`
+/// arm: feeding the result of this builder into `extract_sap_abcd` with
+/// the same `max_sfb_per_group` reproduces the input matrix bit-for-bit
+/// (per-sfb `(1, 1, 1, -1)` for set bands, identity `(1, 0, 0, 1)` for
+/// cleared bands).
+///
+/// Rows shorter than `max_sfb_per_group[g]` are accepted — the writer
+/// in [`crate::encoder_asf::write_chparam_info`] pads missing tail bits
+/// with `false`, which is bit-equivalent to a row that explicitly
+/// carries `false` in that position. Rows longer than the per-group
+/// bound have their tail entries ignored by both writer and
+/// `extract_sap_abcd` (which walks `take(max_sfb_per_group[g])`).
+pub fn build_chparam_info_ms_used(ms_used_per_group: Vec<Vec<bool>>) -> ChparamInfo {
+    ChparamInfo {
+        sap_mode: 1,
+        ms_used: ms_used_per_group,
+        sap_data: None,
+    }
+}
+
+/// Build a `ChparamInfo` with `sap_mode == 3` (`SapMode::SapData`) from
+/// per-(group, sfb) `alpha_q` indices and `sap_coeff_used` flags.
+///
+/// Encoder-side dual of [`extract_sap_abcd`] for the `SapMode::SapData`
+/// arm: computes the pair-major DPCM `dpcm_alpha_q[g][sfb]` deltas the
+/// decoder accumulates back into `alpha_q[g][sfb]` per Pseudocode 59.
+///
+/// `alpha_q_per_group[g][sfb]` is the desired post-DPCM `alpha_q` index
+/// (range `[-60, +60]` — the HCB_SCALEFAC raw symbol offset of 60 is
+/// applied by the writer, not by this builder). Pair-major encoding
+/// per Pseudocode 59:
+///
+/// * Odd sfbs share the pair-mate's `alpha_q` — the decoder inherits
+///   `alpha_q[g][sfb] = alpha_q[g][sfb-1]`. The builder ignores the
+///   odd-sfb input value (callers that pass the inherited value get
+///   the same encoded byte stream).
+/// * Even sfbs differential-decode against the previous reference:
+///   * `code_delta == 1` (cross-group time-code: `g > 0`, the per-group
+///     bound matches `max_sfb_per_group[g-1]`, and `delta_code_time`
+///     is set) — reference is `alpha_q[g-1][sfb]`.
+///   * Otherwise the reference is `alpha_q[g][sfb-2]` for `sfb > 0`
+///     and zero for `sfb == 0`.
+///
+/// `sap_coeff_used_per_group[g][sfb]` — per-pair flag matrix matching
+/// the matrix `extract_sap_abcd` walks; clear flags emit
+/// `dpcm_alpha_q = 0` for that pair and the decoded `alpha_q` stays at
+/// the previous reference (which the SAP layer interprets as
+/// identity-passthrough on that band, so the actual `alpha_q` value at
+/// a cleared pair is don't-care). Rows shorter than the per-group
+/// bound are treated as all-false. The fully-uniform "all set" matrix
+/// is detected and `sap_coeff_all` is set to `1` so the bitstream
+/// elides the per-pair flag array — bit-equivalent to the original
+/// encoder's intent.
+///
+/// `delta_code_time` is honoured only when `max_sfb_per_group.len() > 1`
+/// (single-group payloads omit the bit per Table 48 and the decoder
+/// treats it as `false`).
+///
+/// Round-trip guarantee: feeding the returned `ChparamInfo` into
+/// [`extract_sap_abcd`] with the same `max_sfb_per_group` reproduces
+/// the input `alpha_q_per_group` on set bands (and `(1, 0, 0, 1)` on
+/// cleared bands). The exhaustive coverage of `code_delta == 0` /
+/// `code_delta == 1` is pinned by unit tests below.
+///
+/// Defensive clamps mirror [`crate::encoder_asf::write_sap_data`]:
+/// per-sfb deltas outside `[-60, +60]` clip to the HCB_SCALEFAC
+/// codebook bounds when written; callers driving `alpha_q` jumps
+/// larger than the codebook can express should pre-quantise their
+/// per-band targets to keep the cumulative per-pair delta inside the
+/// codebook range.
+pub fn build_chparam_info_sap_data_from_alpha_q(
+    alpha_q_per_group: &[Vec<i32>],
+    sap_coeff_used_per_group: &[Vec<bool>],
+    delta_code_time: bool,
+    max_sfb_per_group: &[u32],
+) -> ChparamInfo {
+    let num_groups = max_sfb_per_group.len();
+    let mut sap_coeff_used: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
+    let mut dpcm_alpha_q: Vec<Vec<i32>> = Vec::with_capacity(num_groups);
+    let mut all_set = true;
+    let mut max_sfb_prev: u32 = max_sfb_per_group.first().copied().unwrap_or(0);
+    for (g, &m) in max_sfb_per_group.iter().enumerate() {
+        let m = m as usize;
+        let used_row = sap_coeff_used_per_group.get(g);
+        let alpha_row = alpha_q_per_group.get(g);
+        let prev_alpha_row = if g == 0 {
+            None
+        } else {
+            alpha_q_per_group.get(g - 1)
+        };
+        let mut used_out: Vec<bool> = vec![false; m];
+        let mut dpcm_out: Vec<i32> = vec![0i32; m];
+        let mut sfb = 0usize;
+        while sfb < m {
+            let used = used_row.and_then(|r| r.get(sfb).copied()).unwrap_or(false);
+            used_out[sfb] = used;
+            // The decoder's matrix only inherits the pair-mate, so any
+            // sfb+1 within an active pair carries the same flag.
+            if sfb + 1 < m {
+                used_out[sfb + 1] = used;
+            }
+            if !used {
+                all_set = false;
+            }
+            // Even-sfb in an active pair: compute the DPCM delta. Mirror
+            // `extract_sap_abcd`'s `code_delta` policy. Odd sfb leaves
+            // `dpcm_out[sfb] = 0` — the writer walks `sfb += 2` so the
+            // odd slot is never read on emit and the decoder inherits
+            // from the pair-mate anyway.
+            if used && sfb % 2 == 0 {
+                let code_delta = g != 0 && max_sfb_per_group[g] == max_sfb_prev && delta_code_time;
+                let prev = if code_delta {
+                    prev_alpha_row
+                        .and_then(|r| r.get(sfb).copied())
+                        .unwrap_or(0)
+                } else if sfb == 0 {
+                    0
+                } else {
+                    alpha_row
+                        .and_then(|r| r.get(sfb.wrapping_sub(2)).copied())
+                        .unwrap_or(0)
+                };
+                let cur = alpha_row.and_then(|r| r.get(sfb).copied()).unwrap_or(0);
+                dpcm_out[sfb] = cur - prev;
+            }
+            sfb += 1;
+        }
+        sap_coeff_used.push(used_out);
+        dpcm_alpha_q.push(dpcm_out);
+        max_sfb_prev = max_sfb_per_group[g];
+    }
+    // num_groups == 1 -> delta_code_time bit isn't transmitted; the
+    // decoder treats it as `false`. Normalise the field so a
+    // round-trip through write_chparam_info / parse_chparam_info
+    // recovers `delta_code_time == false` regardless of the caller's
+    // input on single-group payloads.
+    let dct_normalised = num_groups != 1 && delta_code_time;
+    ChparamInfo {
+        sap_mode: 3,
+        ms_used: vec![],
+        sap_data: Some(SapData {
+            sap_coeff_all: all_set && num_groups > 0,
+            sap_coeff_used,
+            delta_code_time: dct_normalised,
+            dpcm_alpha_q,
+        }),
+    }
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -4750,5 +4918,152 @@ mod tests {
         assert_eq!(state_bank[0].last_n_mdct, 960);
         assert_eq!(state_bank[0].env_prev.len(), 12);
         assert!(info.tools.ssf_data_primary.is_some());
+    }
+
+    // ----- build_chparam_info_* encoder-side duals of extract_sap_abcd -----
+
+    /// `build_chparam_info_ms_used` round-trip: feeding the result
+    /// into `extract_sap_abcd` reproduces the per-sfb (1, 1, 1, -1)
+    /// vs identity matrix the input ms_used array describes.
+    #[test]
+    fn build_chparam_info_ms_used_round_trips_through_extract_sap_abcd() {
+        let ms_used = vec![vec![true, false, true, true]];
+        let info = build_chparam_info_ms_used(ms_used.clone());
+        assert_eq!(info.sap_mode, 1);
+        assert_eq!(info.ms_used, ms_used);
+        assert!(info.sap_data.is_none());
+        let coeffs = extract_sap_abcd(&info, &[4]);
+        assert_eq!(coeffs.abcd[0][0], (1.0, 1.0, 1.0, -1.0));
+        assert_eq!(coeffs.abcd[0][1], (1.0, 0.0, 0.0, 1.0));
+        assert_eq!(coeffs.abcd[0][2], (1.0, 1.0, 1.0, -1.0));
+        assert_eq!(coeffs.abcd[0][3], (1.0, 1.0, 1.0, -1.0));
+    }
+
+    /// Bit-stream round-trip: write_chparam_info → parse_chparam_info
+    /// recovers the ms_used row that `build_chparam_info_ms_used`
+    /// produced.
+    #[test]
+    fn build_chparam_info_ms_used_round_trips_through_bitstream() {
+        let ms_used = vec![vec![true, false, true, false, true]];
+        let info = build_chparam_info_ms_used(ms_used.clone());
+        let mut bw = BitWriter::new();
+        crate::encoder_asf::write_chparam_info(&mut bw, &info, &[5]);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let parsed = parse_chparam_info(&mut br, &[5]).unwrap();
+        assert_eq!(parsed.sap_mode, 1);
+        assert_eq!(parsed.ms_used, ms_used);
+    }
+
+    /// `build_chparam_info_sap_data_from_alpha_q` single-group:
+    /// pair-major DPCM with `sap_coeff_all = true` reproduces the
+    /// original `alpha_q` row through `extract_sap_abcd`. Mirrors
+    /// `extract_sap_abcd_mode_three_pair_dpcm_decode` from the
+    /// decoder side.
+    #[test]
+    fn build_chparam_info_sap_data_pair_major_round_trip() {
+        // Target alpha_q row [5, 5, 8, 8] — pair-major (sfb 1 mirrors
+        // sfb 0; sfb 3 mirrors sfb 2). Expected dpcm row:
+        // [5 (= 5 - 0), 0, 3 (= 8 - 5), 0].
+        let alpha_q = vec![vec![5, 5, 8, 8]];
+        let used = vec![vec![true, true, true, true]];
+        let info = build_chparam_info_sap_data_from_alpha_q(&alpha_q, &used, false, &[4]);
+        assert_eq!(info.sap_mode, 3);
+        let sd = info.sap_data.as_ref().expect("sap_data populated");
+        assert!(sd.sap_coeff_all);
+        assert_eq!(sd.dpcm_alpha_q[0], vec![5, 0, 3, 0]);
+        // Round-trip back through extract_sap_abcd: alpha_q row is
+        // reproduced and `sap_gain = alpha_q * 0.1` lands the same
+        // (a, b, c, d) tuples the decoder would extract.
+        let coeffs = extract_sap_abcd(&info, &[4]);
+        let row = &coeffs.abcd[0];
+        // sfb 0: alpha=5 -> sap_gain=0.5 -> (1.5, 1, 0.5, -1).
+        assert!((row[0].0 - 1.5).abs() < 1e-6);
+        assert_eq!(row[0].1, 1.0);
+        assert!((row[0].2 - 0.5).abs() < 1e-6);
+        assert_eq!(row[0].3, -1.0);
+        assert_eq!(row[1], row[0]); // pair inherit
+                                    // sfb 2: alpha=8 -> sap_gain=0.8 -> (1.8, 1, 0.2, -1).
+        assert!((row[2].0 - 1.8).abs() < 1e-6);
+        assert!((row[2].2 - 0.2).abs() < 1e-6);
+        assert_eq!(row[3], row[2]);
+    }
+
+    /// Cleared pair flag → builder marks the pair as unused and the
+    /// decoder's `extract_sap_abcd` skips it as identity passthrough
+    /// (a=1, b=0, c=0, d=1).
+    #[test]
+    fn build_chparam_info_sap_data_unused_bands_pass_through() {
+        let alpha_q = vec![vec![10, 10]];
+        let used = vec![vec![false, false]];
+        let info = build_chparam_info_sap_data_from_alpha_q(&alpha_q, &used, false, &[2]);
+        let sd = info.sap_data.as_ref().expect("sap_data populated");
+        assert!(!sd.sap_coeff_all);
+        assert_eq!(sd.sap_coeff_used[0], vec![false, false]);
+        let coeffs = extract_sap_abcd(&info, &[2]);
+        assert_eq!(coeffs.abcd[0][0], (1.0, 0.0, 0.0, 1.0));
+        assert_eq!(coeffs.abcd[0][1], (1.0, 0.0, 0.0, 1.0));
+    }
+
+    /// Cross-group `delta_code_time` round-trip: matching `max_sfb_g`
+    /// across groups lets the DPCM reference the same sfb in the
+    /// previous group instead of `sfb-2` in the current one.
+    #[test]
+    fn build_chparam_info_sap_data_delta_code_time_cross_group() {
+        // Target: group 0 alpha = [4, 4]; group 1 alpha = [6, 6].
+        // delta_code_time = true, both groups max_sfb = 2.
+        // Group 0 dpcm = [4 (= 4 - 0), 0].
+        // Group 1 dpcm = [2 (= 6 - 4), 0] via cross-group reference.
+        let alpha_q = vec![vec![4, 4], vec![6, 6]];
+        let used = vec![vec![true, true], vec![true, true]];
+        let info = build_chparam_info_sap_data_from_alpha_q(&alpha_q, &used, true, &[2, 2]);
+        let sd = info.sap_data.as_ref().expect("sap_data populated");
+        assert!(sd.delta_code_time);
+        assert_eq!(sd.dpcm_alpha_q[0], vec![4, 0]);
+        assert_eq!(sd.dpcm_alpha_q[1], vec![2, 0]);
+        let coeffs = extract_sap_abcd(&info, &[2, 2]);
+        // Group 1 sfb 0: sap_gain = 0.6 -> (1.6, 1, 0.4, -1).
+        let (a, _, c, _) = coeffs.abcd[1][0];
+        assert!((a - 1.6).abs() < 1e-6);
+        assert!((c - 0.4).abs() < 1e-6);
+    }
+
+    /// Single-group: caller-supplied `delta_code_time == true` is
+    /// normalised to `false` (the bit isn't on the wire so the
+    /// decoder sees it as zero — keep the field consistent).
+    #[test]
+    fn build_chparam_info_sap_data_single_group_drops_delta_code_time() {
+        let alpha_q = vec![vec![3, 3]];
+        let used = vec![vec![true, true]];
+        let info = build_chparam_info_sap_data_from_alpha_q(&alpha_q, &used, true, &[2]);
+        let sd = info.sap_data.as_ref().expect("sap_data populated");
+        assert!(!sd.delta_code_time);
+    }
+
+    /// Bit-stream round-trip: write_chparam_info on the builder's
+    /// output → parse_chparam_info recovers the same SAP body, which
+    /// extracts to the original alpha_q matrix.
+    #[test]
+    fn build_chparam_info_sap_data_round_trips_through_bitstream() {
+        let alpha_q = vec![vec![2, 2, 7, 7]];
+        let used = vec![vec![true, true, true, true]];
+        let info = build_chparam_info_sap_data_from_alpha_q(&alpha_q, &used, false, &[4]);
+        let mut bw = BitWriter::new();
+        crate::encoder_asf::write_chparam_info(&mut bw, &info, &[4]);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let parsed = parse_chparam_info(&mut br, &[4]).unwrap();
+        assert_eq!(parsed.sap_mode, 3);
+        let coeffs = extract_sap_abcd(&parsed, &[4]);
+        // sfb 0: alpha=2 -> sap_gain=0.2 -> a = 1.2, c = 0.8.
+        let (a0, _, c0, _) = coeffs.abcd[0][0];
+        assert!((a0 - 1.2).abs() < 1e-6);
+        assert!((c0 - 0.8).abs() < 1e-6);
+        // sfb 2: alpha=7 -> sap_gain=0.7 -> a = 1.7, c = 0.3.
+        let (a2, _, c2, _) = coeffs.abcd[0][2];
+        assert!((a2 - 1.7).abs() < 1e-6);
+        assert!((c2 - 0.3).abs() < 1e-6);
     }
 }
