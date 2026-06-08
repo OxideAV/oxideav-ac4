@@ -1017,6 +1017,140 @@ pub fn build_chparam_info_sap_data_from_alpha_q(
     }
 }
 
+/// Build a header-only `ChparamInfo` with `sap_mode == 0`
+/// ([`SapMode::None`]) — the trivial encoder-side dual of
+/// [`extract_sap_abcd`] for the `SapMode::None` arm.
+///
+/// `SapMode::None` carries no body — both channels stay independent for
+/// the rest of the element. Feeding this builder's result into
+/// [`extract_sap_abcd`] with any `max_sfb_per_group` reproduces the
+/// identity per-sfb matrix `(1, 0, 0, 1)` (same as the decoder's
+/// `SapMode::None` arm), and a `write_chparam_info` / `parse_chparam_info`
+/// round-trip recovers the same header-only element.
+///
+/// This is the trivial third arm of the
+/// [`build_chparam_info_ms_used`] / [`build_chparam_info_sap_data_from_alpha_q`]
+/// builder family; it exists so encoder paths can produce all three
+/// non-reserved `SapMode` arms uniformly without ad-hoc `ChparamInfo {
+/// sap_mode: 0, ..Default::default() }` literals.
+pub fn build_chparam_info_none() -> ChparamInfo {
+    ChparamInfo {
+        sap_mode: 0,
+        ms_used: vec![],
+        sap_data: None,
+    }
+}
+
+/// Per-(group, sfb) M/S-vs-L/R decision driver for the encoder-side
+/// `SapMode::MsUsed` arm — picks `ms_used[g][sfb]` per band using the
+/// energy-concentration criterion.
+///
+/// The decoder's `SapMode::MsUsed` arm reconstructs `(L, R)` from the
+/// joint-stereo pair `(M', S')` via the per-sfb matrix `(1, 1, 1, -1)`
+/// (i.e. `L = M' + S', R = M' - S'`), which means the encoder
+/// transmits `M' = (L + R) / 2` and `S' = (L - R) / 2`. The total
+/// energy is preserved up to the M/S scale:
+/// `E_M' + E_S' = (E_L + E_R) / 2`, so raw total energy is **not** a
+/// useful criterion (M/S always has half the total energy regardless
+/// of correlation).
+///
+/// The criterion this driver uses is the standard joint-stereo
+/// *concentration* test: pick M/S when one of `(M', S')` carries
+/// strictly less energy than the smaller of `(L, R)`. For a
+/// well-correlated pair, M' concentrates the signal and S' vanishes —
+/// `min(E_M', E_S') < min(E_L, E_R)` — and a downstream quantizer can
+/// spend fewer bits on the small-energy channel. For an
+/// uncorrelated pair, E_M' and E_S' are both around `(E_L + E_R) / 4`
+/// and that's not less than `min(E_L, E_R)`, so the band stays L/R.
+///
+/// Algebraically per band (sum over bins `[sfb_offset[sfb],
+/// sfb_offset[sfb+1])`):
+///
+/// ```text
+///   E_L  = sum_k L[k]^2
+///   E_R  = sum_k R[k]^2
+///   E_M' = sum_k ((L[k] + R[k]) / 2)^2  = (E_L + E_R + 2 * cross) / 4
+///   E_S' = sum_k ((L[k] - R[k]) / 2)^2  = (E_L + E_R - 2 * cross) / 4
+///   cross = sum_k L[k] * R[k]
+/// ```
+///
+/// pick `ms_used = true` iff `min(E_M', E_S') < min(E_L, E_R)`.
+///
+/// `l_spec_per_group[g]` / `r_spec_per_group[g]` are per-group MDCT
+/// spectra at the same transform length as `sfb_offset`. Rows shorter
+/// than `sfb_offset[max_sfb_per_group[g]]` produce `false` decisions on
+/// the missing bins (the missing tail bands stay L/R).
+///
+/// Returns a `Vec<Vec<bool>>` shape-matched to `max_sfb_per_group`
+/// suitable for feeding directly into [`build_chparam_info_ms_used`].
+/// The strict-less comparison resolves ties (including zero-energy
+/// bands where `E_L == E_R == E_M' == E_S' == 0`) to `false` — keep
+/// L/R coding when the concentration criterion offers no benefit
+/// rather than spend a `ms_used` bit on the band.
+///
+/// Round-trip: feeding the returned matrix through
+/// [`build_chparam_info_ms_used`] and then [`extract_sap_abcd`] with
+/// the same `max_sfb_per_group` reproduces the per-sfb `(1, 1, 1, -1)`
+/// matrix exactly on the picked bands and identity on the rest.
+pub fn select_ms_used_for_pair(
+    l_spec_per_group: &[Vec<f32>],
+    r_spec_per_group: &[Vec<f32>],
+    sfb_offset: &[u16],
+    max_sfb_per_group: &[u32],
+) -> Vec<Vec<bool>> {
+    let mut out: Vec<Vec<bool>> = Vec::with_capacity(max_sfb_per_group.len());
+    for (g, &m) in max_sfb_per_group.iter().enumerate() {
+        let m_usize = m as usize;
+        let mut row = vec![false; m_usize];
+        let l = l_spec_per_group.get(g);
+        let r = r_spec_per_group.get(g);
+        let (Some(l), Some(r)) = (l, r) else {
+            out.push(row);
+            continue;
+        };
+        for (sfb, slot) in row.iter_mut().enumerate().take(m_usize) {
+            // Guard against an sfb_offset that's shorter than
+            // max_sfb + 1 entries — clamp to the available range so we
+            // never index past the end. (sfb_offset_48 is always
+            // num_sfb_max + 1 in practice but we defensively support
+            // shorter caller-supplied tables.)
+            let Some(&lo) = sfb_offset.get(sfb) else {
+                break;
+            };
+            let Some(&hi) = sfb_offset.get(sfb + 1) else {
+                break;
+            };
+            let lo = lo as usize;
+            let hi = (hi as usize).min(l.len()).min(r.len());
+            if hi <= lo {
+                continue;
+            }
+            // Per-band energies. cross = sum L * R drives the per-band
+            // M' / S' energy distribution via E_M' = (E_L + E_R + 2 *
+            // cross) / 4 and E_S' = (E_L + E_R - 2 * cross) / 4.
+            let mut e_l = 0.0f64;
+            let mut e_r = 0.0f64;
+            let mut cross = 0.0f64;
+            for k in lo..hi {
+                let lk = l[k] as f64;
+                let rk = r[k] as f64;
+                e_l += lk * lk;
+                e_r += rk * rk;
+                cross += lk * rk;
+            }
+            let sum = e_l + e_r;
+            let e_m = (sum + 2.0 * cross) * 0.25;
+            let e_s = (sum - 2.0 * cross) * 0.25;
+            let min_lr = e_l.min(e_r);
+            let min_ms = e_m.min(e_s);
+            // Strict less: ties (incl. zero energy) stay L/R.
+            *slot = min_ms < min_lr;
+        }
+        out.push(row);
+    }
+    out
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -5065,5 +5199,166 @@ mod tests {
         let (a2, _, c2, _) = coeffs.abcd[0][2];
         assert!((a2 - 1.7).abs() < 1e-6);
         assert!((c2 - 0.3).abs() < 1e-6);
+    }
+
+    // ----- build_chparam_info_none / select_ms_used_for_pair -----
+
+    /// The header-only `SapMode::None` builder produces an info that
+    /// extracts to identity per-sfb across any per-group bound and
+    /// survives a bit-stream round-trip as a 2-bit header.
+    #[test]
+    fn build_chparam_info_none_round_trips_through_extract_and_bitstream() {
+        let info = build_chparam_info_none();
+        assert_eq!(info.sap_mode, 0);
+        assert!(info.ms_used.is_empty());
+        assert!(info.sap_data.is_none());
+        // extract_sap_abcd over any per-group bound stays identity.
+        let coeffs = extract_sap_abcd(&info, &[3, 5]);
+        assert_eq!(coeffs.abcd.len(), 2);
+        for row in &coeffs.abcd {
+            for &(a, b, c, d) in row {
+                assert!((a - 1.0).abs() < 1e-6);
+                assert!(b.abs() < 1e-6);
+                assert!(c.abs() < 1e-6);
+                assert!((d - 1.0).abs() < 1e-6);
+            }
+        }
+        // Bit-stream round-trip: header-only, 2 bits + alignment padding.
+        let mut bw = BitWriter::new();
+        crate::encoder_asf::write_chparam_info(&mut bw, &info, &[3, 5]);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let parsed = parse_chparam_info(&mut br, &[3, 5]).unwrap();
+        assert_eq!(parsed.sap_mode, 0);
+        assert_eq!(parsed.mode(), SapMode::None);
+        assert!(parsed.ms_used.is_empty());
+        assert!(parsed.sap_data.is_none());
+    }
+
+    /// `select_ms_used_for_pair` picks `true` on bands where M/S coding
+    /// concentrates energy (one of M', S' carries strictly less than
+    /// the smaller of L, R) and `false` otherwise.
+    ///
+    /// Construct a 4-sfb test signal with bins-per-sfb = 4 (transform
+    /// length 16, single-group, sfb_offset = [0, 4, 8, 12, 16]):
+    ///
+    /// * sfb 0 — L = R (perfectly correlated): M' = L, S' = 0 →
+    ///   min_ms = 0 < min_lr = E_L → pick M/S.
+    /// * sfb 1 — L = -R (anti-correlated): M' = 0, S' = L →
+    ///   min_ms = 0 < min_lr = E_L → pick M/S.
+    /// * sfb 2 — L only, R = 0 (one-sided): E_L = sum L^2, E_R = 0,
+    ///   so min_lr = 0; E_M' = E_S' = E_L/4 so min_ms = E_L/4 >= 0.
+    ///   No concentration benefit — keep L/R.
+    /// * sfb 3 — zero-energy band: every energy is 0 → tie → L/R.
+    #[test]
+    fn select_ms_used_for_pair_per_band_decision() {
+        // Per-sfb bins: 4 bins per sfb, 4 sfbs, single group, total 16
+        // bins (matches a synthetic 16-bin sfb table for the test).
+        let sfb_offset: [u16; 5] = [0, 4, 8, 12, 16];
+        // sfb 0: L == R (correlated).
+        let mut l = vec![1.0f32, 0.5, -0.7, 0.3];
+        let mut r = vec![1.0f32, 0.5, -0.7, 0.3];
+        // sfb 1: L == -R (anti-correlated).
+        l.extend_from_slice(&[0.4, 0.9, -0.2, 0.6]);
+        r.extend_from_slice(&[-0.4, -0.9, 0.2, -0.6]);
+        // sfb 2: L only (one-sided / no concentration benefit).
+        l.extend_from_slice(&[0.8, 0.1, -0.3, 0.5]);
+        r.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        // sfb 3: zero-energy.
+        l.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        r.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        let l_per_group = vec![l];
+        let r_per_group = vec![r];
+        let decisions = select_ms_used_for_pair(&l_per_group, &r_per_group, &sfb_offset, &[4]);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].len(), 4);
+        // sfb 0 (correlated): M/S concentrates → wins.
+        assert!(decisions[0][0], "L == R band must pick M/S");
+        // sfb 1 (anti-correlated): M/S concentrates → wins.
+        assert!(decisions[0][1], "L == -R band must pick M/S");
+        // sfb 2 (L only): no concentration over min(E_L, E_R = 0) → L/R.
+        assert!(!decisions[0][2], "L-only band must stay L/R");
+        // sfb 3 (zero-energy): tie, keep L/R.
+        assert!(!decisions[0][3], "zero-energy band must stay L/R");
+    }
+
+    /// Round-trip: the decision matrix from `select_ms_used_for_pair`
+    /// flows into `build_chparam_info_ms_used`, then `extract_sap_abcd`
+    /// reproduces the per-sfb (1, 1, 1, -1) matrix on the picked
+    /// bands and identity on the rest.
+    #[test]
+    fn select_ms_used_for_pair_round_trips_into_extract_sap_abcd() {
+        let sfb_offset: [u16; 5] = [0, 4, 8, 12, 16];
+        // Two bands picked (sfb 0 correlated, sfb 1 anti-correlated),
+        // two bands not picked (sfb 2 zero-energy, sfb 3 zero-energy).
+        let l = vec![
+            1.0f32, 0.5, -0.7, 0.3, // sfb 0
+            0.4, 0.9, -0.2, 0.6, // sfb 1
+            0.0, 0.0, 0.0, 0.0, // sfb 2
+            0.0, 0.0, 0.0, 0.0, // sfb 3
+        ];
+        let r = vec![
+            1.0f32, 0.5, -0.7, 0.3, // sfb 0
+            -0.4, -0.9, 0.2, -0.6, // sfb 1
+            0.0, 0.0, 0.0, 0.0, // sfb 2
+            0.0, 0.0, 0.0, 0.0, // sfb 3
+        ];
+        let decisions = select_ms_used_for_pair(&[l], &[r], &sfb_offset, &[4]);
+        let info = build_chparam_info_ms_used(decisions.clone());
+        let coeffs = extract_sap_abcd(&info, &[4]);
+        assert_eq!(coeffs.abcd[0].len(), 4);
+        // Picked bands -> (1, 1, 1, -1).
+        for sfb in [0, 1] {
+            let (a, b, c, d) = coeffs.abcd[0][sfb];
+            assert!((a - 1.0).abs() < 1e-6);
+            assert!((b - 1.0).abs() < 1e-6);
+            assert!((c - 1.0).abs() < 1e-6);
+            assert!((d - (-1.0)).abs() < 1e-6);
+        }
+        // Skipped bands -> identity (1, 0, 0, 1).
+        for sfb in [2, 3] {
+            let (a, b, c, d) = coeffs.abcd[0][sfb];
+            assert!((a - 1.0).abs() < 1e-6);
+            assert!(b.abs() < 1e-6);
+            assert!(c.abs() < 1e-6);
+            assert!((d - 1.0).abs() < 1e-6);
+        }
+    }
+
+    /// `select_ms_used_for_pair` honours the per-group bound: extra
+    /// bands beyond `max_sfb_per_group[g]` are not inspected and the
+    /// returned row length matches `max_sfb_per_group[g]` exactly.
+    #[test]
+    fn select_ms_used_for_pair_respects_per_group_bound() {
+        let sfb_offset: [u16; 5] = [0, 2, 4, 6, 8];
+        // 8 bins total — sfb 0 + sfb 1 correlated (would pick M/S),
+        // sfb 2 + sfb 3 also correlated. Bound at max_sfb = 2 so only
+        // the first two bands are evaluated.
+        let l = vec![1.0f32, 0.5, 0.4, 0.9, 0.8, 0.1, -0.3, 0.5];
+        let r = vec![1.0f32, 0.5, 0.4, 0.9, 0.8, 0.1, -0.3, 0.5];
+        let decisions = select_ms_used_for_pair(&[l], &[r], &sfb_offset, &[2]);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].len(), 2);
+        assert!(decisions[0][0]);
+        assert!(decisions[0][1]);
+    }
+
+    /// Multi-group input: per-group decisions are independent — group 0
+    /// is fully correlated (all M/S) and group 1 is fully zero-energy
+    /// (all L/R).
+    #[test]
+    fn select_ms_used_for_pair_multi_group_independent() {
+        let sfb_offset: [u16; 3] = [0, 4, 8];
+        let g0_l = vec![1.0f32, 0.5, -0.7, 0.3, 0.4, 0.9, -0.2, 0.6];
+        let g0_r = vec![1.0f32, 0.5, -0.7, 0.3, 0.4, 0.9, -0.2, 0.6];
+        let g1_l = vec![0.0f32; 8];
+        let g1_r = vec![0.0f32; 8];
+        let decisions = select_ms_used_for_pair(&[g0_l, g1_l], &[g0_r, g1_r], &sfb_offset, &[2, 2]);
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions[0][0]);
+        assert!(decisions[0][1]);
+        assert!(!decisions[1][0]);
+        assert!(!decisions[1][1]);
     }
 }

@@ -1194,7 +1194,41 @@ framework but usable standalone.
 > parameter-band (M/S vs alpha-driven SAP joint stereo)
 > can now materialise the `ChparamInfo` pair from its
 > decision matrix instead of hand-crafting the inner
-> `SapData` body.
+> `SapData` body. Round 263 completes the
+> `build_chparam_info_*` family with the trivial third arm
+> ([`asf::build_chparam_info_none`] — header-only
+> `SapMode::None`; `extract_sap_abcd` reproduces identity
+> per-sfb across any per-group bound) and adds a
+> per-(group, sfb) M/S-vs-L/R **decision driver**
+> ([`asf::select_ms_used_for_pair`]) that picks
+> `ms_used[g][sfb]` per band using the standard
+> joint-stereo *concentration* criterion: pick M/S when
+> `min(E_M', E_S') < min(E_L, E_R)` over the per-band
+> MDCT bins, with `M' = (L + R) / 2, S' = (L - R) / 2`
+> (matching the per-sfb `(1, 1, 1, -1)` matrix the decoder's
+> `SapMode::MsUsed` arm applies). For a correlated pair
+> M' carries the signal and S' vanishes
+> (`min_ms = 0 < min_lr`); for an uncorrelated or
+> anti-correlated pair both sit near `(E_L + E_R) / 4`.
+> Ties (zero-energy bands, no concentration benefit)
+> resolve to `false` so the encoder doesn't spend a
+> `ms_used` bit when joint coding offers no concentration.
+> The returned `Vec<Vec<bool>>` plugs directly into
+> `build_chparam_info_ms_used` and the result round-trips
+> through `extract_sap_abcd` to the per-sfb `(1, 1, 1, -1)`
+> matrix on picked bands and identity on the rest. Five
+> new unit tests in `src/asf.rs` cover `SapMode::None`
+> builder extract + bit-stream round-trip; per-band
+> correlated / anti-correlated / one-sided / zero-energy
+> decision discrimination; round-trip through
+> `build_chparam_info_ms_used` + `extract_sap_abcd`;
+> respect of the per-group `max_sfb` bound; multi-group
+> independence. Total lib tests 679 (was 674); integration
+> suites unchanged. Together with round 260 this closes the
+> encoder path for the `SapMode::None` and `SapMode::MsUsed`
+> arms — an IMS encoder can now go directly from per-group
+> L/R MDCT spectra to a fully-populated `ChparamInfo`
+> without hand-crafting the SAP matrix.
 
 ## Specs
 
