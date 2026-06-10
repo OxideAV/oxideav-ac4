@@ -1228,7 +1228,42 @@ framework but usable standalone.
 > encoder path for the `SapMode::None` and `SapMode::MsUsed`
 > arms — an IMS encoder can now go directly from per-group
 > L/R MDCT spectra to a fully-populated `ChparamInfo`
-> without hand-crafting the SAP matrix.
+> without hand-crafting the SAP matrix. Round 271 closes the
+> last of the three non-reserved arms with the **SAP-coded
+> `alpha_q` decision driver** ([`asf::select_alpha_q_for_pair`])
+> — the `SapMode::SapData` analogue of round-263's
+> `select_ms_used_for_pair`. Given target stereo MDCT spectra
+> `(L, R)` it picks per-(group, sfb) `alpha_q[g][sfb]` indices
+> + `sap_coeff_used[g][sfb]` flags per §5.3.2 Pseudocode 59 +
+> §5.3.3.2. The decoder reconstructs the output pair from the
+> transmitted tracks via the SAP matrix
+> `(a, b, c, d) = (1 + g, 1, 1 - g, -1)` with `g = alpha_q · 0.1`;
+> inverting (`det = -2`) shows the encoder must transmit
+> `I_0 = M = (L + R) / 2` and `I_1 = S − g·M` with
+> `S = (L − R) / 2`, so SAP coding is a one-tap prediction of
+> the side track from the mid. The `g` minimising the
+> transmitted residual energy `Σ (S[k] − g·M[k])²` per
+> parameter band is the least-squares projection
+> `g* = ⟨S, M⟩ / ⟨M, M⟩`, quantised by `alpha_q = round(10·g*)`
+> and clamped to the HCB_SCALEFAC range `[-60, +60]`.
+> `sap_coeff_used` is raised only when the quantised index is
+> non-zero (pure-mid `⟨S, M⟩ == 0` and zero-mid-energy bands
+> clear the flag — no SAP bit where prediction offers nothing).
+> The even (pair-leading) sfb drives each `(sfb, sfb+1)` pair
+> and the odd partner inherits, matching Pseudocode 59's
+> pair-major copy. New public type alias
+> [`asf::SapAlphaDecision`] for the `(alpha_q, sap_coeff_used)`
+> pair. The returned matrices plug directly into the round-260
+> [`asf::build_chparam_info_sap_data_from_alpha_q`] builder,
+> closing the encoder path from per-group L/R MDCT spectra to a
+> fully-populated `SapMode::SapData` `ChparamInfo`. Five new
+> unit tests in `src/asf.rs` pin the least-squares projection
+> (`S = M → +10`, `S = -M → -10`, odd-partner inheritance),
+> flag-clearing on pure-mid / zero-energy bands, round-trip
+> through the SapData builder + `extract_sap_abcd` to the
+> `(2, 1, 0, -1)` matrix on picked bands, `alpha_q = 60`
+> saturation, and multi-group independence. Total lib tests
+> 684 (was 679); integration suites unchanged.
 
 ## Specs
 

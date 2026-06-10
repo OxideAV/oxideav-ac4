@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 271 — `alpha_q` decision driver `select_alpha_q_for_pair`
+  (`crate::asf`).** The SAP-coded (`SapMode::SapData`) analogue of the
+  round-263 `select_ms_used_for_pair` — completes the encoder decision
+  surface for the third non-reserved `chparam_info()` arm. Given the
+  target stereo MDCT spectra `(L, R)` it picks the per-(group, sfb)
+  `alpha_q[g][sfb]` index and the matching `sap_coeff_used[g][sfb]`
+  flag per ETSI TS 103 190-1 §5.3.2 Pseudocode 59 + §5.3.3.2. The
+  decoder reconstructs the output pair from the transmitted tracks via
+  the SAP matrix `(a, b, c, d) = (1 + g, 1, 1 - g, -1)`, `g = alpha_q
+  · 0.1`; inverting (`det = -2`) gives the tracks the encoder must
+  transmit: `I_0 = M = (L + R) / 2` and `I_1 = S − g·M` with `S = (L −
+  R) / 2`. SAP coding is therefore a one-tap prediction of the side
+  track from the mid; the `g` that minimises the transmitted residual
+  energy `Σ (S[k] − g·M[k])²` per parameter band is the least-squares
+  projection `g* = ⟨S, M⟩ / ⟨M, M⟩`, quantised by `alpha_q = round(10
+  · g*)` and clamped to the HCB_SCALEFAC-codable range `[-60, +60]`
+  (the offset of 60 is applied by `write_sap_data`, not the driver).
+  `sap_coeff_used` is raised only when the quantised index is non-zero
+  (a pure-mid band, `⟨S, M⟩ == 0`, and a zero-mid-energy band both
+  clear the flag so no SAP bit is spent where prediction offers no
+  benefit). The decision is taken on the even (pair-leading) sfb of
+  each `(sfb, sfb+1)` pair and copied to the odd partner, matching the
+  pair-major flag-copy semantics of Pseudocode 59 and
+  `build_chparam_info_sap_data_from_alpha_q`. New public type alias
+  `crate::asf::SapAlphaDecision` for the `(alpha_q, sap_coeff_used)`
+  matrix pair. Five new unit tests in `src/asf.rs` pin: the
+  least-squares projection (`S = M → alpha_q = +10`, `S = -M →
+  alpha_q = -10`, with odd-partner inheritance); pure-mid and
+  zero-energy bands clear the flag; round-trip through
+  `build_chparam_info_sap_data_from_alpha_q` + `extract_sap_abcd`
+  reproduces the `(2, 1, 0, -1)` matrix on picked bands and identity
+  on cleared bands; saturation to `alpha_q = 60` for `g* ≫ 6`;
+  multi-group independence. The returned matrices plug directly into
+  the round-260 `build_chparam_info_sap_data_from_alpha_q` builder,
+  closing the encoder path from per-group L/R MDCT spectra to a
+  fully-populated `SapMode::SapData` `ChparamInfo`. Total lib tests
+  684 (was 679); integration suites unchanged.
+
 - **Round 263 — `build_chparam_info_none` + `select_ms_used_for_pair`
   encoder helpers (`crate::asf`).** Completes the
   `build_chparam_info_*` family with the trivial third arm

@@ -1151,6 +1151,142 @@ pub fn select_ms_used_for_pair(
     out
 }
 
+/// `(alpha_q_per_group, sap_coeff_used_per_group)` — the per-(group,
+/// sfb) SAP-coded `alpha_q` index matrix plus the per-band SAP-used
+/// flag matrix produced by [`select_alpha_q_for_pair`], shaped to feed
+/// directly into [`build_chparam_info_sap_data_from_alpha_q`].
+pub type SapAlphaDecision = (Vec<Vec<i32>>, Vec<Vec<bool>>);
+
+/// Per-(group, sfb) `alpha_q` decision driver for the encoder-side
+/// `SapMode::SapData` arm (Pseudocode 59, §5.3.2) — the SAP-coded
+/// analogue of [`select_ms_used_for_pair`]. Picks the per-band
+/// `alpha_q[g][sfb]` index (and the matching `sap_coeff_used[g][sfb]`
+/// flag) from the target stereo MDCT spectra.
+///
+/// The decoder reconstructs the output pair `(O_0, O_1)` from the two
+/// transmitted tracks `(I_0, I_1)` via the §5.3.3.2 matrix
+/// `[[a, b], [c, d]]` with the SAP-coded coefficients
+/// `(a, b, c, d) = (1 + g, 1, 1 - g, -1)`, `g = alpha_q · 0.1`
+/// (Pseudocode 59). The encoder therefore inverts the matrix to find
+/// the tracks it must transmit. With `det = -2` the closed-form inverse
+/// of the target `(L, R) = (O_0, O_1)` is:
+///
+/// ```text
+///   I_0 =  M               with  M = (L + R) / 2
+///   I_1 =  S − g · M       with  S = (L − R) / 2
+/// ```
+///
+/// `I_0` is the unweighted mid; `I_1` is the side **after subtracting a
+/// `g`-scaled copy of the mid** — i.e. SAP coding is a one-tap
+/// prediction of the side track from the mid track. The `g` that
+/// minimises the transmitted side-residual energy `E[I_1²] =
+/// Σ (S[k] − g · M[k])²` is the least-squares projection coefficient
+/// per parameter band (sum over bins `[sfb_offset[sfb],
+/// sfb_offset[sfb+1])`):
+///
+/// ```text
+///   g* = ⟨S, M⟩ / ⟨M, M⟩   = (Σ S[k]·M[k]) / (Σ M[k]²)
+/// ```
+///
+/// quantised by `alpha_q = round(g* / 0.1) = round(10 · g*)` and
+/// clamped to the HCB_SCALEFAC-codable range `[-60, +60]` (the offset
+/// of 60 is applied by [`crate::encoder_asf::write_sap_data`], not
+/// here). This is exactly the inverse-quantisation grid Pseudocode 59
+/// reads (`sap_gain = alpha_q · 0.1`).
+///
+/// `sap_coeff_used[g][sfb]` is raised only when SAP prediction is
+/// beneficial — when the residual energy after the optimal projection
+/// is strictly smaller than the raw side energy, i.e. `g* ≠ 0` after
+/// quantisation. Bands with no mid energy (`⟨M, M⟩ == 0`) or where the
+/// quantised `alpha_q` rounds to 0 (no useful prediction) leave the
+/// flag clear so the band stays at the identity-passthrough convention
+/// the decoder applies to cleared SAP bands. The decision is taken on
+/// the even (pair-leading) sfb of each `(sfb, sfb+1)` pair and copied
+/// to the odd partner, matching the pair-major flag-copy semantics of
+/// Pseudocode 59 and [`build_chparam_info_sap_data_from_alpha_q`];
+/// the odd partner inherits the even partner's `alpha_q` (the decoder
+/// reads `alpha_q[g][sfb] = alpha_q[g][sfb-1]` for odd sfbs).
+///
+/// `l_spec_per_group[g]` / `r_spec_per_group[g]` are per-group MDCT
+/// spectra at the same transform length as `sfb_offset`. Rows shorter
+/// than `sfb_offset[max_sfb_per_group[g]]` produce a `(0, false)`
+/// decision on the missing bins (the band stays identity-passthrough).
+///
+/// Round-trip: feeding the returned `(alpha_q, sap_coeff_used)` through
+/// [`build_chparam_info_sap_data_from_alpha_q`] (with the same
+/// `max_sfb_per_group` and a caller-chosen `delta_code_time`) and then
+/// [`extract_sap_abcd`] reproduces the per-sfb SAP matrix
+/// `(1 + g, 1, 1 - g, -1)` on the picked bands and identity on the
+/// rest.
+pub fn select_alpha_q_for_pair(
+    l_spec_per_group: &[Vec<f32>],
+    r_spec_per_group: &[Vec<f32>],
+    sfb_offset: &[u16],
+    max_sfb_per_group: &[u32],
+) -> SapAlphaDecision {
+    let num_groups = max_sfb_per_group.len();
+    let mut alpha_q_out: Vec<Vec<i32>> = Vec::with_capacity(num_groups);
+    let mut used_out: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
+    for (g, &m) in max_sfb_per_group.iter().enumerate() {
+        let m_usize = m as usize;
+        let mut alpha_row = vec![0i32; m_usize];
+        let mut used_row = vec![false; m_usize];
+        let (Some(l), Some(r)) = (l_spec_per_group.get(g), r_spec_per_group.get(g)) else {
+            alpha_q_out.push(alpha_row);
+            used_out.push(used_row);
+            continue;
+        };
+        // Pair-major: decide on the even (leading) sfb of each pair and
+        // copy to the odd partner.
+        let mut sfb = 0usize;
+        while sfb < m_usize {
+            let Some(&lo) = sfb_offset.get(sfb) else {
+                break;
+            };
+            let Some(&hi) = sfb_offset.get(sfb + 1) else {
+                break;
+            };
+            let lo = lo as usize;
+            let hi = (hi as usize).min(l.len()).min(r.len());
+            if hi > lo {
+                // Per-band least-squares projection of the side track S
+                // onto the mid track M: g* = <S, M> / <M, M>.
+                //   M = (L + R) / 2, S = (L - R) / 2.
+                let mut e_m = 0.0f64; // <M, M>
+                let mut cross_sm = 0.0f64; // <S, M>
+                for k in lo..hi {
+                    let lk = l[k] as f64;
+                    let rk = r[k] as f64;
+                    let mk = (lk + rk) * 0.5;
+                    let sk = (lk - rk) * 0.5;
+                    e_m += mk * mk;
+                    cross_sm += sk * mk;
+                }
+                if e_m > 0.0 {
+                    let g_star = cross_sm / e_m;
+                    // alpha_q = round(g* / 0.1), clamped to the
+                    // HCB_SCALEFAC-codable range [-60, +60].
+                    let aq = (g_star * 10.0).round().clamp(-60.0, 60.0) as i32;
+                    if aq != 0 {
+                        alpha_row[sfb] = aq;
+                        used_row[sfb] = true;
+                        if sfb + 1 < m_usize {
+                            // Odd partner inherits the even partner's
+                            // alpha_q + flag (pair-major copy).
+                            alpha_row[sfb + 1] = aq;
+                            used_row[sfb + 1] = true;
+                        }
+                    }
+                }
+            }
+            sfb += 2;
+        }
+        alpha_q_out.push(alpha_row);
+        used_out.push(used_row);
+    }
+    (alpha_q_out, used_out)
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -5360,5 +5496,164 @@ mod tests {
         assert!(decisions[0][1]);
         assert!(!decisions[1][0]);
         assert!(!decisions[1][1]);
+    }
+
+    // ----- select_alpha_q_for_pair -----
+
+    /// `select_alpha_q_for_pair` picks the least-squares projection
+    /// `g* = <S, M> / <M, M>` per band, quantised to `alpha_q =
+    /// round(10 · g*)`, and raises `sap_coeff_used` only when the
+    /// quantised index is non-zero.
+    ///
+    /// Construct a single-group 4-sfb signal (4 bins/sfb, sfb_offset =
+    /// [0, 4, 8, 12, 16]) where each pair-leading even sfb has a known
+    /// side-vs-mid relationship:
+    ///
+    /// * sfb 0 — L only, R = 0: M = L/2, S = L/2 → S = M exactly →
+    ///   g* = 1.0 → alpha_q = 10 (positive, SAP picked).
+    /// * sfb 2 — R only, L = 0: M = R/2, S = -R/2 → S = -M →
+    ///   g* = -1.0 → alpha_q = -10 (negative, SAP picked).
+    #[test]
+    fn select_alpha_q_for_pair_least_squares_projection() {
+        let sfb_offset: [u16; 5] = [0, 4, 8, 12, 16];
+        let l = vec![
+            1.0f32, 0.5, -0.7, 0.3, // sfb 0: L only
+            0.0, 0.0, 0.0, 0.0, // sfb 1: pair-mate of sfb 0
+            0.0, 0.0, 0.0, 0.0, // sfb 2: R only
+            0.0, 0.0, 0.0, 0.0, // sfb 3: pair-mate of sfb 2
+        ];
+        let r = vec![
+            0.0f32, 0.0, 0.0, 0.0, // sfb 0: R = 0
+            0.0, 0.0, 0.0, 0.0, // sfb 1
+            0.8, 0.2, -0.4, 0.6, // sfb 2: R only
+            0.0, 0.0, 0.0, 0.0, // sfb 3
+        ];
+        let (alpha_q, used) = select_alpha_q_for_pair(&[l], &[r], &sfb_offset, &[4]);
+        assert_eq!(alpha_q.len(), 1);
+        assert_eq!(alpha_q[0].len(), 4);
+        // sfb 0: S = M → g* = 1.0 → alpha_q = 10.
+        assert_eq!(alpha_q[0][0], 10);
+        assert!(used[0][0]);
+        // sfb 1 inherits the even partner's alpha_q + flag.
+        assert_eq!(alpha_q[0][1], 10);
+        assert!(used[0][1]);
+        // sfb 2: S = -M → g* = -1.0 → alpha_q = -10.
+        assert_eq!(alpha_q[0][2], -10);
+        assert!(used[0][2]);
+        assert_eq!(alpha_q[0][3], -10);
+        assert!(used[0][3]);
+    }
+
+    /// A band with `L == R` (pure mid, zero side) projects to `g* = 0`
+    /// (`<S, M> == 0`), so `alpha_q` rounds to 0 and the SAP-used flag
+    /// stays clear — no SAP bit spent where prediction offers nothing.
+    /// A zero-energy band (no mid energy) likewise stays clear.
+    #[test]
+    fn select_alpha_q_for_pair_clears_flag_when_no_prediction_benefit() {
+        let sfb_offset: [u16; 5] = [0, 4, 8, 12, 16];
+        let l = vec![
+            1.0f32, 0.5, -0.7, 0.3, // sfb 0: L == R (S = 0)
+            0.0, 0.0, 0.0, 0.0, // sfb 1
+            0.0, 0.0, 0.0, 0.0, // sfb 2: zero-energy
+            0.0, 0.0, 0.0, 0.0, // sfb 3
+        ];
+        let r = vec![
+            1.0f32, 0.5, -0.7, 0.3, // sfb 0: R == L
+            0.0, 0.0, 0.0, 0.0, // sfb 1
+            0.0, 0.0, 0.0, 0.0, // sfb 2: zero-energy
+            0.0, 0.0, 0.0, 0.0, // sfb 3
+        ];
+        let (alpha_q, used) = select_alpha_q_for_pair(&[l], &[r], &sfb_offset, &[4]);
+        // sfb 0: pure mid → <S, M> == 0 → alpha_q == 0, flag clear.
+        assert_eq!(alpha_q[0][0], 0);
+        assert!(!used[0][0]);
+        assert!(!used[0][1]);
+        // sfb 2: zero-energy → <M, M> == 0 → flag clear.
+        assert_eq!(alpha_q[0][2], 0);
+        assert!(!used[0][2]);
+        assert!(!used[0][3]);
+    }
+
+    /// Round-trip: the `(alpha_q, sap_coeff_used)` matrices from
+    /// `select_alpha_q_for_pair` flow into
+    /// `build_chparam_info_sap_data_from_alpha_q`, then `extract_sap_abcd`
+    /// reproduces the per-sfb SAP matrix `(1 + g, 1, 1 - g, -1)` with
+    /// `g = alpha_q · 0.1` on the picked bands and identity on the rest.
+    #[test]
+    fn select_alpha_q_for_pair_round_trips_through_sap_data_builder() {
+        let sfb_offset: [u16; 5] = [0, 4, 8, 12, 16];
+        // sfb 0 picks alpha_q = +10 (S = M); sfb 2 is a pure-mid band
+        // that clears the flag.
+        let l = vec![
+            1.0f32, 0.5, -0.7, 0.3, // sfb 0: L only → S = M
+            0.0, 0.0, 0.0, 0.0, // sfb 1
+            0.9, 0.4, -0.2, 0.5, // sfb 2: L == R → S = 0
+            0.0, 0.0, 0.0, 0.0, // sfb 3
+        ];
+        let r = vec![
+            0.0f32, 0.0, 0.0, 0.0, // sfb 0: R = 0
+            0.0, 0.0, 0.0, 0.0, // sfb 1
+            0.9, 0.4, -0.2, 0.5, // sfb 2: R == L
+            0.0, 0.0, 0.0, 0.0, // sfb 3
+        ];
+        let (alpha_q, used) = select_alpha_q_for_pair(&[l], &[r], &sfb_offset, &[4]);
+        let info = build_chparam_info_sap_data_from_alpha_q(&alpha_q, &used, false, &[4]);
+        let coeffs = extract_sap_abcd(&info, &[4]);
+        assert_eq!(coeffs.abcd[0].len(), 4);
+        // sfb 0 + 1 (picked, alpha_q = 10 → g = 1.0): (2, 1, 0, -1).
+        for sfb in [0usize, 1] {
+            let (a, b, c, d) = coeffs.abcd[0][sfb];
+            assert!((a - 2.0).abs() < 1e-5, "sfb {sfb} a");
+            assert!((b - 1.0).abs() < 1e-5, "sfb {sfb} b");
+            assert!(c.abs() < 1e-5, "sfb {sfb} c");
+            assert!((d - (-1.0)).abs() < 1e-5, "sfb {sfb} d");
+        }
+        // sfb 2 + 3 (cleared): identity (1, 0, 0, 1).
+        for sfb in [2usize, 3] {
+            let (a, b, c, d) = coeffs.abcd[0][sfb];
+            assert!((a - 1.0).abs() < 1e-5, "sfb {sfb} a");
+            assert!(b.abs() < 1e-5, "sfb {sfb} b");
+            assert!(c.abs() < 1e-5, "sfb {sfb} c");
+            assert!((d - 1.0).abs() < 1e-5, "sfb {sfb} d");
+        }
+    }
+
+    /// The projection coefficient clamps to the HCB_SCALEFAC-codable
+    /// range `[-60, +60]`: a side track that is a large multiple of the
+    /// mid (`g* ≫ 6.0`) saturates at `alpha_q = 60`.
+    #[test]
+    fn select_alpha_q_for_pair_clamps_to_codebook_range() {
+        let sfb_offset: [u16; 2] = [0, 4];
+        // Build L, R so that M = (L + R) / 2 is small and S = (L - R) / 2
+        // is a 10x multiple of M, giving g* = 10 → 10 · g* = 100 → clamp
+        // to 60. Pick M[k] = m, S[k] = 10·m ⇒ L = M + S = 11·m,
+        // R = M - S = -9·m.
+        let l = vec![11.0f32, 5.5, -3.3, 2.2];
+        let r = vec![-9.0f32, -4.5, 2.7, -1.8];
+        let (alpha_q, used) = select_alpha_q_for_pair(&[l], &[r], &sfb_offset, &[1]);
+        assert_eq!(alpha_q[0][0], 60);
+        assert!(used[0][0]);
+    }
+
+    /// Multi-group input: per-group `alpha_q` decisions are independent.
+    /// Group 0 has a `S = M` band (alpha_q = +10), group 1 is fully
+    /// zero-energy (no SAP).
+    #[test]
+    fn select_alpha_q_for_pair_multi_group_independent() {
+        let sfb_offset: [u16; 3] = [0, 4, 8];
+        // Group 0: sfb 0 L-only (S = M → alpha_q = 10), sfb 1 inherits.
+        let g0_l = vec![1.0f32, 0.5, -0.7, 0.3, 0.0, 0.0, 0.0, 0.0];
+        let g0_r = vec![0.0f32; 8];
+        // Group 1: zero-energy throughout.
+        let g1_l = vec![0.0f32; 8];
+        let g1_r = vec![0.0f32; 8];
+        let (alpha_q, used) =
+            select_alpha_q_for_pair(&[g0_l, g1_l], &[g0_r, g1_r], &sfb_offset, &[2, 2]);
+        assert_eq!(alpha_q.len(), 2);
+        assert_eq!(alpha_q[0][0], 10);
+        assert!(used[0][0]);
+        assert!(used[0][1]);
+        assert!(!used[1][0]);
+        assert!(!used[1][1]);
     }
 }
