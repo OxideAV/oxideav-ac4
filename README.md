@@ -1263,7 +1263,40 @@ framework but usable standalone.
 > through the SapData builder + `extract_sap_abcd` to the
 > `(2, 1, 0, -1)` matrix on picked bands, `alpha_q = 60`
 > saturation, and multi-group independence. Total lib tests
-> 684 (was 679); integration suites unchanged.
+> 684 (was 679); integration suites unchanged. Round 279 wires
+> the decision drivers into the encoder proper: the
+> **decision-driven SAP-coded ASPX_ACPL_1 residual layer**
+> (§5.3.4.3.2 Table 181 + §5.3.2 Pseudocode 59). New
+> [`encoder_acpl3::select_acpl1_residual_chparam_pair`] runs the
+> round-271 `select_alpha_q_for_pair` least-squares decision per
+> target `(L, Ls)` / `(R, Rs)` pair over the residual layer's
+> single-group `[max_sfb_master]` layout (clamping `alpha_q` to
+> ±30 so pair-major DPCM deltas stay HCB_SCALEFAC-codable) and
+> materialises the `chparam_info()` rows via the round-260
+> `SapData` builder — falling back to the header-only
+> `SapMode::None` row when no band benefits. New
+> [`encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_sap_auto`]
+> + caller-facing [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_sap`]
+> additionally fix the round-257 deferred carrier side: the
+> `two_channel_data()` payload now carries the Table-181
+> matrix-input carriers `(sSMP_A, sSMP_B) = (M, ·)` recovered via
+> `invert_sap_table_181` (not the raw L/R preliminaries), so the
+> decoder's `apply_sap_table_181` forward mix reproduces the
+> requested `(L, R, Ls, Rs)` exactly (up to sf_data quantisation).
+> For `Ls = κ·L` the optimal projection `g* = (1−κ)/(1+κ)`
+> collapses the transmitted residual `S − g·M` to near-silence —
+> measured end-to-end: SAP residual energy < 5 % (unit) / < 10 %
+> (full PCM→decoder integration) of the identity path's raw-`Ls`
+> residual on correlated tone fixtures, while a no-benefit input
+> (`Ls = L` ⇒ `g* = 0`) encodes bit-for-bit identical to the
+> round-103 identity path (strict-superset invariant). Five new
+> unit tests + 4 integration tests
+> (`tests/round279_5_x_acpl1_sap_auto.rs`) pin the selector's
+> per-band `(1.7, 1, 0.3, −1)` extraction, the ±30 clamp, the
+> identity fallback byte-equality, the bit-stream round trip
+> (decoder recovers `sap_mode = 3` rows + forward mix matches all
+> four preliminaries within 20 % relative L2), and the residual
+> collapse. Total lib tests 689 (was 684); integration suites +4.
 
 ## Specs
 

@@ -3607,6 +3607,261 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_sap(
     bytes
 }
 
+/// Decision-driven `chparam_info()` pair selector for the ASPX_ACPL_1
+/// joint-MDCT residual layer (round 279) — wires the round-271
+/// [`crate::asf::select_alpha_q_for_pair`] decision driver into the
+/// round-257 SAP-aware residual writer.
+///
+/// Per §5.3.4.3.2 / Table 181 the residual layer's two `chparam_info()`
+/// payloads drive two independent 2x2 SAP systems: `chparam_pair[0]`
+/// maps the transmitted `(sSMP_A, sSMP_3)` tracks to the preliminary
+/// `(L, Ls)` pair and `chparam_pair[1]` maps `(sSMP_B, sSMP_4)` to
+/// `(R, Rs)`. The §5.3.2 Pseudocode 59 SAP-coded arm reconstructs each
+/// output pair via `(a, b, c, d) = (1 + g, 1, 1 - g, -1)` with
+/// `g = alpha_q · 0.1`, so the per-pair decision input for
+/// [`crate::asf::select_alpha_q_for_pair`] is the *target output pair*
+/// — `(L, Ls)` for row 0 and `(R, Rs)` for row 1 — and the transmitted
+/// residual is the least-squares side prediction error
+/// `s3 = S − g·M` (`M = (L + Ls) / 2`, `S = (L − Ls) / 2`).
+///
+/// Per pair the selector:
+///
+/// 1. Runs [`crate::asf::select_alpha_q_for_pair`] over the
+///    single-window-group residual layout (`max_sfb_per_group =
+///    [max_sfb_master]`, sfb offsets at `transform_length` — the
+///    residual layer runs on the dominant transform length per the
+///    §4.2.6.6 NOTE).
+/// 2. Clamps the picked `alpha_q` to `[-30, +30]` so the pair-major
+///    DPCM deltas Pseudocode 59 accumulates stay within the
+///    HCB_SCALEFAC-codable `[-60, +60]` range even on a worst-case
+///    sign flip between adjacent pairs.
+/// 3. Builds the `SapMode::SapData` row via
+///    [`crate::asf::build_chparam_info_sap_data_from_alpha_q`]
+///    (`delta_code_time = false` — single group) when at least one
+///    band raised `sap_coeff_used`; otherwise falls back to the
+///    header-only [`crate::asf::build_chparam_info_none`] row so no
+///    `sap_data()` body bits are spent where prediction offers no
+///    benefit.
+///
+/// `max_sfb_master` must be the post-clamp residual band budget (the
+/// caller mirrors [`write_acpl_1_residual_layer_sap`]'s clamp) so the
+/// produced rows match the bound the writer hands
+/// [`crate::encoder_asf::write_chparam_info`]. Returns two identity
+/// (`SapMode::None`) rows when `transform_length` has no SFB table.
+pub fn select_acpl1_residual_chparam_pair(
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    max_sfb_master: u32,
+    transform_length: u32,
+) -> [crate::asf::ChparamInfo; 2] {
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+        return [
+            crate::asf::build_chparam_info_none(),
+            crate::asf::build_chparam_info_none(),
+        ];
+    };
+    let max_sfb_per_group = [max_sfb_master];
+    let build_row = |front: &[f32], surround: &[f32]| -> crate::asf::ChparamInfo {
+        let (mut alpha_q, used) = crate::asf::select_alpha_q_for_pair(
+            &[front.to_vec()],
+            &[surround.to_vec()],
+            sfbo,
+            &max_sfb_per_group,
+        );
+        // Clamp to ±30: limits the worst-case pair-to-pair DPCM delta
+        // to 60, the HCB_SCALEFAC codebook bound (see doc above).
+        for row in alpha_q.iter_mut() {
+            for v in row.iter_mut() {
+                *v = (*v).clamp(-30, 30);
+            }
+        }
+        let any_used = used.iter().any(|row| row.iter().any(|&b| b));
+        if any_used {
+            crate::asf::build_chparam_info_sap_data_from_alpha_q(
+                &alpha_q,
+                &used,
+                false,
+                &max_sfb_per_group,
+            )
+        } else {
+            crate::asf::build_chparam_info_none()
+        }
+    };
+    [
+        build_row(coeffs_l, coeffs_ls),
+        build_row(coeffs_r, coeffs_rs),
+    ]
+}
+
+/// Fully automatic SAP-coded variant of
+/// [`build_5_x_acpl1_body_from_pcm_spectra`] (round 279) — same
+/// argument surface as the identity-SAP builder, but the joint-MDCT
+/// residual layer's `chparam_info()` pair is *derived* from the input
+/// spectra via [`select_acpl1_residual_chparam_pair`] and — unlike the
+/// round-257 [`build_5_x_acpl1_body_from_pcm_spectra_sap`], which
+/// still transmitted the raw L/R preliminaries as carriers — the
+/// `two_channel_data()` payload carries the Table-181 **matrix-input**
+/// carriers `(sSMP_A, sSMP_B)` recovered through
+/// [`crate::asf::invert_sap_table_181`]. On a SAP-coded band the
+/// transmitted pair is therefore `(M, S − g·M)` (mid + side prediction
+/// residual) and the decoder's `apply_sap_table_181` forward mix
+/// reproduces the requested `(L, R, Ls, Rs)` preliminaries exactly (up
+/// to sf_data quantisation):
+///
+/// ```text
+///   L  = (1 + g)·A + s3            A  = (L + Ls) / 2 = M
+///   Ls = (1 − g)·A − s3    with    s3 = S − g·M,  S = (L − Ls) / 2
+/// ```
+///
+/// When the selector picks no SAP band on either pair (e.g. `Ls = L`,
+/// `Rs = R` — zero side energy ⇒ `g* = 0`) both rows fall back to
+/// `SapMode::None`, the inverse degenerates to `A = L, B = R,
+/// s3 = Ls, s4 = Rs`, and the emitted body is bit-for-bit identical to
+/// [`build_5_x_acpl1_body_from_pcm_spectra`] — the strict-superset
+/// invariant pinned by `build_5_x_acpl1_body_sap_auto_identity_matches_legacy`.
+///
+/// For a surround pair correlated with its front carrier
+/// (`Ls = κ·L`) the optimal projection `g* = (1 − κ) / (1 + κ)` drives
+/// the transmitted residual `s3 = S − g*·M` to zero, so the residual
+/// sf_data quantises to (near-)silence and the surround content rides
+/// the carrier + `alpha_q` for free — the measurable bit-efficiency
+/// win of SAP coding over the identity path (which spends a full
+/// sf_data body on the raw `Ls` spectrum).
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl1_body_from_pcm_spectra_sap_auto(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    // Mirror `write_acpl_1_residual_layer_sap`'s max_sfb_master clamp so
+    // the selector's rows and the carrier inverse share the writer's
+    // effective band budget.
+    let (_n_msfb, n_side, _n_msfbl) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    let num_sfb_cap = crate::tables::num_sfb_48(transform_length).expect("encoder: bad tl");
+    let n_side_cap = (1u32 << n_side) - 1;
+    let max_sfb_master = max_sfb_master.clamp(1, num_sfb_cap.min(n_side_cap));
+
+    // Decision pass: derive the residual chparam_info() pair from the
+    // target (L, Ls) / (R, Rs) preliminary pairs.
+    let chparam_pair = select_acpl1_residual_chparam_pair(
+        coeffs_l,
+        coeffs_r,
+        coeffs_ls,
+        coeffs_rs,
+        max_sfb_master,
+        transform_length,
+    );
+
+    // Carrier pass: recover the Table-181 matrix-input carriers
+    // (sSMP_A, sSMP_B) so the decoder's forward mix lands on the
+    // requested preliminaries. The inverse needs tl-length spectra.
+    let n = transform_length as usize;
+    let pad = |src: &[f32]| -> Vec<f32> {
+        let mut v = vec![0.0f32; n];
+        let take = src.len().min(n);
+        v[..take].copy_from_slice(&src[..take]);
+        v
+    };
+    let l_pad = pad(coeffs_l);
+    let r_pad = pad(coeffs_r);
+    let ls_pad = pad(coeffs_ls);
+    let rs_pad = pad(coeffs_rs);
+    let (carrier_a, carrier_b) = match crate::asf::invert_sap_table_181(
+        &l_pad,
+        &r_pad,
+        &ls_pad,
+        &rs_pad,
+        &chparam_pair,
+        max_sfb_master,
+        transform_length,
+    ) {
+        Some((a, b, _s3, _s4)) => (a, b),
+        // Inverse refused — fall back to raw L/R carriers (identity
+        // convention) so the writer stays total.
+        None => (l_pad.clone(), r_pad.clone()),
+    };
+
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_1 (2) — 3 bits.
+    bw.write_u32(2, 3);
+
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // coding_config = 0 (false → AcplLite2 / two_channel_data path).
+    bw.write_bit(false);
+
+    // two_channel_data(): Table-181 matrix-input carriers (sSMP_A,
+    // sSMP_B) — NOT the raw L/R preliminaries (round-279 carrier fix).
+    write_two_channel_data(&mut bw, transform_length, max_sfb, &carrier_a, &carrier_b);
+
+    // ASPX_ACPL_1 joint-MDCT residual layer — SAP-aware path with the
+    // derived chparam pair (recomputes the same inverse internally for
+    // the (s3, s4) residual tracks).
+    write_acpl_1_residual_layer_sap(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_l,
+        coeffs_r,
+        coeffs_ls,
+        coeffs_rs,
+        Some(&chparam_pair),
+    );
+
+    // Cfg0 (coding_config == 0): mono_data(0) — centre carrier.
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+        let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+        write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 // ====================================================================
 // Real per-band α extraction — ETSI TS 103 190-1 §5.7.7 (round 128)
 // ====================================================================
@@ -6245,6 +6500,263 @@ mod tests {
         assert_eq!(cp1.ms_used, vec![ms_row]);
         assert!(tools.acpl_1_residual_pair[0].is_some());
         assert!(tools.acpl_1_residual_pair[1].is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // Round 279 — decision-driven SAP residual selector + auto builder
+    // ------------------------------------------------------------------
+
+    /// Build a synthetic spectrum that is `amp` over the bins of sfbs
+    /// `[0, n_sfb)` at tl = 1920 and zero elsewhere.
+    fn const_spectrum_1920(amp: f32, n_sfb: usize) -> Vec<f32> {
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let hi = sfbo[n_sfb] as usize;
+        let mut v = vec![0.0f32; 1920];
+        for s in v.iter_mut().take(hi) {
+            *s = amp;
+        }
+        v
+    }
+
+    /// `Ls = κ·L` (κ = 0.2) over the first 4 sfbs: the least-squares
+    /// projection is `g* = (1 − κ) / (1 + κ) = 2/3` → `alpha_q = 7` →
+    /// the SAP-coded row extracts to `(1.7, 1, 0.3, −1)` per band.
+    /// The silent (R, Rs) pair falls back to the `SapMode::None` row.
+    #[test]
+    fn select_acpl1_residual_chparam_correlated_pair_picks_sap_row() {
+        let l = const_spectrum_1920(1.0, 4);
+        let ls = const_spectrum_1920(0.2, 4);
+        let zeros = vec![0.0f32; 1920];
+        let max_sfb_master = 4u32;
+        let pair =
+            select_acpl1_residual_chparam_pair(&l, &zeros, &ls, &zeros, max_sfb_master, 1920);
+        assert_eq!(pair[0].sap_mode, 3, "correlated pair must be SAP-coded");
+        assert_eq!(pair[1].sap_mode, 0, "silent pair must fall back to None");
+        let coeffs = crate::asf::extract_sap_abcd(&pair[0], &[max_sfb_master]);
+        for sfb in 0..max_sfb_master as usize {
+            let (a, b, c, d) = coeffs.abcd[0][sfb];
+            assert!(
+                (a - 1.7).abs() < 1e-6 && (b - 1.0).abs() < 1e-6,
+                "sfb {sfb}: expected a = 1.7, b = 1, got ({a}, {b})"
+            );
+            assert!(
+                (c - 0.3).abs() < 1e-6 && (d + 1.0).abs() < 1e-6,
+                "sfb {sfb}: expected c = 0.3, d = -1, got ({c}, {d})"
+            );
+        }
+    }
+
+    /// `Ls = L` exactly ⇒ zero side energy ⇒ `g* = 0` ⇒ no band raises
+    /// `sap_coeff_used` and both rows fall back to `SapMode::None`.
+    #[test]
+    fn select_acpl1_residual_chparam_equal_pair_falls_back_to_none() {
+        let l = const_spectrum_1920(0.7, 4);
+        let r = const_spectrum_1920(0.4, 4);
+        let pair = select_acpl1_residual_chparam_pair(&l, &r, &l, &r, 4, 1920);
+        assert_eq!(pair[0].sap_mode, 0);
+        assert_eq!(pair[1].sap_mode, 0);
+        assert!(pair[0].sap_data.is_none());
+        assert!(pair[1].sap_data.is_none());
+    }
+
+    /// A near-anti-correlated pair (`Ls = −0.9·L`) drives `g*` far past
+    /// the codable range; the selector clamps `alpha_q` to ±30 (g = 3.0
+    /// → a = 4.0) so pair-major DPCM deltas stay HCB_SCALEFAC-codable.
+    #[test]
+    fn select_acpl1_residual_chparam_clamps_alpha_q_to_30() {
+        let l = const_spectrum_1920(1.0, 4);
+        let ls: Vec<f32> = l.iter().map(|v| v * -0.9).collect();
+        let zeros = vec![0.0f32; 1920];
+        let pair = select_acpl1_residual_chparam_pair(&l, &zeros, &ls, &zeros, 4, 1920);
+        assert_eq!(pair[0].sap_mode, 3);
+        let coeffs = crate::asf::extract_sap_abcd(&pair[0], &[4]);
+        let (a, _b, c, _d) = coeffs.abcd[0][0];
+        assert!(
+            (a - 4.0).abs() < 1e-6 && (c + 2.0).abs() < 1e-6,
+            "alpha_q must clamp to +30 (g = 3.0): got a = {a}, c = {c}"
+        );
+    }
+
+    /// Strict-superset invariant: when the selector picks no SAP band
+    /// (`Ls = L`, `Rs = R`) the auto builder's output is bit-for-bit
+    /// identical to the round-103 identity builder on the same input.
+    #[test]
+    fn build_5_x_acpl1_body_sap_auto_identity_matches_legacy() {
+        let tl = 1920u32;
+        let l = const_spectrum_1920(0.6, 6);
+        let r = const_spectrum_1920(0.3, 6);
+        let c = const_spectrum_1920(0.2, 6);
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let legacy = build_5_x_acpl1_body_from_pcm_spectra(
+            tl,
+            16,
+            8,
+            true,
+            &l,
+            &r,
+            &c,
+            &l,
+            &r,
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            0,
+            4096,
+        );
+        let auto = build_5_x_acpl1_body_from_pcm_spectra_sap_auto(
+            tl,
+            16,
+            8,
+            true,
+            &l,
+            &r,
+            &c,
+            &l,
+            &r,
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            0,
+            4096,
+        );
+        assert_eq!(
+            legacy, auto,
+            "no-SAP-band input must produce a bit-identical body"
+        );
+    }
+
+    /// End-to-end bit-stream round trip of the auto builder on a
+    /// correlated surround pair: the decoder walks the body, recovers
+    /// the SAP-coded chparam rows, and `apply_sap_table_181` on the
+    /// parsed carrier + residual spectra reproduces the requested
+    /// `(L, Ls)` / `(R, Rs)` preliminaries (up to sf_data quantisation).
+    /// The transmitted residual energy collapses versus the raw
+    /// surround energy — the measurable SAP win.
+    #[test]
+    fn build_5_x_acpl1_body_sap_auto_round_trips_and_shrinks_residual() {
+        let tl = 1920u32;
+        let max_sfb_master = 8u32;
+        let l = const_spectrum_1920(1.0, 4);
+        let ls = const_spectrum_1920(0.5, 4); // κ = 0.5 → g* = 1/3 → alpha_q = 3
+        let r = const_spectrum_1920(0.8, 4);
+        let rs = const_spectrum_1920(0.2, 4); // κ = 0.25 → g* = 0.6 → alpha_q = 6
+        let c = vec![0.0f32; 1920];
+        let cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let body = build_5_x_acpl1_body_from_pcm_spectra_sap_auto(
+            tl,
+            16,
+            max_sfb_master,
+            true,
+            &l,
+            &r,
+            &c,
+            &ls,
+            &rs,
+            &cfg,
+            3,
+            crate::acpl::AcplQuantMode::Fine,
+            0,
+            8192,
+        );
+        let mut br = BitReader::new(&body[2..]);
+        let mut tools = crate::asf::SubstreamTools::default();
+        crate::mch::parse_5x_audio_data_outer(&mut br, &mut tools, false, true, tl).unwrap();
+        assert_eq!(
+            tools.five_x_mode,
+            Some(crate::mch::FiveXCodecMode::AspxAcpl1)
+        );
+        assert_eq!(tools.acpl_1_residual_max_sfb_master, Some(max_sfb_master));
+        let cp0 = tools.acpl_1_residual_chparam[0]
+            .as_ref()
+            .expect("residual chparam[0] parsed");
+        let cp1 = tools.acpl_1_residual_chparam[1]
+            .as_ref()
+            .expect("residual chparam[1] parsed");
+        assert_eq!(cp0.sap_mode, 3, "pair 0 must be SAP-coded");
+        assert_eq!(cp1.sap_mode, 3, "pair 1 must be SAP-coded");
+
+        // Transmitted residual energy collapses vs the raw surround
+        // energy (the identity path would code the full Ls spectrum).
+        let (_tl3, s3) = tools.acpl_1_residual_pair[0]
+            .as_ref()
+            .expect("residual pair[0] parsed");
+        let e_s3: f64 = s3.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let e_ls: f64 = ls.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        assert!(
+            e_s3 < 0.05 * e_ls,
+            "SAP residual energy must collapse: e_s3 = {e_s3}, e_ls = {e_ls}"
+        );
+
+        // Forward Table-181 mix on the parsed spectra reproduces the
+        // requested preliminaries.
+        let tcd = tools
+            .two_channel_data
+            .first()
+            .expect("two_channel_data parsed");
+        let a_spec = tcd.scaled_spec_per_channel[0]
+            .as_ref()
+            .expect("carrier A spectrum");
+        let b_spec = tcd.scaled_spec_per_channel[1]
+            .as_ref()
+            .expect("carrier B spectrum");
+        let (_tl4, s4) = tools.acpl_1_residual_pair[1]
+            .as_ref()
+            .expect("residual pair[1] parsed");
+        let pad = |src: &[f32]| -> Vec<f32> {
+            let mut v = vec![0.0f32; tl as usize];
+            let take = src.len().min(tl as usize);
+            v[..take].copy_from_slice(&src[..take]);
+            v
+        };
+        let (l_out, r_out, ls_out, rs_out) = crate::asf::apply_sap_table_181(
+            &pad(a_spec),
+            &pad(b_spec),
+            &pad(s3),
+            &pad(s4),
+            &[cp0.clone(), cp1.clone()],
+            max_sfb_master,
+            tl,
+        )
+        .expect("forward SAP mix");
+        let rel_err = |got: &[f32], want: &[f32]| -> f64 {
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for (g, w) in got.iter().zip(want.iter()) {
+                num += ((*g - *w) as f64).powi(2);
+                den += (*w as f64).powi(2);
+            }
+            if den == 0.0 {
+                num.sqrt()
+            } else {
+                (num / den).sqrt()
+            }
+        };
+        assert!(rel_err(&l_out, &l) < 0.2, "L: {}", rel_err(&l_out, &l));
+        assert!(rel_err(&r_out, &r) < 0.2, "R: {}", rel_err(&r_out, &r));
+        assert!(rel_err(&ls_out, &ls) < 0.2, "Ls: {}", rel_err(&ls_out, &ls));
+        assert!(rel_err(&rs_out, &rs) < 0.2, "Rs: {}", rel_err(&rs_out, &rs));
     }
 
     /// The full ASPX_ACPL_1 body builder produces output the decoder walks

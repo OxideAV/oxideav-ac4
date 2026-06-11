@@ -2663,6 +2663,134 @@ impl Ac4ImsEncoder {
     }
 
     /// Encode one IMS v2 frame containing a 5.0 SIMPLE/ASPX_ACPL_1
+    /// multichannel substream whose joint-MDCT residual layer is
+    /// **SAP-coded by decision** (round 279) — the automatic,
+    /// decision-driven counterpart of [`Self::encode_frame_pcm_5_0_acpl1`].
+    ///
+    /// Per ETSI TS 103 190-1 §5.3.4.3.2 / Table 181 + §5.3.2 Pseudocode
+    /// 59, the encoder runs the round-271
+    /// [`crate::asf::select_alpha_q_for_pair`] least-squares decision per
+    /// `(L, Ls)` / `(R, Rs)` target pair, materialises the SAP-coded
+    /// `chparam_info()` rows via
+    /// [`crate::asf::build_chparam_info_sap_data_from_alpha_q`] (falling
+    /// back to the header-only `SapMode::None` row when no band
+    /// benefits), and transmits the Table-181 matrix-input carriers
+    /// `(sSMP_A, sSMP_B) = (M, ·)` plus the side prediction residual
+    /// `(sSMP_3, sSMP_4) = (S − g·M, ·)` recovered through
+    /// [`crate::asf::invert_sap_table_181`]. For a surround pair
+    /// correlated with its front carrier the residual sf_data collapses
+    /// to (near-)silence — the bits the identity path spends on the raw
+    /// Ls/Rs spectra are saved while the decoder's
+    /// `apply_sap_table_181` forward mix reproduces the same
+    /// preliminaries.
+    ///
+    /// On-wire body layout is identical to
+    /// [`Self::encode_frame_pcm_5_0_acpl1`]; when the decision picks no
+    /// SAP band (e.g. `Ls = L`) the emitted frame is bit-for-bit
+    /// identical to the identity-SAP path.
+    pub fn encode_frame_pcm_5_0_acpl1_sap(&mut self, frames: &[&[f32]; 5]) -> Vec<u8> {
+        self.encode_frame_pcm_5_0_acpl1_sap_with_max_sfb(frames, 40, 20)
+    }
+
+    /// `max_sfb` / `max_sfb_master`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_0_acpl1_sap`].
+    pub fn encode_frame_pcm_5_0_acpl1_sap_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        max_sfb: u32,
+        max_sfb_master: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_0_acpl1_sap: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force 5.0 channel_mode prefix '1101', 4 b → channel_mode 3.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1101;
+        self.channel_mode_bits = 4;
+
+        // Forward MDCT analysis per carrier channel (L, R, C, Ls, Rs).
+        let n_channels = 5;
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        // Same ASPX / ACPL parameterisation as the round-103 path.
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+        let acpl_qmf_band_minus1: u8 = 0;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let body = crate::encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_sap_auto(
+            frame_len,
+            max_sfb,
+            max_sfb_master,
+            self.b_iframe_global,
+            &coeffs_per_channel[0],
+            &coeffs_per_channel[1],
+            &coeffs_per_channel[2],
+            &coeffs_per_channel[3],
+            &coeffs_per_channel[4],
+            &aspx_cfg,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+            pad_target_bytes,
+        );
+
+        // Wrap in v2 IMS TOC.
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Encode one IMS v2 frame containing a 5.0 SIMPLE/ASPX_ACPL_1
     /// multichannel substream with **real per-parameter-band α extraction**
     /// (round 128 — replaces the round-103 zero-delta scaffold for the
     /// α coefficient family; β / β3 / γ stay at the scaffold).

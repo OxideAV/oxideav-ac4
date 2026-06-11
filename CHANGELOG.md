@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 279 — decision-driven SAP-coded ASPX_ACPL_1 residual layer
+  (`crate::encoder_acpl3` + `crate::encoder_ims`).** Wires the
+  round-271 `select_alpha_q_for_pair` decision driver into the encoder
+  proper, per ETSI TS 103 190-1 §5.3.4.3.2 / Table 181 + §5.3.2
+  Pseudocode 59. New
+  `encoder_acpl3::select_acpl1_residual_chparam_pair` runs the
+  least-squares `alpha_q` decision per target `(L, Ls)` / `(R, Rs)`
+  pair over the residual layer's single-window-group
+  `[max_sfb_master]` layout — the residual layer's two
+  `chparam_info()` payloads drive two independent 2x2 SAP systems
+  mapping the transmitted `(sSMP_A, sSMP_3)` / `(sSMP_B, sSMP_4)`
+  tracks to the preliminary front/surround pairs — and materialises
+  the rows via the round-260
+  `build_chparam_info_sap_data_from_alpha_q` builder, falling back to
+  the header-only `SapMode::None` row when no band raises
+  `sap_coeff_used`. The picked `alpha_q` is clamped to `[-30, +30]` so
+  the pair-major DPCM deltas Pseudocode 59 accumulates stay within the
+  HCB_SCALEFAC-codable `[-60, +60]` range on a worst-case sign flip.
+  New `encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_sap_auto`
+  (+ caller-facing
+  `encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl1_sap` /
+  `_with_max_sfb`) additionally closes the round-257 deferred carrier
+  side: the `two_channel_data()` payload now carries the Table-181
+  **matrix-input** carriers `(sSMP_A, sSMP_B)` recovered through
+  `invert_sap_table_181` — on a SAP-coded band the transmitted pair is
+  `(M, S − g·M)` (mid + side prediction residual) rather than the raw
+  L/R preliminaries the round-257 builder still emitted, so the
+  decoder's `apply_sap_table_181` forward mix reproduces the requested
+  `(L, R, Ls, Rs)` preliminaries exactly (up to sf_data quantisation).
+  Measured: for `Ls = κ·L` correlated surround the optimal projection
+  `g* = (1 − κ) / (1 + κ)` collapses the transmitted residual to
+  near-silence — SAP residual energy < 5 % (unit, synthetic spectra) /
+  < 10 % (full PCM → MDCT → encode → decode integration) of the
+  identity path's raw-`Ls` residual — while a no-benefit input
+  (`Ls = L` ⇒ zero side energy ⇒ `g* = 0`) encodes **bit-for-bit
+  identical** to the round-103 identity path (strict-superset
+  invariant). Five new unit tests in `src/encoder_acpl3.rs` pin the
+  selector's per-band `(1.7, 1, 0.3, −1)` extraction for `κ = 0.2`,
+  the `SapMode::None` fallback on equal pairs, the ±30 clamp on a
+  near-anti-correlated pair, the identity byte-equality, and the
+  bit-stream round trip (decoder walker recovers `sap_mode = 3` rows;
+  forward Table-181 mix matches all four preliminaries within 20 %
+  relative L2; residual energy < 5 % of raw surround energy). Four new
+  integration tests in `tests/round279_5_x_acpl1_sap_auto.rs` cover
+  the 5-channel AudioFrame shape, the recovered SAP rows + residual
+  collapse vs the identity encoder on the same tone fixture, the
+  no-benefit byte-equality through the full encoder entry point, and
+  sequence-counter advancement. Total lib tests 689 (was 684);
+  integration suites +4.
+
 - **Round 271 — `alpha_q` decision driver `select_alpha_q_for_pair`
   (`crate::asf`).** The SAP-coded (`SapMode::SapData`) analogue of the
   round-263 `select_ms_used_for_pair` — completes the encoder decision
