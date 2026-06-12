@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 285 — real per-parameter-band β₃ extraction for the 5_X
+  SIMPLE/ASPX_ACPL_3 encoder (`crate::encoder_acpl3` +
+  `crate::encoder_ims`).** Closes the round-215 "β₃ stays at the
+  round-95 zero-delta scaffold" deferral. Per ETSI TS 103 190-1
+  §5.7.7.6.2 Pseudocode 118 steps 8-10, β₃ is the gain on the third
+  decorrelator output `y₂`; step 10 + step 11 give the centre channel
+  a wet contribution `C_wet = −√2 · 0.5 · β₃ · y₂` carrying energy
+  `0.5 · β₃² · E[y₂²]`. `y₂` is decoder-side decorrelator state and
+  unobservable at encode time, but its energy is not: the
+  decorrelator + ducker chain is energy-preserving in steady state,
+  so `E[y₂²] ≈ E[v₃²]` with the third-Transform drive
+  `v₃ = (γ₁+γ₃+γ₅)·x0in + (γ₂+γ₄+γ₆)·x1in` (Pseudocode 118 step 2)
+  fully determined by the carrier spectra and the quantised γ matrix
+  the encoder is already emitting. New
+  `encoder_acpl3::extract_beta3_q_per_band_centre_residual` energy-
+  matches that wet contribution against the per-band least-squares
+  remainder of the round-208 centre dry fit
+  `E_res = Σ (C − K·(γ₅·L + γ₆·R))²` (`K = 1 + √(1/2)`, using the
+  quantised γ₅ / γ₆ the decoder will apply), giving the encoder
+  decision `β₃ = √(2 · E_res / E[v₃²])` — a non-negative magnitude,
+  quantised per §5.7.7.7 Table 207 (`beta3_q = round(β₃ / beta3_delta)`
+  with `beta3_delta = 0.125` Fine / `0.25` Coarse and the symmetric
+  `±cb_off` clamp at `±8` / `±4` — half the BETA3 F0 codebook length
+  per the staged ETSI table file §A.3 Tables A.46 / A.47). New BETA3
+  value writers `write_acpl_beta3_f0_value` / `write_acpl_beta3_df_value`
+  mirror the round-208 γ writers (`symbol_index = q + cb_off`
+  addressing); a new full `acpl_data_2ch()` emitter
+  `write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3` lifts the β₃
+  entropy layer from zero-delta scaffold to real FREQ-direction DPCM
+  codewords. New public builder
+  `encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3`
+  is a drop-in over the round-215 full-γ builder with an extra
+  `beta3_scale` decision knob, and new caller-facing entry points
+  `encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_alpha_beta_full_gamma_beta3`
+  / `_5_1_` accept `[L, R, C, Ls, Rs]` / `[L, R, C, Ls, Rs, LFE]` PCM.
+  `beta3_scale = 0.0` reproduces the round-215 byte stream exactly
+  (the all-zero β₃ row emits exactly the zero-delta scaffold
+  codewords). Four new unit tests pin the Table-207 quant grid +
+  clamp, the BETA3 F0/DF writer round-trip through
+  `parse_acpl_huff_data` + Pseudocode-121 accumulation, the
+  zero-residual ⇒ β₃ = 0 / uncaptured-centre ⇒ β₃ > 0 decision
+  split, and builder byte-equality at `beta3_scale = 0`. Six
+  integration tests (`tests/round285_5_x_acpl3_real_beta3.rs`) pin
+  5.0 → 5-channel and 5.1 → 6-channel decoder round-trips, the
+  decode-side recovery of the exact per-band `beta3_q` row through
+  `parse_5x_audio_data_outer` + `differential_decode`, IMS
+  byte-equality with the round-215 entry at `beta3_scale = 0`,
+  wire-liveness of the β₃ layer for an uncaptured centre, and
+  bit-determinism. Total tests 919 → 929.
+
 - **Round 279 — decision-driven SAP-coded ASPX_ACPL_1 residual layer
   (`crate::encoder_acpl3` + `crate::encoder_ims`).** Wires the
   round-271 `select_alpha_q_for_pair` decision driver into the encoder

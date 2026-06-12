@@ -1297,6 +1297,53 @@ framework but usable standalone.
 > (decoder recovers `sap_mode = 3` rows + forward mix matches all
 > four preliminaries within 20 % relative L2), and the residual
 > collapse. Total lib tests 689 (was 684); integration suites +4.
+> Round 285 closes the round-215 "β₃ stays at the round-95 zero-delta
+> scaffold" deferral with **real per-parameter-band β₃ extraction**
+> for the 5_X SIMPLE/ASPX_ACPL_3 encoder — the last of the eleven
+> `acpl_data_2ch()` parameter layers (α₁ α₂ β₁ β₂ β₃ γ₁..γ₆) to go
+> real. Per §5.7.7.6.2 Pseudocode 118, β₃ gains the third decorrelator
+> output `y₂` into all three output pairs (steps 8-10); on the centre
+> channel step 10 + step 11 give the wet contribution
+> `C_wet = −√2·0.5·β₃·y₂` with energy `0.5·β₃²·E[y₂²]`. `y₂` itself is
+> decoder-side decorrelator state — unobservable at encode time — but
+> its energy is observable: the decorrelator + ducker chain is
+> energy-preserving in steady state so `E[y₂²] ≈ E[v₃²]`, and the
+> step-2 third-Transform drive
+> `v₃ = (γ₁+γ₃+γ₅)·x0in + (γ₂+γ₄+γ₆)·x1in` is fully determined by the
+> carrier spectra and the quantised γ matrix the encoder is already
+> emitting. New
+> [`encoder_acpl3::extract_beta3_q_per_band_centre_residual`]
+> energy-matches the wet centre contribution against the per-band
+> least-squares remainder of the round-208 dry fit
+> `E_res = Σ (C − K·(γ₅·L + γ₆·R))²` (with the *quantised* γ₅ / γ₆ the
+> decoder will apply), giving `β₃ = √(2·E_res / E[v₃²])` — quantised
+> per Table 207 (`beta3_q = round(β₃ / beta3_delta)`, delta 0.125
+> Fine / 0.25 Coarse, symmetric clamp ±8 / ±4 per the staged ETSI
+> table file's BETA3 F0 codebooks). New BETA3 value writers
+> (`write_acpl_beta3_f0_value` / `_df_value`), a full
+> `acpl_data_2ch()` emitter with the β₃ layer live
+> (`write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3`), the
+> drop-in builder
+> [`encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3`]
+> (extra `beta3_scale` knob) and caller-facing
+> [`encoder_ims::Ac4ImsEncoder::encode_frame_pcm_5_0_acpl3_real_alpha_beta_full_gamma_beta3`]
+> / `_5_1_` entry points. `beta3_scale = 0.0` reproduces the round-215
+> full-γ bytes exactly. Four unit + six integration tests
+> (`tests/round285_5_x_acpl3_real_beta3.rs`) pin the Table-207 quant
+> grid + clamp, BETA3 F0/DF round-trip through `parse_acpl_huff_data`
+> + Pseudocode-121 accumulation, zero-residual ⇒ β₃ = 0 vs
+> uncaptured-centre ⇒ β₃ > 0 decisioning, 5.0 → 5-ch and 5.1 → 6-ch
+> decoder round-trips, decode-side recovery of the exact per-band
+> `beta3_q` row through `parse_5x_audio_data_outer` +
+> `differential_decode`, byte-equality at `beta3_scale = 0`,
+> wire-liveness, and determinism. Total tests 929 (was 919). Remaining
+> ACPL deferral: the 7_X back-pair Lb/Rb — §5.7.7.6.3 Table 202 maps
+> the 7_X ASPX_ACPL_{1,2} A-CPL pair onto (Ls → Lb) / (Rs → Rb) with
+> L / R / C as passthrough (`z6 = x6`, `z7 = x7`, `z4 = x2` in
+> Pseudocode 120), whereas the current decoder render + encoder
+> builders reuse the 5_X (L → Ls) / (R → Rs) mapping and leave the
+> back-pair slots silent; lifting both sides onto the Table-202
+> mapping is the next 7_X round.
 
 ## Specs
 

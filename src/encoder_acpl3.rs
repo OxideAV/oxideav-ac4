@@ -1302,6 +1302,127 @@ fn write_acpl_data_2ch_real_alpha_beta_full_gamma(
     emit_real_gamma(bw, quant_mode_1, gamma6_q_per_band);
 }
 
+/// Emit a full `acpl_data_2ch()` body per §4.2.13.4 Table 62 with the
+/// α₁ / α₂ / β₁ / β₂ / β₃ / γ₁..γ₆ entropy layers ALL carrying real
+/// per-parameter-band values — the round-285 β₃-real extension of
+/// [`write_acpl_data_2ch_real_alpha_beta_full_gamma`]. The β₃ layer
+/// (BETA3 codebook family, `quant_mode_0`) emits one F0 codeword at
+/// band 0 followed by DF deltas, same FREQ-direction DPCM shape as the
+/// α / β / γ layers. An all-zero `beta3_q_per_band` is byte-identical
+/// to the zero-delta scaffold emission (the F0 value 0 and DF delta 0
+/// codewords are exactly the `write_acpl_f0_zero` / `write_acpl_df_zero`
+/// picks).
+#[allow(clippy::too_many_arguments)]
+fn write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
+    bw: &mut BitWriter,
+    num_bands: u32,
+    quant_mode_0: crate::acpl::AcplQuantMode,
+    quant_mode_1: crate::acpl::AcplQuantMode,
+    alpha1_q_per_band: &[i32],
+    alpha2_q_per_band: &[i32],
+    beta1_q_per_band: &[i32],
+    beta2_q_per_band: &[i32],
+    beta3_q_per_band: &[i32],
+    gamma1_q_per_band: &[i32],
+    gamma2_q_per_band: &[i32],
+    gamma3_q_per_band: &[i32],
+    gamma4_q_per_band: &[i32],
+    gamma5_q_per_band: &[i32],
+    gamma6_q_per_band: &[i32],
+) {
+    // acpl_framing_data(): smooth interp (1 b) + num_param_sets_cod = 0 (1 b).
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    // Helper: emit one real-α `acpl_huff_data()` FREQ-mode block.
+    let emit_real_alpha = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, alpha_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let a_q = alpha_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_alpha_f0_value(bw, qm, a_q);
+                first = false;
+            } else {
+                let delta = a_q - prev_q;
+                write_acpl_alpha_df_value(bw, qm, delta);
+            }
+            prev_q = a_q;
+        }
+    };
+
+    // Helper: emit one real-β `acpl_huff_data()` FREQ-mode block.
+    let emit_real_beta = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, beta_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let b_q = beta_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_beta_f0_value(bw, qm, b_q);
+                first = false;
+            } else {
+                let delta = b_q - prev_q;
+                write_acpl_beta_df_value(bw, qm, delta);
+            }
+            prev_q = b_q;
+        }
+    };
+
+    // Helper: emit one real-β₃ `acpl_huff_data()` FREQ-mode block.
+    let emit_real_beta3 = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, beta3_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let b_q = beta3_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_beta3_f0_value(bw, qm, b_q);
+                first = false;
+            } else {
+                let delta = b_q - prev_q;
+                write_acpl_beta3_df_value(bw, qm, delta);
+            }
+            prev_q = b_q;
+        }
+    };
+
+    // Helper: emit one real-γ `acpl_huff_data()` FREQ-mode block.
+    let emit_real_gamma = |bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, gamma_q: &[i32]| {
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev_q: i32 = 0;
+        let mut first = true;
+        for pb in 0..num_bands {
+            let g_q = gamma_q.get(pb as usize).copied().unwrap_or(0);
+            if first {
+                write_acpl_gamma_f0_value(bw, qm, g_q);
+                first = false;
+            } else {
+                let delta = g_q - prev_q;
+                write_acpl_gamma_df_value(bw, qm, delta);
+            }
+            prev_q = g_q;
+        }
+    };
+
+    // alpha1, alpha2 — REAL (ALPHA family, quant_mode_0).
+    emit_real_alpha(bw, quant_mode_0, alpha1_q_per_band);
+    emit_real_alpha(bw, quant_mode_0, alpha2_q_per_band);
+    // beta1, beta2 — REAL (BETA family, quant_mode_0).
+    emit_real_beta(bw, quant_mode_0, beta1_q_per_band);
+    emit_real_beta(bw, quant_mode_0, beta2_q_per_band);
+    // beta3 — REAL (BETA3 family, quant_mode_0).
+    emit_real_beta3(bw, quant_mode_0, beta3_q_per_band);
+    // gamma1..gamma6 — REAL (GAMMA family, quant_mode_1).
+    emit_real_gamma(bw, quant_mode_1, gamma1_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma2_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma3_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma4_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma5_q_per_band);
+    emit_real_gamma(bw, quant_mode_1, gamma6_q_per_band);
+}
+
 // ====================================================================
 // Top-level body builder: `5_X_channel_element` ASPX_ACPL_3
 // ====================================================================
@@ -1988,6 +2109,217 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma(
             &alpha_q,
             &beta1_q,
             &beta2_q,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
+            &g5_q,
+            &g6_q,
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+/// Like [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma`]
+/// but with the β₃ entropy layer ALSO carrying real per-parameter-band
+/// values derived by energy-matching the centre-channel reconstruction
+/// residual against the third-decorrelator drive (Pseudocode 118 steps
+/// 2 / 7 / 10 / 11 — see
+/// [`extract_beta3_q_per_band_centre_residual`]). This closes the
+/// round-215 "β₃ stays at the round-95 zero-delta scaffold" deferral:
+/// the unobservable decoder-side decorrelator output `y₂` is modelled
+/// by its drive energy `E[v₃²]` (the decorrelator + ducker chain is
+/// energy-preserving in steady state), which IS observable at encode
+/// time from the carrier spectra and the quantised γ matrix.
+///
+/// `beta3_scale` controls the magnitude of the recovered β₃ values:
+/// `beta3_scale = 1.0` applies the full energy-matching solution
+/// (clamped to the Table-207 ±1.0 magnitude bound); `beta3_scale = 0.0`
+/// reproduces the round-215
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma`]
+/// output byte-for-byte (an all-zero β₃ row emits exactly the
+/// zero-delta scaffold codewords).
+///
+/// With `alpha_scale = beta_scale = gamma_scale = beta3_scale = 0.0`
+/// this entry point reproduces the round-95 zero-delta scaffold
+/// ([`build_5_x_acpl3_body_from_pcm_spectra`]) byte-for-byte.
+///
+/// β₃ extraction requires the centre spectrum (the residual target)
+/// and fires only when `coeffs_c` is `Some`; with `coeffs_c = None`
+/// the β₃ layer falls back to the zero-delta scaffold.
+///
+/// Returns the substream bytes sized to `pad_target_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    beta3_scale: f32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+
+    let alpha_q = extract_alpha_q_per_band_carrier_correlation(
+        coeffs_l,
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        alpha_scale,
+        acpl_qm0,
+    );
+    let beta1_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_l,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let beta2_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let (g1_q, g2_q) = if let Some(coeffs_ls_buf) = coeffs_ls {
+        extract_gamma_1_2_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_ls_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g3_q, g4_q) = if let Some(coeffs_rs_buf) = coeffs_rs {
+        extract_gamma_3_4_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_rs_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g5_q, g6_q) = if let Some(coeffs_c_buf) = coeffs_c {
+        extract_gamma_5_6_q_per_band_centre_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_c_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let beta3_q = if let Some(coeffs_c_buf) = coeffs_c {
+        extract_beta3_q_per_band_centre_residual(
+            coeffs_l,
+            coeffs_r,
+            coeffs_c_buf,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
+            &g5_q,
+            &g6_q,
+            transform_length,
+            acpl_num_bands,
+            0,
+            beta3_scale,
+            acpl_qm1,
+            acpl_qm0,
+        )
+    } else {
+        vec![0i32; acpl_num_bands as usize]
+    };
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_3 (4) — 3 bits.
+    bw.write_u32(4, 3);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_2ch() (4 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_2ch(&mut bw, acpl_num_param_bands_id, acpl_qm0, acpl_qm1);
+    }
+
+    // LFE: mono_data(b_lfe=1) when present.
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(2): sync=1, on=1, no avg.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // stereo_data(): split-MDCT L/R carriers.
+    write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // I-frame: aspx_data_2ch() + acpl_data_2ch() with real α/β/β₃/γ1..6.
+    if b_iframe {
+        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+        write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
+            &mut bw,
+            acpl_num_bands,
+            acpl_qm0,
+            acpl_qm1,
+            &alpha_q,
+            &alpha_q,
+            &beta1_q,
+            &beta2_q,
+            &beta3_q,
             &g1_q,
             &g2_q,
             &g3_q,
@@ -4272,6 +4604,29 @@ fn quantise_gamma(gamma: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
     raw.clamp(-cb_off, cb_off)
 }
 
+/// Quantise an analytic β₃ magnitude (signed) to the spec's nearest
+/// `beta3_q` index in the signed range `-cb_off..=+cb_off` (where
+/// `cb_off = 4` Coarse / `8` Fine — half the BETA3 F0 codebook length
+/// per the staged ETSI table file §A.3 Tables A.46 / A.47), per
+/// §5.7.7.7 Table 207. The β₃ dequantisation is the simple linear map
+/// `acpl_beta_3_dq = beta3_q · beta3_delta(qm)` so we recover
+/// `beta3_q` as the nearest-integer multiple of `1 / beta3_delta`.
+///
+/// Fine:   `beta3_delta = 0.125`, table magnitude bound `8 · 0.125 = 1.0`.
+/// Coarse: `beta3_delta = 0.25`,  table magnitude bound `4 · 0.25 = 1.0`.
+fn quantise_beta3(beta3: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
+    let delta = crate::acpl_synth::beta3_delta(qm);
+    let cb_off: i32 = match qm {
+        crate::acpl::AcplQuantMode::Fine => 8,
+        crate::acpl::AcplQuantMode::Coarse => 4,
+    };
+    // β₃ magnitude bound: cb_off · delta (= 1.0 for both modes).
+    let max_abs = (cb_off as f32) * delta;
+    let b = beta3.clamp(-max_abs, max_abs);
+    let raw = (b / delta).round() as i32;
+    raw.clamp(-cb_off, cb_off)
+}
+
 /// Compute the per-parameter-band gamma pair `(γ5, γ6)` that minimises
 /// the centre-channel reconstruction error for ASPX_ACPL_3 step 7 of
 /// §5.7.7.6.2 Pseudocode 118:
@@ -4594,6 +4949,144 @@ pub fn extract_gamma_3_4_q_per_band_surround_least_squares(
     )
 }
 
+/// Compute the per-parameter-band β₃ index that energy-matches the
+/// centre-channel reconstruction residual left over after the
+/// round-208 γ₅ / γ₆ dry-mix fit, for ASPX_ACPL_3 steps 7 / 10 / 11 of
+/// §5.7.7.6.2 Pseudocode 118.
+///
+/// β₃ is the gain on the third decorrelator output `y₂` (Pseudocode
+/// 118 steps 8–10, `ACplModule3`). The decoder's centre channel is
+///
+/// ```text
+///   z4  = 0.5 · (γ₅·x0in + γ₆·x1in)                    (step 7, dry)
+///   z4 += 0.25 · y₂ · (−β₃ − β₃·1) = −0.5 · β₃ · y₂    (step 10, wet)
+///   C   = √2 · z4                                       (step 11)
+/// ```
+///
+/// so the wet (decorrelated) centre contribution carries energy
+/// `(√2 · 0.5 · β₃)² · E[y₂²] = 0.5 · β₃² · E[y₂²]` per band. The
+/// decorrelator input is `v₃ = (γ₁+γ₃+γ₅)·x0in + (γ₂+γ₄+γ₆)·x1in`
+/// (Pseudocode 118 step 2, third `Transform()` call) and the
+/// decorrelator + ducker chain is energy-preserving in steady state,
+/// so the encoder estimates `E[y₂²] ≈ E[v₃²]` from the carrier
+/// spectra and the already-quantised γ indices:
+///
+/// ```text
+///   E[v₃²] = (1+√2)² · (G₁²·<L,L> + 2·G₁·G₂·<L,R> + G₂²·<R,R>)
+///   G₁ = (γ₁+γ₃+γ₅)_dq,  G₂ = (γ₂+γ₄+γ₆)_dq
+/// ```
+///
+/// The dry-fit residual the wet path must cover is the per-band
+/// least-squares remainder of the round-208 centre fit `C ≈ K·(γ₅·L +
+/// γ₆·R)` with `K = 1 + √(1/2)` (using the *quantised* γ₅ / γ₆ the
+/// decoder will actually apply):
+///
+/// ```text
+///   E_res = <C,C> − 2K·(γ₅·<L,C> + γ₆·<R,C>)
+///         + K²·(γ₅²·<L,L> + 2·γ₅·γ₆·<L,R> + γ₆²·<R,R>)
+/// ```
+///
+/// Energy matching `0.5 · β₃² · E[v₃²] = E_res` gives the encoder
+/// decision `β₃ = √(2 · E_res / E[v₃²])` — a non-negative magnitude
+/// (decorrelated noise carries no usable sign), scaled by
+/// `beta3_scale` and quantised through [`quantise_beta3`] (Table-207
+/// linear, symmetric `±cb_off` clamp). Bands with no decorrelator
+/// drive (`E[v₃²] ≈ 0`, e.g. all-zero γ) or no residual return 0.
+///
+/// `gamma*_q` are the per-band quantised γ indices the encoder is
+/// emitting (dequantised internally per Table 208 with `qm_gamma` —
+/// the `acpl_config_2ch` `quant_mode_1`); the returned `beta3_q` is
+/// quantised per Table 207 with `qm_beta3` (`quant_mode_0`). Entries
+/// below `start_pb` are 0. `beta3_scale = 0.0` returns all-zero
+/// `beta3_q` (matching the round-95 zero-delta scaffold).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_beta3_q_per_band_centre_residual(
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    gamma1_q: &[i32],
+    gamma2_q: &[i32],
+    gamma3_q: &[i32],
+    gamma4_q: &[i32],
+    gamma5_q: &[i32],
+    gamma6_q: &[i32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    beta3_scale: f32,
+    qm_gamma: crate::acpl::AcplQuantMode,
+    qm_beta3: crate::acpl::AcplQuantMode,
+) -> Vec<i32> {
+    let n = num_param_bands as usize;
+    let mut e_ll = vec![0.0f32; n];
+    let mut e_rr = vec![0.0f32; n];
+    let mut e_lr = vec![0.0f32; n];
+    let mut e_lc = vec![0.0f32; n];
+    let mut e_rc = vec![0.0f32; n];
+    let mut e_cc = vec![0.0f32; n];
+    let len = coeffs_l.len().min(coeffs_r.len()).min(coeffs_c.len());
+    for bin in 0..len {
+        let pb = mdct_bin_to_param_band(bin as u32, transform_length, num_param_bands) as usize;
+        if (pb as u32) < start_pb {
+            continue;
+        }
+        let xl = coeffs_l[bin];
+        let xr = coeffs_r[bin];
+        let xc = coeffs_c[bin];
+        e_ll[pb] += xl * xl;
+        e_rr[pb] += xr * xr;
+        e_lr[pb] += xl * xr;
+        e_lc[pb] += xl * xc;
+        e_rc[pb] += xr * xc;
+        e_cc[pb] += xc * xc;
+    }
+    let gd = crate::acpl_synth::gamma_delta(qm_gamma);
+    // K = √2 · (1 + √2) / 2 = 1 + √(1/2) — step-1 carrier rescale folded
+    // with the step-7 0.5 and the step-11 √2 (same constant as the
+    // round-208 γ₅ / γ₆ centre fit).
+    let k = 1.0 + (0.5f32).sqrt();
+    // (1 + √2)² — step-1 carrier rescale entering the Transform() input.
+    let s2 = {
+        let s = 1.0 + (2.0f32).sqrt();
+        s * s
+    };
+    let mut beta3_q = vec![0i32; n];
+    for pb in 0..n {
+        if (pb as u32) < start_pb {
+            continue;
+        }
+        let g_at = |g: &[i32]| g.get(pb).copied().unwrap_or(0) as f32 * gd;
+        let g1 = g_at(gamma1_q);
+        let g2 = g_at(gamma2_q);
+        let g3 = g_at(gamma3_q);
+        let g4 = g_at(gamma4_q);
+        let g5 = g_at(gamma5_q);
+        let g6 = g_at(gamma6_q);
+        // Dry-fit residual energy (floored at 0 — the quantised γ pair
+        // can over/undershoot the analytic optimum slightly and float
+        // rounding may drive the closed form fractionally negative).
+        let e_res = (e_cc[pb] - 2.0 * k * (g5 * e_lc[pb] + g6 * e_rc[pb])
+            + k * k * (g5 * g5 * e_ll[pb] + 2.0 * g5 * g6 * e_lr[pb] + g6 * g6 * e_rr[pb]))
+            .max(0.0);
+        // Third-decorrelator drive energy E[v₃²].
+        let big_g1 = g1 + g3 + g5;
+        let big_g2 = g2 + g4 + g6;
+        let e_v3 = s2
+            * (big_g1 * big_g1 * e_ll[pb]
+                + 2.0 * big_g1 * big_g2 * e_lr[pb]
+                + big_g2 * big_g2 * e_rr[pb]);
+        if !e_res.is_finite() || !e_v3.is_finite() || e_res <= 0.0 || e_v3 <= f32::EPSILON {
+            continue;
+        }
+        let b3 = beta3_scale * (2.0 * e_res / e_v3).sqrt();
+        if !b3.is_finite() {
+            continue;
+        }
+        beta3_q[pb] = quantise_beta3(b3, qm_beta3);
+    }
+    beta3_q
+}
+
 /// Compute per-parameter-band carrier and surround energies
 /// `(E_c = Σ x_carrier², E_s = Σ x_surround²)` across one MDCT frame.
 ///
@@ -4796,6 +5289,36 @@ fn write_acpl_gamma_f0_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode,
 fn write_acpl_gamma_df_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, delta_q: i32) {
     let (len, cw, cb_off) = acpl_hcb_arrays(
         crate::acpl::AcplDataType::Gamma,
+        qm,
+        crate::acpl::AcplHcbType::Df,
+    );
+    let idx = (delta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write the ACPL BETA3 F0 codeword for a signed `beta3_q` index per
+/// the staged ETSI table file §A.3 Tables A.46 (Coarse) / A.47 (Fine).
+/// The Huffman table is addressed by `symbol_index = beta3_q + cb_off`
+/// with `cb_off = 4` Coarse / `8` Fine — the codebook is symmetric
+/// around the centre so `beta3_q` carries its sign.
+fn write_acpl_beta3_f0_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, beta3_q: i32) {
+    let (len, cw, cb_off) = acpl_hcb_arrays(
+        crate::acpl::AcplDataType::Beta3,
+        qm,
+        crate::acpl::AcplHcbType::F0,
+    );
+    let idx = (beta3_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Write the ACPL BETA3 DF codeword for a band-to-band delta
+/// `delta_q = beta3_q[pb] - beta3_q[pb-1]`. Per the staged ETSI table
+/// file §A.3 Tables A.48 / A.49 the DF codebook is addressed by
+/// `symbol_index = delta_q + cb_off` with `cb_off = 8` Coarse / `16`
+/// Fine.
+fn write_acpl_beta3_df_value(bw: &mut BitWriter, qm: crate::acpl::AcplQuantMode, delta_q: i32) {
+    let (len, cw, cb_off) = acpl_hcb_arrays(
+        crate::acpl::AcplDataType::Beta3,
         qm,
         crate::acpl::AcplHcbType::Df,
     );
@@ -7023,5 +7546,192 @@ mod tests {
             absvals.push(acc);
         }
         assert_eq!(absvals, beta_seq);
+    }
+
+    // ================================================================
+    // Round 285 — real β₃ (ACPL_3 third-decorrelator gain)
+    // ================================================================
+
+    /// `quantise_beta3` follows the Table-207 linear map on the quant
+    /// grid for both modes and clamps at the BETA3 F0 codebook's
+    /// symmetric `±cb_off` edge (±8 Fine / ±4 Coarse, magnitude bound
+    /// 1.0 in both modes).
+    #[test]
+    fn quantise_beta3_grid_and_clamp() {
+        use crate::acpl::AcplQuantMode::{Coarse, Fine};
+        // Fine: delta = 0.125 → 0.25 ⇒ 2; -0.5 ⇒ -4; saturation at ±8.
+        assert_eq!(quantise_beta3(0.0, Fine), 0);
+        assert_eq!(quantise_beta3(0.25, Fine), 2);
+        assert_eq!(quantise_beta3(-0.5, Fine), -4);
+        assert_eq!(quantise_beta3(1.0, Fine), 8);
+        assert_eq!(quantise_beta3(7.5, Fine), 8);
+        assert_eq!(quantise_beta3(-99.0, Fine), -8);
+        // Coarse: delta = 0.25 → 0.5 ⇒ 2; saturation at ±4.
+        assert_eq!(quantise_beta3(0.5, Coarse), 2);
+        assert_eq!(quantise_beta3(1.0, Coarse), 4);
+        assert_eq!(quantise_beta3(2.0, Coarse), 4);
+        assert_eq!(quantise_beta3(-2.0, Coarse), -4);
+    }
+
+    /// The BETA3 F0 + DF value writers round-trip through the decoder's
+    /// `acpl_huff_data()` parser (DIFF_FREQ direction) and Pseudocode
+    /// 121 accumulation for a representative signed sequence.
+    #[test]
+    fn write_beta3_f0_df_round_trips_through_parse_acpl_huff_data() {
+        use crate::acpl::{parse_acpl_huff_data, AcplDataType, AcplQuantMode};
+        let qm = AcplQuantMode::Fine;
+        let beta3_seq = [3i32, 3, -2, 0, 8, -8];
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // diff_type = 0 (DIFF_FREQ)
+        let mut prev = 0i32;
+        for (i, &b) in beta3_seq.iter().enumerate() {
+            if i == 0 {
+                write_acpl_beta3_f0_value(&mut bw, qm, b);
+            } else {
+                write_acpl_beta3_df_value(&mut bw, qm, b - prev);
+            }
+            prev = b;
+        }
+        let bytes = bw.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let param =
+            parse_acpl_huff_data(&mut br, AcplDataType::Beta3, beta3_seq.len() as u32, 0, qm)
+                .expect("parse");
+        assert!(!param.direction_time);
+        let mut state = crate::acpl_synth::AcplDiffState::new();
+        let rows = crate::acpl_synth::differential_decode(
+            std::slice::from_ref(&param),
+            beta3_seq.len() as u32,
+            &mut state,
+        );
+        assert_eq!(rows[0], beta3_seq);
+    }
+
+    /// A centre channel that the γ₅ / γ₆ dry mix reproduces exactly (γ
+    /// on the Table-208 quant grid, residual = 0) yields β₃_q = 0 in
+    /// every band; a centre with content the dry mix cannot capture
+    /// yields β₃_q > 0 in the affected band.
+    #[test]
+    fn extract_beta3_zero_residual_vs_uncaptured_centre() {
+        use crate::acpl::AcplQuantMode::Fine;
+        let tl = 1920u32;
+        let nb = 12u32;
+        let gd = crate::acpl_synth::gamma_delta(Fine);
+        let k = 1.0 + (0.5f32).sqrt();
+        // L active everywhere; R quiet-but-distinct so the gamma Gram
+        // matrix stays non-singular.
+        let mut l = vec![0.0f32; tl as usize];
+        let mut r = vec![0.0f32; tl as usize];
+        for (i, v) in l.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 1.0 } else { 0.5 };
+        }
+        for (i, v) in r.iter_mut().enumerate() {
+            *v = if i % 3 == 0 { 0.8 } else { -0.4 };
+        }
+        // Exactly-representable centre: C = K · (10·gd · L) → γ₅_q = 10,
+        // γ₆_q = 0, residual 0.
+        let c_exact: Vec<f32> = l.iter().map(|&x| k * 10.0 * gd * x).collect();
+        let (g5_q, g6_q) = extract_gamma_5_6_q_per_band_centre_least_squares(
+            &l, &r, &c_exact, tl, nb, 0, 1.0, Fine,
+        );
+        assert!(g5_q.iter().all(|&q| q == 10), "γ₅_q = 10: {g5_q:?}");
+        let zeros = vec![0i32; nb as usize];
+        let b3_exact = extract_beta3_q_per_band_centre_residual(
+            &l, &r, &c_exact, &zeros, &zeros, &zeros, &zeros, &g5_q, &g6_q, tl, nb, 0, 1.0, Fine,
+            Fine,
+        );
+        assert!(
+            b3_exact.iter().all(|&q| q == 0),
+            "exact dry fit ⇒ β₃_q = 0 everywhere: {b3_exact:?}"
+        );
+
+        // Uncaptured centre: alternate bins orthogonal to L and R within
+        // each band (C lives on bins where the dry mix has independent
+        // content) → non-zero residual → β₃_q > 0 somewhere.
+        let c_orth: Vec<f32> = (0..tl as usize)
+            .map(|i| if i % 5 == 1 { 2.0 } else { -1.0 })
+            .collect();
+        let (g5o, g6o) = extract_gamma_5_6_q_per_band_centre_least_squares(
+            &l, &r, &c_orth, tl, nb, 0, 1.0, Fine,
+        );
+        let b3_orth = extract_beta3_q_per_band_centre_residual(
+            &l, &r, &c_orth, &zeros, &zeros, &zeros, &zeros, &g5o, &g6o, tl, nb, 0, 1.0, Fine, Fine,
+        );
+        assert!(
+            b3_orth.iter().any(|&q| q > 0),
+            "uncaptured centre ⇒ β₃_q > 0 in ≥ 1 band: {b3_orth:?}"
+        );
+        // β₃ is a non-negative magnitude decision.
+        assert!(b3_orth.iter().all(|&q| q >= 0));
+    }
+
+    /// `beta3_scale = 0.0` reproduces the round-215 full-γ builder
+    /// byte-for-byte (the all-zero β₃ row emits exactly the zero-delta
+    /// scaffold codewords).
+    #[test]
+    fn build_acpl3_beta3_zero_scale_matches_round215_full_gamma_builder() {
+        let tl = 1920u32;
+        let n = tl as usize;
+        let l: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+        let r: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.07).collect();
+        let c: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let ls: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.04).collect();
+        let rs: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.03).collect();
+        let aspx_cfg = aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        };
+        let qm = crate::acpl::AcplQuantMode::Fine;
+        let legacy = build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma(
+            tl,
+            40,
+            None,
+            true,
+            &l,
+            &r,
+            Some(&c),
+            Some(&ls),
+            Some(&rs),
+            None,
+            &aspx_cfg,
+            3,
+            qm,
+            qm,
+            0.5,
+            0.1,
+            1.0,
+            8192,
+        );
+        let with_beta3_off = build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3(
+            tl,
+            40,
+            None,
+            true,
+            &l,
+            &r,
+            Some(&c),
+            Some(&ls),
+            Some(&rs),
+            None,
+            &aspx_cfg,
+            3,
+            qm,
+            qm,
+            0.5,
+            0.1,
+            1.0,
+            0.0,
+            8192,
+        );
+        assert_eq!(legacy, with_beta3_off);
     }
 }
