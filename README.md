@@ -1344,6 +1344,41 @@ framework but usable standalone.
 > builders reuse the 5_X (L → Ls) / (R → Rs) mapping and leave the
 > back-pair slots silent; lifting both sides onto the Table-202
 > mapping is the next 7_X round.
+>
+> Round 292 adds the **encoder-side TIME-direction ASPX envelope DPCM**
+> — the dual of the `direction_time == true` branch of the decoder's
+> `delta_decode_sig` / `delta_decode_noise` (§5.7.6.3.4 Pseudocode
+> 80 / 81). Until now the round-219/226/234/240 envelope-coding chain
+> only emitted the **FREQ** direction (`freq_dpcm_encode_qscf`:
+> first-difference of `qscf` across subband groups, one envelope at a
+> time). The decoder, though, carries a per-envelope direction flag and
+> reconstructs the TIME branch as
+> `qscf[sbg][atsg] = prev[sbg] + delta·values[sbg]`, where `prev` is
+> the previous envelope's row (or the carried-over `qscf_prev_last` for
+> the first envelope of the frame). New
+> [`encoder_acpl3::time_dpcm_encode_qscf`] inverts that exactly —
+> `values[sbg] = (qscf[sbg] − prev[sbg]) / delta` — with the same
+> zero-extend-short-`prev` and `±1` step semantics; a `delta = 0` is
+> treated as `1` so the helper stays total. New
+> [`encoder_acpl3::dpcm_encode_qscf_envelopes`] packs a full
+> `qscf[sbg][atsg]` matrix into per-envelope
+> [`encoder_acpl3::AspxEncodedEnvelope`] `{ values, direction_time }`
+> rows, picking the cheaper transmission direction per envelope by
+> minimising `Σ|values[sbg]|` (the `*_DF` / `*_DT` codebooks both peak
+> at the zero-delta lane, so the smaller-magnitude row is the cheaper
+> one); FREQ wins ties (no cross-envelope state needed), and
+> `force_freq` reproduces the legacy single-direction scaffold. Twelve
+> integration tests (`tests/round292_aspx_time_direction_dpcm.rs`) pin
+> the bit-exact round-trip through both `delta_decode_sig` and
+> `delta_decode_noise`, the `±1` step and `delta = 0` totality, short-
+> `prev` zero-extension, the min-L1 direction policy (a temporally
+> stable envelope codes TIME; a tie codes FREQ), `force_freq` matching
+> `freq_dpcm_encode_qscf` column-for-column, and the empty-input edges.
+> Total tests 941 (was 929). This closes the FREQ-only gap in the
+> envelope-coding chain; driving the new multi-envelope packer from
+> the high-level encode entry points (which still emit minimum-cost
+> zero-delta single-envelope scaffolds) remains the open envelope
+> follow-up.
 
 ## Specs
 

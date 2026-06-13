@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 292 — encoder-side TIME-direction ASPX envelope DPCM packing
+  (`crate::encoder_acpl3`).** The dual of the `direction_time == true`
+  branch of the decoder's `aspx::delta_decode_sig` /
+  `aspx::delta_decode_noise` (ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode
+  80 / 81). The prior round-219/226/234/240 envelope-coding chain only
+  emitted the FREQ direction (`freq_dpcm_encode_qscf`); the decoder also
+  accepts a per-envelope direction flag and walks a TIME branch
+  reconstructing `qscf[sbg][atsg] = prev[sbg] + delta·values[sbg]`
+  (with `prev` the previous envelope's row, or `qscf_prev_last` for the
+  first envelope). New `encoder_acpl3::time_dpcm_encode_qscf` inverts it
+  exactly (`values[sbg] = (qscf[sbg] − prev[sbg]) / delta`), with
+  zero-extend-short-`prev` and `±1`-step semantics matching the decoder
+  (`delta = 0` treated as `1` for totality). New
+  `encoder_acpl3::dpcm_encode_qscf_envelopes` packs a full
+  `qscf[sbg][atsg]` matrix into per-envelope
+  `encoder_acpl3::AspxEncodedEnvelope { values, direction_time }` rows,
+  selecting the cheaper direction per envelope by minimising
+  `Σ|values[sbg]|` (FREQ wins ties; `force_freq` reproduces the legacy
+  single-direction scaffold). Twelve integration tests
+  (`tests/round292_aspx_time_direction_dpcm.rs`) pin the bit-exact
+  round-trip through both `delta_decode_sig` and `delta_decode_noise`,
+  step/totality edges, short-`prev` zero-extension, the min-L1 policy,
+  `force_freq` parity with `freq_dpcm_encode_qscf`, and empty inputs.
+  Total tests 941 (was 929).
 - **Round 285 — real per-parameter-band β₃ extraction for the 5_X
   SIMPLE/ASPX_ACPL_3 encoder (`crate::encoder_acpl3` +
   `crate::encoder_ims`).** Closes the round-215 "β₃ stays at the

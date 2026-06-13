@@ -2896,6 +2896,158 @@ pub fn freq_dpcm_encode_qscf(qscf: &[i32]) -> Vec<i32> {
     out
 }
 
+/// Encode one envelope's per-`sbg` `qscf` row into the **TIME-direction**
+/// DPCM delta sequence — the exact dual of the `direction_time == true`
+/// branch of the decoder's [`crate::aspx::delta_decode_sig`] /
+/// [`crate::aspx::delta_decode_noise`].
+///
+/// On the decode side the TIME branch reconstructs, per subband group,
+///
+/// ```text
+///   qscf[sbg][atsg] = prev[sbg] + delta · values[sbg]
+/// ```
+///
+/// where `prev[sbg]` is the same subband group's `qscf` in the
+/// *previous* envelope (`qscf[sbg][atsg-1]`), or — for the first
+/// envelope of the frame (`atsg == 0`) — the carried-over
+/// `qscf_prev_last[sbg]` from the previous frame (Pseudocode 80 / 81
+/// `qscf[sbg][-1]`). Inverting for the transmitted DT value:
+///
+/// ```text
+///   values[sbg] = (qscf[sbg] − prev[sbg]) / delta
+/// ```
+///
+/// `delta` is the per-frame DPCM step sign (`±1` for A-SPX — the only
+/// values the bitstream carries); the division is therefore exact. A
+/// `delta == 0` (never produced by a conformant decoder configuration)
+/// is treated as `delta == 1` so the encoder stays total.
+///
+/// `qscf` is this envelope's per-`sbg` quant indices; `prev` is the
+/// reference row the decoder will subtract against (length-mismatched
+/// `prev` zero-extends, matching the decoder's
+/// `qscf_prev_last.get(sbg).unwrap_or(0)`). The returned vector has the
+/// same length as `qscf`. Empty input returns an empty vector.
+///
+/// Refs ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80 (TIME branch) /
+/// Pseudocode 81 (NOISE TIME branch).
+pub fn time_dpcm_encode_qscf(qscf: &[i32], prev: &[i32], delta: i32) -> Vec<i32> {
+    if qscf.is_empty() {
+        return Vec::new();
+    }
+    let step = if delta == 0 { 1 } else { delta };
+    qscf.iter()
+        .enumerate()
+        .map(|(sbg, &q)| {
+            let p = prev.get(sbg).copied().unwrap_or(0);
+            (q - p) / step
+        })
+        .collect()
+}
+
+/// One encoded ASPX envelope: the transmission direction the encoder
+/// chose plus the per-`sbg` DPCM delta sequence for that direction.
+/// `direction_time == false` ⇒ FREQ (`[F0, DF₁, …]`, from
+/// [`freq_dpcm_encode_qscf`]); `direction_time == true` ⇒ TIME
+/// (all-`DT`, from [`time_dpcm_encode_qscf`]). Mirrors the decoder's
+/// [`crate::aspx::AspxHuffEnv`] before Huffman coding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AspxEncodedEnvelope {
+    /// Per-subband-group DPCM delta values for the chosen direction.
+    pub values: Vec<i32>,
+    /// Transmission direction (false = FREQ, true = TIME).
+    pub direction_time: bool,
+}
+
+/// Encode a full multi-envelope `qscf[sbg][atsg]` matrix into a sequence
+/// of [`AspxEncodedEnvelope`] rows — one per envelope (`atsg`) — choosing
+/// the cheaper transmission direction per envelope.
+///
+/// This is the encoder-side inverse of [`crate::aspx::delta_decode_sig`]
+/// / [`crate::aspx::delta_decode_noise`]: for each envelope `atsg` the
+/// encoder can transmit either
+///
+/// * **FREQ** — first-difference across subband groups within the
+///   envelope ([`freq_dpcm_encode_qscf`]), independent of any other
+///   envelope; or
+/// * **TIME** — difference against the *previous* envelope's row
+///   ([`time_dpcm_encode_qscf`]); for `atsg == 0` the reference is
+///   `qscf_prev_last` (the previous frame's last envelope, Pseudocode
+///   80 / 81 `qscf[sbg][-1]`).
+///
+/// The direction policy minimises the L1 norm `Σ|values[sbg]|` of the
+/// transmitted deltas per envelope (a proxy for Huffman cost: the
+/// `*_DF` / `*_DT` codebooks both peak at the zero-delta lane, so the
+/// row with the smaller absolute deltas is the cheaper one). FREQ wins
+/// ties — it needs no cross-envelope state, matching the decoder's
+/// independent-envelope default. When `force_freq` is `true` every
+/// envelope is coded FREQ regardless (reproduces the single-direction
+/// scaffold path).
+///
+/// Round-trip guarantee: feeding the returned `(direction_time, values)`
+/// rows back through `delta_decode_sig` / `delta_decode_noise` with the
+/// same `delta` and `qscf_prev_last` reconstructs the input `qscf`
+/// matrix exactly.
+///
+/// `qscf` is indexed `[sbg][atsg]` (the decoder's output shape).
+/// `qscf_prev_last` is the previous frame's last-envelope row (empty for
+/// an I-frame / first envelope with no history). `delta` is the per-frame
+/// DPCM step sign (`±1`). An empty `qscf` (no subband groups) returns an
+/// empty row list.
+///
+/// Refs ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80 / 81.
+pub fn dpcm_encode_qscf_envelopes(
+    qscf: &[Vec<i32>],
+    qscf_prev_last: &[i32],
+    delta: i32,
+    force_freq: bool,
+) -> Vec<AspxEncodedEnvelope> {
+    let num_sbg = qscf.len();
+    if num_sbg == 0 {
+        return Vec::new();
+    }
+    let num_env = qscf[0].len();
+    let mut out: Vec<AspxEncodedEnvelope> = Vec::with_capacity(num_env);
+    for atsg in 0..num_env {
+        // Gather this envelope's per-sbg qscf column.
+        let col: Vec<i32> = (0..num_sbg)
+            .map(|sbg| qscf[sbg].get(atsg).copied().unwrap_or(0))
+            .collect();
+        let freq = freq_dpcm_encode_qscf(&col);
+        if force_freq {
+            out.push(AspxEncodedEnvelope {
+                values: freq,
+                direction_time: false,
+            });
+            continue;
+        }
+        // TIME reference row: previous envelope, or carried-over history
+        // for the first envelope.
+        let prev: Vec<i32> = if atsg == 0 {
+            qscf_prev_last.to_vec()
+        } else {
+            (0..num_sbg)
+                .map(|sbg| qscf[sbg].get(atsg - 1).copied().unwrap_or(0))
+                .collect()
+        };
+        let time = time_dpcm_encode_qscf(&col, &prev, delta);
+        let cost_freq: i64 = freq.iter().map(|&v| (v as i64).abs()).sum();
+        let cost_time: i64 = time.iter().map(|&v| (v as i64).abs()).sum();
+        // FREQ wins ties (no cross-envelope state needed).
+        if cost_time < cost_freq {
+            out.push(AspxEncodedEnvelope {
+                values: time,
+                direction_time: true,
+            });
+        } else {
+            out.push(AspxEncodedEnvelope {
+                values: freq,
+                direction_time: false,
+            });
+        }
+    }
+    out
+}
+
 /// Extract per-channel ASPX SIGNAL envelope quant indices from an input
 /// `scf_sig` vector (the per-`sbg` signal envelope-energy scale factors
 /// the decoder produces from Pseudocode 82) and pack them into the
