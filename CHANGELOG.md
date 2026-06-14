@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 306 — encoder-side `aspx_hfgen_iwc_1ch()` /
+  `aspx_hfgen_iwc_2ch()` writers (`crate::encoder_acpl3`).** The exact
+  duals of the decoder's `aspx::parse_aspx_hfgen_iwc_1ch` /
+  `parse_aspx_hfgen_iwc_2ch` (ETSI TS 103 190-1 §4.2.12.6 / §4.2.12.7,
+  Tables 55 / 56). Until now every encoder body writer emitted this
+  HF-generation / interleaved-waveform-coding element as the all-zero
+  compact form (`aspx_tna_mode[*] = 0`, all three presence bits 0),
+  even though the decoder fully parses real inverse-filtering modes,
+  additive harmonics (`add_harmonic`), frequency-interleaved coding
+  (`fic_used_in_sfb`) and time-interleaved coding (`tic_used_in_slot`).
+  New `encoder_acpl3::write_aspx_hfgen_iwc_1ch` /
+  `write_aspx_hfgen_iwc_2ch` take real per-SBG `tna_mode` (2 b, masked
+  to `0..=3`) plus per-SBG / per-timeslot flag vectors via the public
+  `encoder_acpl3::AspxHfgenIwc1ChPayload` /
+  `encoder_acpl3::AspxHfgenIwc2ChPayload` payloads, and auto-derive
+  every gate from the payload (`*_present` / `*_left` / `*_right` set
+  iff the slice has an active flag in range; the 2ch TIC path uses the
+  compact `aspx_tic_copy = 1` form when both channels carry the same
+  active pattern). Under `aspx_balance = 1` only channel-0 `tna_mode`
+  is written (decoder mirrors it); short caller slices zero-pad. The
+  existing `write_aspx_data_1ch_minimal` HFGEN block is refactored to
+  route through the new 1ch writer with a default payload — output
+  stays byte-identical. Eight integration tests in
+  `tests/round306_aspx_hfgen_iwc_writers.rs` pin the bit-exact
+  round-trip through the decoder parsers (all-zero compact form, real
+  flags, padding + masking, balance-mirror, distinct-tna, TIC-copy,
+  TIC-right-only, full multi-field stress).
 - **Round 292 — encoder-side TIME-direction ASPX envelope DPCM packing
   (`crate::encoder_acpl3`).** The dual of the `direction_time == true`
   branch of the decoder's `aspx::delta_decode_sig` /

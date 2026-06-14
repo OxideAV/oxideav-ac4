@@ -1424,6 +1424,40 @@ framework but usable standalone.
 > points (which still emit single-envelope scaffolds) plus the
 > QMF-energy → multi-envelope `qscf` aggregation that selects the
 > per-frame envelope count remain the open envelope follow-ups.
+>
+> Round 306 lands the **encoder-side `aspx_hfgen_iwc_1ch()` /
+> `aspx_hfgen_iwc_2ch()` writers** (ETSI TS 103 190-1 §4.2.12.6 /
+> §4.2.12.7, Tables 55 / 56) — the exact duals of the decoder's
+> [`aspx::parse_aspx_hfgen_iwc_1ch`] / `parse_aspx_hfgen_iwc_2ch`.
+> Until now every encoder body writer emitted this HF-generation /
+> interleaved-waveform-coding element as the all-zero compact form
+> (`aspx_tna_mode[*] = 0`, `aspx_ah_present = aspx_fic_present =
+> aspx_tic_present = 0`), even though the decoder fully parses real
+> inverse-filtering modes, additive harmonics (`add_harmonic`),
+> frequency-interleaved coding (`fic_used_in_sfb`) and
+> time-interleaved coding (`tic_used_in_slot`). The new
+> [`encoder_acpl3::write_aspx_hfgen_iwc_1ch`] /
+> [`encoder_acpl3::write_aspx_hfgen_iwc_2ch`] take real per-SBG
+> `tna_mode` (2 b, masked to `0..=3`) plus per-SBG / per-timeslot
+> flag vectors via the public [`encoder_acpl3::AspxHfgenIwc1ChPayload`]
+> / [`encoder_acpl3::AspxHfgenIwc2ChPayload`] payloads, and
+> auto-derive every gate from the payload: each `*_present` /
+> `*_left` / `*_right` bit is `1` iff its slice has an active flag in
+> range, and the 2ch TIC path emits the compact `aspx_tic_copy = 1`
+> form when both channels carry the identical active pattern. Under
+> `aspx_balance = 1` only channel-0 `tna_mode` is written (the
+> decoder mirrors it). Short caller slices zero-pad. The existing
+> `write_aspx_data_1ch_minimal` HFGEN block is refactored to route
+> through the new 1ch writer with a default (empty) payload — output
+> stays byte-identical, confirmed by the unchanged minimal-writer
+> tests. Eight integration tests in
+> `tests/round306_aspx_hfgen_iwc_writers.rs` pin the bit-exact
+> round-trip through `parse_aspx_hfgen_iwc_{1,2}ch`: all-zero compact
+> form, real flags, padding + masking, balance-mirror, distinct-tna,
+> TIC-copy, TIC-right-only, and a full multi-field stress. Total
+> tests 955 (was 947). Driving these real HFGEN/IWC decisions from
+> the high-level encode entry points (which still emit the all-zero
+> form) remains the open follow-up.
 
 ## Specs
 

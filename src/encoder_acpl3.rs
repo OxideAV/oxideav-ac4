@@ -2471,6 +2471,245 @@ fn write_mono_data_centre(bw: &mut BitWriter, transform_length: u32, max_sfb: u3
     write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb);
 }
 
+// ====================================================================
+// ASPX HF-generation / interleaved-waveform-coding writers
+// (encoder duals of parse_aspx_hfgen_iwc_1ch / _2ch)
+// ====================================================================
+
+/// Caller-provided `aspx_hfgen_iwc_1ch()` payload — the real
+/// inverse-filtering (`aspx_tna_mode`), additive-harmonic
+/// (`aspx_add_harmonic`), frequency-interleaved-coding
+/// (`aspx_fic_used_in_sfb`) and time-interleaved-coding
+/// (`aspx_tic_used_in_slot`) decisions for a single channel.
+///
+/// Every slice is interpreted positionally against the derived
+/// subband-group / time-slot counts:
+///
+/// * `tna_mode` — `num_sbg_noise` entries, each a 2-bit inverse-
+///   filtering mode in `0..=3`. Missing entries default to `0`; values
+///   above `3` are masked to their low 2 bits (matching the decoder's
+///   `read_u32(2)`).
+/// * `add_harmonic` — `num_sbg_sig_highres` booleans. The presence bit
+///   `aspx_ah_present` is emitted as `1` iff any entry is `true`; only
+///   then is the per-SBG vector written. An all-`false` slice (or an
+///   empty one) emits `aspx_ah_present = 0` and no per-SBG bits, which
+///   the decoder reconstructs as an all-`false` vector.
+/// * `fic_used_in_sfb` — `num_sbg_sig_highres` booleans, gated by
+///   `aspx_fic_present` with the same any-true rule.
+/// * `tic_used_in_slot` — `num_aspx_timeslots` booleans, gated by
+///   `aspx_tic_present` with the same any-true rule.
+#[derive(Debug, Clone, Default)]
+pub struct AspxHfgenIwc1ChPayload<'a> {
+    /// Per-noise-SBG 2-bit inverse-filtering modes (`0..=3`).
+    pub tna_mode: &'a [u8],
+    /// Per-high-res-signal-SBG additive-harmonic flags.
+    pub add_harmonic: &'a [bool],
+    /// Per-high-res-signal-SBG frequency-interleaved-coding flags.
+    pub fic_used_in_sfb: &'a [bool],
+    /// Per-A-SPX-time-slot time-interleaved-coding flags.
+    pub tic_used_in_slot: &'a [bool],
+}
+
+/// Emit a positional run of `n` booleans, reading from `src` and
+/// zero-(false-)padding past its end.
+fn write_bool_run(bw: &mut BitWriter, src: &[bool], n: u32) {
+    for i in 0..n as usize {
+        bw.write_bit(src.get(i).copied().unwrap_or(false));
+    }
+}
+
+/// Returns `true` iff any of the first `n` entries of `src` is set
+/// (entries past `src.len()` count as `false`). Drives the encoder's
+/// `*_present` gate decision so a payload with no active flags emits the
+/// compact `present = 0` form.
+fn any_set(src: &[bool], n: u32) -> bool {
+    src.iter().take(n as usize).any(|&b| b)
+}
+
+/// Write `aspx_hfgen_iwc_1ch()` per ETSI TS 103 190-1 §4.2.12.6
+/// (Table 55) — the exact encoder dual of
+/// [`crate::aspx::parse_aspx_hfgen_iwc_1ch`].
+///
+/// Bit layout (matching the parser):
+///
+/// ```text
+///   for n in 0..num_sbg_noise:        aspx_tna_mode[n]        // 2 b
+///   aspx_ah_present                                           // 1 b
+///   if aspx_ah_present:
+///     for n in 0..num_sbg_sig_highres: aspx_add_harmonic[n]   // 1 b
+///   aspx_fic_present                                          // 1 b
+///   if aspx_fic_present:
+///     for n in 0..num_sbg_sig_highres: aspx_fic_used_in_sfb[n] // 1 b
+///   aspx_tic_present                                          // 1 b
+///   if aspx_tic_present:
+///     for n in 0..num_aspx_timeslots: aspx_tic_used_in_slot[n] // 1 b
+/// ```
+///
+/// The three `*_present` gates are set automatically from the payload:
+/// each is `1` iff the corresponding slice has at least one active flag
+/// in range. Re-parsing the emitted bits with
+/// `parse_aspx_hfgen_iwc_1ch` recovers an [`crate::aspx::AspxHfgenIwc1Ch`]
+/// whose `tna_mode` equals the (masked, padded) input and whose
+/// `add_harmonic` / `fic_used_in_sfb` / `tic_used_in_slot` vectors equal
+/// the (padded) inputs.
+pub fn write_aspx_hfgen_iwc_1ch(
+    bw: &mut BitWriter,
+    payload: &AspxHfgenIwc1ChPayload<'_>,
+    num_sbg_noise: u32,
+    num_sbg_sig_highres: u32,
+    num_aspx_timeslots: u32,
+) {
+    // aspx_tna_mode[0..num_sbg_noise] — 2 b each, low 2 bits.
+    for i in 0..num_sbg_noise as usize {
+        let mode = payload.tna_mode.get(i).copied().unwrap_or(0);
+        bw.write_u32((mode & 0x3) as u32, 2);
+    }
+    // aspx_ah_present + optional per-SBG add_harmonic vector.
+    let ah_present = any_set(payload.add_harmonic, num_sbg_sig_highres);
+    bw.write_bit(ah_present);
+    if ah_present {
+        write_bool_run(bw, payload.add_harmonic, num_sbg_sig_highres);
+    }
+    // aspx_fic_present + optional per-SBG fic_used_in_sfb vector.
+    let fic_present = any_set(payload.fic_used_in_sfb, num_sbg_sig_highres);
+    bw.write_bit(fic_present);
+    if fic_present {
+        write_bool_run(bw, payload.fic_used_in_sfb, num_sbg_sig_highres);
+    }
+    // aspx_tic_present + optional per-timeslot tic_used_in_slot vector.
+    let tic_present = any_set(payload.tic_used_in_slot, num_aspx_timeslots);
+    bw.write_bit(tic_present);
+    if tic_present {
+        write_bool_run(bw, payload.tic_used_in_slot, num_aspx_timeslots);
+    }
+}
+
+/// Caller-provided `aspx_hfgen_iwc_2ch()` payload — the stereo dual of
+/// [`AspxHfgenIwc1ChPayload`]. Index `[0]` is the left channel, `[1]`
+/// the right.
+///
+/// `aspx_balance` selects how the right channel's inverse-filtering is
+/// signalled:
+///
+/// * `aspx_balance == false` — both `tna_mode[0]` and `tna_mode[1]` are
+///   written explicitly (2 b per SBG per channel).
+/// * `aspx_balance == true` — only `tna_mode[0]` is written; the decoder
+///   mirrors it into channel 1. The caller's `tna_mode[1]` is ignored in
+///   that case (the round-trip yields `tna_mode[1] == tna_mode[0]`).
+///
+/// `add_harmonic` is gated per channel (`aspx_ah_left` / `aspx_ah_right`,
+/// each auto-set from the channel's slice). `fic_used_in_sfb` is gated by
+/// an outer `aspx_fic_present` plus per-channel `aspx_fic_left` /
+/// `aspx_fic_right`. `tic_used_in_slot` is gated by `aspx_tic_present`;
+/// when both channels carry the identical pattern the writer emits the
+/// compact `aspx_tic_copy = 1` form, otherwise per-channel
+/// `aspx_tic_left` / `aspx_tic_right` gates.
+#[derive(Debug, Clone, Default)]
+pub struct AspxHfgenIwc2ChPayload<'a> {
+    /// Per-channel per-noise-SBG 2-bit inverse-filtering modes.
+    pub tna_mode: [&'a [u8]; 2],
+    /// Per-channel per-high-res-signal-SBG additive-harmonic flags.
+    pub add_harmonic: [&'a [bool]; 2],
+    /// Per-channel per-high-res-signal-SBG frequency-interleaved-coding
+    /// flags.
+    pub fic_used_in_sfb: [&'a [bool]; 2],
+    /// Per-channel per-A-SPX-time-slot time-interleaved-coding flags.
+    pub tic_used_in_slot: [&'a [bool]; 2],
+}
+
+/// Write `aspx_hfgen_iwc_2ch(aspx_balance)` per ETSI TS 103 190-1
+/// §4.2.12.7 (Table 56) — the exact encoder dual of
+/// [`crate::aspx::parse_aspx_hfgen_iwc_2ch`].
+///
+/// The per-channel `add_harmonic` gates (`aspx_ah_left` /
+/// `aspx_ah_right`), the outer `aspx_fic_present` + per-channel
+/// `aspx_fic_left` / `aspx_fic_right` gates, and the `aspx_tic_present` +
+/// `aspx_tic_copy` / `aspx_tic_left` / `aspx_tic_right` gates are all set
+/// automatically from the payload (a gate is `1` iff its slice has an
+/// active flag in range). When both channels' `tic_used_in_slot`
+/// patterns are equal **and** at least one slot is active, the compact
+/// `aspx_tic_copy = 1` encoding is used.
+///
+/// Re-parsing the emitted bits with `parse_aspx_hfgen_iwc_2ch` (same
+/// `aspx_balance`, same counts) recovers an
+/// [`crate::aspx::AspxHfgenIwc2Ch`] whose `tna_mode` /
+/// `add_harmonic` / `fic_used_in_sfb` / `tic_used_in_slot` reproduce the
+/// (masked, padded) inputs.
+pub fn write_aspx_hfgen_iwc_2ch(
+    bw: &mut BitWriter,
+    payload: &AspxHfgenIwc2ChPayload<'_>,
+    aspx_balance: bool,
+    num_sbg_noise: u32,
+    num_sbg_sig_highres: u32,
+    num_aspx_timeslots: u32,
+) {
+    // aspx_tna_mode[0][..] always written.
+    for i in 0..num_sbg_noise as usize {
+        let mode = payload.tna_mode[0].get(i).copied().unwrap_or(0);
+        bw.write_u32((mode & 0x3) as u32, 2);
+    }
+    // aspx_tna_mode[1][..] only when balance == 0; else mirrors ch0.
+    if !aspx_balance {
+        for i in 0..num_sbg_noise as usize {
+            let mode = payload.tna_mode[1].get(i).copied().unwrap_or(0);
+            bw.write_u32((mode & 0x3) as u32, 2);
+        }
+    }
+    // Per-channel additive-harmonic gates + vectors.
+    let ah_left = any_set(payload.add_harmonic[0], num_sbg_sig_highres);
+    bw.write_bit(ah_left);
+    if ah_left {
+        write_bool_run(bw, payload.add_harmonic[0], num_sbg_sig_highres);
+    }
+    let ah_right = any_set(payload.add_harmonic[1], num_sbg_sig_highres);
+    bw.write_bit(ah_right);
+    if ah_right {
+        write_bool_run(bw, payload.add_harmonic[1], num_sbg_sig_highres);
+    }
+    // Frequency-interleaved-coding: outer present gate, then per-channel
+    // left/right gates.
+    let fic_left = any_set(payload.fic_used_in_sfb[0], num_sbg_sig_highres);
+    let fic_right = any_set(payload.fic_used_in_sfb[1], num_sbg_sig_highres);
+    let fic_present = fic_left || fic_right;
+    bw.write_bit(fic_present);
+    if fic_present {
+        bw.write_bit(fic_left);
+        if fic_left {
+            write_bool_run(bw, payload.fic_used_in_sfb[0], num_sbg_sig_highres);
+        }
+        bw.write_bit(fic_right);
+        if fic_right {
+            write_bool_run(bw, payload.fic_used_in_sfb[1], num_sbg_sig_highres);
+        }
+    }
+    // Time-interleaved-coding: outer present gate, then copy / per-channel
+    // gates.
+    let tic_left_active = any_set(payload.tic_used_in_slot[0], num_aspx_timeslots);
+    let tic_right_active = any_set(payload.tic_used_in_slot[1], num_aspx_timeslots);
+    let tic_present = tic_left_active || tic_right_active;
+    bw.write_bit(tic_present);
+    if tic_present {
+        // Use the compact copy form when both channels carry the same
+        // active pattern.
+        let patterns_equal = (0..num_aspx_timeslots as usize).all(|i| {
+            payload.tic_used_in_slot[0].get(i).copied().unwrap_or(false)
+                == payload.tic_used_in_slot[1].get(i).copied().unwrap_or(false)
+        });
+        let tic_copy = patterns_equal && tic_left_active;
+        bw.write_bit(tic_copy);
+        if !tic_copy {
+            bw.write_bit(tic_left_active);
+            bw.write_bit(tic_right_active);
+        }
+        if tic_copy || tic_left_active {
+            write_bool_run(bw, payload.tic_used_in_slot[0], num_aspx_timeslots);
+        }
+        if !tic_copy && tic_right_active {
+            write_bool_run(bw, payload.tic_used_in_slot[1], num_aspx_timeslots);
+        }
+    }
+}
+
 /// Emit a minimum-viable `aspx_data_1ch()` body per §4.2.12.3 Table 51
 /// with the FIXFIX + num_env = 1 path:
 ///
@@ -2513,14 +2752,18 @@ fn write_aspx_data_1ch_minimal(
         .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
     let counts = tables.counts;
 
-    // aspx_hfgen_iwc_1ch(): tna_mode[0..num_sbg_noise] = 0 (2 b each) +
-    // ah_present / fic_present / tic_present = 0 (3 × 1 b).
-    for _ in 0..counts.num_sbg_noise {
-        bw.write_u32(0, 2);
-    }
-    bw.write_bit(false); // ah_present = 0
-    bw.write_bit(false); // fic_present = 0
-    bw.write_bit(false); // tic_present = 0
+    // aspx_hfgen_iwc_1ch(): all-zero payload — tna_mode[0..num_sbg_noise]
+    // = 0 (2 b each) + ah_present / fic_present / tic_present = 0 (3 × 1 b).
+    // Routed through the real writer with a default (empty) payload so the
+    // gates auto-collapse to the compact form. `num_sbg_sig_highres` /
+    // `num_aspx_timeslots` are irrelevant when all gates are 0.
+    write_aspx_hfgen_iwc_1ch(
+        bw,
+        &AspxHfgenIwc1ChPayload::default(),
+        counts.num_sbg_noise,
+        counts.num_sbg_sig_highres,
+        0,
+    );
 
     // num_env = 1 with empty freq_res → SIGNAL ec_data reads the high-res
     // subband count (see doc comment).
