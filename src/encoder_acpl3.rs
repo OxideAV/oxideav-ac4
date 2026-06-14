@@ -2802,6 +2802,340 @@ fn write_aspx_noise_envelope_values(
     }
 }
 
+/// Write one ASPX SIGNAL envelope honouring its transmission direction
+/// per ETSI TS 103 190-1 §4.2.12.9 Table 58 (`aspx_huff_data()`):
+///
+/// * FREQ (`direction_time == false`): one `*_F0` codeword followed by
+///   `(num_sbg − 1)` `*_DF` codewords (matching the decoder's FREQ
+///   branch in [`crate::aspx::parse_aspx_huff_data`]).
+/// * TIME (`direction_time == true`): `num_sbg` `*_DT` codewords (every
+///   subband group carries a delta-time value).
+///
+/// Caller-supplied `values` shorter than `num_sbg` zero-pad the trailing
+/// entries (matching the decoder's `unwrap_or(0)` clamp surface).
+fn write_aspx_sig_envelope_directional(
+    bw: &mut BitWriter,
+    quant: aspx::AspxQuantStep,
+    stereo: aspx::AspxStereoMode,
+    env: &AspxEncodedEnvelope,
+    num_sbg: u32,
+) {
+    if num_sbg == 0 {
+        return;
+    }
+    if env.direction_time {
+        for i in 0..num_sbg as usize {
+            let d = env.values.get(i).copied().unwrap_or(0);
+            write_aspx_sig_dt_value(bw, quant, stereo, d);
+        }
+    } else {
+        let f0 = env.values.first().copied().unwrap_or(0);
+        write_aspx_sig_f0_value(bw, quant, stereo, f0);
+        for i in 1..num_sbg as usize {
+            let d = env.values.get(i).copied().unwrap_or(0);
+            write_aspx_sig_df_value(bw, quant, stereo, d);
+        }
+    }
+}
+
+/// Write one ASPX NOISE envelope honouring its transmission direction
+/// per ETSI TS 103 190-1 §4.2.12.9 Table 58. Same FREQ / TIME shape as
+/// [`write_aspx_sig_envelope_directional`] but routed through the NOISE
+/// value writers (NOISE quant step is always Fine / 1.5 dB).
+fn write_aspx_noise_envelope_directional(
+    bw: &mut BitWriter,
+    stereo: aspx::AspxStereoMode,
+    env: &AspxEncodedEnvelope,
+    num_sbg: u32,
+) {
+    if num_sbg == 0 {
+        return;
+    }
+    if env.direction_time {
+        for i in 0..num_sbg as usize {
+            let d = env.values.get(i).copied().unwrap_or(0);
+            write_aspx_noise_dt_value(bw, stereo, d);
+        }
+    } else {
+        let f0 = env.values.first().copied().unwrap_or(0);
+        write_aspx_noise_f0_value(bw, stereo, f0);
+        for i in 1..num_sbg as usize {
+            let d = env.values.get(i).copied().unwrap_or(0);
+            write_aspx_noise_df_value(bw, stereo, d);
+        }
+    }
+}
+
+/// A multi-envelope ASPX channel payload — per-envelope SIGNAL + NOISE
+/// DPCM rows (the round-292 [`AspxEncodedEnvelope`] shape, carrying each
+/// envelope's chosen FREQ / TIME direction).
+///
+/// `sig` carries `num_env` SIGNAL envelopes; `noise` carries
+/// `num_noise` NOISE envelopes (the decoder derives `num_noise = 2` when
+/// `num_env > 1`, else `1` — see [`crate::aspx::AspxFraming`]). Slices
+/// shorter than the framing's envelope count zero-pad the missing
+/// envelopes (each missing envelope emits an all-zero FREQ row).
+#[derive(Debug, Clone, Default)]
+pub struct AspxMultiEnvelopeChannel<'a> {
+    /// Per-envelope SIGNAL DPCM rows (length `num_env`).
+    pub sig: &'a [AspxEncodedEnvelope],
+    /// Per-envelope NOISE DPCM rows (length `num_noise`).
+    pub noise: &'a [AspxEncodedEnvelope],
+}
+
+/// Default all-zero FREQ envelope used to zero-pad short caller slices.
+fn zero_freq_env() -> AspxEncodedEnvelope {
+    AspxEncodedEnvelope {
+        values: Vec::new(),
+        direction_time: false,
+    }
+}
+
+/// Emit a **multi-envelope** `aspx_data_2ch()` body per ETSI TS 103
+/// 190-1 §4.2.12.4 Table 52 — the `num_env > 1` generalisation of
+/// [`write_aspx_data_2ch_real_envelope`].
+///
+/// The framing is still FIXFIX, but `tmp_num_env` is set so the decoder
+/// derives `num_env = 1 << tmp_num_env` (Table 123 / Table 126):
+///
+/// * `aspx_xover_subband_offset = 0` (3 b).
+/// * `aspx_framing(0)`: FIXFIX prefix `0` (1 b), `tmp_num_env` (the
+///   config's `fixfix_tmp_num_env_bits()` width) = `log2(num_env)`.
+/// * `aspx_balance = 1` (1 b) — channel 1 reuses channel 0's framing.
+/// * `aspx_delta_dir(0)` + `aspx_delta_dir(1)`: per-envelope SIGNAL
+///   direction bits (`num_env` each) followed by per-envelope NOISE
+///   direction bits (`num_noise` each), taken from the
+///   [`AspxEncodedEnvelope::direction_time`] flags.
+/// * `aspx_hfgen_iwc_2ch(balance = 1)`: per-SBG `tna_mode = 0` (2 b
+///   each) + the four trailer gate bits all zero.
+/// * Four `aspx_ec_data()` calls (ch0 / ch1 SIGNAL, ch0 / ch1 NOISE) —
+///   each walks `num_env` (SIGNAL) / `num_noise` (NOISE) envelopes,
+///   honouring per-envelope FREQ / TIME directions via
+///   [`write_aspx_sig_envelope_directional`] /
+///   [`write_aspx_noise_envelope_directional`].
+///
+/// Per Table 52 the SIGNAL quant step is `cfg.quant_mode_env` for
+/// `num_env > 1` (the FIXFIX + `num_env == 1` → Fine clamp does not
+/// apply); NOISE is always Fine. The body round-trips through
+/// [`crate::asf::parse_aspx_data_2ch_body`] → `delta_decode_sig` /
+/// `delta_decode_noise` to recover the caller's per-`[sbg][atsg]`
+/// `qscf` matrices.
+///
+/// `num_env` must be a power of two in `2..=1 << fixfix_tmp_num_env_bits()`
+/// and the config must not signal a per-envelope `aspx_freq_res` bit
+/// (`!cfg.signals_freq_res()`) — FIXFIX carries only one freq_res entry
+/// while the SIGNAL ec_data walks `num_env` envelopes, so the high-res
+/// fallback must apply uniformly. The writer returns an error otherwise.
+pub fn write_aspx_data_2ch_multi_envelope(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    num_env: u32,
+    ch0: AspxMultiEnvelopeChannel<'_>,
+    ch1: AspxMultiEnvelopeChannel<'_>,
+) -> Result<(), &'static str> {
+    let tmp_num_env = check_multi_env_cfg(cfg, num_env)?;
+    let num_noise = if num_env > 1 { 2 } else { 1 };
+
+    let xover: u32 = 0;
+    bw.write_u32(xover, 3);
+
+    // aspx_framing(0): FIXFIX prefix `0`, tmp_num_env → num_env.
+    bw.write_bit(false);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(tmp_num_env, envbits);
+    // signals_freq_res() is guaranteed false by check_multi_env_cfg.
+
+    // aspx_balance = 1 → channel-1 reuses channel-0's framing.
+    bw.write_bit(true);
+
+    // aspx_delta_dir(0): num_env SIGNAL bits + num_noise NOISE bits.
+    write_delta_dir_bits(bw, num_env, num_noise, &ch0);
+    // aspx_delta_dir(1): same shape for channel 1.
+    write_delta_dir_bits(bw, num_env, num_noise, &ch1);
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    // aspx_hfgen_iwc_2ch(balance = 1): tna_mode (2 b × num_sbg_noise)
+    // + 4 trailer bits.
+    for _ in 0..counts.num_sbg_noise {
+        bw.write_u32(0, 2);
+    }
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    // SIGNAL band count: high-res (no in-band freq_res bit).
+    let num_sbg_sig = counts.num_sbg_sig_highres;
+    let num_sbg_noise = counts.num_sbg_noise;
+    // num_env > 1 ⇒ no FIXFIX Fine clamp; use cfg.quant_mode_env.
+    let qmode_sig = cfg.quant_mode_env;
+
+    // ch0 SIGNAL (LEVEL) — num_env envelopes.
+    write_sig_envelopes(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Level,
+        ch0.sig,
+        num_env,
+        num_sbg_sig,
+    );
+    // ch1 SIGNAL (BALANCE).
+    write_sig_envelopes(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Balance,
+        ch1.sig,
+        num_env,
+        num_sbg_sig,
+    );
+    // ch0 NOISE (LEVEL) — num_noise envelopes.
+    write_noise_envelopes(
+        bw,
+        aspx::AspxStereoMode::Level,
+        ch0.noise,
+        num_noise,
+        num_sbg_noise,
+    );
+    // ch1 NOISE (BALANCE).
+    write_noise_envelopes(
+        bw,
+        aspx::AspxStereoMode::Balance,
+        ch1.noise,
+        num_noise,
+        num_sbg_noise,
+    );
+    Ok(())
+}
+
+/// Emit a **multi-envelope** `aspx_data_1ch()` body per ETSI TS 103
+/// 190-1 §4.2.12.3 Table 51 — the `num_env > 1` generalisation of
+/// [`write_aspx_data_1ch_real_envelope`]. Same framing rules as
+/// [`write_aspx_data_2ch_multi_envelope`] minus the `aspx_balance` bit
+/// and the second channel; the lone channel uses the LEVEL stereo mode
+/// throughout. Round-trips through [`crate::asf::parse_aspx_data_1ch_body`].
+pub fn write_aspx_data_1ch_multi_envelope(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    num_env: u32,
+    ch: AspxMultiEnvelopeChannel<'_>,
+) -> Result<(), &'static str> {
+    let tmp_num_env = check_multi_env_cfg(cfg, num_env)?;
+    let num_noise = if num_env > 1 { 2 } else { 1 };
+
+    let xover: u32 = 0;
+    bw.write_u32(xover, 3);
+
+    // aspx_framing(0): FIXFIX, tmp_num_env → num_env.
+    bw.write_bit(false);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(tmp_num_env, envbits);
+
+    // aspx_delta_dir(0): num_env SIGNAL + num_noise NOISE direction bits.
+    write_delta_dir_bits(bw, num_env, num_noise, &ch);
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    // aspx_hfgen_iwc_1ch(): tna_mode (2 b × num_sbg_noise) + 3 trailer.
+    for _ in 0..counts.num_sbg_noise {
+        bw.write_u32(0, 2);
+    }
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    let num_sbg_sig = counts.num_sbg_sig_highres;
+    let num_sbg_noise = counts.num_sbg_noise;
+    let qmode_sig = cfg.quant_mode_env;
+
+    write_sig_envelopes(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Level,
+        ch.sig,
+        num_env,
+        num_sbg_sig,
+    );
+    write_noise_envelopes(
+        bw,
+        aspx::AspxStereoMode::Level,
+        ch.noise,
+        num_noise,
+        num_sbg_noise,
+    );
+    Ok(())
+}
+
+/// Validate the multi-envelope writer preconditions and return the
+/// `tmp_num_env` field value (`log2(num_env)`).
+fn check_multi_env_cfg(cfg: &aspx::AspxConfig, num_env: u32) -> Result<u32, &'static str> {
+    if cfg.signals_freq_res() {
+        return Err("encoder: multi-envelope writer requires !signals_freq_res()");
+    }
+    if num_env == 0 || !num_env.is_power_of_two() {
+        return Err("encoder: num_env must be a positive power of two");
+    }
+    let tmp_num_env = num_env.trailing_zeros();
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    if tmp_num_env >= (1u32 << envbits) {
+        return Err("encoder: num_env exceeds fixfix_tmp_num_env_bits() capacity");
+    }
+    Ok(tmp_num_env)
+}
+
+/// Emit one channel's `aspx_delta_dir(ch)` bits: `num_env` SIGNAL
+/// direction flags then `num_noise` NOISE direction flags (Table 54).
+fn write_delta_dir_bits(
+    bw: &mut BitWriter,
+    num_env: u32,
+    num_noise: u32,
+    ch: &AspxMultiEnvelopeChannel<'_>,
+) {
+    for e in 0..num_env as usize {
+        let dir = ch.sig.get(e).map(|r| r.direction_time).unwrap_or(false);
+        bw.write_bit(dir);
+    }
+    for e in 0..num_noise as usize {
+        let dir = ch.noise.get(e).map(|r| r.direction_time).unwrap_or(false);
+        bw.write_bit(dir);
+    }
+}
+
+/// Emit `num_env` SIGNAL envelopes for one channel.
+fn write_sig_envelopes(
+    bw: &mut BitWriter,
+    quant: aspx::AspxQuantStep,
+    stereo: aspx::AspxStereoMode,
+    rows: &[AspxEncodedEnvelope],
+    num_env: u32,
+    num_sbg: u32,
+) {
+    let pad = zero_freq_env();
+    for e in 0..num_env as usize {
+        let env = rows.get(e).unwrap_or(&pad);
+        write_aspx_sig_envelope_directional(bw, quant, stereo, env, num_sbg);
+    }
+}
+
+/// Emit `num_noise` NOISE envelopes for one channel.
+fn write_noise_envelopes(
+    bw: &mut BitWriter,
+    stereo: aspx::AspxStereoMode,
+    rows: &[AspxEncodedEnvelope],
+    num_noise: u32,
+    num_sbg: u32,
+) {
+    let pad = zero_freq_env();
+    for e in 0..num_noise as usize {
+        let env = rows.get(e).unwrap_or(&pad);
+        write_aspx_noise_envelope_directional(bw, stereo, env, num_sbg);
+    }
+}
+
 // ====================================================================
 // ASPX envelope-extractor (round 234)
 // ====================================================================

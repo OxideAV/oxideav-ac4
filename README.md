@@ -1379,6 +1379,51 @@ framework but usable standalone.
 > the high-level encode entry points (which still emit minimum-cost
 > zero-delta single-envelope scaffolds) remains the open envelope
 > follow-up.
+>
+> Round 299 lands the **multi-envelope (`num_env > 1`) ASPX body
+> writers** that consume the round-292 packer output — the missing
+> link between [`encoder_acpl3::dpcm_encode_qscf_envelopes`] and the
+> on-wire `aspx_data_1ch()` / `aspx_data_2ch()` bodies per ETSI TS
+> 103 190-1 §4.2.12.3 Table 51 / §4.2.12.4 Table 52 + §4.2.12.5
+> Table 54 + §4.2.12.8 Table 57. The round-226 real-envelope writers
+> (`write_aspx_data_{1,2}ch_real_envelope`) only ever emitted a single
+> FIXFIX envelope (`num_env == 1`, FREQ direction); the new
+> [`encoder_acpl3::write_aspx_data_2ch_multi_envelope`] and
+> [`encoder_acpl3::write_aspx_data_1ch_multi_envelope`] emit FIXFIX
+> bodies with `tmp_num_env` set so the decoder derives
+> `num_env = 1 << tmp_num_env` (Table 123 / Table 126), per-envelope
+> `aspx_delta_dir` bits taken from each
+> [`encoder_acpl3::AspxEncodedEnvelope::direction_time`] flag
+> (`num_env` SIGNAL + `num_noise` NOISE bits per channel), and
+> per-envelope SIGNAL / NOISE ec_data honouring each envelope's chosen
+> FREQ / TIME direction via two new direction-aware envelope writers
+> (`write_aspx_sig_envelope_directional` / `write_aspx_noise_envelope_directional`,
+> routing through the round-219 F0/DF/DT value helpers). A new public
+> payload type [`encoder_acpl3::AspxMultiEnvelopeChannel`]
+> (`{ sig: &[AspxEncodedEnvelope], noise: &[AspxEncodedEnvelope] }`)
+> carries the per-envelope rows; short slices zero-pad missing
+> envelopes (all-zero FREQ rows). Per Table 52 the SIGNAL quant step
+> is `cfg.quant_mode_env` for `num_env > 1` (the FIXFIX + `num_env == 1`
+> → Fine clamp does **not** apply — matching the decoder's
+> `parse_aspx_data_2ch_body` qmode resolution); NOISE is always Fine,
+> and `num_noise = 2` when `num_env > 1`. The writers validate their
+> preconditions (`!signals_freq_res()` — FIXFIX carries only one
+> freq_res entry while SIGNAL ec_data walks `num_env` envelopes, so the
+> high-res fallback must apply uniformly; `num_env` a power of two
+> within `fixfix_tmp_num_env_bits()` capacity) and return an error
+> otherwise. Six integration tests in
+> `tests/round299_aspx_multi_envelope_writers.rs` pin: 2ch and 1ch
+> `num_env = 2` round-trip through `parse_aspx_framing` +
+> `parse_aspx_delta_dir` + `parse_aspx_ec_data` + `delta_decode_sig` /
+> `delta_decode_noise` recovering the caller's per-`[sbg][atsg]` `qscf`
+> matrices exactly; a temporally-stable second envelope packs as TIME
+> and its `aspx_sig_delta_dir[1]` bit reads back `true` off the wire;
+> short caller slices zero-pad; invalid configs are rejected; the
+> writer is byte-deterministic. Total tests 947 (was 941). Driving the
+> new multi-envelope body writers from the high-level encode entry
+> points (which still emit single-envelope scaffolds) plus the
+> QMF-energy → multi-envelope `qscf` aggregation that selects the
+> per-frame envelope count remain the open envelope follow-ups.
 
 ## Specs
 
