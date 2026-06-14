@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.6...v0.0.7) - 2026-06-14
+
+### Other
+
+- ac4 round 306 — encoder-side aspx_hfgen_iwc_1ch/_2ch writers
+- ac4 r299: multi-envelope ASPX body writers (num_env > 1) consuming the r292 packer
+- ac4 round 292 — encoder-side TIME-direction ASPX envelope DPCM packing
+- ac4 round 285 — real per-band β₃ for the 5_X ASPX_ACPL_3 encoder
+- ac4 round 279 — decision-driven SAP-coded ASPX_ACPL_1 residual layer
+- ac4 round 271 — SAP-coded alpha_q decision driver (select_alpha_q_for_pair)
+- ac4 r263: build_chparam_info_none + select_ms_used_for_pair
+- ac4 r260: encoder-side ChparamInfo builders — duals of extract_sap_abcd
+- ac4 r257: SAP-aware ASPX_ACPL_1 residual-layer writer
+- drop release-plz.toml — use release-plz defaults across the workspace
+- ac4 r246: encoder-side Table-181 SAP residual extractor
+- ac4 r243: encoder-side chparam_info() / sap_data() builders
+- ac4 r240: encoder-side HF QMF energy aggregator (dual of Pseudocodes 90 + 91)
+- ac4 r234: encoder-side ASPX envelope extractor (inverse of P82/83 + P80/81 DPCM)
+- ac4 r226: write_aspx_data_{1,2}ch_real_envelope() builders
+- ac4 r219: ASPX envelope value-emitting helpers (sig/noise F0/DF/DT)
+- ac4 r215: real per-band γ₁ / γ₂ / γ₃ / γ₄ extraction in 5_X ASPX_ACPL_3 encoder
+- ac4 r208: real per-band γ5 / γ6 extraction in 5_X ASPX_ACPL_3 encoder
+- ac4 r202: real per-band α + β extraction in 7.0/7.1 ASPX_ACPL_2 encoder
+- ac4 r196: real per-band α1/α2 extraction in 5_X ASPX_ACPL_3 encoder
+
 ### Added
 
 - **Round 306 — encoder-side `aspx_hfgen_iwc_1ch()` /
