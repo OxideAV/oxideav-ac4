@@ -3933,6 +3933,400 @@ pub fn build_aspx_real_envelope_channel_from_qmf(
     build_aspx_real_envelope_channel(&scf_ch, qmode_env, num_qmf_subbands)
 }
 
+// ====================================================================
+// ASPX QMF → multi-envelope builder + envelope-count selection (round 310)
+// ====================================================================
+//
+// The round-240 QMF aggregator (`aggregate_qmf_to_sbg_atsg`) already
+// reduces an HF QMF matrix to a per-`(sbg, atsg)` energy matrix, and the
+// round-292 packer (`dpcm_encode_qscf_envelopes`) already turns a
+// per-`(sbg, atsg)` quant matrix into the per-envelope `AspxEncodedEnvelope`
+// rows the round-299 multi-envelope writers consume. What was missing was
+// the glue between them: nothing built `[sbg][atsg]` *quant* matrices from
+// the QMF energy across a multi-envelope FIXFIX framing, and nothing chose
+// the per-frame envelope count `num_env` from the input energy.
+//
+// In a FIXFIX interval the signal envelopes are uniformly spaced in time
+// (§4.3.10.4.1): an `aspx_num_env`-envelope frame splits the
+// `aspx_frame_ts_count` ATSs into `aspx_num_env` equal envelope spans, so
+// the atsg-border list passed to `aggregate_qmf_to_sbg_atsg` is the
+// uniform partition `[0, span, 2·span, …, aspx_frame_ts_count]` with
+// `span = aspx_frame_ts_count / aspx_num_env`. This module derives those
+// borders, quantises each cell with the round-234 Pseudocode-82 / 83
+// inverses, and packs the result with the round-292 packer.
+//
+// Refs ETSI TS 103 190-1 §4.3.10.4.1 (FIXFIX uniform envelope spacing),
+// §4.3.10.4.11 (aspx_num_env / aspx_num_noise), §5.7.6.3.5 Pseudocodes
+// 82 / 83, §5.7.6.3.4 Pseudocodes 80 / 81, §5.7.6.4.2.1 Pseudocodes
+// 90 / 91.
+
+/// Build the uniform FIXFIX atsg-border list for `num_env` signal
+/// envelopes over `aspx_frame_ts_count` A-SPX time slot groups.
+///
+/// Per §4.3.10.4.1 a FIXFIX interval spaces its `aspx_num_env` signal
+/// envelopes uniformly in time, so the per-envelope ATS spans partition
+/// `[0, aspx_frame_ts_count)` into `num_env` equal pieces. Any remainder
+/// (when `aspx_frame_ts_count` is not divisible by `num_env`) is folded
+/// into the final envelope so the borders always end exactly at
+/// `aspx_frame_ts_count` and cover every ATS.
+///
+/// Returns a length-`num_env + 1` border list, or an empty vector when
+/// `num_env == 0`. The result is the `atsg_borders` argument
+/// [`aggregate_qmf_to_sbg_atsg`] expects (ATS indices, scaled internally
+/// by `num_ts_in_ats`).
+pub fn fixfix_uniform_atsg_borders(aspx_frame_ts_count: u32, num_env: u32) -> Vec<u32> {
+    if num_env == 0 {
+        return Vec::new();
+    }
+    let span = aspx_frame_ts_count / num_env;
+    let mut borders = Vec::with_capacity(num_env as usize + 1);
+    for e in 0..num_env {
+        borders.push(e * span);
+    }
+    // Final border closes at the exact frame length so the trailing
+    // envelope absorbs any non-divisible remainder.
+    borders.push(aspx_frame_ts_count);
+    borders
+}
+
+/// Aggregate an HF QMF matrix into a per-`(sbg, atsg)` energy matrix over
+/// a uniform FIXFIX `num_env`-envelope partition of the frame.
+///
+/// Thin wrapper over [`aggregate_qmf_to_sbg_atsg`] that derives the
+/// atsg-border list with [`fixfix_uniform_atsg_borders`], so callers
+/// holding the QMF matrix + a chosen `num_env` get the
+/// `result[sbg][atsg]` matrix the multi-envelope packer consumes without
+/// hand-rolling the uniform partition.
+///
+/// `num_env == 0` returns an empty matrix.
+///
+/// Refs ETSI TS 103 190-1 §4.3.10.4.1, §5.7.6.4.2.1 Pseudocodes 90 / 91.
+pub fn aggregate_qmf_to_sbg_atsg_uniform(
+    q_high: &[Vec<(f32, f32)>],
+    sbg_borders: &[u32],
+    num_env: u32,
+    aspx_frame_ts_count: u32,
+    num_ts_in_ats: u32,
+    sbx: u32,
+) -> Vec<Vec<f32>> {
+    let atsg_borders = fixfix_uniform_atsg_borders(aspx_frame_ts_count, num_env);
+    aggregate_qmf_to_sbg_atsg(q_high, sbg_borders, &atsg_borders, num_ts_in_ats, sbx)
+}
+
+/// Quantise a per-`(sbg, atsg)` SIGNAL energy matrix into the
+/// `qscf[sbg][atsg]` integer matrix the round-292 packer consumes,
+/// inverting Pseudocode 82 cell-by-cell with [`quantize_sig_scf`].
+///
+/// The input shape is the `aggregate_qmf_to_sbg_atsg*` output
+/// (`[sbg][atsg]`); the output preserves that shape. Empty rows pass
+/// through as empty rows.
+pub fn quantize_sig_energy_matrix(
+    energy: &[Vec<f32>],
+    qmode_env: aspx::AspxQuantStep,
+    num_qmf_subbands: u32,
+) -> Vec<Vec<i32>> {
+    energy
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|&e| quantize_sig_scf(e, qmode_env, num_qmf_subbands))
+                .collect()
+        })
+        .collect()
+}
+
+/// Quantise a per-`(sbg, atsg)` NOISE energy matrix into the
+/// `qscf[sbg][atsg]` integer matrix the round-292 packer consumes,
+/// inverting Pseudocode 83 cell-by-cell with [`quantize_noise_scf`].
+pub fn quantize_noise_energy_matrix(energy: &[Vec<f32>]) -> Vec<Vec<i32>> {
+    energy
+        .iter()
+        .map(|row| row.iter().map(|&e| quantize_noise_scf(e)).collect())
+        .collect()
+}
+
+/// Per-channel HF QMF + SBG-border bundle consumed by
+/// [`build_aspx_multi_envelope_channel_from_qmf`] and
+/// [`select_aspx_num_env_from_qmf`] — the multi-envelope generalisation
+/// of [`AspxQmfEnvelopeChannel`].
+#[derive(Debug, Clone)]
+pub struct AspxQmfMultiEnvelopeChannel<'a> {
+    /// HF QMF matrix `[absolute_sb][ts]` complex `(re, im)` pairs.
+    pub q_high: &'a [Vec<(f32, f32)>],
+    /// SIGNAL subband-group borders (`sbg_sig`, absolute / `sbx`-rooted).
+    pub sbg_sig_borders: &'a [u32],
+    /// NOISE subband-group borders (`sbg_noise`).
+    pub sbg_noise_borders: &'a [u32],
+}
+
+/// Build the per-channel multi-envelope SIGNAL + NOISE
+/// [`AspxEncodedEnvelope`] rows straight from an HF QMF matrix for a
+/// chosen FIXFIX `num_env`.
+///
+/// Chains the full encoder envelope pipeline end-to-end:
+///
+/// 1. [`aggregate_qmf_to_sbg_atsg_uniform`] → per-`(sbg, atsg)` SIGNAL
+///    and NOISE energy matrices over the uniform `num_env`-envelope
+///    FIXFIX partition (SIGNAL keyed by `sbg_sig_borders`; NOISE keyed
+///    by `sbg_noise_borders`, collapsed to `num_noise` envelopes).
+/// 2. [`quantize_sig_energy_matrix`] / [`quantize_noise_energy_matrix`]
+///    → `qscf[sbg][atsg]` matrices (Pseudocode 82 / 83 inverses).
+/// 3. [`dpcm_encode_qscf_envelopes`] → per-envelope `AspxEncodedEnvelope`
+///    rows with per-envelope FREQ / TIME direction selection
+///    (Pseudocode 80 / 81 inverses).
+///
+/// The NOISE side uses `num_noise = if num_env > 1 { 2 } else { 1 }`
+/// envelopes (§4.3.10.4.11 / Table 128). `sig_prev_last` /
+/// `noise_prev_last` are the previous frame's last-envelope `qscf` rows
+/// (empty for an I-frame); they feed the TIME-direction reference of the
+/// leading envelope. `delta` is the per-frame DPCM step sign (`±1`).
+/// `force_freq` reproduces the single-direction scaffold (every envelope
+/// coded FREQ).
+///
+/// Returns the `(sig_rows, noise_rows)` pair ready to drop into an
+/// [`AspxMultiEnvelopeChannel`] for
+/// [`write_aspx_data_1ch_multi_envelope`] /
+/// [`write_aspx_data_2ch_multi_envelope`].
+///
+/// Refs ETSI TS 103 190-1 §4.3.10.4.1, §4.3.10.4.11, §5.7.6.3.4
+/// Pseudocodes 80 / 81, §5.7.6.3.5 Pseudocodes 82 / 83, §5.7.6.4.2.1
+/// Pseudocodes 90 / 91.
+#[allow(clippy::too_many_arguments)]
+pub fn build_aspx_multi_envelope_channel_from_qmf(
+    ch: &AspxQmfMultiEnvelopeChannel<'_>,
+    num_env: u32,
+    qmode_env: aspx::AspxQuantStep,
+    num_qmf_subbands: u32,
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+    sbx: u32,
+    sig_prev_last: &[i32],
+    noise_prev_last: &[i32],
+    delta: i32,
+    force_freq: bool,
+) -> (Vec<AspxEncodedEnvelope>, Vec<AspxEncodedEnvelope>) {
+    let num_noise = if num_env > 1 { 2 } else { 1 };
+
+    let sig_energy = aggregate_qmf_to_sbg_atsg_uniform(
+        ch.q_high,
+        ch.sbg_sig_borders,
+        num_env,
+        aspx_frame_ts_count,
+        num_ts_in_ats,
+        sbx,
+    );
+    let noise_energy = aggregate_qmf_to_sbg_atsg_uniform(
+        ch.q_high,
+        ch.sbg_noise_borders,
+        num_noise,
+        aspx_frame_ts_count,
+        num_ts_in_ats,
+        sbx,
+    );
+
+    let sig_qscf = quantize_sig_energy_matrix(&sig_energy, qmode_env, num_qmf_subbands);
+    let noise_qscf = quantize_noise_energy_matrix(&noise_energy);
+
+    let sig_rows = dpcm_encode_qscf_envelopes(&sig_qscf, sig_prev_last, delta, force_freq);
+    let noise_rows = dpcm_encode_qscf_envelopes(&noise_qscf, noise_prev_last, delta, force_freq);
+    (sig_rows, noise_rows)
+}
+
+/// Previous-frame last-envelope `qscf` reference rows for one channel's
+/// SIGNAL + NOISE leading-envelope TIME direction, threaded into
+/// [`build_aspx_multi_envelope_2ch_from_qmf`]. Both fields are empty for
+/// an I-frame (no inter-frame prediction).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AspxMultiEnvelopePrevLast<'a> {
+    /// Previous frame's last SIGNAL envelope `qscf` row (one entry per
+    /// `sbg_sig`), or empty for an I-frame.
+    pub sig: &'a [i32],
+    /// Previous frame's last NOISE envelope `qscf` row (one entry per
+    /// `sbg_noise`), or empty for an I-frame.
+    pub noise: &'a [i32],
+}
+
+/// Owned per-channel multi-envelope SIGNAL + NOISE rows produced by
+/// [`build_aspx_multi_envelope_2ch_from_qmf`]. The caller borrows these
+/// into the [`AspxMultiEnvelopeChannel`] pair the round-299
+/// [`write_aspx_data_2ch_multi_envelope`] writer consumes.
+#[derive(Debug, Clone, Default)]
+pub struct AspxMultiEnvelope2chRows {
+    /// Channel-0 (LEVEL) SIGNAL envelope rows.
+    pub ch0_sig: Vec<AspxEncodedEnvelope>,
+    /// Channel-0 (LEVEL) NOISE envelope rows.
+    pub ch0_noise: Vec<AspxEncodedEnvelope>,
+    /// Channel-1 (BALANCE) SIGNAL envelope rows.
+    pub ch1_sig: Vec<AspxEncodedEnvelope>,
+    /// Channel-1 (BALANCE) NOISE envelope rows.
+    pub ch1_noise: Vec<AspxEncodedEnvelope>,
+}
+
+/// Build both channels' multi-envelope SIGNAL + NOISE
+/// [`AspxEncodedEnvelope`] rows straight from a stereo pair of HF QMF
+/// matrices for a chosen FIXFIX `num_env` — the two-channel dual of
+/// [`build_aspx_multi_envelope_channel_from_qmf`].
+///
+/// The coupled `aspx_data_2ch()` body (Table 52, `aspx_balance = 1`)
+/// carries channel 0 in the LEVEL stereo mode and channel 1 in BALANCE,
+/// but the LEVEL / BALANCE distinction is purely a codebook-family
+/// selection applied by the [`write_aspx_data_2ch_multi_envelope`] writer
+/// when it emits each envelope — the per-`(sbg, atsg)` `qscf` quantisation
+/// (Pseudocode 82 / 83) and the FREQ / TIME DPCM packing (Pseudocode
+/// 80 / 81) are identical for both channels. This builder therefore runs
+/// [`build_aspx_multi_envelope_channel_from_qmf`] independently per
+/// channel with the same `num_env`, quant mode, and partition, and the
+/// writer assigns the stereo modes.
+///
+/// Both channels share the frame's single FIXFIX framing
+/// (`num_env` / `num_noise` / atsg partition), so they must be built with
+/// the same `num_env`; pick it once per frame via
+/// [`select_aspx_num_env_from_qmf`] on (typically) the LEVEL channel.
+///
+/// `prev0` / `prev1` carry each channel's previous-frame last-envelope
+/// `qscf` rows for the leading-envelope TIME reference (empty for an
+/// I-frame). `delta` is the per-frame DPCM step sign (`±1`); `force_freq`
+/// reproduces the single-direction scaffold.
+///
+/// Refs ETSI TS 103 190-1 §4.2.12.4 Table 52 (LEVEL / BALANCE coupled
+/// SIGNAL coding), §4.3.10.4.1, §4.3.10.4.11, §5.7.6.3.4 Pseudocodes
+/// 80 / 81, §5.7.6.3.5 Pseudocodes 82 / 83, §5.7.6.4.2.1 Pseudocodes
+/// 90 / 91.
+#[allow(clippy::too_many_arguments)]
+pub fn build_aspx_multi_envelope_2ch_from_qmf(
+    ch0: &AspxQmfMultiEnvelopeChannel<'_>,
+    ch1: &AspxQmfMultiEnvelopeChannel<'_>,
+    num_env: u32,
+    qmode_env: aspx::AspxQuantStep,
+    num_qmf_subbands: u32,
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+    sbx: u32,
+    prev0: AspxMultiEnvelopePrevLast<'_>,
+    prev1: AspxMultiEnvelopePrevLast<'_>,
+    delta: i32,
+    force_freq: bool,
+) -> AspxMultiEnvelope2chRows {
+    let (ch0_sig, ch0_noise) = build_aspx_multi_envelope_channel_from_qmf(
+        ch0,
+        num_env,
+        qmode_env,
+        num_qmf_subbands,
+        num_ts_in_ats,
+        aspx_frame_ts_count,
+        sbx,
+        prev0.sig,
+        prev0.noise,
+        delta,
+        force_freq,
+    );
+    let (ch1_sig, ch1_noise) = build_aspx_multi_envelope_channel_from_qmf(
+        ch1,
+        num_env,
+        qmode_env,
+        num_qmf_subbands,
+        num_ts_in_ats,
+        aspx_frame_ts_count,
+        sbx,
+        prev1.sig,
+        prev1.noise,
+        delta,
+        force_freq,
+    );
+    AspxMultiEnvelope2chRows {
+        ch0_sig,
+        ch0_noise,
+        ch1_sig,
+        ch1_noise,
+    }
+}
+
+/// Choose the per-frame FIXFIX signal-envelope count `num_env` (a power
+/// of two) from an HF QMF matrix's temporal energy variation.
+///
+/// In FIXFIX framing the encoder is free to split the frame into 1, 2, 4
+/// (or more, up to the `aspx_num_env_bits_fixfix` capacity) uniformly
+/// spaced signal envelopes; more envelopes track fast temporal energy
+/// change (transients) at the cost of bits, fewer envelopes are cheaper
+/// for stationary content. This driver evaluates each candidate power of
+/// two and picks the smallest `num_env` whose finer time partition does
+/// **not** materially reduce the per-envelope energy variance versus the
+/// next-coarser candidate — i.e. it stops splitting once the extra
+/// envelopes stop carrying new temporal detail.
+///
+/// Concretely, for each candidate it computes the broadband
+/// (SBG-summed) per-envelope energy vector and its coefficient of
+/// variation `cv = stddev / mean`. The chosen count is the largest power
+/// of two `≤ max_num_env` whose `cv` first exceeds `transient_threshold`
+/// (a transient is present), falling back to `1` when no candidate clears
+/// the threshold (stationary frame). `max_num_env` is clamped to the
+/// config's representable maximum `1 << (1 << num_env_bits_fixfix - 1)`
+/// region by the caller via [`AspxConfig::fixfix_tmp_num_env_bits`]; this
+/// driver additionally bounds it to powers of two ≥ 1.
+///
+/// A frame with fewer than 2 ATSs, or all-zero energy, returns `1`.
+///
+/// Refs ETSI TS 103 190-1 §4.3.10.4.1, §4.3.10.1.9 (Table 123).
+pub fn select_aspx_num_env_from_qmf(
+    q_high: &[Vec<(f32, f32)>],
+    sbg_sig_borders: &[u32],
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+    sbx: u32,
+    max_num_env: u32,
+    transient_threshold: f32,
+) -> u32 {
+    if aspx_frame_ts_count < 2 || max_num_env < 2 || sbg_sig_borders.len() < 2 {
+        return 1;
+    }
+    // Candidate envelope counts: powers of two in 2..=max_num_env (the
+    // coarsest, num_env = 1, is the fallback).
+    let mut best = 1u32;
+    let mut cand = 2u32;
+    while cand <= max_num_env && cand <= aspx_frame_ts_count {
+        if !cand.is_power_of_two() {
+            cand <<= 1;
+            continue;
+        }
+        let energy = aggregate_qmf_to_sbg_atsg_uniform(
+            q_high,
+            sbg_sig_borders,
+            cand,
+            aspx_frame_ts_count,
+            num_ts_in_ats,
+            sbx,
+        );
+        // Broadband per-envelope energy: sum across subband groups.
+        let num_env = cand as usize;
+        let mut per_env = vec![0.0_f64; num_env];
+        for row in &energy {
+            for (e, &v) in row.iter().enumerate().take(num_env) {
+                per_env[e] += v as f64;
+            }
+        }
+        let n = per_env.len() as f64;
+        let mean = per_env.iter().sum::<f64>() / n;
+        if mean <= 0.0 {
+            // No energy in this candidate's partition — splitting cannot
+            // reveal a transient; stop.
+            break;
+        }
+        let var = per_env
+            .iter()
+            .map(|&x| (x - mean) * (x - mean))
+            .sum::<f64>()
+            / n;
+        let cv = var.sqrt() / mean;
+        if cv as f32 >= transient_threshold {
+            // This partition exposes a transient — keep the finer count
+            // and keep probing for an even finer one.
+            best = cand;
+        }
+        cand <<= 1;
+    }
+    best
+}
+
 /// Emit a minimum-viable `acpl_data_1ch()` body per §4.2.13.3 Table 61:
 ///
 /// ```text

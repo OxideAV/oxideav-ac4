@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- ac4 round 316 — stereo QMF → multi-envelope ASPX builder (build_aspx_multi_envelope_2ch_from_qmf), the two-channel dual of the round-310 builder feeding the round-299 coupled aspx_data_2ch() writer
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.6...v0.0.7) - 2026-06-14
 
 ### Other

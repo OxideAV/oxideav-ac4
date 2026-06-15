@@ -74,9 +74,15 @@ an S16 `AudioFrame`:
 - TS 103 190-2 multi-stream / immersive / object-based (IFM) extensions.
 - Per-`emdf_payload_id` semantic interpretation of EMDF payload bodies
   (captured as raw bytes).
-- Some advanced A-CPL parameters (β3 / γ on certain encoder paths) and
-  real ASPX envelope coding on the encoder remain scaffolded at
-  minimum-bit-cost defaults.
+- Some advanced A-CPL parameters (β3 / γ on certain encoder paths)
+  remain scaffolded at minimum-bit-cost defaults.
+- Real ASPX envelope coding on the encoder has a complete QMF →
+  multi-envelope builder pipeline for both the mono (`aspx_data_1ch`)
+  and coupled stereo (`aspx_data_2ch`) bodies — energy aggregation,
+  Pseudocode-82/83 quantisation, FIXFIX `num_env` selection, and
+  per-envelope FREQ/TIME DPCM packing — but the live frame emission
+  still writes the minimum-bit-cost ASPX scaffold; switching the frame
+  path over to the real-envelope builders is the remaining step.
 
 ## Specs
 
