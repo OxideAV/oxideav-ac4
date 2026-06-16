@@ -2340,6 +2340,261 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3(
     bytes
 }
 
+/// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3`]
+/// but with the I-frame `aspx_data_2ch()` element carrying **real**
+/// per-subband-group SIGNAL / NOISE envelope quant indices for the L / R
+/// carriers (via [`write_aspx_data_2ch_real_envelope`]) instead of the
+/// round-95 minimum-bit-cost ASPX scaffold (`write_aspx_data_2ch_minimal`).
+///
+/// This is the frame-path wiring of the round-226 real-envelope ASPX
+/// writers: the caller passes the `[F0, DF₁, …]` SIGNAL + NOISE quant
+/// index vectors for channel 0 (L carrier) and channel 1 (R carrier) —
+/// the same shape [`build_aspx_real_envelope_channel_from_qmf`] produces
+/// from an HF QMF matrix — and this builder splices them into the live
+/// substream body in place of the scaffold. Every other element (LFE,
+/// companding, split-MDCT stereo, the full real α / β / β₃ / γ₁..γ₆
+/// A-CPL layers) is byte-for-byte identical to the round-285 builder.
+///
+/// The decoder walks the same Table 25 ASPX_ACPL_3 body; the
+/// real-envelope `aspx_data_2ch()` is a strict framing superset of the
+/// minimal one (FIXFIX, `num_env = 1`, `aspx_balance = 1`, all-FREQ
+/// `aspx_delta_dir`, zero `aspx_hfgen_iwc_2ch`), so the substream still
+/// parses end-to-end and synthesises 5-channel PCM. The difference is
+/// that the SIGNAL / NOISE envelope ec_data now carries the L / R HF
+/// energy distribution rather than an all-zero scaffold.
+///
+/// Passing all-zero / empty envelope vectors for both channels
+/// reproduces the round-285 scaffold body byte-for-byte at the
+/// `aspx_data_2ch()` position (the round-226 writer's all-zero path
+/// resolves to the same minimum-bit-cost F0 / DF codewords the minimal
+/// writer emits).
+///
+/// Refs ETSI TS 103 190-1 §4.2.6.6 Table 25, §4.2.12.4 Table 52,
+/// §5.7.6.3.4 / §5.7.6.3.5 Pseudocodes 80–83.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    aspx_l_sig: &[i32],
+    aspx_l_noise: &[i32],
+    aspx_r_sig: &[i32],
+    aspx_r_noise: &[i32],
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    beta3_scale: f32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+
+    let alpha_q = extract_alpha_q_per_band_carrier_correlation(
+        coeffs_l,
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        alpha_scale,
+        acpl_qm0,
+    );
+    let beta1_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_l,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let beta2_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let (g1_q, g2_q) = if let Some(coeffs_ls_buf) = coeffs_ls {
+        extract_gamma_1_2_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_ls_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g3_q, g4_q) = if let Some(coeffs_rs_buf) = coeffs_rs {
+        extract_gamma_3_4_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_rs_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g5_q, g6_q) = if let Some(coeffs_c_buf) = coeffs_c {
+        extract_gamma_5_6_q_per_band_centre_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_c_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let beta3_q = if let Some(coeffs_c_buf) = coeffs_c {
+        extract_beta3_q_per_band_centre_residual(
+            coeffs_l,
+            coeffs_r,
+            coeffs_c_buf,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
+            &g5_q,
+            &g6_q,
+            transform_length,
+            acpl_num_bands,
+            0,
+            beta3_scale,
+            acpl_qm1,
+            acpl_qm0,
+        )
+    } else {
+        vec![0i32; acpl_num_bands as usize]
+    };
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_3 (4) — 3 bits.
+    bw.write_u32(4, 3);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_2ch() (4 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_2ch(&mut bw, acpl_num_param_bands_id, acpl_qm0, acpl_qm1);
+    }
+
+    // LFE: mono_data(b_lfe=1) when present.
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(2): sync=1, on=1, no avg.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // stereo_data(): split-MDCT L/R carriers.
+    write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // I-frame: real-envelope aspx_data_2ch() + acpl_data_2ch() with real
+    // α / β / β₃ / γ₁..γ₆.
+    if b_iframe {
+        write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: aspx_l_sig,
+                noise: aspx_l_noise,
+            },
+            AspxRealEnvelopeChannel {
+                sig: aspx_r_sig,
+                noise: aspx_r_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
+            &mut bw,
+            acpl_num_bands,
+            acpl_qm0,
+            acpl_qm1,
+            &alpha_q,
+            &alpha_q,
+            &beta1_q,
+            &beta2_q,
+            &beta3_q,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
+            &g5_q,
+            &g6_q,
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
+/// Transpose a `[ts][sb]` QMF analysis matrix (the row-per-time-slot
+/// shape [`crate::qmf::QmfAnalysisBank::process_block`] returns) into the
+/// `[absolute_sb][ts]` column-per-subband shape the round-240 energy
+/// aggregator ([`aggregate_qmf_to_sbg_atsg`] and its callers) consumes
+/// on `q_high`.
+///
+/// `slots[ts][sb]` becomes `out[sb][ts]` for all `64` QMF subbands. The
+/// result has `64` rows (one per absolute QMF subband) each of length
+/// `slots.len()` (one per time slot). An empty input returns an empty
+/// matrix.
+pub fn qmf_slots_to_sb_major(slots: &[[(f32, f32); 64]]) -> Vec<Vec<(f32, f32)>> {
+    if slots.is_empty() {
+        return Vec::new();
+    }
+    let n_ts = slots.len();
+    let mut out: Vec<Vec<(f32, f32)>> = vec![vec![(0.0, 0.0); n_ts]; 64];
+    for (ts, slot) in slots.iter().enumerate() {
+        for (sb, &val) in slot.iter().enumerate() {
+            out[sb][ts] = val;
+        }
+    }
+    out
+}
+
 /// Emit a `mono_data(b_lfe = 1)` element per Table 21. No leading
 /// `spec_frontend` bit; `sf_info_lfe()` writes `max_sfb[0]` in
 /// `n_msfbl_bits` bits (Table 106 column 4). Then a full `sf_data(ASF)`

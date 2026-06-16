@@ -68,6 +68,12 @@ an S16 `AudioFrame`:
   the `.1` layouts).
 - 5.X / 7.X ASPX_ACPL_1 / _2 / _3 paths with real per-parameter-band
   α / β extraction from the input channels' MDCT energy / correlation.
+- 5.X ASPX_ACPL_3 with a **real ASPX SIGNAL / NOISE envelope** on the
+  L / R carriers (`encode_frame_pcm_5_{0,1}_acpl3_real_aspx`): the
+  encoder QMF-analyses the input PCM, aggregates the HF energy across the
+  A-SPX subband-group borders (Pseudocodes 90/91), quantises + FREQ-DPCM
+  packs it (Pseudocodes 80–83), and emits a real-envelope
+  `aspx_data_2ch()` instead of the minimum-bit-cost scaffold.
 
 ## Not yet supported
 
@@ -76,13 +82,12 @@ an S16 `AudioFrame`:
   (captured as raw bytes).
 - Some advanced A-CPL parameters (β3 / γ on certain encoder paths)
   remain scaffolded at minimum-bit-cost defaults.
-- Real ASPX envelope coding on the encoder has a complete QMF →
-  multi-envelope builder pipeline for both the mono (`aspx_data_1ch`)
-  and coupled stereo (`aspx_data_2ch`) bodies — energy aggregation,
-  Pseudocode-82/83 quantisation, FIXFIX `num_env` selection, and
-  per-envelope FREQ/TIME DPCM packing — but the live frame emission
-  still writes the minimum-bit-cost ASPX scaffold; switching the frame
-  path over to the real-envelope builders is the remaining step.
+- The live real-ASPX frame path emits a single FIXFIX envelope
+  (`num_env = 1`); the multi-envelope QMF builders (`num_env > 1`
+  FIXFIX selection, FREQ/TIME DPCM per envelope) exist and round-trip
+  in isolation but are not yet wired into the frame emission. The
+  1-channel (`aspx_data_1ch`) real-envelope path and the 7.X layouts
+  also still write the scaffold on the live frame path.
 
 ## Specs
 

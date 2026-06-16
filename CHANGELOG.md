@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 322 — wire the real ASPX SIGNAL/NOISE envelope into the live 5_X ASPX_ACPL_3 frame path (encode_frame_pcm_5_{0,1}_acpl3_real_aspx): QMF-analyse the L/R input, aggregate HF energy across the A-SPX subband-group borders, and emit a real-envelope aspx_data_2ch() in place of the minimum-bit-cost scaffold; adds qmf_slots_to_sb_major + build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx
 - ac4 round 316 — stereo QMF → multi-envelope ASPX builder (build_aspx_multi_envelope_2ch_from_qmf), the two-channel dual of the round-310 builder feeding the round-299 coupled aspx_data_2ch() writer
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.6...v0.0.7) - 2026-06-14
