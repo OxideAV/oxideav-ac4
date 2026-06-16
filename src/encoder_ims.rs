@@ -2496,6 +2496,66 @@ impl Ac4ImsEncoder {
         )
     }
 
+    /// 5.0 SIMPLE/ASPX_ACPL_3 encode with a **real multi-envelope** ASPX
+    /// SIGNAL / NOISE payload on the L / R carriers.
+    ///
+    /// Identical to [`Self::encode_frame_pcm_5_0_acpl3_real_aspx`] except
+    /// the encoder probes the L-carrier HF QMF energy for a temporal
+    /// transient (via
+    /// [`crate::encoder_acpl3::select_aspx_num_env_from_qmf`]) and, when one
+    /// is present, splits the frame into `num_env > 1` uniformly spaced
+    /// FIXFIX signal envelopes — emitting the round-299 multi-envelope
+    /// `aspx_data_2ch()` body (per-envelope FREQ / TIME DPCM) instead of
+    /// the single-envelope body. Stationary frames fall back to the
+    /// single-envelope path, so this method is a strict superset of the
+    /// round-322 entry point. `frames` is in `[L, R, C, Ls, Rs]` order.
+    ///
+    /// Refs ETSI TS 103 190-1 §4.2.12.4 Table 52, §4.3.10.1.9 Table 123,
+    /// §4.3.10.4.1.
+    pub fn encode_frame_pcm_5_0_acpl3_real_aspx_multi_env(
+        &mut self,
+        frames: &[&[f32]; 5],
+        alpha_scale: f32,
+        beta_scale: f32,
+        gamma_scale: f32,
+        beta3_scale: f32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_5_x_acpl3_real_aspx_multi_env_with_max_sfb(
+            frames,
+            None,
+            40,
+            None,
+            alpha_scale,
+            beta_scale,
+            gamma_scale,
+            beta3_scale,
+        )
+    }
+
+    /// 5.1 counterpart to
+    /// [`Self::encode_frame_pcm_5_0_acpl3_real_aspx_multi_env`].
+    /// `frames` is in `[L, R, C, Ls, Rs, LFE]` order.
+    pub fn encode_frame_pcm_5_1_acpl3_real_aspx_multi_env(
+        &mut self,
+        frames: &[&[f32]; 6],
+        alpha_scale: f32,
+        beta_scale: f32,
+        gamma_scale: f32,
+        beta3_scale: f32,
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_5_x_acpl3_real_aspx_multi_env_with_max_sfb(
+            &surround,
+            Some(frames[5]),
+            40,
+            Some(7),
+            alpha_scale,
+            beta_scale,
+            gamma_scale,
+            beta3_scale,
+        )
+    }
+
     /// Shared body for the real-ASPX ACPL_3 entry points. Mirrors
     /// [`Self::encode_frame_pcm_5_x_acpl3_real_alpha_beta_full_gamma_beta3_with_max_sfb`]
     /// but derives per-channel ASPX envelope quant indices from the L / R
@@ -2711,6 +2771,270 @@ impl Ac4ImsEncoder {
             sbx,
         );
         (l_sig, l_noise, r_sig, r_noise)
+    }
+
+    /// Multi-envelope counterpart to [`Self::extract_aspx_lr_envelopes`].
+    ///
+    /// Runs the same QMF analysis over the L / R carrier PCM, then probes
+    /// the L-carrier HF energy for a temporal transient
+    /// ([`crate::encoder_acpl3::select_aspx_num_env_from_qmf`]) to pick the
+    /// frame's FIXFIX signal-envelope count `num_env` (a power of two in
+    /// `1..=1 << fixfix_tmp_num_env_bits()`), and builds both channels'
+    /// per-envelope SIGNAL / NOISE [`crate::encoder_acpl3::AspxEncodedEnvelope`]
+    /// rows ([`crate::encoder_acpl3::build_aspx_multi_envelope_2ch_from_qmf`]).
+    ///
+    /// Returns `(num_env, rows)`. When the frequency-table derivation fails
+    /// or the frame carries no usable QMF slots, returns `(1, default)` so
+    /// the caller falls back to the single-envelope path.
+    fn extract_aspx_lr_multi_env(
+        &mut self,
+        aspx_cfg: &crate::aspx::AspxConfig,
+        frame_len: u32,
+        pcm_l: &[f32],
+        pcm_r: &[f32],
+    ) -> (u32, crate::encoder_acpl3::AspxMultiEnvelope2chRows) {
+        let fallback = || {
+            (
+                1u32,
+                crate::encoder_acpl3::AspxMultiEnvelope2chRows::default(),
+            )
+        };
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return fallback();
+        };
+        let num_ts_in_ats = crate::aspx::num_ts_in_ats(frame_len);
+        let aspx_frame_ts_count = crate::aspx::num_aspx_timeslots(frame_len);
+        if num_ts_in_ats == 0 || aspx_frame_ts_count == 0 {
+            return fallback();
+        }
+        let sbg_sig_borders = &tables.sbg_sig_highres;
+        let sbg_noise_borders = &tables.sbg_noise;
+        let sbx = tables.sbx;
+
+        let n_slots = pcm_l.len() / 64;
+        if n_slots == 0 {
+            return fallback();
+        }
+        let usable = n_slots * 64;
+        let mut bank_l = crate::qmf::QmfAnalysisBank::new();
+        let mut bank_r = crate::qmf::QmfAnalysisBank::new();
+        let slots_l = bank_l.process_block(&pcm_l[..usable]);
+        let slots_r = bank_r.process_block(&pcm_r[..usable]);
+        let q_high_l = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots_l);
+        let q_high_r = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots_r);
+
+        // Pick num_env from the L-carrier HF energy. The maximum is the
+        // config's FIXFIX capacity: 1 << fixfix_tmp_num_env_bits() bits of
+        // tmp_num_env address 1 << (1 << bits - 1) envelopes, but the live
+        // config (num_env_bits_fixfix = 0) addresses {1, 2}.
+        let max_num_env = 1u32 << ((1u32 << aspx_cfg.fixfix_tmp_num_env_bits()) - 1);
+        let num_env = crate::encoder_acpl3::select_aspx_num_env_from_qmf(
+            &q_high_l,
+            sbg_sig_borders,
+            num_ts_in_ats,
+            aspx_frame_ts_count,
+            sbx,
+            max_num_env,
+            // Coefficient-of-variation threshold above which the finer
+            // partition is deemed to expose a transient.
+            0.30,
+        );
+        if num_env <= 1 {
+            return (1, crate::encoder_acpl3::AspxMultiEnvelope2chRows::default());
+        }
+
+        let ch0 = crate::encoder_acpl3::AspxQmfMultiEnvelopeChannel {
+            q_high: &q_high_l,
+            sbg_sig_borders,
+            sbg_noise_borders,
+        };
+        let ch1 = crate::encoder_acpl3::AspxQmfMultiEnvelopeChannel {
+            q_high: &q_high_r,
+            sbg_sig_borders,
+            sbg_noise_borders,
+        };
+        let rows = crate::encoder_acpl3::build_aspx_multi_envelope_2ch_from_qmf(
+            &ch0,
+            &ch1,
+            num_env,
+            aspx_cfg.quant_mode_env,
+            64,
+            num_ts_in_ats,
+            aspx_frame_ts_count,
+            sbx,
+            // I-frame: no inter-frame TIME-direction history.
+            crate::encoder_acpl3::AspxMultiEnvelopePrevLast::default(),
+            crate::encoder_acpl3::AspxMultiEnvelopePrevLast::default(),
+            1,
+            false,
+        );
+        (num_env, rows)
+    }
+
+    /// Shared body for the multi-envelope real-ASPX ACPL_3 entry points.
+    /// Mirrors [`Self::encode_frame_pcm_5_x_acpl3_real_aspx_with_max_sfb`]
+    /// but probes the L / R HF energy for a transient and, when one is
+    /// present, routes the substream through the round-299 multi-envelope
+    /// `aspx_data_2ch()` body
+    /// ([`crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_multi_env`]).
+    /// Stationary frames (or a config that rejects `num_env > 1`) fall back
+    /// to the single-envelope path, so the output is always a valid
+    /// ASPX_ACPL_3 frame.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_frame_pcm_5_x_acpl3_real_aspx_multi_env_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_lfe: Option<u32>,
+        alpha_scale: f32,
+        beta_scale: f32,
+        gamma_scale: f32,
+        beta3_scale: f32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl3_real_aspx_multi_env: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(lfe_buf) = lfe {
+            assert_eq!(
+                lfe_buf.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl3_real_aspx_multi_env: LFE input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // Probe for a transient and build the multi-envelope rows. A
+        // stationary frame returns num_env = 1, in which case we delegate
+        // to the single-envelope path (which carries the FIXFIX num_env==1
+        // Fine clamp the multi-envelope writer does not apply).
+        let (num_env, rows) =
+            self.extract_aspx_lr_multi_env(&aspx_cfg, frame_len, frames[0], frames[1]);
+        if num_env <= 1 {
+            return self.encode_frame_pcm_5_x_acpl3_real_aspx_with_max_sfb(
+                frames,
+                lfe,
+                max_sfb,
+                max_sfb_lfe,
+                alpha_scale,
+                beta_scale,
+                gamma_scale,
+                beta3_scale,
+            );
+        }
+
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        if lfe.is_some() {
+            self.channel_mode_value = 0b1110;
+            self.channel_mode_bits = 4;
+        } else {
+            self.channel_mode_value = 0b1101;
+            self.channel_mode_bits = 4;
+        }
+
+        let n_channels = if lfe.is_some() { 6 } else { 5 };
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+        let coeffs_lfe: Option<Vec<f32>> =
+            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
+
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_qm0 = crate::acpl::AcplQuantMode::Fine;
+        let acpl_qm1 = crate::acpl::AcplQuantMode::Fine;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let body =
+            crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_multi_env(
+                frame_len,
+                max_sfb,
+                max_sfb_lfe,
+                self.b_iframe_global,
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                Some(&coeffs_per_channel[2]),
+                Some(&coeffs_per_channel[3]),
+                Some(&coeffs_per_channel[4]),
+                coeffs_lfe.as_deref(),
+                &aspx_cfg,
+                num_env,
+                &rows,
+                acpl_num_param_bands_id,
+                acpl_qm0,
+                acpl_qm1,
+                alpha_scale,
+                beta_scale,
+                gamma_scale,
+                beta3_scale,
+                pad_target_bytes,
+            );
+
+        // The multi-envelope body builder returns an empty Vec if the
+        // writer rejected the config / num_env; fall back in that case.
+        if body.is_empty() {
+            self.channel_mode_value = saved_mode.0;
+            self.channel_mode_bits = saved_mode.1;
+            return self.encode_frame_pcm_5_x_acpl3_real_aspx_with_max_sfb(
+                frames,
+                lfe,
+                max_sfb,
+                max_sfb_lfe,
+                alpha_scale,
+                beta_scale,
+                gamma_scale,
+                beta3_scale,
+            );
+        }
+
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
     }
 
     /// Encode one IMS v2 5.0 frame in 5_X_codec_mode = ASPX_ACPL_2 per

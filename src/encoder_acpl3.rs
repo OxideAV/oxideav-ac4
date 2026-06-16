@@ -2571,6 +2571,243 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     bytes
 }
 
+/// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx`]
+/// but with the I-frame `aspx_data_2ch()` element carrying a **real
+/// multi-envelope** SIGNAL / NOISE payload (`num_env > 1`) for the L / R
+/// carriers via [`write_aspx_data_2ch_multi_envelope`] instead of the
+/// single-envelope [`write_aspx_data_2ch_real_envelope`].
+///
+/// This is the frame-path wiring of the round-299 multi-envelope
+/// `aspx_data_2ch()` writer and the round-316
+/// [`build_aspx_multi_envelope_2ch_from_qmf`] QMF→rows builder: the caller
+/// passes the per-channel [`AspxMultiEnvelopeChannel`] rows (one
+/// [`AspxEncodedEnvelope`] per envelope, each carrying its chosen FREQ /
+/// TIME DPCM direction) together with the frame's chosen FIXFIX `num_env`
+/// (a power of two in `2..=1 << fixfix_tmp_num_env_bits()`). Every other
+/// element (LFE, companding, split-MDCT stereo, the full real
+/// α / β / β₃ / γ₁..γ₆ A-CPL layers) is byte-for-byte identical to the
+/// round-322 single-envelope builder.
+///
+/// The decoder walks the same Table 25 ASPX_ACPL_3 body; the
+/// multi-envelope `aspx_data_2ch()` signals `tmp_num_env = log2(num_env)`
+/// in the FIXFIX `aspx_framing()` so the decoder derives `num_env`
+/// SIGNAL envelopes and `num_noise = 2` NOISE envelopes, then walks the
+/// per-envelope SIGNAL / NOISE ec_data. The body parses end-to-end
+/// through [`crate::asf::parse_aspx_data_2ch_body`] and synthesises
+/// 5-channel PCM. Per Table 52, with `num_env > 1` the FIXFIX
+/// `num_env == 1` → Fine quant clamp does **not** apply, so `cfg`'s
+/// `quant_mode_env` carries through unchanged.
+///
+/// Returns an empty `Vec` when [`write_aspx_data_2ch_multi_envelope`]
+/// rejects the config / `num_env` combination (caller should fall back to
+/// the single-envelope path); the substream is otherwise structurally
+/// identical to the round-322 builder.
+///
+/// Refs ETSI TS 103 190-1 §4.2.6.6 Table 25, §4.2.12.4 Table 52,
+/// §4.3.10.1.9 Table 123, §5.7.6.3.4 / §5.7.6.3.5 Pseudocodes 80–83.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_multi_env(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    aspx_num_env: u32,
+    aspx_rows: &AspxMultiEnvelope2chRows,
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    beta3_scale: f32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+
+    let alpha_q = extract_alpha_q_per_band_carrier_correlation(
+        coeffs_l,
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        alpha_scale,
+        acpl_qm0,
+    );
+    let beta1_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_l,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let beta2_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let (g1_q, g2_q) = if let Some(coeffs_ls_buf) = coeffs_ls {
+        extract_gamma_1_2_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_ls_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g3_q, g4_q) = if let Some(coeffs_rs_buf) = coeffs_rs {
+        extract_gamma_3_4_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_rs_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let (g5_q, g6_q) = if let Some(coeffs_c_buf) = coeffs_c {
+        extract_gamma_5_6_q_per_band_centre_least_squares(
+            coeffs_l,
+            coeffs_r,
+            coeffs_c_buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        )
+    } else {
+        (
+            vec![0i32; acpl_num_bands as usize],
+            vec![0i32; acpl_num_bands as usize],
+        )
+    };
+    let beta3_q = if let Some(coeffs_c_buf) = coeffs_c {
+        extract_beta3_q_per_band_centre_residual(
+            coeffs_l,
+            coeffs_r,
+            coeffs_c_buf,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
+            &g5_q,
+            &g6_q,
+            transform_length,
+            acpl_num_bands,
+            0,
+            beta3_scale,
+            acpl_qm1,
+            acpl_qm0,
+        )
+    } else {
+        vec![0i32; acpl_num_bands as usize]
+    };
+
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_3 (4) — 3 bits.
+    bw.write_u32(4, 3);
+
+    // I-frame block: aspx_config() (15 b) + acpl_config_2ch() (4 b).
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_2ch(&mut bw, acpl_num_param_bands_id, acpl_qm0, acpl_qm1);
+    }
+
+    // LFE: mono_data(b_lfe=1) when present.
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    // companding_control(2): sync=1, on=1, no avg.
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    // stereo_data(): split-MDCT L/R carriers.
+    write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+
+    // I-frame: multi-envelope real aspx_data_2ch() + acpl_data_2ch() with
+    // real α / β / β₃ / γ₁..γ₆.
+    if b_iframe {
+        if write_aspx_data_2ch_multi_envelope(
+            &mut bw,
+            aspx_cfg,
+            aspx_num_env,
+            AspxMultiEnvelopeChannel {
+                sig: &aspx_rows.ch0_sig,
+                noise: &aspx_rows.ch0_noise,
+            },
+            AspxMultiEnvelopeChannel {
+                sig: &aspx_rows.ch1_sig,
+                noise: &aspx_rows.ch1_noise,
+            },
+        )
+        .is_err()
+        {
+            // Config / num_env rejected — signal the caller to fall back.
+            return Vec::new();
+        }
+        write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
+            &mut bw,
+            acpl_num_bands,
+            acpl_qm0,
+            acpl_qm1,
+            &alpha_q,
+            &alpha_q,
+            &beta1_q,
+            &beta2_q,
+            &beta3_q,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
+            &g5_q,
+            &g6_q,
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 /// Transpose a `[ts][sb]` QMF analysis matrix (the row-per-time-slot
 /// shape [`crate::qmf::QmfAnalysisBank::process_block`] returns) into the
 /// `[absolute_sb][ts]` column-per-subband shape the round-240 energy

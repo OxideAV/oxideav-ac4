@@ -82,12 +82,16 @@ an S16 `AudioFrame`:
   (captured as raw bytes).
 - Some advanced A-CPL parameters (β3 / γ on certain encoder paths)
   remain scaffolded at minimum-bit-cost defaults.
-- The live real-ASPX frame path emits a single FIXFIX envelope
-  (`num_env = 1`); the multi-envelope QMF builders (`num_env > 1`
-  FIXFIX selection, FREQ/TIME DPCM per envelope) exist and round-trip
-  in isolation but are not yet wired into the frame emission. The
+- The live 5_X ASPX_ACPL_3 real-ASPX frame path now selects between a
+  single FIXFIX envelope and a `num_env = 2` multi-envelope body per
+  frame (`encode_frame_pcm_5_{0,1}_acpl3_real_aspx_multi_env` — the
+  encoder probes the L/R HF QMF energy for a transient and emits the
+  multi-envelope `aspx_data_2ch()` with per-envelope FREQ/TIME DPCM when
+  one is present, else falls back to the single-envelope path). The
   1-channel (`aspx_data_1ch`) real-envelope path and the 7.X layouts
-  also still write the scaffold on the live frame path.
+  still write the single-envelope scaffold on the live frame path, and
+  `num_env > 2` (requiring a wider `num_env_bits_fixfix`) is not yet
+  selected.
 
 ## Specs
 
