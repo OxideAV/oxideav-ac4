@@ -93,10 +93,17 @@ an S16 `AudioFrame`:
   (`encode_frame_pcm_5_{0,1}_acpl2_real_aspx`: QMF-analyses L/R **and** C,
   emitting real SIGNAL/NOISE envelopes on all three carriers via
   `write_aspx_data_1ch_real_envelope` + `write_aspx_data_2ch_real_envelope`).
-  The 7.X layouts still write the single-envelope scaffold on the live
-  frame path, the live `aspx_data_1ch()` path remains single-envelope
-  (`num_env = 1`), and `num_env > 2` (requiring a wider
-  `num_env_bits_fixfix`) is not yet selected.
+  The 7.X ASPX_ACPL_2 live frame path now also emits real single-envelope
+  ASPX on all three carriers — both carrier-pair `aspx_data_2ch()` elements
+  (L/R front, Ls/Rs surround) **and** the centre `aspx_data_1ch()`
+  (`encode_frame_pcm_7_{0,1}_acpl2_real_aspx` →
+  `build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx`). The
+  remaining 7.X paths (ASPX_ACPL_1 / ASPX_ACPL_3 / pure-ASPX) still write
+  the single-envelope scaffold on the live frame path, the live
+  `aspx_data_1ch()` path remains single-envelope (`num_env = 1`), and
+  multi-envelope (`num_env > 1`) is wired only on the 5.X ASPX_ACPL_3 live
+  path; `num_env > 2` (requiring a wider `num_env_bits_fixfix`) is not yet
+  selected.
 
 ## Specs
 
