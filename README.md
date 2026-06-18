@@ -88,10 +88,15 @@ an S16 `AudioFrame`:
   encoder probes the L/R HF QMF energy for a transient and emits the
   multi-envelope `aspx_data_2ch()` with per-envelope FREQ/TIME DPCM when
   one is present, else falls back to the single-envelope path). The
-  1-channel (`aspx_data_1ch`) real-envelope path and the 7.X layouts
-  still write the single-envelope scaffold on the live frame path, and
-  `num_env > 2` (requiring a wider `num_env_bits_fixfix`) is not yet
-  selected.
+  ASPX_ACPL_2 5.X live frame path now also emits a **real single-envelope
+  `aspx_data_1ch()`** for the centre carrier
+  (`encode_frame_pcm_5_{0,1}_acpl2_real_aspx`: QMF-analyses L/R **and** C,
+  emitting real SIGNAL/NOISE envelopes on all three carriers via
+  `write_aspx_data_1ch_real_envelope` + `write_aspx_data_2ch_real_envelope`).
+  The 7.X layouts still write the single-envelope scaffold on the live
+  frame path, the live `aspx_data_1ch()` path remains single-envelope
+  (`num_env = 1`), and `num_env > 2` (requiring a wider
+  `num_env_bits_fixfix`) is not yet selected.
 
 ## Specs
 

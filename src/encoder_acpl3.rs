@@ -5122,6 +5122,185 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
     bytes
 }
 
+/// 5_X SIMPLE/ASPX_ACPL_2 body with **real** ASPX SIGNAL / NOISE
+/// envelopes on both the L / R carrier pair (`aspx_data_2ch()`) and the
+/// centre carrier (`aspx_data_1ch()`), plus the real per-band α / β
+/// A-CPL parameters.
+///
+/// Identical framing to [`build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta`]
+/// except the I-frame's `aspx_data_2ch()` + `aspx_data_1ch()` elements
+/// carry caller-provided envelope quant-index vectors (via
+/// [`write_aspx_data_2ch_real_envelope`] / [`write_aspx_data_1ch_real_envelope`])
+/// instead of the round-95 minimum-bit-cost
+/// [`write_aspx_data_2ch_minimal`] / [`write_aspx_data_1ch_minimal`]
+/// scaffolds. The L / R / C SIGNAL + NOISE rows come from
+/// [`build_aspx_real_envelope_channel_from_qmf`] run over the input PCM.
+///
+/// `l_sig` / `l_noise` / `r_sig` / `r_noise` feed the two-channel
+/// element (channel 0 = L carrier, channel 1 = R carrier); `c_sig` /
+/// `c_noise` feed the single-channel centre element. Every other element
+/// (companding, split-MDCT stereo carriers, the centre `mono_data`, the
+/// two real-α/β `acpl_data_1ch()` parameter sets) stays byte-for-byte
+/// identical to the round-144 builder, so the round-trip continues to
+/// parse through [`crate::asf::parse_aspx_data_2ch_body`] +
+/// [`crate::asf::parse_aspx_data_1ch_body`] and synthesise 5-channel PCM.
+///
+/// Refs ETSI TS 103 190-1 §4.2.6.6 Table 25 (`case ASPX_ACPL_2:`),
+/// §4.2.12.3 Table 51 (`aspx_data_1ch()`), §4.2.12.4 Table 52
+/// (`aspx_data_2ch()`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
+    transform_length: u32,
+    max_sfb: u32,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    aspx_cfg: &aspx::AspxConfig,
+    l_sig: &[i32],
+    l_noise: &[i32],
+    r_sig: &[i32],
+    r_noise: &[i32],
+    c_sig: &[i32],
+    c_noise: &[i32],
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let start_band = 0u32;
+
+    // α / β extraction — identical to the round-144 real-α/β builder.
+    let (num_l, den_l) = compute_per_band_correlations(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    let (num_r, den_r) = compute_per_band_correlations(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    let alpha_l_real = analytic_alpha_per_band(&num_l, &den_l, acpl_quant_mode);
+    let alpha_r_real = analytic_alpha_per_band(&num_r, &den_r, acpl_quant_mode);
+    let alpha_l_q: Vec<i32> = alpha_l_real
+        .iter()
+        .map(|&a| quantise_alpha(a, acpl_quant_mode))
+        .collect();
+    let alpha_r_q: Vec<i32> = alpha_r_real
+        .iter()
+        .map(|&a| quantise_alpha(a, acpl_quant_mode))
+        .collect();
+
+    let (e_c_l, e_s_l) = compute_per_band_energies(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    let (e_c_r, e_s_r) = compute_per_band_energies(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+    );
+    let alpha_l_dq: Vec<f32> = alpha_l_q
+        .iter()
+        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
+        .collect();
+    let alpha_r_dq: Vec<f32> = alpha_r_q
+        .iter()
+        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
+        .collect();
+    let beta_l_real = analytic_beta_per_band(&e_c_l, &e_s_l, &alpha_l_dq, acpl_quant_mode);
+    let beta_r_real = analytic_beta_per_band(&e_c_r, &e_s_r, &alpha_r_dq, acpl_quant_mode);
+    let beta_l_q: Vec<i32> = beta_l_real
+        .iter()
+        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
+        .collect();
+    let beta_r_q: Vec<i32> = beta_r_real
+        .iter()
+        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
+        .collect();
+
+    let mut bw = BitWriter::new();
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_2 (3) — 3 bits.
+    bw.write_u32(3, 3);
+
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
+    }
+    write_companding_control_2ch_sync_on(&mut bw);
+    bw.write_bit(false); // coding_config = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    if b_iframe {
+        write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: l_sig,
+                noise: l_noise,
+            },
+            AspxRealEnvelopeChannel {
+                sig: r_sig,
+                noise: r_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: c_sig,
+                noise: c_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_l_q,
+            Some(&beta_l_q),
+        );
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_r_q,
+            Some(&beta_r_q),
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 // ====================================================================
 // ASPX_ACPL_1 emitters — §4.2.6.6 Table 25 row `case ASPX_ACPL_1:`
 // (round 103)

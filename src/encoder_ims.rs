@@ -3314,6 +3314,207 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// 5.0 SIMPLE/ASPX_ACPL_2 encode with a **real** ASPX SIGNAL / NOISE
+    /// envelope on both the L / R carrier pair (`aspx_data_2ch()`) and the
+    /// centre carrier (`aspx_data_1ch()`).
+    ///
+    /// This is the ACPL_2 counterpart to
+    /// [`Self::encode_frame_pcm_5_0_acpl3_real_aspx`]: where the round-322
+    /// ACPL_3 path wired the real-envelope writers into the carrier-pair
+    /// `aspx_data_2ch()` element only, the ACPL_2 body additionally carries
+    /// an `aspx_data_1ch()` element for the centre carrier. This method
+    /// QMF-analyses the L / R **and** C input PCM and emits real
+    /// `[F0, DF₁, …]` SIGNAL / NOISE envelopes on all three carriers via
+    /// [`crate::encoder_acpl3::write_aspx_data_2ch_real_envelope`] /
+    /// [`crate::encoder_acpl3::write_aspx_data_1ch_real_envelope`],
+    /// replacing the round-144 minimum-bit-cost scaffolds — closing the
+    /// README's "the 1-channel (`aspx_data_1ch`) real-envelope path … still
+    /// writes the single-envelope scaffold on the live frame path"
+    /// deferral. The real per-band α / β A-CPL parameters are unchanged
+    /// from [`Self::encode_frame_pcm_5_0_acpl2_real_alpha_beta`].
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs]` order. The output round-trips
+    /// through [`crate::decoder::Ac4Decoder`] to a 5-channel `AudioFrame`.
+    ///
+    /// Refs ETSI TS 103 190-1 §4.2.6.6 Table 25, §4.2.12.3 Table 51,
+    /// §4.2.12.4 Table 52, §5.7.6.3.4 / §5.7.6.3.5.
+    pub fn encode_frame_pcm_5_0_acpl2_real_aspx(&mut self, frames: &[&[f32]; 5]) -> Vec<u8> {
+        self.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_0_acpl2_real_aspx`].
+    pub fn encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_0_acpl2_real_aspx: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Force 5.0 channel_mode prefix '1101', 4 b → channel_mode 3.
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1101;
+        self.channel_mode_bits = 4;
+
+        let n_channels = 5;
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // Real ASPX envelope extraction over the L / R carrier pair …
+        let (l_sig, l_noise, r_sig, r_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
+        // … and the centre carrier (the ACPL_2 body's `aspx_data_1ch()`).
+        let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
+
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let body =
+            crate::encoder_acpl3::build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
+                frame_len,
+                max_sfb,
+                self.b_iframe_global,
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[2],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &aspx_cfg,
+                &l_sig,
+                &l_noise,
+                &r_sig,
+                &r_noise,
+                &c_sig,
+                &c_noise,
+                acpl_num_param_bands_id,
+                acpl_quant_mode,
+                pad_target_bytes,
+            );
+
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// 5.1 counterpart to [`Self::encode_frame_pcm_5_0_acpl2_real_aspx`].
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, LFE]` order. The LFE channel is
+    /// MDCT-analysed for state continuity but the ACPL_2 body reconstructs
+    /// the `.1` low-frequency element from the same scaffold as the
+    /// round-144 path; only the three ASPX carriers carry real envelopes.
+    pub fn encode_frame_pcm_5_1_acpl2_real_aspx(&mut self, frames: &[&[f32]; 6]) -> Vec<u8> {
+        // ACPL_2 reconstructs the surround pair from L/R + the parameter
+        // sets, so the body shape is independent of LFE — route the first
+        // five channels through the 5.0 path. (The dedicated `.1`
+        // low-frequency element on the ACPL_2 wire is unchanged from the
+        // round-144 builder, which the 5.0 path already emits.)
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_5_0_acpl2_real_aspx(&surround)
+    }
+
+    /// Derive the per-channel ASPX SIGNAL / NOISE envelope quant indices
+    /// for a single carrier (the ACPL_2 centre carrier's `aspx_data_1ch()`)
+    /// by running the QMF analysis bank over the input PCM and aggregating
+    /// the HF energy across the A-SPX subband-group borders.
+    ///
+    /// Mirrors the per-channel half of [`Self::extract_aspx_lr_envelopes`].
+    /// Returns `(sig, noise)` — each a `[F0, DF₁, …]` FREQ-DPCM
+    /// quant-index vector. Empty vectors when the frequency-table
+    /// derivation fails (the writer then falls back to its all-zero path).
+    fn extract_aspx_mono_envelope(
+        &mut self,
+        aspx_cfg: &crate::aspx::AspxConfig,
+        frame_len: u32,
+        pcm: &[f32],
+    ) -> (Vec<i32>, Vec<i32>) {
+        let empty = || (Vec::new(), Vec::new());
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return empty();
+        };
+        let num_ts_in_ats = crate::aspx::num_ts_in_ats(frame_len);
+        let aspx_frame_ts_count = crate::aspx::num_aspx_timeslots(frame_len);
+        if num_ts_in_ats == 0 || aspx_frame_ts_count == 0 {
+            return empty();
+        }
+        let sbg_sig_borders = &tables.sbg_sig_highres;
+        let sbg_noise_borders = &tables.sbg_noise;
+        let sbx = tables.sbx;
+
+        let n_slots = pcm.len() / 64;
+        if n_slots == 0 {
+            return empty();
+        }
+        let usable = n_slots * 64;
+        let mut bank = crate::qmf::QmfAnalysisBank::new();
+        let slots = bank.process_block(&pcm[..usable]);
+        let q_high = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
+
+        let ch = crate::encoder_acpl3::AspxQmfEnvelopeChannel {
+            q_high: &q_high,
+            sbg_sig_borders,
+            sbg_noise_borders,
+        };
+        crate::encoder_acpl3::build_aspx_real_envelope_channel_from_qmf(
+            &ch,
+            aspx_cfg.quant_mode_env,
+            64,
+            num_ts_in_ats,
+            aspx_frame_ts_count,
+            sbx,
+        )
+    }
+
     /// Encode one IMS v2 frame containing a 5.0 SIMPLE/ASPX_ACPL_1
     /// multichannel substream per ETSI TS 103 190-1 §4.2.6.6 Table 25 row
     /// `case ASPX_ACPL_1:` (Pseudocode 117).
