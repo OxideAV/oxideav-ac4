@@ -1217,6 +1217,143 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Encode one IMS v2 7.0 (3/4/0) **pure-ASPX** (`7_X_codec_mode = ASPX`)
+    /// frame per ETSI TS 103 190-1 §4.2.6.14 Table 33 row `case ASPX:`.
+    ///
+    /// The ASPX counterpart of [`Self::encode_frame_pcm_7_0`]: the same
+    /// `five_channel_data()` (L/R/C/Ls/Rs) + additional `two_channel_data()`
+    /// (Lb/Rb) carrier body, but `7_X_codec_mode = ASPX` and the body
+    /// carries the **four** ASPX trailers the decoder walks for ASPX mode —
+    /// `aspx_data_2ch()` (L/R) + `aspx_data_2ch()` (Ls/Rs) + `aspx_data_1ch()`
+    /// (centre) + the extra `aspx_data_2ch()` for the **back pair Lb/Rb**
+    /// (Table 202 x3/x4; carried independently because pure-ASPX mode has no
+    /// A-CPL coupling). The encoder QMF-analyses all seven input carriers
+    /// and emits real SIGNAL/NOISE envelopes on each.
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb]` order; the output
+    /// round-trips through [`crate::decoder::Ac4Decoder`] to a 7-channel
+    /// `AudioFrame`.
+    pub fn encode_frame_pcm_7_0_aspx_real_aspx(&mut self, frames: &[&[f32]; 7]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_aspx_real_aspx_with_max_sfb(frames, 40, 40)
+    }
+
+    /// `max_sfb` / `max_sfb_add`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_0_aspx_real_aspx`].
+    pub fn encode_frame_pcm_7_0_aspx_real_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 7],
+        max_sfb: u32,
+        max_sfb_add: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_0_aspx_real_aspx: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        let max_sfb_add = max_sfb_add.min(n_msfb_cap);
+
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = 0b1111000;
+        self.channel_mode_bits = 7;
+
+        while self.mdct_states_multi.len() < 7 {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(7);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // Real ASPX envelope extraction over all four ASPX elements: L/R
+        // front pair, Ls/Rs surround pair, centre carrier, and the back
+        // pair Lb/Rb.
+        let (l_sig, l_noise, r_sig, r_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
+        let (ls_sig, ls_noise, rs_sig, rs_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[3], frames[4]);
+        let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
+        let (lb_sig, lb_noise, rb_sig, rb_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[5], frames[6]);
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 12288,
+            41..=50 => 24576,
+            _ => 32767,
+        };
+
+        let body = crate::encoder_asf::build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
+            frame_len,
+            max_sfb,
+            max_sfb_add,
+            self.b_iframe_global,
+            &[
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[2],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
+            ],
+            &aspx_cfg,
+            &l_sig,
+            &l_noise,
+            &r_sig,
+            &r_noise,
+            &ls_sig,
+            &ls_noise,
+            &rs_sig,
+            &rs_noise,
+            &c_sig,
+            &c_noise,
+            &lb_sig,
+            &lb_noise,
+            &rb_sig,
+            &rb_noise,
+            pad_target_bytes,
+        );
+
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
     /// Encode one IMS v2 7.1 (3/4/0.1) frame from float PCM input per ETSI
     /// TS 103 190-1 §4.2.6.14 Table 33 + §4.2.7.5 Table 29
     /// (`five_channel_data()`) + §4.2.7.4 Table 26 (`two_channel_data()`),

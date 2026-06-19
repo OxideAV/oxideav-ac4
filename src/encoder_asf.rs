@@ -2234,6 +2234,258 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     bytes
 }
 
+/// Build a 7.0 (3/4/0) **pure-ASPX** (`7_X_codec_mode = ASPX`) substream
+/// body per ETSI TS 103 190-1 §4.2.6.14 Table 33 row `case ASPX:`.
+///
+/// Structurally this is [`build_7_0_simple_asf_body_from_pcm_spectra`] with
+/// the ASPX-mode additions per Table 33:
+///
+/// 1. `7_X_codec_mode` is **1** (ASPX) rather than 0 (SIMPLE).
+/// 2. An I-frame `aspx_config()` (15 b) follows the codec-mode field
+///    (`if (b_iframe && 7_X_codec_mode != SIMPLE) aspx_config()`).
+/// 3. After the additional-channel `two_channel_data()` (Lb/Rb), the body
+///    carries the **four** ASPX trailers the decoder's
+///    [`crate::mch::parse_7x_audio_data_outer`] walks for `mode == ASPX`:
+///    `aspx_data_2ch()` (L/R front pair) + `aspx_data_2ch()` (Ls/Rs
+///    surround pair) + `aspx_data_1ch()` (centre) — the `7_X_codec_mode !=
+///    SIMPLE` block — followed by the extra `aspx_data_2ch()` (the back
+///    pair **Lb/Rb**) — the `7_X_codec_mode == ASPX` block. Per Table 202
+///    (7_X_channel_element A-CPL mapping) the 3/4/0.x back pair Lb/Rb maps
+///    to A-CPL variables x3/x4 and, in pure-ASPX mode (no A-CPL coupling),
+///    is carried as an independent `two_channel_data()` with its own
+///    `aspx_data_2ch()` HF-reconstruction envelope.
+///
+/// Every front/surround/back carrier is still coded with identity SAP
+/// (`b_use_sap_add_ch = 0`) so the decoder routes Lb/Rb directly into
+/// output slots 5/6 (Table 183 row "3/4/0.x" identity path). The four ASPX
+/// envelope vectors are caller-provided (from
+/// [`crate::encoder_acpl3::build_aspx_real_envelope_channel_from_qmf`] run
+/// over the input PCM).
+///
+/// `coeffs_per_channel` is in `[L, R, C, Ls, Rs, Lb, Rb]` order.
+///
+/// Refs ETSI TS 103 190-1 §4.2.6.14 Table 33 (`case ASPX:`), Table 202,
+/// §4.2.12.3 Table 51 (`aspx_data_1ch()`), §4.2.12.4 Table 52
+/// (`aspx_data_2ch()`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_add: u32,
+    b_iframe: bool,
+    coeffs_per_channel: &[&[f32]; 7],
+    aspx_cfg: &crate::aspx::AspxConfig,
+    l_sig: &[i32],
+    l_noise: &[i32],
+    r_sig: &[i32],
+    r_noise: &[i32],
+    ls_sig: &[i32],
+    ls_noise: &[i32],
+    rs_sig: &[i32],
+    rs_noise: &[i32],
+    c_sig: &[i32],
+    c_noise: &[i32],
+    lb_sig: &[i32],
+    lb_noise: &[i32],
+    rb_sig: &[i32],
+    rb_noise: &[i32],
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    use crate::encoder_acpl3::{
+        write_aspx_config, write_aspx_data_1ch_real_envelope, write_aspx_data_2ch_real_envelope,
+        AspxRealEnvelopeChannel,
+    };
+
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+
+    type SevenZeroChannelAnalysis = (Vec<i32>, Vec<i32>, Vec<u32>, AsfSections, Option<Vec<i32>>);
+    let prepare_channel = |coeffs: &[f32], max_sfb_use: u32| -> SevenZeroChannelAnalysis {
+        let local_end = sfbo[max_sfb_use as usize] as usize;
+        let mut qspec = vec![0i32; local_end];
+        let mut sf_per_band = vec![100i32; max_sfb_use as usize];
+        let mut max_quant_idx = vec![0u32; max_sfb_use as usize];
+        let mut natural_q_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb_use as usize);
+        for sfb in 0..max_sfb_use as usize {
+            let a = sfbo[sfb] as usize;
+            let b = sfbo[sfb + 1] as usize;
+            let band = &coeffs[a..b.min(coeffs.len())];
+            let (_cb_picked, sf, q, _cost) = pick_best_codebook_for_band(band);
+            sf_per_band[sfb] = sf;
+            let mut max_q: u32 = 0;
+            for (i, &qi) in q.iter().enumerate() {
+                qspec[a + i] = qi;
+                max_q = max_q.max(qi.unsigned_abs());
+            }
+            max_quant_idx[sfb] = max_q;
+            natural_q_per_band.push(q);
+        }
+        let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
+        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
+        let snf = compute_snf_dpcm_for_zero_quant_bands(
+            coeffs,
+            sfbo,
+            max_sfb_use,
+            &sections.sfb_cb,
+            &max_quant_idx,
+        );
+        (qspec, sf_per_band, max_quant_idx, sections, snf)
+    };
+
+    let analyses_five: [SevenZeroChannelAnalysis; 5] = [
+        prepare_channel(coeffs_per_channel[0], max_sfb),
+        prepare_channel(coeffs_per_channel[1], max_sfb),
+        prepare_channel(coeffs_per_channel[2], max_sfb),
+        prepare_channel(coeffs_per_channel[3], max_sfb),
+        prepare_channel(coeffs_per_channel[4], max_sfb),
+    ];
+    let analyses_add: [SevenZeroChannelAnalysis; 2] = [
+        prepare_channel(coeffs_per_channel[5], max_sfb_add),
+        prepare_channel(coeffs_per_channel[6], max_sfb_add),
+    ];
+
+    let mut bw = BitWriter::new();
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_codec_mode = ASPX (1) — 2 bits.
+    bw.write_u32(1, 2);
+
+    // I-frame block: `if (7_X_codec_mode != SIMPLE) aspx_config()`.
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+    }
+
+    // 7.X ASPX skips companding_control (only ASPX_ACPL_{1,2} get it).
+    // coding_config = Cfg3Five (3) — 2 bits.
+    bw.write_u32(3, 2);
+
+    let (n_msfb_bits, _, _) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+
+    // five_channel_data() per Table 29.
+    bw.write_bit(true);
+    bw.write_u32(max_sfb, n_msfb_bits);
+    bw.write_u32(0, 4);
+    for _ in 0..5 {
+        bw.write_u32(0, 2);
+    }
+    for analysis in &analyses_five {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb,
+        );
+    }
+
+    // 7.X SIMPLE/ASPX additional-channel block: b_use_sap_add_ch = 0 →
+    // identity SAP, then `two_channel_data()` for Lb/Rb.
+    bw.write_bit(false);
+    bw.write_bit(true); // b_long_frame = 1
+    bw.write_u32(max_sfb_add, n_msfb_bits);
+    bw.write_u32(0, 2); // chparam_info(): identity SAP
+    for analysis in &analyses_add {
+        let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
+        write_section_data(&mut bw, sections);
+        write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
+        write_scalefac_data(
+            &mut bw,
+            sf_per_band,
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_add,
+        );
+        write_snf_data(
+            &mut bw,
+            snf.as_deref(),
+            &sections.sfb_cb,
+            max_quant_idx,
+            max_sfb_add,
+        );
+    }
+
+    // ASPX trailers per Table 33: the `7_X_codec_mode != SIMPLE` block
+    // (aspx_data_2ch L/R + aspx_data_2ch Ls/Rs + aspx_data_1ch centre)
+    // followed by the `7_X_codec_mode == ASPX` block (extra aspx_data_2ch
+    // for the back pair Lb/Rb).
+    if b_iframe {
+        write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: l_sig,
+                noise: l_noise,
+            },
+            AspxRealEnvelopeChannel {
+                sig: r_sig,
+                noise: r_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: ls_sig,
+                noise: ls_noise,
+            },
+            AspxRealEnvelopeChannel {
+                sig: rs_sig,
+                noise: rs_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: c_sig,
+                noise: c_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        // Extra aspx_data_2ch() — the back pair Lb/Rb (Table 202 x3/x4).
+        write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: lb_sig,
+                noise: lb_noise,
+            },
+            AspxRealEnvelopeChannel {
+                sig: rb_sig,
+                noise: rb_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 /// Build a 7.1 (3/4/0.1) SIMPLE/Cfg3Five substream body — extends
 /// [`build_5_1_simple_asf_body_from_pcm_spectra`] for the immersive
 /// 7.X channel-element shell per ETSI TS 103 190-1 §4.2.6.14 Table 33.
