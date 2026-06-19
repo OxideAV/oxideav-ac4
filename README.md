@@ -47,6 +47,21 @@ an S16 `AudioFrame`:
 - **A-CPL** channel-pair coupling — ASPX_ACPL_1 / _2 (Pseudocode 117)
   and ASPX_ACPL_3 (Pseudocode 118) synthesis producing 5-channel
   L/R/C/Ls/Rs PCM, plus the 7.X (7.0 / 7.1) walker.
+- **A-JOC** (Advanced Joint Object Coding, TS 103 190-2 §5.7 + §6.2.5 /
+  §6.3.6) — the `ajoc` module lands the bit-exact parameter-processing
+  core: the §5.7.3.1 Table 42 QMF-subband → parameter-band mapping
+  (`sb_to_pb`, all eight `ajoc_num_bands` configs) + Table 100 band-code
+  resolution, the §5.7.3.2 Table 43 differential decoder (DIFF_FREQ /
+  DIFF_TIME / sparse-absent), the §5.7.3.3 Tables 44-47 uniform
+  dequantizers (validated against the documented dry ±5,0048828 / wet
+  ±2,001953125 endpoints), the §5.7.3.4 Table 48 linear-ramp time
+  interpolator, and the §5.7.3.6 Table 49 dry + wet matrix
+  reconstruction (`reconstruct`). The Huffman-independent §6.2.5
+  config-layer parsers (`ajoc_ctrl_info`, `ajoc_data_point_info`,
+  `ajoc_bed_info`, `ajoc_dmx_de_data` with the Table 106
+  `de_dlg_dmx_coeff` prefix code) walk the side-information. The
+  per-codeword `ajoc_huff_data()` decode is blocked on the missing
+  `AJOC_HCB_*` codebook arrays (see "Not yet supported").
 - **SSF** front-end — the §5.2.8 arithmetic decoder + Annex C scalar
   inventory + 37 prediction-coefficient matrices, the bitstream walker,
   the §5.2.3–5.2.7 PCM synthesis chain, and §5.2.5.2.2 heuristic
@@ -77,6 +92,17 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
+- **A-JOC per-codeword Huffman decode** (`ajoc_huff_data()`, §6.2.5.5) —
+  blocked on a docs gap: the twelve `AJOC_HCB_*` Huffman `_LEN` / `_CW`
+  arrays (Annex A.1.1 Tables A.1-A.12) are named in the spec with their
+  `codebook_length` / `cb_off` metadata, but the actual codeword and
+  length values are not listed in the TS 103 190-2 PDF and are not in
+  the part-1 accompaniment table file (which carries only the part-1
+  ASF / DRC / DE codebooks). The `ajoc` module's differential decoder
+  consumes those deltas directly the moment the arrays are supplied; the
+  full end-to-end A-JOC object decode also needs the surrounding
+  immersive / OAMD substream machinery (`audio_data_ajoc()`,
+  `oamd_dyndata_single()`, `var_channel_element()`).
 - TS 103 190-2 multi-stream / immersive / object-based (IFM) extensions.
 - Per-`emdf_payload_id` semantic interpretation of EMDF payload bodies
   (captured as raw bytes).
