@@ -4933,6 +4933,247 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Multi-envelope centre-carrier variant of
+    /// [`Self::encode_frame_pcm_7_0_acpl2_real_aspx`] — the 7_X dual of
+    /// [`Self::encode_frame_pcm_5_0_acpl2_real_aspx_centre_multi_env`].
+    /// Probes the centre carrier for a transient and, when one is present,
+    /// emits a multi-envelope centre `aspx_data_1ch()` (`num_env > 1`) via
+    /// [`crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_multi_env`].
+    /// Both carrier pairs (L/R front, Ls/Rs surround) keep their
+    /// single-envelope `aspx_data_2ch()`. Stationary centre carriers fall
+    /// back to the round-337 single-envelope path.
+    ///
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb]` order.
+    pub fn encode_frame_pcm_7_0_acpl2_real_aspx_centre_multi_env(
+        &mut self,
+        frames: &[&[f32]; 7],
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env_with_max_sfb(
+            &surround, None, 40, None, 0b1111000, 7,
+        )
+    }
+
+    /// 7.1 counterpart to
+    /// [`Self::encode_frame_pcm_7_0_acpl2_real_aspx_centre_multi_env`].
+    /// `frames` is in `[L, R, C, Ls, Rs, Lb, Rb, LFE]` order.
+    pub fn encode_frame_pcm_7_1_acpl2_real_aspx_centre_multi_env(
+        &mut self,
+        frames: &[&[f32]; 8],
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env_with_max_sfb(
+            &surround,
+            Some(frames[7]),
+            40,
+            Some(7),
+            0b1111001,
+            7,
+        )
+    }
+
+    /// Shared body for the 7_X ASPX_ACPL_2 centre-multi-envelope entry
+    /// points. `surround` is `[L, R, C, Ls, Rs]`; the back pair Lb/Rb is
+    /// reconstructed at decode time from the A-CPL coupling (Table 202), so
+    /// it carries no carrier here. A stationary centre carrier — or a config
+    /// the multi-envelope writer rejects — falls back to the round-337
+    /// single-envelope 7_X path, so the output is always a valid frame.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env_with_max_sfb(
+        &mut self,
+        surround: &[&[f32]; 5],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_lfe: Option<u32>,
+        channel_mode_value: u8,
+        channel_mode_bits: u8,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in surround.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(lfe_buf) = lfe {
+            assert_eq!(
+                lfe_buf.len(),
+                frame_len as usize,
+                "encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env: LFE input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+
+        // Probe the centre carrier (surround[2]) for a transient.
+        let (c_num_env, c_sig_rows, c_noise_rows) =
+            self.extract_aspx_mono_multi_env(&aspx_cfg, frame_len, surround[2]);
+        if c_num_env <= 1 {
+            return self.fallback_7_x_acpl2_real_aspx_single_env(
+                surround,
+                lfe,
+                max_sfb,
+                max_sfb_lfe,
+            );
+        }
+
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = channel_mode_value;
+        self.channel_mode_bits = channel_mode_bits;
+
+        let n_channels = if lfe.is_some() { 6 } else { 5 };
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in surround.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+        let coeffs_lfe: Option<Vec<f32>> =
+            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
+
+        // L/R front + Ls/Rs surround stay single-envelope.
+        let (l_sig, l_noise, r_sig, r_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, surround[0], surround[1]);
+        let (ls_sig, ls_noise, rs_sig, rs_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, surround[3], surround[4]);
+
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 12288,
+            41..=50 => 24576,
+            _ => 32767,
+        };
+
+        let centre = crate::encoder_acpl3::AspxMultiEnvelopeChannel {
+            sig: &c_sig_rows,
+            noise: &c_noise_rows,
+        };
+        let body =
+            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_multi_env(
+                frame_len,
+                max_sfb,
+                max_sfb_lfe,
+                self.b_iframe_global,
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &coeffs_per_channel[2],
+                coeffs_lfe.as_deref(),
+                &aspx_cfg,
+                &l_sig,
+                &l_noise,
+                &r_sig,
+                &r_noise,
+                &ls_sig,
+                &ls_noise,
+                &rs_sig,
+                &rs_noise,
+                c_num_env,
+                centre,
+                acpl_num_param_bands_id,
+                acpl_quant_mode,
+                pad_target_bytes,
+            );
+
+        if body.is_empty() {
+            self.channel_mode_value = saved_mode.0;
+            self.channel_mode_bits = saved_mode.1;
+            return self.fallback_7_x_acpl2_real_aspx_single_env(
+                surround,
+                lfe,
+                max_sfb,
+                max_sfb_lfe,
+            );
+        }
+
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Single-envelope fallback shared by the 7_X centre-multi-env entry
+    /// points. Routes through the round-337 single-envelope 7_X path, which
+    /// expects `[L, R, C, Ls, Rs, Lb, Rb(, LFE)]` — the back pair carries no
+    /// carrier under ASPX_ACPL_2 (Table 202), so it is filled with the
+    /// centre buffer (any value works: the decoder reconstructs Lb/Rb from
+    /// the A-CPL coupling, never from these slots).
+    fn fallback_7_x_acpl2_real_aspx_single_env(
+        &mut self,
+        surround: &[&[f32]; 5],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_lfe: Option<u32>,
+    ) -> Vec<u8> {
+        let c = surround[2];
+        match lfe {
+            Some(lfe_buf) => {
+                let frames: [&[f32]; 8] = [
+                    surround[0],
+                    surround[1],
+                    surround[2],
+                    surround[3],
+                    surround[4],
+                    c,
+                    c,
+                    lfe_buf,
+                ];
+                self.encode_frame_pcm_7_1_acpl2_real_aspx_with_max_sfb(
+                    &frames,
+                    max_sfb,
+                    max_sfb_lfe.unwrap_or(7),
+                )
+            }
+            None => {
+                let frames: [&[f32]; 7] = [
+                    surround[0],
+                    surround[1],
+                    surround[2],
+                    surround[3],
+                    surround[4],
+                    c,
+                    c,
+                ];
+                self.encode_frame_pcm_7_0_acpl2_real_aspx_with_max_sfb(&frames, max_sfb)
+            }
+        }
+    }
+
     /// 7.1 (3/4/0.1) counterpart to
     /// [`Self::encode_frame_pcm_7_0_acpl2_real_aspx`]. Emits the identical
     /// 7_X ASPX_ACPL_2 real-α/β + real-ASPX body plus a leading LFE

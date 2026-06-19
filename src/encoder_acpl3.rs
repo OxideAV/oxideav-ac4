@@ -8243,6 +8243,183 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
     bytes
 }
 
+/// Multi-envelope **centre-carrier** variant of
+/// [`build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx`] — the
+/// 7_X dual of
+/// [`build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_multi_env`].
+///
+/// The 7_X ASPX_ACPL_2 body carries three A-SPX trailers — `aspx_data_2ch()`
+/// for the L / R front pair, `aspx_data_2ch()` for the Ls / Rs surround
+/// pair, and `aspx_data_1ch()` for the centre carrier. This variant emits a
+/// **multi-envelope** `aspx_data_1ch()` (`num_env > 1`) for the centre via
+/// [`write_aspx_data_1ch_multi_envelope`] when the caller's transient probe
+/// selected `num_env > 1`; both carrier pairs retain their single-envelope
+/// `aspx_data_2ch()` (the decoder reads `num_env` independently per A-SPX
+/// element).
+///
+/// `c_num_env` must be a power of two within the config's FIXFIX capacity,
+/// and `centre` carries the per-envelope SIGNAL / NOISE DPCM rows from
+/// [`build_aspx_multi_envelope_channel_from_qmf`]. Returns an **empty
+/// `Vec`** when [`write_aspx_data_1ch_multi_envelope`] rejects the config /
+/// `num_env`, so the caller can fall back to the single-envelope builder.
+/// Every other element is byte-for-byte identical to the single-envelope
+/// 7_X builder.
+///
+/// Refs ETSI TS 103 190-1 §4.2.6.14 Table 33 (`case ASPX_ACPL_2:`),
+/// §4.2.12.3 Table 51 (`aspx_data_1ch()`), §4.3.10.4.11 (`aspx_num_env`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_multi_env(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    l_sig: &[i32],
+    l_noise: &[i32],
+    r_sig: &[i32],
+    r_noise: &[i32],
+    ls_sig: &[i32],
+    ls_noise: &[i32],
+    rs_sig: &[i32],
+    rs_noise: &[i32],
+    c_num_env: u32,
+    centre: AspxMultiEnvelopeChannel<'_>,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let start_band = 0u32;
+
+    let alpha_l_q = extract_alpha_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let alpha_r_q = extract_alpha_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let beta_l_q = extract_beta_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_l_q,
+        acpl_quant_mode,
+    );
+    let beta_r_q = extract_beta_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_r_q,
+        acpl_quant_mode,
+    );
+
+    let mut bw = BitWriter::new();
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_codec_mode = ASPX_ACPL_2 (3) — 2 bits.
+    bw.write_u32(3, 2);
+
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
+    }
+
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    bw.write_u32(0, 2); // coding_config = 0
+    bw.write_bit(false); // b_2ch_mode = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
+
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    if b_iframe {
+        write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: l_sig,
+                noise: l_noise,
+            },
+            AspxRealEnvelopeChannel {
+                sig: r_sig,
+                noise: r_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            aspx_cfg,
+            AspxRealEnvelopeChannel {
+                sig: ls_sig,
+                noise: ls_noise,
+            },
+            AspxRealEnvelopeChannel {
+                sig: rs_sig,
+                noise: rs_noise,
+            },
+        )
+        .expect("encoder: aspx config invalid");
+        // Multi-envelope centre `aspx_data_1ch()`. A rejection signals the
+        // caller to fall back to the single-envelope 7_X builder.
+        if write_aspx_data_1ch_multi_envelope(&mut bw, aspx_cfg, c_num_env, centre).is_err() {
+            return Vec::new();
+        }
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_l_q,
+            Some(&beta_l_q),
+        );
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_r_q,
+            Some(&beta_r_q),
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 // ====================================================================
 // 7_X ASPX_ACPL_1 emitter — §4.2.6.14 Table 33 row `case ASPX_ACPL_1:`
 // (round 118)
