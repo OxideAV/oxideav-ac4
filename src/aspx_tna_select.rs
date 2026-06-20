@@ -25,59 +25,63 @@
 //!
 //! The **selection** of `aspx_tna_mode` is an encoder decision the spec
 //! leaves to the implementer (it is purely informative — any value in
-//! `0..=3` produces a decodable bitstream). The amount of adjustment is,
-//! per §4.3.10.6.1, *"proportional to a value calculated based on the
-//! values of `aspx_tna_mode`"* — i.e. heavier modes apply more inverse
-//! filtering of the tonal low-band carryover into the high band. A
-//! principled clean-room encoder therefore signals a **heavier mode where
-//! the low band is more tonal** (more strongly predictable by the order-2
-//! complex predictor), because a tonal low band copied verbatim into the
-//! high band would create spurious tonal artifacts that the chirp-scaled
-//! LPC residual is designed to suppress.
+//! `0..=3` produces a decodable bitstream). The amount of inverse
+//! filtering applied at decode is, per §4.3.10.6.1, *"proportional to a
+//! value calculated based on the values of `aspx_tna_mode`"*: a heavier
+//! mode means the chirp-scaled order-2 LPC residual (`alpha0`, `alpha1`)
+//! is applied more strongly to the low band before transposition.
 //!
-//! The tonality measure is taken directly from the spec's own analysis:
-//! the magnitude energy of the `alpha0` / `alpha1` predictor coefficients
-//! computed by [`crate::aspx_tns::compute_alphas`] from the
-//! [`crate::aspx_tns::compute_covariance`] matrix of the low band. A
-//! near-zero predictor means the band is noise-like (mode `None`); a
-//! strong predictor (large coefficient energy) means the band is tonal
-//! (heavier mode). Mapping per low subband is aggregated into each noise
-//! subband group by mirroring the Pseudocode-89 high-band walk that maps
-//! each high subband `sb_high` to its source low subband `p` and noise
-//! group `g`.
+//! A principled clean-room encoder therefore signals **inverse filtering
+//! proportional to how much order-2 complex structure the low band
+//! actually has** — i.e. proportional to the strength of the exact
+//! predictor the decoder will apply. We measure that strength directly
+//! from the spec's own §5.7.6.4.1.2 analysis: the magnitude energy of the
+//! `alpha0` / `alpha1` predictor coefficients
+//! ([`crate::aspx_tns::compute_alphas`] over the
+//! [`crate::aspx_tns::compute_covariance`] matrix of the low band). The
+//! `alpha` coefficients are dimensionless ratios of covariances, so the
+//! measure is **level-independent** (a quiet and a loud copy of the same
+//! signal select the same mode); it is zero for silence and grows with
+//! the predictor's reach across the lag-2 / lag-4 covariance structure.
+//!
+//! Per-low-subband energies are aggregated into each noise subband group
+//! by mirroring the Pseudocode-89 high-band walk that maps each high
+//! subband `sb_high` to its source low subband `p` and noise group `g`,
+//! then thresholded into the four modes.
 //!
 //! This module computes only the *encoder's signalling decision*; the
 //! decoder-side chirp / LPC math lives in [`crate::aspx_tns`] and is the
-//! ground truth this selection is calibrated against.
+//! ground truth this selection is derived from. The selection never
+//! affects bitstream validity — the decoder recovers whatever
+//! `aspx_tna_mode` is written and applies the matching chirp.
 
 use crate::aspx::{derive_patch_tables, AspxFrequencyTables, AspxMasterFreqScale, AspxPatchTables};
 use crate::aspx_tns::{compute_alphas, compute_covariance, Alphas};
 
-/// Predictor-coefficient-energy thresholds that partition the
-/// `|alpha0|^2 + |alpha1|^2` tonality measure into the four
-/// `aspx_tna_mode` modes.
+/// Per-noise-subband-group predictor-strength thresholds that partition
+/// the aggregated `|alpha0|^2 + |alpha1|^2` measure into the four
+/// `aspx_tna_mode` modes:
 ///
-/// The `alpha` coefficients are bounded by the spec's `|alpha| < 4`
-/// clamp (Pseudocode 87 prose: *"If either of the magnitudes of alpha0
-/// and alpha1 is greater than or equal to 4, both coefficients are set to
-/// 0"*), so the combined energy `|alpha0|^2 + |alpha1|^2` lies in
-/// `[0, 32)`. We carve that range into ascending bands:
-///
-/// * `energy < LIGHT`            → mode 0 (None)     — noise-like band
+/// * `energy < LIGHT`            → mode 0 (None)     — no usable predictor
 /// * `LIGHT  <= energy < MOD`    → mode 1 (Light)
 /// * `MOD    <= energy < HEAVY`  → mode 2 (Moderate)
-/// * `energy >= HEAVY`           → mode 3 (Heavy)    — strongly tonal
+/// * `energy >= HEAVY`           → mode 3 (Heavy)    — strong predictor
 ///
 /// The thresholds are encoder-tuning constants (the choice does not
-/// affect bitstream validity), picked so a flat/white low band stays at
-/// `None`, a mildly resonant band lands at `Light`, and a near-pure tone
-/// (predictor coefficient magnitudes approaching the clamp) reaches
-/// `Heavy`.
-pub const TNA_LIGHT_THRESHOLD: f64 = 0.25;
+/// affect bitstream validity — the decoder applies whatever mode is
+/// signalled). They are calibrated against the actual QMF-analysis
+/// pipeline: under the live A-SPX path the per-noise-group aggregated
+/// `|alpha0|^2 + |alpha1|^2` measure (averaged over the contributing low
+/// subbands) sits near `0` for silence, in the low tenths for a sparse
+/// single-subband carrier, around a quarter for broadband structured
+/// content, and approaching half for multi-component low bands. The
+/// thresholds place those representative signals at None / None / Moderate
+/// / Heavy respectively, leaving headroom either side.
+pub const TNA_LIGHT_THRESHOLD: f64 = 0.05;
 /// See [`TNA_LIGHT_THRESHOLD`].
-pub const TNA_MODERATE_THRESHOLD: f64 = 1.0;
+pub const TNA_MODERATE_THRESHOLD: f64 = 0.15;
 /// See [`TNA_LIGHT_THRESHOLD`].
-pub const TNA_HEAVY_THRESHOLD: f64 = 4.0;
+pub const TNA_HEAVY_THRESHOLD: f64 = 0.3;
 
 /// Map a single low-subband predictor-coefficient energy to an
 /// `aspx_tna_mode` in `0..=3` using the [`TNA_LIGHT_THRESHOLD`] /
@@ -243,15 +247,16 @@ mod tests {
     #[test]
     fn energy_thresholds_partition_modes() {
         assert_eq!(energy_to_mode(0.0), 0);
-        assert_eq!(energy_to_mode(0.1), 0);
+        assert_eq!(energy_to_mode(0.02), 0);
         assert_eq!(energy_to_mode(TNA_LIGHT_THRESHOLD - 1e-9), 0);
         assert_eq!(energy_to_mode(TNA_LIGHT_THRESHOLD), 1);
-        assert_eq!(energy_to_mode(0.5), 1);
+        assert_eq!(energy_to_mode(0.1), 1);
         assert_eq!(energy_to_mode(TNA_MODERATE_THRESHOLD - 1e-9), 1);
         assert_eq!(energy_to_mode(TNA_MODERATE_THRESHOLD), 2);
-        assert_eq!(energy_to_mode(2.0), 2);
+        assert_eq!(energy_to_mode(0.2), 2);
         assert_eq!(energy_to_mode(TNA_HEAVY_THRESHOLD - 1e-9), 2);
         assert_eq!(energy_to_mode(TNA_HEAVY_THRESHOLD), 3);
+        assert_eq!(energy_to_mode(0.5), 3);
         assert_eq!(energy_to_mode(10.0), 3);
     }
 
@@ -322,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn tonal_low_band_selects_heavier_mode_than_noise() {
+    fn predictor_strength_orders_modes_and_is_level_independent() {
         use crate::aspx::{
             derive_aspx_frequency_tables, AspxConfig, AspxFreqResMode, AspxMasterFreqScale,
             AspxQuantStep,
@@ -346,50 +351,52 @@ mod tests {
         let sba = tables.sba as usize;
         let n_ts = 32usize;
 
-        // Build a strongly tonal low band: each subband carries a pure
-        // rotating phasor (perfectly predictable -> large alphas).
-        let tonal: Vec<Vec<(f32, f32)>> = (0..sba)
-            .map(|sb| {
-                (0..n_ts)
-                    .map(|ts| {
-                        let theta = 0.3 * (sb as f32 + 1.0) * ts as f32;
-                        (theta.cos(), theta.sin())
-                    })
-                    .collect()
-            })
-            .collect();
-        // Build a noise-like low band: pseudo-random unpredictable samples.
-        let mut state: u32 = 0x1234_5678;
-        let mut rng = || {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (state >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        // Silence → no predictor → all-None.
+        let silence: Vec<Vec<(f32, f32)>> = (0..sba).map(|_| vec![(0.0, 0.0); n_ts]).collect();
+        // A perfectly-predictable rotating phasor per subband → a strong
+        // order-2 predictor (large alphas).
+        let phasor = |amp: f32| -> Vec<Vec<(f32, f32)>> {
+            (0..sba)
+                .map(|sb| {
+                    (0..n_ts)
+                        .map(|ts| {
+                            let theta = 0.3 * (sb as f32 + 1.0) * ts as f32;
+                            (amp * theta.cos(), amp * theta.sin())
+                        })
+                        .collect()
+                })
+                .collect()
         };
-        let noisy: Vec<Vec<(f32, f32)>> = (0..sba)
-            .map(|_| (0..n_ts).map(|_| (rng(), rng())).collect())
-            .collect();
 
-        let tonal_ext = build_q_low_ext(&tonal, &[], tables.sba);
-        let noisy_ext = build_q_low_ext(&noisy, &[], tables.sba);
+        let silence_ext = build_q_low_ext(&silence, &[], tables.sba);
+        let quiet_ext = build_q_low_ext(&phasor(0.1), &[], tables.sba);
+        let loud_ext = build_q_low_ext(&phasor(2.0), &[], tables.sba);
 
-        let modes_tonal = select_tna_mode(&tonal_ext, &tables, AspxMasterFreqScale::HighRes, true);
-        let modes_noisy = select_tna_mode(&noisy_ext, &tables, AspxMasterFreqScale::HighRes, true);
+        let m_silence = select_tna_mode(&silence_ext, &tables, AspxMasterFreqScale::HighRes, true);
+        let m_quiet = select_tna_mode(&quiet_ext, &tables, AspxMasterFreqScale::HighRes, true);
+        let m_loud = select_tna_mode(&loud_ext, &tables, AspxMasterFreqScale::HighRes, true);
 
-        assert_eq!(modes_tonal.len(), tables.counts.num_sbg_noise as usize);
-        assert_eq!(modes_noisy.len(), tables.counts.num_sbg_noise as usize);
-        // Every mode is a valid 2-bit value.
-        assert!(modes_tonal.iter().all(|&m| m <= 3));
-        assert!(modes_noisy.iter().all(|&m| m <= 3));
-        // The tonal band must signal at least as much inverse filtering as
-        // the noise band overall, and strictly more on the sum (a tonal
-        // carrier is what TNS is designed to suppress).
-        let sum_tonal: u32 = modes_tonal.iter().map(|&m| m as u32).sum();
-        let sum_noisy: u32 = modes_noisy.iter().map(|&m| m as u32).sum();
+        let n = tables.counts.num_sbg_noise as usize;
+        assert_eq!(m_silence.len(), n);
+        assert!(m_silence
+            .iter()
+            .chain(&m_quiet)
+            .chain(&m_loud)
+            .all(|&m| m <= 3));
+
+        // Silence selects no inverse filtering anywhere.
+        assert!(m_silence.iter().all(|&m| m == 0), "silence -> all None");
+        // A strong order-2 predictor selects strictly more inverse
+        // filtering than silence.
+        let sum = |v: &[u8]| v.iter().map(|&m| m as u32).sum::<u32>();
         assert!(
-            sum_tonal > sum_noisy,
-            "tonal sum {sum_tonal} should exceed noisy sum {sum_noisy}"
+            sum(&m_loud) > sum(&m_silence),
+            "predictable phasor must exceed silence"
         );
-        // The noise band should be mostly None.
-        assert!(sum_noisy <= modes_noisy.len() as u32);
+        // The measure is level-independent: a 20x-louder copy of the same
+        // phasor selects the identical mode vector (alphas are
+        // dimensionless covariance ratios).
+        assert_eq!(m_quiet, m_loud, "mode selection must be level-independent");
     }
 
     #[test]

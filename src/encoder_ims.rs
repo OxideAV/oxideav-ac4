@@ -2782,6 +2782,11 @@ impl Ac4ImsEncoder {
         let (l_sig, l_noise, r_sig, r_noise) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
 
+        // Encoder-side A-SPX inverse-filtering decision for the L carrier
+        // (mirrored to R under aspx_balance = 1). Heavier where the low
+        // band is more tonal (§4.3.10.6.1 / §5.7.6.4.1.3).
+        let aspx_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_qm0 = crate::acpl::AcplQuantMode::Fine;
         let acpl_qm1 = crate::acpl::AcplQuantMode::Fine;
@@ -2794,7 +2799,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx(
+            crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna(
                 frame_len,
                 max_sfb,
                 max_sfb_lfe,
@@ -2810,6 +2815,7 @@ impl Ac4ImsEncoder {
                 &l_noise,
                 &r_sig,
                 &r_noise,
+                &aspx_tna_mode,
                 acpl_num_param_bands_id,
                 acpl_qm0,
                 acpl_qm1,
@@ -2908,6 +2914,50 @@ impl Ac4ImsEncoder {
             sbx,
         );
         (l_sig, l_noise, r_sig, r_noise)
+    }
+
+    /// Compute the per-noise-subband-group `aspx_tna_mode` inverse-
+    /// filtering vector for the L carrier from its QMF low band, per
+    /// ETSI TS 103 190-1 §4.3.10.6.1 (selection) + §5.7.6.4.1.2-3 (the
+    /// tonality analysis it is calibrated against).
+    ///
+    /// Returns an empty vector when the A-SPX frequency tables cannot be
+    /// derived or the carrier is too short to QMF-analyse (the caller then
+    /// emits the all-zero scaffold). Under `aspx_balance = 1` the R carrier
+    /// mirrors this vector, so a single L-derived `tna_mode` suffices.
+    fn extract_aspx_l_tna_mode(
+        &mut self,
+        aspx_cfg: &crate::aspx::AspxConfig,
+        pcm_l: &[f32],
+    ) -> Vec<u8> {
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return Vec::new();
+        };
+        let n_slots = pcm_l.len() / 64;
+        if n_slots == 0 || tables.sba == 0 {
+            return Vec::new();
+        }
+        let usable = n_slots * 64;
+        let mut bank = crate::qmf::QmfAnalysisBank::new();
+        let slots = bank.process_block(&pcm_l[..usable]);
+        let q_sb_major = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
+        // Take the low band (subbands 0..sba) and build the extended
+        // low-band matrix the covariance analysis consumes.
+        let sba = tables.sba as usize;
+        let q_low: Vec<Vec<(f32, f32)>> = q_sb_major
+            .iter()
+            .take(sba)
+            .map(|row| row.to_vec())
+            .collect();
+        let q_low_ext = crate::aspx_tns::build_q_low_ext(&q_low, &[], tables.sba);
+        // 48 kHz family is the only base_samp_freq wired in this path
+        // (matching extract_aspx_lr_envelopes / the decoder call site).
+        crate::aspx_tna_select::select_tna_mode(
+            &q_low_ext,
+            &tables,
+            aspx_cfg.master_freq_scale,
+            true,
+        )
     }
 
     /// Multi-envelope counterpart to [`Self::extract_aspx_lr_envelopes`].

@@ -2398,6 +2398,75 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     beta3_scale: f32,
     pad_target_bytes: usize,
 ) -> Vec<u8> {
+    // Delegate with an empty tna_mode → all-zero `aspx_hfgen_iwc_2ch`,
+    // reproducing the historical (round-285/322) body byte-for-byte.
+    build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna(
+        transform_length,
+        max_sfb,
+        max_sfb_lfe,
+        b_iframe,
+        coeffs_l,
+        coeffs_r,
+        coeffs_c,
+        coeffs_ls,
+        coeffs_rs,
+        coeffs_lfe,
+        aspx_cfg,
+        aspx_l_sig,
+        aspx_l_noise,
+        aspx_r_sig,
+        aspx_r_noise,
+        &[],
+        acpl_num_param_bands_id,
+        acpl_qm0,
+        acpl_qm1,
+        alpha_scale,
+        beta_scale,
+        gamma_scale,
+        beta3_scale,
+        pad_target_bytes,
+    )
+}
+
+/// `aspx_tna_mode`-carrying variant of
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx`].
+///
+/// Identical except the I-frame `aspx_data_2ch()` element is emitted via
+/// [`write_aspx_data_2ch_real_envelope_tna`] with the caller-supplied
+/// per-noise-subband-group `tna_mode` vector (signalled once on channel 0
+/// and mirrored to channel 1 by `aspx_balance = 1`). An empty / all-zero
+/// `tna_mode` reproduces the non-tna builder byte-for-byte.
+///
+/// The `tna_mode` is the encoder's §4.3.10.6.1 inverse-filtering decision
+/// — typically produced by [`crate::aspx_tna_select::select_tna_mode`]
+/// from the L-carrier QMF low band.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    aspx_l_sig: &[i32],
+    aspx_l_noise: &[i32],
+    aspx_r_sig: &[i32],
+    aspx_r_noise: &[i32],
+    aspx_tna_mode: &[u8],
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    beta3_scale: f32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
 
     let alpha_q = extract_alpha_q_per_band_carrier_correlation(
@@ -2528,7 +2597,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     // I-frame: real-envelope aspx_data_2ch() + acpl_data_2ch() with real
     // α / β / β₃ / γ₁..γ₆.
     if b_iframe {
-        write_aspx_data_2ch_real_envelope(
+        write_aspx_data_2ch_real_envelope_tna(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -2539,6 +2608,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
                 sig: aspx_r_sig,
                 noise: aspx_r_noise,
             },
+            aspx_tna_mode,
         )
         .expect("encoder: aspx config invalid");
         write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(

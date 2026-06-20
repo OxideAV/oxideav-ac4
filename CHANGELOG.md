@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 351 — **encoder-side `aspx_tna_mode` selection** (A-SPX
+  inverse-filtering, ETSI TS 103 190-1 §4.3.10.6.1 Table 131 — None /
+  Light / Moderate / Heavy) wired into the live 5_X ASPX_ACPL_3 frame
+  path, replacing the all-zero `aspx_hfgen_iwc` inverse-filtering
+  scaffold. The spec leaves the selection informative (any value 0..=3
+  decodes), so the new `aspx_tna_select` module grounds it in the spec's
+  own §5.7.6.4.1.2 analysis: a **level-independent predictor-strength**
+  measure — the magnitude energy `|alpha0|² + |alpha1|²` of the order-2
+  complex LPC coefficients the decoder itself computes
+  (`compute_covariance` / `compute_alphas`), aggregated per noise subband
+  group by mirroring the Pseudocode-89 high-band walk (`sb_high → source
+  low subband p → noise group g`) and thresholded into the four modes.
+  Because the `alpha` coefficients are dimensionless covariance ratios the
+  measure is level-independent (a quiet and a loud copy of the same signal
+  select the same mode) and zero for silence. Lands: `aspx_tna_select`
+  (`predictor_energy`, `aggregate_noise_group_energy`, `energy_to_mode`,
+  `select_tna_mode_from_qmf` / `select_tna_mode`); the `_tna` real-envelope
+  body writers (`write_aspx_data_{1,2}ch_real_envelope_tna`) routing the
+  tna_mode through the round-306 `write_aspx_hfgen_iwc_{1,2}ch` writers
+  (2ch uses `aspx_balance = 1` so channel 0's modes mirror to channel 1);
+  the `build_5_x_acpl3_body_..._real_aspx_tna` body builder; and the live
+  `Ac4ImsEncoder::extract_aspx_l_tna_mode` driving the 5_X ACPL_3 path. An
+  empty / all-zero `tna_mode` reproduces the historical body byte-for-byte
+  (preserving the round-322/327 round-trips). 10 unit tests (threshold
+  partition, monotonicity, predictor-energy math, patch→noise-group walk,
+  degenerate groups, level-independence, writer byte-equivalence + decoder
+  round-trip for both 1ch/2ch) + 4 integration tests
+  (`tests/round351_aspx_tna_mode.rs`: live 5.0 round-trip, selection
+  sanity incl. silence→None + level-independence, tna-reaches-the-wire +
+  `parse_aspx_hfgen_iwc_2ch` recovery, determinism). **Note:** the
+  threshold mapping is an encoder tuning choice calibrated to the live QMF
+  pipeline, not yet tuned against a perceptual reference; `add_harmonic` /
+  `fic_used_in_sfb` / `tic_used_in_slot` remain scaffolded
 - ac4 round 347 — **A-JOC spatial reconstruction** (TS 103 190-2 §5.7.3.5 + §5.7.3.6 Table 49): the new `ajoc_reconstruct` driver closes the A-JOC decode chain end-to-end, transforming the `num_dmx` jointly-coded downmix QMF objects into the `num_umx` reconstructed output objects `z[ts][sb][o]`. Lands (1) `pre_matrix_param` — the §5.7.3.6.2 decorrelation-input pre-matrix `D[de][ch] = Σ_o |mtx_wet_dq[o][de]|·mtx_dry_dq[o][ch]` (= `|Csub2'^T|×Csub1`), accumulated per data point per Table 49's first loop; (2) `decorr_module_for` — the §5.7.3.5 cyclic 0,2,1,0,2,1,0 mapping from the `ajoc_num_decorr` A-JOC decorrelator indices onto the three physical part-1 §5.7.7.4.2 decorrelator modules, reusing `acpl_synth::InputSignalModifier` (no new decorrelator math); (3) `AjocReconState` — persistent per-track linear-ramp interpolators (dry `[o][ch][sb]` / wet `[o][de][sb]` / pre `[de][ch][sb]`) plus the per-decorrelator history banks, carried across AC-4 frames; (4) the full Table 49 `(ts, sb)`-grid driver: interpolate the dry/wet/pre tracks (ungrouping parameter bands to QMF subbands via `sb_to_pb`), form the decorrelator inputs `u = Σ_ch mtx_pre·x`, decorrelate `y = ajoc_decorrelate(u)`, then reconstruct `z[o] = Σ_ch x·mtx_dry + Σ_de y·mtx_wet` gated by `ajoc_object_present[o]`, with the end-of-time-slot ramp reset at each `ajoc_start_pos`. Five new unit tests pin the cyclic decorrelator mapping, the pre-matrix sum-over-objects, the dry-only interpolated-coefficient passthrough (incl. the documented Table-48 one-extra-increment plateau), the absent-object zeroing, and the wet-path decorrelator-tail energy injection. The upstream `ajoc_huff_data()` codeword decode that produces the quantised matrices remains the only A-JOC docs gap (twelve `AJOC_HCB_*` `_LEN`/`_CW` arrays still absent from the part-2 PDF + part-1 table file)
 
 - ac4 round 343 — first A-JOC (Advanced Joint Object Coding, TS 103 190-2 §5.7 + §6.2.5 / §6.3.6) **decode** landing: a new `ajoc` module implementing the fully-specified, bit-exact parameter-processing core that is independent of the per-codeword Huffman tables. Lands the §5.7.3.1 Table 42 QMF-subband → A-JOC-parameter-band mapping (`sb_to_pb`) for all eight `ajoc_num_bands` configurations (23/15/12/9/7/5/3/1) + Table 100 `ajoc_num_bands_code` resolution; the §5.7.3.2 Table 43 differential decoder (`differential_decode_dry`/`_wet` — DIFF_FREQ running modulo-`nquant` sum, DIFF_TIME per-band add to the previous frame's quantised values via `AjocDiffState`, and the `ajoc_sparse_select` zero-centre default); the §5.7.3.3 Tables 44-47 uniform dequantizers (`dequantize_dry`/`_wet`, validated bit-exactly against the documented dry ±5,0048828 / wet ±2,001953125 endpoints); the §5.7.3.4 Table 48 linear-ramp time interpolator (`AjocInterpolator::step`/`end_of_slot`); and the §5.7.3.6 Table 49 dry + wet matrix signal reconstruction (`reconstruct_dry`/`reconstruct`). Adds the Huffman-independent §6.2.5 config-layer parsers (`parse_ajoc_ctrl_info`, `parse_ajoc_data_point_info`, `parse_ajoc_bed_info`, `parse_ajoc_dmx_de_data` with the §6.3.6.6.4 Table 106 `de_dlg_dmx_coeff` prefix code + the §6.3.6.6.3 `dlg_obj()` helper). 19 module unit tests pin the table endpoints, mapping completeness, differential / interpolation / reconstruction math, and the config parsers. **Docs gap:** the `ajoc_huff_data()` codeword decode (§6.2.5.5) is blocked — the twelve `AJOC_HCB_*` `_LEN` / `_CW` Huffman arrays (Annex A.1.1 Tables A.1-A.12) are named with `codebook_length` / `cb_off` metadata but their codeword / length values are absent from both the part-2 PDF and the part-1 accompaniment table file; the differential decoder consumes those deltas directly once the arrays are supplied

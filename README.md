@@ -43,7 +43,16 @@ an S16 `AudioFrame`:
   IMDCT (`mdct`) with overlap-add.
 - **A-SPX** bandwidth extension — `aspx_config()` / `companding_control`
   parse, the FIXFIX / FIXVAR / VARFIX / VARVAR ATSG border derivation,
-  envelope / noise / tone payload decode, and QMF analysis/synthesis.
+  envelope / noise / tone payload decode, QMF analysis/synthesis, and the
+  §5.7.6.4.1.2–4 temporal-noise-shaping chirp / order-2 LPC inverse
+  filtering driven by `aspx_tna_mode`. The encoder now **selects** a real
+  per-noise-subband-group `aspx_tna_mode` (§4.3.10.6.1 None / Light /
+  Moderate / Heavy) from the carrier's QMF low band — a level-independent
+  predictor-strength measure (`|alpha0|² + |alpha1|²` from the decoder's
+  own `compute_covariance` / `compute_alphas`, aggregated per noise group
+  via the Pseudocode-89 high-band walk) — and wires it into the live 5_X
+  ASPX_ACPL_3 frame path (`aspx_tna_select` + the `_tna` body writers),
+  replacing the all-zero inverse-filtering scaffold.
 - **A-CPL** channel-pair coupling — ASPX_ACPL_1 / _2 (Pseudocode 117)
   and ASPX_ACPL_3 (Pseudocode 118) synthesis producing 5-channel
   L/R/C/Ls/Rs PCM, plus the 7.X (7.0 / 7.1) walker.
@@ -119,6 +128,15 @@ an S16 `AudioFrame`:
   (captured as raw bytes).
 - Some advanced A-CPL parameters (β3 / γ on certain encoder paths)
   remain scaffolded at minimum-bit-cost defaults.
+- **A-SPX `aspx_hfgen_iwc` sub-fields:** the live 5_X ASPX_ACPL_3 path now
+  emits a real `aspx_tna_mode` (inverse filtering), but `add_harmonic` /
+  `fic_used_in_sfb` / `tic_used_in_slot` remain at the all-zero scaffold
+  on every live path, and the real-`aspx_tna_mode` selection is wired only
+  into the 5_X ASPX_ACPL_3 frame path so far (the `_tna` body / writer
+  variants exist for the other paths but aren't yet driven by the live
+  encoders). The `aspx_tna_mode` threshold mapping is an encoder tuning
+  choice (the spec leaves the selection informative); it is calibrated to
+  the live QMF pipeline but not yet tuned against a perceptual reference.
 - The live 5_X ASPX_ACPL_3 real-ASPX frame path now selects between a
   single FIXFIX envelope and a `num_env = 2` multi-envelope body per
   frame (`encode_frame_pcm_5_{0,1}_acpl3_real_aspx_multi_env` — the
