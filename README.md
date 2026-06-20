@@ -56,11 +56,22 @@ an S16 `AudioFrame`:
   dequantizers (validated against the documented dry ±5,0048828 / wet
   ±2,001953125 endpoints), the §5.7.3.4 Table 48 linear-ramp time
   interpolator, and the §5.7.3.6 Table 49 dry + wet matrix
-  reconstruction (`reconstruct`). The Huffman-independent §6.2.5
-  config-layer parsers (`ajoc_ctrl_info`, `ajoc_data_point_info`,
+  reconstruction (`reconstruct`). The **full §5.7.3.6 spatial
+  reconstruction** (`ajoc_reconstruct`) closes the A-JOC decode chain
+  end-to-end: it accumulates the §5.7.3.6.2 decorrelation-input
+  pre-matrix `D[de][ch] = Σ_o |wet[o][de]|·dry[o][ch]`
+  (`pre_matrix_param`), walks the `(ts, sb)` QMF grid interpolating the
+  dry / wet / pre tracks (per-track interpolators carried across frames
+  in `AjocReconState`), forms the decorrelator inputs `u = pre · x`,
+  decorrelates them with the §5.7.3.5 cyclic-0,2,1 decorrelator bank
+  (reusing the part-1 §5.7.7.4.2 `InputSignalModifier`), and sums the dry
+  (`x · mtx_dry`) + wet (`y · mtx_wet`) contributions into the
+  reconstructed output objects `z[ts][sb][o]`. The Huffman-independent
+  §6.2.5 config-layer parsers (`ajoc_ctrl_info`, `ajoc_data_point_info`,
   `ajoc_bed_info`, `ajoc_dmx_de_data` with the Table 106
   `de_dlg_dmx_coeff` prefix code) walk the side-information. The
-  per-codeword `ajoc_huff_data()` decode is blocked on the missing
+  per-codeword `ajoc_huff_data()` decode that feeds the dequantized
+  matrices into `ajoc_reconstruct` is blocked on the missing
   `AJOC_HCB_*` codebook arrays (see "Not yet supported").
 - **SSF** front-end — the §5.2.8 arithmetic decoder + Annex C scalar
   inventory + 37 prediction-coefficient matrices, the bitstream walker,

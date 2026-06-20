@@ -47,6 +47,22 @@
 //!   structured in [`reconstruct`] and gated behind the supplied
 //!   decorrelator output matrices.
 //!
+//! * **Full spatial reconstruction** (§5.7.3.5 + §5.7.3.6 Table 49) —
+//!   [`ajoc_reconstruct`] is the complete Table 49 driver: it accumulates
+//!   the §5.7.3.6.2 decorrelation-input pre-matrix
+//!   `D[de][ch] = Σ_o |mtx_wet_dq[o][de]| · mtx_dry_dq[o][ch]`
+//!   ([`pre_matrix_param`]), then walks the `(ts, sb)` grid interpolating
+//!   the dry / wet / pre tracks (per-track [`AjocInterpolator`] carried
+//!   across frames in [`AjocReconState`]), forms the decorrelator inputs
+//!   `u = pre · x`, decorrelates them with the §5.7.3.5 cyclic-0,2,1
+//!   decorrelator bank (reusing the part-1 §5.7.7.4.2
+//!   [`crate::acpl_synth::InputSignalModifier`]), and sums the dry
+//!   (`x · mtx_dry`) + wet (`y · mtx_wet`) contributions into the
+//!   reconstructed output objects `z[ts][sb][o]`. This closes the A-JOC
+//!   decode chain from dequantized matrices to output QMF objects; what
+//!   remains upstream is the per-codeword `ajoc_huff_data()` decode (see
+//!   the docs gap below) that produces those quantised matrices.
+//!
 //! Config-layer bitstream parsers ([`parse_ajoc_ctrl_info`],
 //! [`parse_ajoc_data_point_info`], [`parse_ajoc_bed_info`],
 //! [`parse_ajoc_dmx_de_data`], [`AjocCtrlInfo`]) walk the §6.2.5
@@ -503,6 +519,350 @@ pub fn reconstruct(
     let dry: f64 = mtx_dry.iter().zip(x.iter()).map(|(&m, &xc)| m * xc).sum();
     let wet: f64 = mtx_wet.iter().zip(y.iter()).map(|(&m, &yd)| m * yd).sum();
     dry + wet
+}
+
+// ---------------------------------------------------------------------
+// §5.7.3.6 Table 49 — full A-JOC spatial reconstruction driver
+// ---------------------------------------------------------------------
+
+use crate::acpl_synth::{DecorrelatorId, InputSignalModifier};
+
+/// A complex QMF sample `(re, im)`.
+pub type Cplx = (f64, f64);
+
+/// Per-data-point dequantized A-JOC reconstruction matrices for one AC-4
+/// frame, addressed in parameter-band space (the output of differential
+/// decode + dequantize, §5.7.3.2 / §5.7.3.3 — *before* the ts/sb
+/// interpolation + ungrouping done by [`ajoc_reconstruct`]).
+///
+/// The dimensions follow the Table 49 NOTE: `dry_dq[o][dp][ch][pb]` and
+/// `wet_dq[o][dp][de][pb]`. `num_bands[o]` may differ per object, but
+/// every row is sized to that object's `ajoc_num_bands[o]`.
+#[derive(Clone, Debug, Default)]
+pub struct AjocDequantMatrices {
+    /// `mtx_dry_dq[o][dp][ch][pb]`.
+    pub dry_dq: Vec<Vec<Vec<Vec<f64>>>>,
+    /// `mtx_wet_dq[o][dp][de][pb]`.
+    pub wet_dq: Vec<Vec<Vec<Vec<f64>>>>,
+    /// `ajoc_num_bands[o]` for each output object.
+    pub num_bands: Vec<u32>,
+}
+
+/// Geometry of one A-JOC reconstruction call.
+#[derive(Clone, Copy, Debug)]
+pub struct AjocGeometry {
+    /// `num_dmx_signals` — number of jointly-coded downmix input objects.
+    pub num_dmx: usize,
+    /// `num_umx_signals` — number of reconstructed output objects.
+    pub num_umx: usize,
+    /// `ajoc_num_decorr` — number of parallel decorrelator instances.
+    pub num_decorr: usize,
+    /// `num_qmf_timeslots` for this frame.
+    pub num_timeslots: usize,
+    /// `num_qmf_subbands` (64 in AC-4 A-JOC).
+    pub num_subbands: usize,
+}
+
+/// Map an A-JOC decorrelator index `de` to one of the three physical
+/// decorrelator modules per §5.7.3.5: the three available decorrelators
+/// are used cyclically `0, 2, 1, 0, 2, 1, 0` as `de` increases.
+pub fn decorr_module_for(de: usize) -> DecorrelatorId {
+    match de % 3 {
+        0 => DecorrelatorId::D0,
+        1 => DecorrelatorId::D2,
+        _ => DecorrelatorId::D1,
+    }
+}
+
+/// Persistent A-JOC reconstruction state carried across AC-4 frames: the
+/// per-track linear-ramp interpolators for the dry / wet / pre matrices,
+/// plus the `ajoc_num_decorr` decorrelator history banks.
+///
+/// Track layout (matching the Table 49 NOTE dimensions, addressed in
+/// QMF-subband space because interpolation runs per `(ts, sb)`):
+/// * `dry[o][ch][sb]`, `wet[o][de][sb]`, `pre[de][ch][sb]`.
+#[derive(Clone, Debug)]
+pub struct AjocReconState {
+    dry: Vec<Vec<Vec<AjocInterpolator>>>,
+    wet: Vec<Vec<Vec<AjocInterpolator>>>,
+    pre: Vec<Vec<Vec<AjocInterpolator>>>,
+    decorr: Vec<InputSignalModifier>,
+    geom: (usize, usize, usize, usize),
+}
+
+impl AjocReconState {
+    /// Allocate fresh reconstruction state for the given geometry. All
+    /// interpolators start at 0 (matching the spec's `*_prev` arrays,
+    /// which are zero on the first frame) and the decorrelator histories
+    /// are empty.
+    pub fn new(geom: &AjocGeometry) -> Self {
+        let mk = || AjocInterpolator::new(0.0);
+        let dry = (0..geom.num_umx)
+            .map(|_| {
+                (0..geom.num_dmx)
+                    .map(|_| (0..geom.num_subbands).map(|_| mk()).collect())
+                    .collect()
+            })
+            .collect();
+        let wet = (0..geom.num_umx)
+            .map(|_| {
+                (0..geom.num_decorr)
+                    .map(|_| (0..geom.num_subbands).map(|_| mk()).collect())
+                    .collect()
+            })
+            .collect();
+        let pre = (0..geom.num_decorr)
+            .map(|_| {
+                (0..geom.num_dmx)
+                    .map(|_| (0..geom.num_subbands).map(|_| mk()).collect())
+                    .collect()
+            })
+            .collect();
+        let decorr = (0..geom.num_decorr)
+            .map(|de| InputSignalModifier::new(decorr_module_for(de)))
+            .collect();
+        AjocReconState {
+            dry,
+            wet,
+            pre,
+            decorr,
+            geom: (
+                geom.num_dmx,
+                geom.num_umx,
+                geom.num_decorr,
+                geom.num_subbands,
+            ),
+        }
+    }
+}
+
+/// Compute the §5.7.3.6.2 decorrelation-input pre-matrix parameters
+/// `mtx_pre_param[de][ch][pb]` from the dequantized dry / wet matrices,
+/// per the first loop of Table 49:
+///
+/// `mtx_pre_param[pb][de][ch] += |mtx_wet_dq[o][de][pb]| * mtx_dry_dq[o][ch][pb]`
+///
+/// summed over the output objects `o` (= `|Csub2'^T| × Csub1`,
+/// §5.7.3.6.2). The result is addressed `[de][ch][pb]` with `pb`
+/// running over `num_bands` (the maximum band count across objects;
+/// objects with fewer bands contribute only to their own range).
+fn pre_matrix_param(
+    matrices: &AjocDequantMatrices,
+    dp: usize,
+    geom: &AjocGeometry,
+    num_bands: usize,
+) -> Vec<Vec<Vec<f64>>> {
+    let mut pre = vec![vec![vec![0.0f64; num_bands]; geom.num_dmx]; geom.num_decorr];
+    for o in 0..geom.num_umx {
+        let nb = matrices.num_bands.get(o).copied().unwrap_or(0) as usize;
+        let dry_o = match matrices.dry_dq.get(o).and_then(|d| d.get(dp)) {
+            Some(d) => d,
+            None => continue,
+        };
+        let wet_o = match matrices.wet_dq.get(o).and_then(|w| w.get(dp)) {
+            Some(w) => w,
+            None => continue,
+        };
+        for pb in 0..nb {
+            for ch in 0..geom.num_dmx {
+                let dry = dry_o
+                    .get(ch)
+                    .and_then(|r| r.get(pb))
+                    .copied()
+                    .unwrap_or(0.0);
+                for de in 0..geom.num_decorr {
+                    let wet = wet_o
+                        .get(de)
+                        .and_then(|r| r.get(pb))
+                        .copied()
+                        .unwrap_or(0.0);
+                    pre[de][ch][pb] += wet.abs() * dry;
+                }
+            }
+        }
+    }
+    pre
+}
+
+/// Per-track target value for a given parameter band, ungrouped to a QMF
+/// subband via [`sb_to_pb`]. Returns 0 when the band is out of range.
+fn band_value(row: &[f64], sb: usize, num_bands: u32) -> f64 {
+    match sb_to_pb(sb as u32, num_bands) {
+        Ok(pb) => row.get(pb as usize).copied().unwrap_or(0.0),
+        Err(_) => 0.0,
+    }
+}
+
+/// Run the full §5.7.3.6 / Table 49 A-JOC spatial reconstruction for one
+/// AC-4 frame, transforming the `num_dmx` downmix QMF signals into the
+/// `num_umx` reconstructed output objects.
+///
+/// * `x[ts][sb][ch]` — input downmix QMF samples.
+/// * `matrices` — per-data-point dequantized dry / wet matrices.
+/// * `data_point_info` — `ajoc_start_pos` / `ajoc_ramp_len` per data point.
+/// * `object_present[o]` — gates the per-object reconstruction.
+/// * `state` — interpolator + decorrelator history carried across frames.
+///
+/// Returns `z[ts][sb][o]`, the reconstructed output objects. Mirrors the
+/// pseudocode order exactly: pre-matrix-param accumulation, then for each
+/// `(ts, sb)` interpolate the dry / wet / pre tracks, form the
+/// decorrelator inputs `u = pre · x`, decorrelate `y = D(u)`, and sum the
+/// dry (`x · mtx_dry`) and wet (`y · mtx_wet`) contributions into `z`.
+pub fn ajoc_reconstruct(
+    x: &[Vec<Vec<Cplx>>],
+    matrices: &AjocDequantMatrices,
+    data_point_info: &AjocDataPointInfo,
+    object_present: &[bool],
+    geom: &AjocGeometry,
+    state: &mut AjocReconState,
+) -> Vec<Vec<Vec<Cplx>>> {
+    let num_dp = data_point_info.num_dpoints.max(1) as usize;
+    let start_pos = &data_point_info.start_pos;
+    let ramp_len = &data_point_info.ramp_len;
+
+    // Maximum band count over all objects, for the pre-matrix-param grid.
+    let max_bands = matrices.num_bands.iter().copied().max().unwrap_or(0) as usize;
+
+    // §5.7.3.6.2 decorrelation-input pre-matrix parameter, per data point.
+    let pre_param: Vec<Vec<Vec<Vec<f64>>>> = (0..num_dp)
+        .map(|dp| pre_matrix_param(matrices, dp, geom, max_bands))
+        .collect();
+
+    // Build per-track target arrays (target per data point) addressed by
+    // QMF subband. For each `(o, ch, sb)` the dry target at data point dp
+    // is `mtx_dry_dq[o][dp][ch][sb_to_pb(sb)]`, etc.
+    let mut z = vec![vec![vec![(0.0, 0.0); geom.num_umx]; geom.num_subbands]; geom.num_timeslots];
+
+    for ts in 0..geom.num_timeslots {
+        for sb in 0..geom.num_subbands {
+            // Interpolate dry tracks → mtx_dry[o][ch].
+            let mut mtx_dry = vec![vec![0.0f64; geom.num_dmx]; geom.num_umx];
+            for o in 0..geom.num_umx {
+                let nb = matrices.num_bands.get(o).copied().unwrap_or(0);
+                for ch in 0..geom.num_dmx {
+                    let targets: Vec<f64> = (0..num_dp)
+                        .map(|dp| {
+                            matrices
+                                .dry_dq
+                                .get(o)
+                                .and_then(|d| d.get(dp))
+                                .and_then(|d| d.get(ch))
+                                .map(|row| band_value(row, sb, nb))
+                                .unwrap_or(0.0)
+                        })
+                        .collect();
+                    mtx_dry[o][ch] =
+                        state.dry[o][ch][sb].step(ts as u32, &targets, start_pos, ramp_len);
+                }
+            }
+            // Interpolate wet tracks → mtx_wet[o][de].
+            let mut mtx_wet = vec![vec![0.0f64; geom.num_decorr]; geom.num_umx];
+            for o in 0..geom.num_umx {
+                let nb = matrices.num_bands.get(o).copied().unwrap_or(0);
+                for de in 0..geom.num_decorr {
+                    let targets: Vec<f64> = (0..num_dp)
+                        .map(|dp| {
+                            matrices
+                                .wet_dq
+                                .get(o)
+                                .and_then(|w| w.get(dp))
+                                .and_then(|w| w.get(de))
+                                .map(|row| band_value(row, sb, nb))
+                                .unwrap_or(0.0)
+                        })
+                        .collect();
+                    mtx_wet[o][de] =
+                        state.wet[o][de][sb].step(ts as u32, &targets, start_pos, ramp_len);
+                }
+            }
+            // Interpolate pre tracks → mtx_pre[de][ch].
+            let mut mtx_pre = vec![vec![0.0f64; geom.num_dmx]; geom.num_decorr];
+            for de in 0..geom.num_decorr {
+                for ch in 0..geom.num_dmx {
+                    let targets: Vec<f64> = (0..num_dp)
+                        .map(|dp| {
+                            let pb = sb_to_pb(sb as u32, max_bands.max(1) as u32).unwrap_or(0);
+                            pre_param[dp][de][ch]
+                                .get(pb as usize)
+                                .copied()
+                                .unwrap_or(0.0)
+                        })
+                        .collect();
+                    mtx_pre[de][ch] =
+                        state.pre[de][ch][sb].step(ts as u32, &targets, start_pos, ramp_len);
+                }
+            }
+
+            // Decorrelation pre-matrix: u[de] = Σ_ch mtx_pre[de][ch] · x[ch].
+            // Then decorrelate: y[de] = ajoc_decorrelate(u[de]).
+            let mut y = vec![(0.0f64, 0.0f64); geom.num_decorr];
+            for de in 0..geom.num_decorr {
+                let mut u_re = 0.0f64;
+                let mut u_im = 0.0f64;
+                for ch in 0..geom.num_dmx {
+                    let xc = x
+                        .get(ts)
+                        .and_then(|r| r.get(sb))
+                        .and_then(|r| r.get(ch))
+                        .copied()
+                        .unwrap_or((0.0, 0.0));
+                    u_re += mtx_pre[de][ch] * xc.0;
+                    u_im += mtx_pre[de][ch] * xc.1;
+                }
+                let yd = state.decorr[de].process_sample(sb as u32, (u_re as f32, u_im as f32));
+                y[de] = (yd.0 as f64, yd.1 as f64);
+            }
+
+            // Reconstruct: z[o] = Σ_ch x[ch]·mtx_dry[o][ch] + Σ_de y[de]·mtx_wet[o][de].
+            for o in 0..geom.num_umx {
+                if !object_present.get(o).copied().unwrap_or(false) {
+                    continue;
+                }
+                let mut z_re = 0.0f64;
+                let mut z_im = 0.0f64;
+                for ch in 0..geom.num_dmx {
+                    let xc = x
+                        .get(ts)
+                        .and_then(|r| r.get(sb))
+                        .and_then(|r| r.get(ch))
+                        .copied()
+                        .unwrap_or((0.0, 0.0));
+                    z_re += xc.0 * mtx_dry[o][ch];
+                    z_im += xc.1 * mtx_dry[o][ch];
+                }
+                for de in 0..geom.num_decorr {
+                    z_re += y[de].0 * mtx_wet[o][de];
+                    z_im += y[de].1 * mtx_wet[o][de];
+                }
+                z[ts][sb][o] = (z_re, z_im);
+            }
+        }
+
+        // End-of-time-slot ramp reset (Table 49 trailer): re-arm every
+        // track's ramp counter at each data point's `ajoc_start_pos`.
+        for o in 0..geom.num_umx {
+            for ch in 0..geom.num_dmx {
+                for sb in 0..geom.num_subbands {
+                    state.dry[o][ch][sb].end_of_slot(ts as u32, start_pos, ramp_len);
+                }
+            }
+            for de in 0..geom.num_decorr {
+                for sb in 0..geom.num_subbands {
+                    state.wet[o][de][sb].end_of_slot(ts as u32, start_pos, ramp_len);
+                }
+            }
+        }
+        for de in 0..geom.num_decorr {
+            for ch in 0..geom.num_dmx {
+                for sb in 0..geom.num_subbands {
+                    state.pre[de][ch][sb].end_of_slot(ts as u32, start_pos, ramp_len);
+                }
+            }
+        }
+    }
+
+    let _ = state.geom;
+    z
 }
 
 // ---------------------------------------------------------------------
@@ -1023,6 +1383,168 @@ mod tests {
         assert!(bi.non_bed_obj_present);
         assert_eq!(bi.num_bed_obj, 5);
         assert_eq!(bi.bits_read, 4);
+    }
+
+    #[test]
+    fn decorr_module_cyclic_021() {
+        // §5.7.3.5: three decorrelators used cyclically 0, 2, 1, 0, 2, 1, 0.
+        let ids: Vec<_> = (0..7).map(decorr_module_for).collect();
+        let as_num = |d: &DecorrelatorId| match d {
+            DecorrelatorId::D0 => 0,
+            DecorrelatorId::D1 => 1,
+            DecorrelatorId::D2 => 2,
+        };
+        let seq: Vec<_> = ids.iter().map(as_num).collect();
+        assert_eq!(seq, vec![0, 2, 1, 0, 2, 1, 0]);
+    }
+
+    #[test]
+    fn pre_matrix_param_sum_over_objects() {
+        // 2 umx objects, 2 dmx, 1 decorr, 1 band.
+        // dry[o][dp][ch][pb], wet[o][dp][de][pb].
+        // D[de][ch] = Σ_o |wet[o][de]| · dry[o][ch].
+        let matrices = AjocDequantMatrices {
+            dry_dq: vec![
+                vec![vec![vec![1.0], vec![2.0]]],  // o0: ch0=1, ch1=2
+                vec![vec![vec![0.5], vec![-1.0]]], // o1: ch0=0.5, ch1=-1
+            ],
+            wet_dq: vec![
+                vec![vec![vec![3.0]]],  // o0: de0 = 3
+                vec![vec![vec![-2.0]]], // o1: de0 = -2
+            ],
+            num_bands: vec![1, 1],
+        };
+        let geom = AjocGeometry {
+            num_dmx: 2,
+            num_umx: 2,
+            num_decorr: 1,
+            num_timeslots: 1,
+            num_subbands: 64,
+        };
+        let pre = pre_matrix_param(&matrices, 0, &geom, 1);
+        // D[0][0] = |3|·1 + |-2|·0.5 = 3 + 1 = 4
+        // D[0][1] = |3|·2 + |-2|·(-1) = 6 - 2 = 4
+        assert!((pre[0][0][0] - 4.0).abs() < 1e-9);
+        assert!((pre[0][1][0] - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reconstruct_dry_only_tracks_interpolated_coeff() {
+        // Single object, single downmix, no decorrelators, single data
+        // point. The output equals the input times the interpolated dry
+        // coefficient; on a converged plateau the interpolator settles at
+        // the §5.7.3.4 Table 48 value `target·(1 + 1/ramp_len)` (the
+        // documented one-extra-increment overshoot, see
+        // `interpolate_ramp_then_hold`). Here target = 1.0, ramp_len = 4 →
+        // plateau coefficient 1.25, input 2.0 → output 2.5.
+        let geom = AjocGeometry {
+            num_dmx: 1,
+            num_umx: 1,
+            num_decorr: 0,
+            num_timeslots: 8,
+            num_subbands: 64,
+        };
+        let matrices = AjocDequantMatrices {
+            dry_dq: vec![vec![vec![vec![1.0]]]],
+            wet_dq: vec![vec![vec![]]],
+            num_bands: vec![1],
+        };
+        let dpi = AjocDataPointInfo {
+            num_dpoints: 1,
+            start_pos: vec![0],
+            ramp_len: vec![4],
+        };
+        let mut x = vec![vec![vec![(0.0f64, 0.0f64); 1]; 64]; 8];
+        for ts in 0..8 {
+            x[ts][5][0] = (2.0, 0.0);
+        }
+        let mut state = AjocReconState::new(&geom);
+        let z = ajoc_reconstruct(&x, &matrices, &dpi, &[true], &geom, &mut state);
+        // Converged plateau coefficient = 1.0·(1 + 1/4) = 1.25; ×2.0 input.
+        assert!((z[7][5][0].0 - 2.5).abs() < 1e-6, "got {:?}", z[7][5][0]);
+        // The output is purely real (input has zero imaginary part).
+        assert!(z[7][5][0].1.abs() < 1e-9);
+        // A subband with no input stays zero.
+        assert!(z[7][10][0].0.abs() < 1e-9);
+        // Early ramp slot is below the plateau (monotone climb).
+        assert!(z[1][5][0].0 < z[7][5][0].0);
+    }
+
+    #[test]
+    fn reconstruct_absent_object_zeroed() {
+        let geom = AjocGeometry {
+            num_dmx: 1,
+            num_umx: 1,
+            num_decorr: 0,
+            num_timeslots: 2,
+            num_subbands: 64,
+        };
+        let matrices = AjocDequantMatrices {
+            dry_dq: vec![vec![vec![vec![1.0]]]],
+            wet_dq: vec![vec![vec![]]],
+            num_bands: vec![1],
+        };
+        let dpi = AjocDataPointInfo {
+            num_dpoints: 1,
+            start_pos: vec![0],
+            ramp_len: vec![1],
+        };
+        let mut x = vec![vec![vec![(5.0f64, 0.0f64); 1]; 64]; 2];
+        x[0][0][0] = (5.0, 0.0);
+        let mut state = AjocReconState::new(&geom);
+        // object_present = false → all outputs zero despite non-zero dry.
+        let z = ajoc_reconstruct(&x, &matrices, &dpi, &[false], &geom, &mut state);
+        for ts in 0..2 {
+            for sb in 0..64 {
+                assert_eq!(z[ts][sb][0], (0.0, 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_wet_adds_decorrelator_energy() {
+        // With a non-zero wet matrix and a non-zero pre-matrix, the
+        // decorrelator path injects energy distinct from the pure dry
+        // passthrough: the output should differ from the dry-only result.
+        let geom = AjocGeometry {
+            num_dmx: 1,
+            num_umx: 1,
+            num_decorr: 1,
+            num_timeslots: 8,
+            num_subbands: 64,
+        };
+        let matrices = AjocDequantMatrices {
+            // dry = 1.0, wet = 0.5 — so pre-param = |0.5|·1.0 = 0.5.
+            dry_dq: vec![vec![vec![vec![1.0]]]],
+            wet_dq: vec![vec![vec![vec![0.5]]]],
+            num_bands: vec![1],
+        };
+        let dpi = AjocDataPointInfo {
+            num_dpoints: 1,
+            start_pos: vec![0],
+            ramp_len: vec![1],
+        };
+        // Drive subband 3 (decorrelator region k0, delay 7) with a steady
+        // input. The decorrelator's delayed tap means y[de] becomes
+        // non-zero only once the input history fills the delay line, so a
+        // late time slot carries wet energy injected through the
+        // pre-matrix → decorrelate → wet-matrix chain.
+        let geom = AjocGeometry {
+            num_timeslots: 16,
+            ..geom
+        };
+        let mut x = vec![vec![vec![(0.0f64, 0.0f64); 1]; 64]; 16];
+        for ts in 0..16 {
+            x[ts][3][0] = (1.0, 0.0);
+        }
+        let mut state = AjocReconState::new(&geom);
+        let z = ajoc_reconstruct(&x, &matrices, &dpi, &[true], &geom, &mut state);
+        // Dry-only contribution (coefficient plateau 2.0 with ramp_len 1):
+        // input 1.0 → 2.0. The full output differs once the decorrelator
+        // tail (delay 7) arrives and the wet matrix injects it.
+        let dry_only = 2.0f64;
+        let late_diff: f64 = (8..16).map(|ts| (z[ts][3][0].0 - dry_only).abs()).sum();
+        assert!(late_diff > 1e-6, "expected decorrelator wet energy");
     }
 
     #[test]
