@@ -3304,7 +3304,7 @@ fn write_aspx_data_1ch_minimal(
 /// count are ignored. F0 values outside `[0, codebook_length)` clamp
 /// to the codebook's extreme entries; DF values outside `[-cb_off,
 /// +cb_off]` saturate to the symmetric edge.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct AspxRealEnvelopeChannel<'a> {
     /// SIGNAL envelope quant indices for this channel — `[F0, DF1, DF2, …]`
     /// (length should match `num_sbg_sig` for the active framing).
@@ -3422,6 +3422,93 @@ pub fn write_aspx_data_2ch_real_envelope(
     Ok(())
 }
 
+/// `aspx_data_2ch()` real-envelope writer that additionally carries a
+/// real channel-0 `aspx_tna_mode` inverse-filtering vector.
+///
+/// Identical to [`write_aspx_data_2ch_real_envelope`] except the
+/// `aspx_hfgen_iwc_2ch(balance = 1)` element is routed through
+/// [`write_aspx_hfgen_iwc_2ch`] with the caller-supplied `tna_mode`
+/// payload on channel 0. Because `aspx_balance = 1` is used (channel 1
+/// mirrors channel 0's framing), the decoder copies channel 0's
+/// `tna_mode` into channel 1, so only one vector is signalled. The
+/// `add_harmonic` / `fic_used_in_sfb` / `tic_used_in_slot` gates stay 0.
+///
+/// Passing an all-zero (or empty) `tna_mode` slice reproduces the
+/// [`write_aspx_data_2ch_real_envelope`] bytes exactly.
+pub fn write_aspx_data_2ch_real_envelope_tna(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch0: AspxRealEnvelopeChannel<'_>,
+    ch1: AspxRealEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+) -> Result<(), &'static str> {
+    let xover: u32 = 0;
+    bw.write_u32(xover, 3);
+
+    bw.write_bit(false);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(0, envbits);
+    if cfg.signals_freq_res() {
+        bw.write_bit(false);
+    }
+    // aspx_balance = 1 → channel-1 reuses channel-0's framing + tna_mode.
+    bw.write_bit(true);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    // aspx_hfgen_iwc_2ch(balance = 1): real tna_mode[0], mirrored to [1].
+    let empty: &[u8] = &[];
+    let payload = AspxHfgenIwc2ChPayload {
+        tna_mode: [tna_mode, empty],
+        ..AspxHfgenIwc2ChPayload::default()
+    };
+    write_aspx_hfgen_iwc_2ch(
+        bw,
+        &payload,
+        true, // aspx_balance = 1
+        counts.num_sbg_noise,
+        counts.num_sbg_sig_highres,
+        0,
+    );
+
+    let num_sbg_sig = if cfg.signals_freq_res() {
+        counts.num_sbg_sig_lowres
+    } else {
+        counts.num_sbg_sig_highres
+    };
+    let num_sbg_noise = counts.num_sbg_noise;
+
+    let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+
+    write_aspx_sig_envelope_values(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Level,
+        ch0.sig,
+        num_sbg_sig,
+    );
+    write_aspx_sig_envelope_values(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Balance,
+        ch1.sig,
+        num_sbg_sig,
+    );
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, ch0.noise, num_sbg_noise);
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Balance, ch1.noise, num_sbg_noise);
+    Ok(())
+}
+
 /// Emit an `aspx_data_1ch()` body per ETSI TS 103 190-1 §4.2.12.3
 /// Table 51 with caller-provided real envelope quant indices, mirroring
 /// the [`write_aspx_data_1ch_minimal`] framing skeleton:
@@ -3493,6 +3580,82 @@ pub fn write_aspx_data_1ch_real_envelope(
         num_sbg_sig,
     );
     // NOISE ec_data (LEVEL, qmode Fine per Table 51).
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, ch.noise, num_sbg_noise);
+    Ok(())
+}
+
+/// `aspx_data_1ch()` real-envelope writer that additionally carries a
+/// real per-noise-subband-group `aspx_tna_mode` inverse-filtering vector.
+///
+/// Identical to [`write_aspx_data_1ch_real_envelope`] except the
+/// `aspx_hfgen_iwc_1ch()` element is routed through
+/// [`write_aspx_hfgen_iwc_1ch`] with the caller-supplied `tna_mode`
+/// payload instead of the all-zero scaffold. The `add_harmonic` /
+/// `fic_used_in_sfb` / `tic_used_in_slot` flags remain absent (the
+/// `*_present` gates auto-collapse to 0 for the default empty slices), so
+/// the only wire difference from the scaffold is the 2-bit-per-SBG
+/// `tna_mode` field — which the decoder's `parse_aspx_hfgen_iwc_1ch`
+/// recovers verbatim and feeds into the §5.7.6.4.1.3 chirp pipeline.
+///
+/// Passing an all-zero (or empty) `tna_mode` slice reproduces the
+/// [`write_aspx_data_1ch_real_envelope`] bytes exactly.
+pub fn write_aspx_data_1ch_real_envelope_tna(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch: AspxRealEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+) -> Result<(), &'static str> {
+    let xover: u32 = 0;
+    bw.write_u32(xover, 3);
+
+    // aspx_framing(0): FIXFIX, num_env = 1.
+    bw.write_bit(false);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(0, envbits);
+    if cfg.signals_freq_res() {
+        bw.write_bit(false);
+    }
+    // aspx_delta_dir(0): SIGNAL + NOISE both FREQ.
+    bw.write_bit(false);
+    bw.write_bit(false);
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    // aspx_hfgen_iwc_1ch(): real tna_mode + all-zero ah/fic/tic gates.
+    let payload = AspxHfgenIwc1ChPayload {
+        tna_mode,
+        ..AspxHfgenIwc1ChPayload::default()
+    };
+    write_aspx_hfgen_iwc_1ch(
+        bw,
+        &payload,
+        counts.num_sbg_noise,
+        counts.num_sbg_sig_highres,
+        0,
+    );
+
+    let num_sbg_sig = if cfg.signals_freq_res() {
+        counts.num_sbg_sig_lowres
+    } else {
+        counts.num_sbg_sig_highres
+    };
+    let num_sbg_noise = counts.num_sbg_noise;
+
+    let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+
+    write_aspx_sig_envelope_values(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Level,
+        ch.sig,
+        num_sbg_sig,
+    );
     write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, ch.noise, num_sbg_noise);
     Ok(())
 }
@@ -10090,5 +10253,175 @@ mod tests {
             8192,
         );
         assert_eq!(legacy, with_beta3_off);
+    }
+
+    /// A representative high-res FIXFIX `aspx_config` with several noise
+    /// subband groups, used by the `_tna` round-trip tests.
+    fn tna_test_cfg() -> aspx::AspxConfig {
+        aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::HighRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 3, // larger noise-SBG count so tna_mode has width
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::High,
+        }
+    }
+
+    /// `write_aspx_data_1ch_real_envelope_tna` with an all-zero tna_mode
+    /// reproduces the non-tna writer byte-for-byte.
+    #[test]
+    fn write_1ch_tna_all_zero_matches_base_writer() {
+        let cfg = tna_test_cfg();
+        let sig = [5_i32, 1, -1, 0, 2];
+        let noise = [3_i32, -1, 0, 1];
+        let ch = AspxRealEnvelopeChannel {
+            sig: &sig,
+            noise: &noise,
+        };
+        let mut bw_base = BitWriter::new();
+        write_aspx_data_1ch_real_envelope(&mut bw_base, &cfg, ch).unwrap();
+        bw_base.align_to_byte();
+        let base = bw_base.finish();
+
+        let zeros = vec![0u8; 8];
+        let mut bw_tna = BitWriter::new();
+        write_aspx_data_1ch_real_envelope_tna(&mut bw_tna, &cfg, ch, &zeros).unwrap();
+        bw_tna.align_to_byte();
+        let tna = bw_tna.finish();
+        assert_eq!(base, tna, "all-zero tna must match the base writer");
+    }
+
+    /// A non-zero tna_mode produces different bytes than the all-zero
+    /// scaffold and round-trips through `parse_aspx_hfgen_iwc_1ch`.
+    #[test]
+    fn write_1ch_tna_round_trips_through_parser() {
+        let cfg = tna_test_cfg();
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let counts = tables.counts;
+        let n_noise = counts.num_sbg_noise as usize;
+        assert!(n_noise >= 2, "need multiple noise SBGs to exercise tna");
+
+        // Distinct per-SBG modes (cycling 0..=3) so position matters.
+        let tna_mode: Vec<u8> = (0..n_noise).map(|i| (i % 4) as u8).collect();
+        let sig = [5_i32, 1, -1, 0, 2, 0, 1];
+        let noise = [3_i32, -1, 0, 1, 0];
+        let ch = AspxRealEnvelopeChannel {
+            sig: &sig,
+            noise: &noise,
+        };
+
+        let mut bw = BitWriter::new();
+        write_aspx_data_1ch_real_envelope_tna(&mut bw, &cfg, ch, &tna_mode).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+
+        // Re-parse the leading header to reach the hfgen element, then the
+        // hfgen, and confirm tna_mode round-trips.
+        let mut br = BitReader::new(&bytes);
+        br.read_u32(3).unwrap(); // aspx_xover_subband_offset
+        br.read_bit().unwrap(); // FIXFIX prefix
+        let envbits = cfg.fixfix_tmp_num_env_bits();
+        if envbits > 0 {
+            br.read_u32(envbits).unwrap();
+        }
+        if cfg.signals_freq_res() {
+            br.read_bit().unwrap(); // aspx_freq_res[0]
+        }
+        br.read_bit().unwrap(); // sig delta_dir
+        br.read_bit().unwrap(); // noise delta_dir
+        let hfgen = aspx::parse_aspx_hfgen_iwc_1ch(
+            &mut br,
+            counts.num_sbg_noise,
+            counts.num_sbg_sig_highres,
+            0,
+        )
+        .unwrap();
+        assert_eq!(hfgen.tna_mode, tna_mode);
+        assert!(!hfgen.ah_present);
+        assert!(!hfgen.fic_present);
+        assert!(!hfgen.tic_present);
+
+        // The tna body must differ from the all-zero scaffold (some mode
+        // is non-zero).
+        let mut bw_zero = BitWriter::new();
+        write_aspx_data_1ch_real_envelope(&mut bw_zero, &cfg, ch).unwrap();
+        bw_zero.align_to_byte();
+        assert_ne!(bytes, bw_zero.finish());
+    }
+
+    /// `write_aspx_data_2ch_real_envelope_tna` with all-zero tna matches
+    /// the base 2ch writer; a non-zero tna round-trips (balance = 1 →
+    /// channel 0's modes mirror to channel 1).
+    #[test]
+    fn write_2ch_tna_matches_base_and_round_trips() {
+        let cfg = tna_test_cfg();
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).unwrap();
+        let counts = tables.counts;
+        let n_noise = counts.num_sbg_noise as usize;
+
+        let s0 = [4_i32, 1, 0, -1, 2, 0, 1];
+        let n0 = [2_i32, 0, -1, 1, 0];
+        let s1 = [3_i32, -1, 1, 0, 0, 1, 0];
+        let n1 = [1_i32, 1, 0, -1, 0];
+        let ch0 = AspxRealEnvelopeChannel {
+            sig: &s0,
+            noise: &n0,
+        };
+        let ch1 = AspxRealEnvelopeChannel {
+            sig: &s1,
+            noise: &n1,
+        };
+
+        // All-zero tna == base writer.
+        let zeros = vec![0u8; n_noise];
+        let mut bw_base = BitWriter::new();
+        write_aspx_data_2ch_real_envelope(&mut bw_base, &cfg, ch0, ch1).unwrap();
+        bw_base.align_to_byte();
+        let base = bw_base.finish();
+        let mut bw_tz = BitWriter::new();
+        write_aspx_data_2ch_real_envelope_tna(&mut bw_tz, &cfg, ch0, ch1, &zeros).unwrap();
+        bw_tz.align_to_byte();
+        assert_eq!(base, bw_tz.finish());
+
+        // Non-zero tna round-trips (balance = 1 mirrors ch0 → ch1).
+        let tna_mode: Vec<u8> = (0..n_noise).map(|i| ((i + 1) % 4) as u8).collect();
+        let mut bw = BitWriter::new();
+        write_aspx_data_2ch_real_envelope_tna(&mut bw, &cfg, ch0, ch1, &tna_mode).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        assert_ne!(bytes, base);
+
+        let mut br = BitReader::new(&bytes);
+        br.read_u32(3).unwrap(); // xover
+        br.read_bit().unwrap(); // FIXFIX prefix
+        let envbits = cfg.fixfix_tmp_num_env_bits();
+        if envbits > 0 {
+            br.read_u32(envbits).unwrap();
+        }
+        if cfg.signals_freq_res() {
+            br.read_bit().unwrap();
+        }
+        let balance = br.read_bit().unwrap();
+        assert!(balance, "writer uses aspx_balance = 1");
+        br.read_bit().unwrap(); // ch0 sig delta_dir
+        br.read_bit().unwrap(); // ch0 noise delta_dir
+        br.read_bit().unwrap(); // ch1 sig delta_dir
+        br.read_bit().unwrap(); // ch1 noise delta_dir
+        let hfgen = aspx::parse_aspx_hfgen_iwc_2ch(
+            &mut br,
+            balance,
+            counts.num_sbg_noise,
+            counts.num_sbg_sig_highres,
+            0,
+        )
+        .unwrap();
+        assert_eq!(hfgen.tna_mode[0], tna_mode);
+        // balance = 1 → channel 1 mirrors channel 0.
+        assert_eq!(hfgen.tna_mode[1], tna_mode);
     }
 }
