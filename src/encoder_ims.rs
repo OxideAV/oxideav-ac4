@@ -3591,6 +3591,12 @@ impl Ac4ImsEncoder {
         // … and the centre carrier (the ACPL_2 body's `aspx_data_1ch()`).
         let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
 
+        // Encoder-side A-SPX inverse-filtering decision per carrier: the
+        // L / R front pair shares the L-derived vector (aspx_balance = 1),
+        // and the centre carrier derives its own from its QMF low band.
+        let lr_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -3602,7 +3608,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
+            crate::encoder_acpl3::build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 frame_len,
                 max_sfb,
                 self.b_iframe_global,
@@ -3618,6 +3624,8 @@ impl Ac4ImsEncoder {
                 &r_noise,
                 &c_sig,
                 &c_noise,
+                &lr_tna_mode,
+                &c_tna_mode,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
