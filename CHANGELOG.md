@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 358 — extend the real `aspx_tna_mode` (A-SPX inverse
+  filtering, ETSI TS 103 190-1 §4.3.10.6.1 Table 131) from the 5_X
+  ASPX_ACPL_3 path to the **5_X and 7_X ASPX_ACPL_2 frame paths**, on
+  every A-SPX carrier. The ACPL_2 bodies carry three A-SPX trailers
+  (front-pair `aspx_data_2ch()`, surround-pair `aspx_data_2ch()` for 7_X,
+  centre `aspx_data_1ch()`); the live `encode_frame_pcm_5_{0,1}_acpl2_real_aspx`
+  / `encode_frame_pcm_7_{0,1}_acpl2_real_aspx` paths now derive an
+  independent `aspx_tna_mode` per carrier from that carrier's own QMF low
+  band (front from L, surround from Ls, centre from C — mirrored to the
+  paired channel under `aspx_balance = 1`) and route them through the new
+  `build_5_x_acpl2_…_real_aspx_tna` / `build_7_x_acpl2_…_real_aspx_tna`
+  body builders. This drives the previously-undriven 1-channel
+  `write_aspx_data_1ch_real_envelope_tna` writer on a live path for the
+  first time. Empty / all-zero `tna_mode` reproduces the scaffold bytes
+  exactly; the only wire delta is the 2-bit-per-noise-SBG field the
+  decoder's `parse_aspx_hfgen_iwc_{1,2}ch` recovers and feeds into the
+  §5.7.6.4.1.3 chirp / order-2 LPC inverse filtering.
+
 - ac4 round 351 — **encoder-side `aspx_tna_mode` selection** (A-SPX
   inverse-filtering, ETSI TS 103 190-1 §4.3.10.6.1 Table 131 — None /
   Light / Moderate / Heavy) wired into the live 5_X ASPX_ACPL_3 frame

@@ -128,15 +128,19 @@ an S16 `AudioFrame`:
   (captured as raw bytes).
 - Some advanced A-CPL parameters (β3 / γ on certain encoder paths)
   remain scaffolded at minimum-bit-cost defaults.
-- **A-SPX `aspx_hfgen_iwc` sub-fields:** the live 5_X ASPX_ACPL_3 path now
-  emits a real `aspx_tna_mode` (inverse filtering), but `add_harmonic` /
-  `fic_used_in_sfb` / `tic_used_in_slot` remain at the all-zero scaffold
-  on every live path, and the real-`aspx_tna_mode` selection is wired only
-  into the 5_X ASPX_ACPL_3 frame path so far (the `_tna` body / writer
-  variants exist for the other paths but aren't yet driven by the live
-  encoders). The `aspx_tna_mode` threshold mapping is an encoder tuning
-  choice (the spec leaves the selection informative); it is calibrated to
-  the live QMF pipeline but not yet tuned against a perceptual reference.
+- **A-SPX `aspx_hfgen_iwc` sub-fields:** the live 5_X ASPX_ACPL_3 path and
+  the 5_X / 7_X ASPX_ACPL_2 paths now emit a real `aspx_tna_mode` (inverse
+  filtering) on every A-SPX carrier — the ACPL_2 bodies derive an
+  independent `aspx_tna_mode` per carrier (front pair from L, surround pair
+  from Ls, centre from its own QMF low band; the `_tna` 1-channel writer is
+  driven on a live path for the first time), but `add_harmonic` /
+  `fic_used_in_sfb` / `tic_used_in_slot` remain at the all-zero scaffold on
+  every live path, and the real-`aspx_tna_mode` selection is not yet wired
+  into the remaining live encoders (ASPX_ACPL_1 / 7_X ASPX_ACPL_3 /
+  pure-ASPX — the `_tna` body / writer variants exist but aren't yet driven
+  there). The `aspx_tna_mode` threshold mapping is an encoder tuning choice
+  (the spec leaves the selection informative); it is calibrated to the live
+  QMF pipeline but not yet tuned against a perceptual reference.
 - The live 5_X ASPX_ACPL_3 real-ASPX frame path now selects between a
   single FIXFIX envelope and a `num_env = 2` multi-envelope body per
   frame (`encode_frame_pcm_5_{0,1}_acpl3_real_aspx_multi_env` — the

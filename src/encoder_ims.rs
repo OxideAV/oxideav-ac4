@@ -5079,6 +5079,13 @@ impl Ac4ImsEncoder {
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[3], frames[4]);
         let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
 
+        // Per-carrier A-SPX inverse-filtering decisions: the front pair
+        // shares L's vector, the surround pair shares Ls's, the centre its
+        // own (all under aspx_balance = 1 for the pairs).
+        let front_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
+        let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -5090,7 +5097,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
+            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 frame_len,
                 max_sfb,
                 None, // 7.0 — no LFE
@@ -5112,6 +5119,9 @@ impl Ac4ImsEncoder {
                 &rs_noise,
                 &c_sig,
                 &c_noise,
+                &front_tna_mode,
+                &surround_tna_mode,
+                &c_tna_mode,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
@@ -5452,6 +5462,12 @@ impl Ac4ImsEncoder {
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[3], frames[4]);
         let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
 
+        // Per-carrier A-SPX inverse-filtering decisions (front pair from L,
+        // surround pair from Ls, centre from C — under aspx_balance = 1).
+        let front_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
+        let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -5463,7 +5479,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
+            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 frame_len,
                 max_sfb,
                 Some(max_sfb_lfe),
@@ -5485,6 +5501,9 @@ impl Ac4ImsEncoder {
                 &rs_noise,
                 &c_sig,
                 &c_noise,
+                &front_tna_mode,
+                &surround_tna_mode,
+                &c_tna_mode,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
