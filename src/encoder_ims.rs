@@ -1304,6 +1304,16 @@ impl Ac4ImsEncoder {
         let (lb_sig, lb_noise, rb_sig, rb_noise) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[5], frames[6]);
 
+        // Per-carrier `aspx_tna_mode` inverse-filtering vectors, each
+        // derived from its own carrier's QMF low band (front from L,
+        // surround from Ls, centre from C, back from Lb). Under
+        // `aspx_balance = 1` channel 1 of each pair mirrors channel 0, so a
+        // single per-pair vector suffices. See §4.3.10.6.1 Table 131.
+        let front_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
+        let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
+        let back_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[5]);
+
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
             21..=40 => 12288,
@@ -1311,7 +1321,7 @@ impl Ac4ImsEncoder {
             _ => 32767,
         };
 
-        let body = crate::encoder_asf::build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
+        let body = crate::encoder_asf::build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
             frame_len,
             max_sfb,
             max_sfb_add,
@@ -1340,6 +1350,10 @@ impl Ac4ImsEncoder {
             &lb_noise,
             &rb_sig,
             &rb_noise,
+            &front_tna_mode,
+            &surround_tna_mode,
+            &c_tna_mode,
+            &back_tna_mode,
             pad_target_bytes,
         );
 
