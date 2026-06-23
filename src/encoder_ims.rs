@@ -5768,6 +5768,20 @@ impl Ac4ImsEncoder {
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
         let acpl_qmf_band_minus1: u8 = 0;
 
+        // Real ASPX envelope extraction over the three A-CPL_1 carriers:
+        // L/R front pair, Ls/Rs surround pair, centre.
+        let (l_sig, l_noise, r_sig, r_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
+        let (ls_sig, ls_noise, rs_sig, rs_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[3], frames[4]);
+        let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
+
+        // Per-carrier real aspx_tna_mode (front from L, surround from Ls,
+        // centre from C; channel 1 of each pair mirrors via balance = 1).
+        let front_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
+        let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
+
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
             21..=40 => 12288,
@@ -5775,24 +5789,52 @@ impl Ac4ImsEncoder {
             _ => 32767,
         };
 
-        let body = crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
-            frame_len,
-            max_sfb,
-            max_sfb_master,
-            None, // 7.0 — no LFE
-            self.b_iframe_global,
-            &coeffs_per_channel[0],
-            &coeffs_per_channel[1],
-            &coeffs_per_channel[3],
-            &coeffs_per_channel[4],
-            &coeffs_per_channel[2],
-            None, // 7.0 — no LFE
-            &aspx_cfg,
-            acpl_num_param_bands_id,
-            acpl_quant_mode,
-            acpl_qmf_band_minus1,
-            pad_target_bytes,
-        );
+        let body =
+            crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+                frame_len,
+                max_sfb,
+                max_sfb_master,
+                None, // 7.0 — no LFE
+                self.b_iframe_global,
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &coeffs_per_channel[2],
+                None, // 7.0 — no LFE
+                &aspx_cfg,
+                acpl_num_param_bands_id,
+                acpl_quant_mode,
+                acpl_qmf_band_minus1,
+                (
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &l_sig,
+                        noise: &l_noise,
+                    },
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &r_sig,
+                        noise: &r_noise,
+                    },
+                ),
+                (
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &ls_sig,
+                        noise: &ls_noise,
+                    },
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &rs_sig,
+                        noise: &rs_noise,
+                    },
+                ),
+                crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                    sig: &c_sig,
+                    noise: &c_noise,
+                },
+                &front_tna_mode,
+                &surround_tna_mode,
+                &c_tna_mode,
+                pad_target_bytes,
+            );
 
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);
@@ -6057,6 +6099,20 @@ impl Ac4ImsEncoder {
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
         let acpl_qmf_band_minus1: u8 = 0;
 
+        // Real ASPX envelope extraction over the three A-CPL_1 carriers:
+        // L/R front pair, Ls/Rs surround pair, centre.
+        let (l_sig, l_noise, r_sig, r_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
+        let (ls_sig, ls_noise, rs_sig, rs_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[3], frames[4]);
+        let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
+
+        // Per-carrier real aspx_tna_mode (front from L, surround from Ls,
+        // centre from C; channel 1 of each pair mirrors via balance = 1).
+        let front_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
+        let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
+
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
             21..=40 => 12288,
@@ -6064,24 +6120,52 @@ impl Ac4ImsEncoder {
             _ => 32767,
         };
 
-        let body = crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
-            frame_len,
-            max_sfb,
-            max_sfb_master,
-            Some(max_sfb_lfe),
-            self.b_iframe_global,
-            &coeffs_per_channel[0],
-            &coeffs_per_channel[1],
-            &coeffs_per_channel[3],
-            &coeffs_per_channel[4],
-            &coeffs_per_channel[2],
-            Some(&coeffs_per_channel[7]),
-            &aspx_cfg,
-            acpl_num_param_bands_id,
-            acpl_quant_mode,
-            acpl_qmf_band_minus1,
-            pad_target_bytes,
-        );
+        let body =
+            crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+                frame_len,
+                max_sfb,
+                max_sfb_master,
+                Some(max_sfb_lfe),
+                self.b_iframe_global,
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &coeffs_per_channel[2],
+                Some(&coeffs_per_channel[7]),
+                &aspx_cfg,
+                acpl_num_param_bands_id,
+                acpl_quant_mode,
+                acpl_qmf_band_minus1,
+                (
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &l_sig,
+                        noise: &l_noise,
+                    },
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &r_sig,
+                        noise: &r_noise,
+                    },
+                ),
+                (
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &ls_sig,
+                        noise: &ls_noise,
+                    },
+                    crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                        sig: &rs_sig,
+                        noise: &rs_noise,
+                    },
+                ),
+                crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                    sig: &c_sig,
+                    noise: &c_noise,
+                },
+                &front_tna_mode,
+                &surround_tna_mode,
+                &c_tna_mode,
+                pad_target_bytes,
+            );
 
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);

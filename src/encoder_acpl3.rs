@@ -9377,6 +9377,187 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
     bytes
 }
 
+/// Real-ASPX + `aspx_tna_mode` variant of
+/// [`build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta`].
+///
+/// Identical to that builder — same α + β A-CPL extraction, same Cfg0
+/// `two_channel_data()` / residual-layer / centre `mono_data()` body —
+/// except the three I-frame ASPX trailers carry **real** per-sbg SIGNAL /
+/// NOISE envelopes ([`write_aspx_data_2ch_real_envelope_tna`] /
+/// [`write_aspx_data_1ch_real_envelope_tna`]) plus a real per-noise-
+/// subband-group `aspx_tna_mode` inverse-filtering vector, instead of the
+/// round-118 minimum-bit-cost ASPX scaffold (`write_aspx_data_2ch_minimal`
+/// / `write_aspx_data_1ch_minimal`):
+///
+/// * the L / R front pair `aspx_data_2ch()` carries `front` envelopes +
+///   `front_tna_mode`,
+/// * the Ls / Rs surround pair `aspx_data_2ch()` carries `surround`
+///   envelopes + `surround_tna_mode`,
+/// * the centre `aspx_data_1ch()` carries `c` envelopes + `c_tna_mode`.
+///
+/// Each carrier's envelopes come from
+/// [`build_aspx_real_envelope_channel_from_qmf`] over its own input PCM,
+/// and its tna_mode from [`crate::aspx_tna_select::select_tna_mode`] over
+/// the same carrier's QMF low band. Under `aspx_balance = 1` channel 1 of
+/// each pair mirrors channel 0's framing + tna_mode, so a single per-pair
+/// vector suffices.
+///
+/// Passing empty (or all-zero) envelopes + tna slices reproduces the
+/// `write_aspx_data_*_minimal` framing exactly, so the decoder still
+/// round-trips; the difference is the real envelope values + the 2-bit-
+/// per-noise-subband-group `aspx_tna_mode` field the decoder feeds into
+/// the §5.7.6.4.1.2-4 chirp / order-2 LPC inverse filter.
+///
+/// Refs ETSI TS 103 190-1 §4.2.6.14 Table 33 (`case ASPX_ACPL_1:`),
+/// §4.2.12.3 Table 51 (`aspx_data_1ch()`), §4.2.12.4 Table 52
+/// (`aspx_data_2ch()`), §4.3.10.6.1 Table 131 (`aspx_tna_mode`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    front: (AspxRealEnvelopeChannel<'_>, AspxRealEnvelopeChannel<'_>),
+    surround: (AspxRealEnvelopeChannel<'_>, AspxRealEnvelopeChannel<'_>),
+    c: AspxRealEnvelopeChannel<'_>,
+    front_tna_mode: &[u8],
+    surround_tna_mode: &[u8],
+    c_tna_mode: &[u8],
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+    let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+
+    // α + β extraction — identical primitives to the real_alpha_beta path.
+    let alpha_l_q = extract_alpha_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let alpha_r_q = extract_alpha_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let beta_l_q = extract_beta_q_per_band(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_l_q,
+        acpl_quant_mode,
+    );
+    let beta_r_q = extract_beta_q_per_band(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        &alpha_r_q,
+        acpl_quant_mode,
+    );
+
+    let mut bw = BitWriter::new();
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 7_X_codec_mode = ASPX_ACPL_1 (2) — 2 bits.
+    bw.write_u32(2, 2);
+
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+
+    if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
+        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+    }
+
+    write_companding_control_2ch_sync_on(&mut bw);
+
+    bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
+    bw.write_bit(false); // b_2ch_mode = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
+
+    write_acpl_1_residual_layer(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+    );
+
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    if b_iframe {
+        write_aspx_data_2ch_real_envelope_tna(&mut bw, aspx_cfg, front.0, front.1, front_tna_mode)
+            .expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_real_envelope_tna(
+            &mut bw,
+            aspx_cfg,
+            surround.0,
+            surround.1,
+            surround_tna_mode,
+        )
+        .expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_real_envelope_tna(&mut bw, aspx_cfg, c, c_tna_mode)
+            .expect("encoder: aspx config invalid");
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_l_q,
+            Some(&beta_l_q),
+        );
+        write_acpl_data_1ch_real_alpha_beta(
+            &mut bw,
+            acpl_num_bands,
+            start_band,
+            acpl_quant_mode,
+            &alpha_r_q,
+            Some(&beta_r_q),
+        );
+    }
+
+    bw.align_to_byte();
+    while bw.byte_len() < pad_target_bytes {
+        bw.write_u32(0, 8);
+    }
+    let mut bytes = bw.finish();
+    if bytes.len() > pad_target_bytes {
+        bytes.truncate(pad_target_bytes);
+    }
+    bytes
+}
+
 // ====================================================================
 // Tests
 // ====================================================================
