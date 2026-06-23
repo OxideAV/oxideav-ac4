@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 363 — extend the real `aspx_tna_mode` (A-SPX inverse
+  filtering, ETSI TS 103 190-1 §4.3.10.6.1 Table 131) to the **7.0
+  pure-ASPX** and **7_X ASPX_ACPL_1** live frame paths, on every A-SPX
+  carrier, and additionally promote the 7_X ASPX_ACPL_1 trailers from the
+  round-118 minimum-bit-cost scaffold (`write_aspx_data_*_minimal`) to
+  **real** per-sbg SIGNAL/NOISE ASPX envelopes. The 7.0 pure-ASPX body
+  carries four A-SPX trailers (L/R front, Ls/Rs surround, centre, Lb/Rb
+  back pair) and the ACPL_1 body three (front, surround, centre); each now
+  derives an independent `aspx_tna_mode` from that carrier's own QMF low
+  band (front from L, surround from Ls, centre from C, back from Lb —
+  mirrored to the paired channel under `aspx_balance = 1`), routed through
+  the new `build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna` /
+  `build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna`
+  builders. Empty / all-zero `tna_mode` reproduces the scaffold framing
+  exactly; the only wire delta is the 2-bit-per-noise-SBG field the
+  decoder's `parse_aspx_hfgen_iwc_{1,2}ch` recovers and feeds into the
+  §5.7.6.4.1.3 chirp / order-2 LPC inverse filtering. All 7.0 / 7.1
+  ACPL_1 + pure-ASPX round-trips stay green.
+
 - ac4 round 358 — extend the real `aspx_tna_mode` (A-SPX inverse
   filtering, ETSI TS 103 190-1 §4.3.10.6.1 Table 131) from the 5_X
   ASPX_ACPL_3 path to the **5_X and 7_X ASPX_ACPL_2 frame paths**, on
