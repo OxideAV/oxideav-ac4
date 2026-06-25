@@ -203,6 +203,81 @@ pub fn de_diff_huffman(br: &mut BitReader<'_>, table_idx: u32) -> Result<i32> {
     }
 }
 
+// ============================================================================
+// Encoder helpers — inverse of huff_decode_diff_de over the same tables.
+// ============================================================================
+
+/// Generic Huffman encoder over a `(len[], cw[])` table pair: map `value`
+/// to the symbol index `value + cb_off`, then emit `cw[idx]` MSB-first in
+/// `len[idx]` bits. Returns `Error::invalid` for out-of-range values.
+fn huff_encode_diff_de(
+    bw: &mut oxideav_core::bits::BitWriter,
+    len_table: &[u8],
+    cw_table: &[u32],
+    cb_off: i32,
+    value: i32,
+) -> Result<()> {
+    let idx = value
+        .checked_add(cb_off)
+        .ok_or_else(|| Error::invalid("ac4: DE_HCB symbol index overflow"))?;
+    if idx < 0 || idx as usize >= len_table.len() {
+        return Err(Error::invalid("ac4: DE_HCB value out of codebook range"));
+    }
+    let idx = idx as usize;
+    bw.write_u32(cw_table[idx], len_table[idx] as u32);
+    Ok(())
+}
+
+/// Inverse of [`de_abs_huffman`].
+pub fn write_de_abs_huffman(
+    bw: &mut oxideav_core::bits::BitWriter,
+    table_idx: u32,
+    value: i32,
+) -> Result<()> {
+    if table_idx == 0 {
+        huff_encode_diff_de(
+            bw,
+            DE_HCB_ABS_0_LEN,
+            DE_HCB_ABS_0_CW,
+            DE_HCB_ABS_0_OFFSET,
+            value,
+        )
+    } else {
+        huff_encode_diff_de(
+            bw,
+            DE_HCB_ABS_1_LEN,
+            DE_HCB_ABS_1_CW,
+            DE_HCB_ABS_1_OFFSET,
+            value,
+        )
+    }
+}
+
+/// Inverse of [`de_diff_huffman`].
+pub fn write_de_diff_huffman(
+    bw: &mut oxideav_core::bits::BitWriter,
+    table_idx: u32,
+    value: i32,
+) -> Result<()> {
+    if table_idx == 0 {
+        huff_encode_diff_de(
+            bw,
+            DE_HCB_DIFF_0_LEN,
+            DE_HCB_DIFF_0_CW,
+            DE_HCB_DIFF_0_OFFSET,
+            value,
+        )
+    } else {
+        huff_encode_diff_de(
+            bw,
+            DE_HCB_DIFF_1_LEN,
+            DE_HCB_DIFF_1_CW,
+            DE_HCB_DIFF_1_OFFSET,
+            value,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +526,54 @@ mod tests {
         assert_eq!(de_diff_huffman(&mut br, 0).unwrap(), 1);
         assert_eq!(de_diff_huffman(&mut br, 0).unwrap(), 0);
         assert_eq!(de_diff_huffman(&mut br, 0).unwrap(), -1);
+    }
+
+    // ------------------------------------------------------------------------
+    // Write-helper round-trips: encode(value) → decode == value for every
+    // symbol in each codebook. Valid because all four tables are proven
+    // prefix codes (no (len, cw) collisions), so each value is invertible.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn write_de_abs_huffman_round_trips_all_symbols() {
+        for (table_idx, len, off) in [
+            (0u32, DE_HCB_ABS_0_LEN, DE_HCB_ABS_0_OFFSET),
+            (1, DE_HCB_ABS_1_LEN, DE_HCB_ABS_1_OFFSET),
+        ] {
+            for sym in 0..len.len() {
+                let value = sym as i32 - off;
+                let mut bw = BitWriter::new();
+                write_de_abs_huffman(&mut bw, table_idx, value).unwrap();
+                bw.align_to_byte();
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                assert_eq!(de_abs_huffman(&mut br, table_idx).unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn write_de_diff_huffman_round_trips_all_symbols() {
+        for (table_idx, len, off) in [
+            (0u32, DE_HCB_DIFF_0_LEN, DE_HCB_DIFF_0_OFFSET),
+            (1, DE_HCB_DIFF_1_LEN, DE_HCB_DIFF_1_OFFSET),
+        ] {
+            for sym in 0..len.len() {
+                let value = sym as i32 - off;
+                let mut bw = BitWriter::new();
+                write_de_diff_huffman(&mut bw, table_idx, value).unwrap();
+                bw.align_to_byte();
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                assert_eq!(de_diff_huffman(&mut br, table_idx).unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn write_de_huffman_rejects_out_of_range() {
+        let mut bw = BitWriter::new();
+        assert!(write_de_abs_huffman(&mut bw, 0, 1000).is_err());
+        assert!(write_de_diff_huffman(&mut bw, 0, -1000).is_err());
     }
 }

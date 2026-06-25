@@ -15,7 +15,9 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::de_huffman::{de_abs_huffman, de_diff_huffman};
+use crate::de_huffman::{
+    de_abs_huffman, de_diff_huffman, write_de_abs_huffman, write_de_diff_huffman,
+};
 
 /// Constant per §4.3.14.5.1: dialogue-enhancement parameter bands count
 /// is always 8 (Table 173).
@@ -195,6 +197,160 @@ pub fn parse_de_config(br: &mut BitReader<'_>) -> Result<DeConfig> {
         max_gain,
         channel_config,
     })
+}
+
+/// Write `de_config()` per §4.2.14.12 Table 77, the inverse of
+/// [`parse_de_config`].
+pub fn write_de_config(bw: &mut oxideav_core::bits::BitWriter, cfg: &DeConfig) -> Result<()> {
+    if cfg.max_gain > 3 {
+        return Err(Error::invalid("ac4: de_max_gain exceeds 2 bits"));
+    }
+    if cfg.channel_config > 7 {
+        return Err(Error::invalid("ac4: de_channel_config exceeds 3 bits"));
+    }
+    bw.write_u32(cfg.method.raw(), 2);
+    bw.write_u32(cfg.max_gain as u32, 2);
+    bw.write_u32(cfg.channel_config as u32, 3);
+    Ok(())
+}
+
+/// Write `dialog_enhancement(b_iframe)` per §4.2.14.11 Table 76, the
+/// inverse of [`parse_dialog_enhancement`].
+///
+/// On non-I frames the `de_config_flag` is taken from `de.config_flag`;
+/// the embedded `de_config()` is only written when that flag is set. The
+/// `de_data()` payload is written against the active config.
+pub fn write_dialog_enhancement(
+    bw: &mut oxideav_core::bits::BitWriter,
+    de: &DialogEnhancement,
+    b_iframe: bool,
+) -> Result<()> {
+    bw.write_bit(de.data_present);
+    if !de.data_present {
+        return Ok(());
+    }
+
+    let active_cfg = if b_iframe {
+        let cfg = de
+            .config
+            .ok_or_else(|| Error::invalid("ac4: I-frame dialog_enhancement requires config"))?;
+        write_de_config(bw, &cfg)?;
+        cfg
+    } else {
+        bw.write_bit(de.config_flag);
+        let cfg = de
+            .config
+            .ok_or_else(|| Error::invalid("ac4: dialog_enhancement requires active config"))?;
+        if de.config_flag {
+            write_de_config(bw, &cfg)?;
+        }
+        cfg
+    };
+
+    let data = de
+        .data
+        .as_ref()
+        .ok_or_else(|| Error::invalid("ac4: dialog_enhancement data_present but data is None"))?;
+    write_de_data(bw, active_cfg, b_iframe, data)
+}
+
+/// Write `de_data(de_method, de_nr_channels, b_iframe)` per §4.2.14.13
+/// Table 78, the inverse of [`parse_de_data`].
+///
+/// The de_par parameter matrix is re-Huffman-encoded: on I-frames the
+/// first channel emits a leading `de_abs_huffman` band-0 value followed
+/// by `de_diff_huffman` deltas; cross-channel/non-I delta conventions
+/// mirror the decoder (the surfaced `de_par` already holds the values the
+/// decoder reconstructed, so we re-derive the transmitted deltas here).
+pub fn write_de_data(
+    bw: &mut oxideav_core::bits::BitWriter,
+    cfg: DeConfig,
+    b_iframe: bool,
+    data: &DeData,
+) -> Result<()> {
+    let nr_channels = cfg.nr_channels() as usize;
+    if nr_channels == 0 {
+        return Ok(());
+    }
+
+    let raw_method = cfg.method.raw();
+    let cross_channel = (raw_method == 1 || raw_method == 3) && nr_channels > 1;
+    if cross_channel {
+        if !b_iframe {
+            bw.write_bit(data.keep_pos_flag);
+        }
+        if !data.keep_pos_flag {
+            bw.write_u32(
+                data.mix_coef1_idx
+                    .ok_or_else(|| Error::invalid("ac4: mix_coef1_idx required"))?
+                    as u32,
+                5,
+            );
+            if nr_channels == 3 {
+                bw.write_u32(
+                    data.mix_coef2_idx
+                        .ok_or_else(|| Error::invalid("ac4: mix_coef2_idx required (3 ch)"))?
+                        as u32,
+                    5,
+                );
+            }
+        }
+    }
+
+    if !b_iframe {
+        bw.write_bit(data.keep_data_flag);
+    }
+
+    if !data.keep_data_flag {
+        let ms_capable = (raw_method == 0 || raw_method == 2) && nr_channels == 2;
+        if ms_capable {
+            bw.write_bit(data.ms_proc_flag);
+        }
+
+        let table_idx = cfg.method.huffman_table_idx();
+        let n_decode_channels = nr_channels - data.ms_proc_flag as usize;
+        if data.de_par.len() != n_decode_channels {
+            return Err(Error::invalid(
+                "ac4: de_par channel count mismatches de_nr_channels - ms_proc_flag",
+            ));
+        }
+
+        let mut ref_val: i32 = 0;
+        for (ch, bands) in data.de_par.iter().enumerate() {
+            if b_iframe && ch == 0 {
+                write_de_abs_huffman(bw, table_idx, bands[0])?;
+                ref_val = bands[0];
+                for &v in bands.iter().skip(1) {
+                    write_de_diff_huffman(bw, table_idx, v - ref_val)?;
+                    ref_val = v;
+                }
+            } else if b_iframe {
+                // ch > 0 on I-frame: deltas vs running ref_val.
+                for &v in bands.iter() {
+                    write_de_diff_huffman(bw, table_idx, v - ref_val)?;
+                    ref_val = v;
+                }
+            } else {
+                // Non-I: de_par holds the raw transmitted deltas verbatim.
+                for &v in bands.iter() {
+                    write_de_diff_huffman(bw, table_idx, v)?;
+                }
+            }
+            if b_iframe {
+                ref_val = bands[0];
+            }
+        }
+
+        if raw_method >= 2 {
+            bw.write_u32(
+                data.signal_contribution.ok_or_else(|| {
+                    Error::invalid("ac4: signal_contribution required (method>=2)")
+                })? as u32,
+                5,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Walk `de_data(de_method, de_nr_channels, b_iframe)` per §4.2.14.13
@@ -716,5 +872,146 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let err = parse_dialog_enhancement(&mut br, false, None).unwrap_err();
         assert!(format!("{err}").contains("dialog_enhancement"));
+    }
+
+    // ------------------------------------------------------------------
+    // Write-side round-trips — de_config / de_data / dialog_enhancement
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn write_de_config_round_trips_all_fields() {
+        for method in [
+            DeMethod::ChannelIndependent,
+            DeMethod::CrossChannel,
+            DeMethod::HybridChannelIndependent,
+            DeMethod::HybridCrossChannel,
+        ] {
+            for max_gain in 0u8..=3 {
+                for channel_config in 0u8..=7 {
+                    let cfg = DeConfig {
+                        method,
+                        max_gain,
+                        channel_config,
+                    };
+                    let mut bw = BitWriter::new();
+                    write_de_config(&mut bw, &cfg).unwrap();
+                    bw.align_to_byte();
+                    let bytes = bw.finish();
+                    let mut br = BitReader::new(&bytes);
+                    let got = parse_de_config(&mut br).unwrap();
+                    assert_eq!(
+                        got, cfg,
+                        "method={method:?} mg={max_gain} cc={channel_config}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Helper: encode then decode a `DeData` for a config, asserting
+    /// parse(write(parse(x))) is stable.
+    fn de_data_parse_write_parse_stable(cfg: DeConfig, b_iframe: bool, raw: &[u8]) {
+        let mut br = BitReader::new(raw);
+        let first = parse_de_data(&mut br, cfg, b_iframe).unwrap();
+        let mut bw = BitWriter::new();
+        write_de_data(&mut bw, cfg, b_iframe, &first).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br2 = BitReader::new(&bytes);
+        let second = parse_de_data(&mut br2, cfg, b_iframe).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn write_de_data_iframe_single_channel_round_trips() {
+        // channel_config 001 (centre, 1 channel), method 0 (no cross-ch,
+        // no ms for 1 channel). de_keep_data_flag forced 0 on I-frame.
+        // Build de_par via abs(band0) + 7 diffs using the smallest
+        // codewords (index == cb_off → value 0 for abs/diff table 0).
+        let cfg = DeConfig {
+            method: DeMethod::ChannelIndependent,
+            max_gain: 1,
+            channel_config: 0b001,
+        };
+        // Emit a leading abs + 7 diff codewords (all value 0 → shortest
+        // codes). value 0 maps to symbol cb_off in each table.
+        let mut bw = BitWriter::new();
+        write_de_abs_huffman(&mut bw, 0, 0).unwrap();
+        for _ in 0..7 {
+            write_de_diff_huffman(&mut bw, 0, 0).unwrap();
+        }
+        bw.align_to_byte();
+        let raw = bw.finish();
+        de_data_parse_write_parse_stable(cfg, true, &raw);
+    }
+
+    #[test]
+    fn write_de_data_iframe_cross_channel_pair_round_trips() {
+        // channel_config 110 (L+R, 2 channels), method 1 (cross-channel).
+        // I-frame: keep_pos_flag forced 0 → mix_coef1_idx present.
+        let cfg = DeConfig {
+            method: DeMethod::CrossChannel,
+            max_gain: 2,
+            channel_config: 0b110,
+        };
+        let mut bw = BitWriter::new();
+        bw.write_u32(9, 5); // mix_coef1_idx (no mix_coef2 for 2 ch)
+                            // ch0: abs + 7 diffs; ch1: 8 diffs (table_idx for method 1 == 1).
+        write_de_abs_huffman(&mut bw, 1, 0).unwrap();
+        for _ in 0..7 {
+            write_de_diff_huffman(&mut bw, 1, 0).unwrap();
+        }
+        for _ in 0..8 {
+            write_de_diff_huffman(&mut bw, 1, 0).unwrap();
+        }
+        bw.align_to_byte();
+        let raw = bw.finish();
+        de_data_parse_write_parse_stable(cfg, true, &raw);
+    }
+
+    #[test]
+    fn write_dialog_enhancement_iframe_round_trips() {
+        // Full dialog_enhancement on an I-frame, channel_config 001.
+        let cfg = DeConfig {
+            method: DeMethod::ChannelIndependent,
+            max_gain: 0,
+            channel_config: 0b001,
+        };
+        let mut payload = BitWriter::new();
+        payload.write_u32(1, 1); // b_de_data_present
+        write_de_config(&mut payload, &cfg).unwrap();
+        write_de_abs_huffman(&mut payload, 0, 0).unwrap();
+        for _ in 0..7 {
+            write_de_diff_huffman(&mut payload, 0, 0).unwrap();
+        }
+        payload.align_to_byte();
+        let raw = payload.finish();
+
+        let mut br = BitReader::new(&raw);
+        let first = parse_dialog_enhancement(&mut br, true, None).unwrap();
+        let mut bw = BitWriter::new();
+        write_dialog_enhancement(&mut bw, &first, true).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br2 = BitReader::new(&bytes);
+        let second = parse_dialog_enhancement(&mut br2, true, None).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn write_dialog_enhancement_not_present_round_trips() {
+        let de = DialogEnhancement {
+            data_present: false,
+            config_flag: false,
+            config: None,
+            data: None,
+        };
+        let mut bw = BitWriter::new();
+        write_dialog_enhancement(&mut bw, &de, true).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_dialog_enhancement(&mut br, true, None).unwrap();
+        assert_eq!(got, de);
     }
 }
