@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 370 — **metadata write-side (encoder symmetry)**: give every
+  `metadata()` parser a bit-exact inverse so a decoded `Metadata`
+  round-trips back to a parse-equivalent bitstream. Lands a canonical
+  `write_variable_bits` (proven bit-exact against the §4.2.2 decoder for
+  every `u32`), the EMDF write-side (`write_emdf_payloads_substream` /
+  `write_emdf_payload_config`, Table 18/79), `write_basic_metadata` +
+  `write_further_loudness_info` (Table 67/68, incl. the `prgmbndy` unary
+  code and loudness-version escape), `write_extended_metadata` (Table 69,
+  adding an explicit `b_channels_classifier` flag),
+  `write_drc_config` / `write_drc_compression_curve` (Table 71/72/73),
+  `write_drc_frame` / `write_drc_data` / `write_drc_gains` (Table 70/74/75,
+  re-deriving DRC_HCB gain deltas via `write_drc_huff_diff`),
+  `write_dialog_enhancement` / `write_de_config` / `write_de_data`
+  (Table 76/77/78, re-encoding `de_par` through the Annex A.4
+  `write_de_abs_huffman` / `write_de_diff_huffman` helpers), and the outer
+  `write_metadata` (Table 66) that ties them together with the
+  `tools_metadata_size` envelope + trailing-bit reconciliation. ~40 new
+  round-trip tests; the full lib + integration suites stay green. (A-JOC
+  `AJOC_HCB_*` codeword decode remains docs-gapped — see below.)
+
 - ac4 round 363 — extend the real `aspx_tna_mode` (A-SPX inverse
   filtering, ETSI TS 103 190-1 §4.3.10.6.1 Table 131) to the **7.0
   pure-ASPX** and **7_X ASPX_ACPL_1** live frame paths, on every A-SPX

@@ -92,6 +92,22 @@ an S16 `AudioFrame`:
   Table 79, capturing each payload's bytes verbatim), DRC gain
   application (`drc_raw_to_linear` + dialnorm correction applied to
   planar PCM), and the DE (dialogue enhancement) walker.
+- **Metadata write-side (encoder symmetry)** — every metadata parser now
+  has a bit-exact inverse, so a decoded `Metadata` round-trips back to a
+  parse-equivalent bitstream. `write_metadata` (Table 66) drives
+  `write_basic_metadata` + `write_further_loudness_info` (Table 67/68,
+  incl. the `prgmbndy` unary code and the loudness-version escape),
+  `write_extended_metadata` (Table 69, with an explicit
+  `b_channels_classifier` flag for layouts that carry no classifiable
+  channels), `write_drc_frame` / `write_drc_data` / `write_drc_gains`
+  (Table 70/74/75, re-deriving the DRC_HCB gain deltas via
+  `write_drc_huff_diff`) and `write_drc_config` / `write_drc_compression_curve`
+  (Table 71/72/73), `write_dialog_enhancement` / `write_de_config` /
+  `write_de_data` (Table 76/77/78, re-encoding `de_par` through the
+  Annex A.4 `write_de_abs_huffman` / `write_de_diff_huffman` helpers),
+  and `write_emdf_payloads_substream` / `write_emdf_payload_config`
+  (Table 18/79), all over the canonical `write_variable_bits` codec
+  (proven bit-exact against the §4.2.2 decoder for every `u32`).
 
 ### Encoder
 
