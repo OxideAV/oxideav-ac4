@@ -97,6 +97,41 @@ pub fn variable_bits(br: &mut BitReader<'_>, n_bits: u32) -> Result<u32> {
     }
 }
 
+/// Inverse of [`variable_bits`] — write `value` as a `variable_bits(n_bits)`
+/// field (TS 103 190-1 §4.2.2).
+///
+/// The decoder accumulates, per extra chunk, `value = (value << n) +
+/// (1 << n) + chunk = ((value + 1) << n) + chunk`. We invert that
+/// recurrence from the least-significant side: while `value >= (1 << n)`,
+/// the trailing chunk is `value & ((1 << n) - 1)` and the preceding
+/// accumulator was `(value >> n) - 1`. The remaining `value < (1 << n)`
+/// is the first chunk `c0`. Chunks are emitted most-significant first,
+/// each followed by a `1` continuation flag, with the final chunk
+/// followed by `0`.
+///
+/// Round-trips bit-exactly with [`variable_bits`] for every `u32`.
+pub fn write_variable_bits(bw: &mut oxideav_core::bits::BitWriter, n_bits: u32, mut value: u32) {
+    debug_assert!((1..=32).contains(&n_bits), "variable_bits chunk width");
+    let bias = 1u32 << n_bits;
+    let mask = bias - 1;
+
+    // Peel trailing chunks (most-significant accumulator stages) first.
+    let mut chunks: Vec<u32> = Vec::new();
+    while value >= bias {
+        chunks.push(value & mask);
+        value = (value >> n_bits) - 1;
+    }
+    // `value` now holds the first chunk `c0`.
+    chunks.push(value);
+
+    // Emit oldest (c0) → newest. c0 is `chunks.last()`.
+    for (i, chunk) in chunks.iter().rev().enumerate() {
+        bw.write_u32(*chunk, n_bits);
+        let more = i + 1 < chunks.len();
+        bw.write_bit(more);
+    }
+}
+
 /// Channel mode lookup — maps the encoded bit pattern to channel count.
 ///
 /// The channel_mode field uses a variable-length code: 1, 2, 4 or 7 bits
@@ -1077,6 +1112,62 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let v = variable_bits(&mut br, 2).unwrap();
         assert_eq!(v, 17);
+    }
+
+    #[test]
+    fn write_variable_bits_round_trips_decoder() {
+        use oxideav_core::bits::BitWriter;
+        // Exhaustive small values + boundaries for several chunk widths.
+        let values = [
+            0u32,
+            1,
+            2,
+            3,
+            4,
+            7,
+            8,
+            15,
+            16,
+            17,
+            31,
+            32,
+            63,
+            64,
+            100,
+            255,
+            256,
+            1023,
+            1024,
+            4095,
+            4096,
+            65_535,
+            65_536,
+            1_000_000,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        for n in [2u32, 3, 5, 8, 11] {
+            for &v in &values {
+                let mut bw = BitWriter::new();
+                write_variable_bits(&mut bw, n, v);
+                bw.align_to_byte();
+                let bytes = bw.finish();
+                let mut br = BitReader::new(&bytes);
+                let got = variable_bits(&mut br, n).unwrap();
+                assert_eq!(got, v, "n={n} v={v}");
+            }
+        }
+    }
+
+    #[test]
+    fn write_variable_bits_matches_known_multichunk() {
+        use oxideav_core::bits::BitWriter;
+        // value 17 at n=2 must encode as `11 1 01 0` (see
+        // variable_bits_multi_chunk above).
+        let mut bw = BitWriter::new();
+        write_variable_bits(&mut bw, 2, 17);
+        bw.align_to_byte();
+        assert_eq!(bw.finish(), vec![0b1110_1000]);
     }
 
     #[test]

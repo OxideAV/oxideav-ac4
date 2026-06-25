@@ -27,10 +27,10 @@
 //! - All sub-parsers are infallible-on-EOF only via the wrapped
 //!   `BitReader`: an over-read bubbles up as `Error::invalid`.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
 
-use crate::toc::variable_bits;
+use crate::toc::{variable_bits, write_variable_bits};
 
 /// Hard upper bound on the number of payloads a single
 /// `emdf_payloads_substream()` may carry. Real bitstreams sit well
@@ -243,6 +243,136 @@ pub fn parse_emdf_payload_config(br: &mut BitReader<'_>) -> Result<EmdfPayloadCo
     })
 }
 
+/// Write `emdf_payload_config()` per §4.2.14.14 Table 79, the exact
+/// inverse of [`parse_emdf_payload_config`].
+///
+/// The `Option` fields must be consistent with their gating bit flags
+/// (e.g. `smpoffst.is_some()` iff `b_smpoffst`); an inconsistency yields
+/// `Error::invalid` rather than emitting a malformed field. Values that
+/// the syntax does not carry (because their gate is false) are ignored.
+pub fn write_emdf_payload_config(bw: &mut BitWriter, cfg: &EmdfPayloadConfig) -> Result<()> {
+    bw.write_bit(cfg.b_smpoffst);
+    if cfg.b_smpoffst {
+        let v = cfg
+            .smpoffst
+            .ok_or_else(|| Error::invalid("ac4: b_smpoffst set but smpoffst is None"))?;
+        write_variable_bits(bw, 11, v);
+    }
+
+    bw.write_bit(cfg.b_duration);
+    if cfg.b_duration {
+        let v = cfg
+            .duration
+            .ok_or_else(|| Error::invalid("ac4: b_duration set but duration is None"))?;
+        write_variable_bits(bw, 11, v);
+    }
+
+    bw.write_bit(cfg.b_groupid);
+    if cfg.b_groupid {
+        let v = cfg
+            .groupid
+            .ok_or_else(|| Error::invalid("ac4: b_groupid set but groupid is None"))?;
+        write_variable_bits(bw, 2, v);
+    }
+
+    bw.write_bit(cfg.b_codecdata);
+    if cfg.b_codecdata {
+        let v = cfg
+            .codecdata
+            .ok_or_else(|| Error::invalid("ac4: b_codecdata set but codecdata is None"))?;
+        bw.write_u32(v as u32, 8);
+    }
+
+    bw.write_bit(cfg.b_discard_unknown_payload);
+    if !cfg.b_discard_unknown_payload {
+        if !cfg.b_smpoffst {
+            let aligned = cfg.b_payload_frame_aligned.ok_or_else(|| {
+                Error::invalid("ac4: b_payload_frame_aligned required when !discard && !smpoffst")
+            })?;
+            bw.write_bit(aligned);
+            if aligned {
+                let create = cfg.b_create_duplicate.ok_or_else(|| {
+                    Error::invalid("ac4: b_create_duplicate required when frame_aligned")
+                })?;
+                let remove = cfg.b_remove_duplicate.ok_or_else(|| {
+                    Error::invalid("ac4: b_remove_duplicate required when frame_aligned")
+                })?;
+                bw.write_bit(create);
+                bw.write_bit(remove);
+            }
+        }
+
+        let aligned_or_offset = cfg.b_smpoffst || cfg.b_payload_frame_aligned.unwrap_or(false);
+        if aligned_or_offset {
+            let priority = cfg
+                .priority
+                .ok_or_else(|| Error::invalid("ac4: priority required in this gate"))?;
+            let proc_allowed = cfg
+                .proc_allowed
+                .ok_or_else(|| Error::invalid("ac4: proc_allowed required in this gate"))?;
+            bw.write_u32(priority as u32, 5);
+            bw.write_u32(proc_allowed as u32, 2);
+        }
+    }
+
+    Ok(())
+}
+
+/// Write `emdf_payloads_substream()` per §4.2.4.4 Table 18, the exact
+/// inverse of [`parse_emdf_payloads_substream`].
+///
+/// Each payload's `emdf_payload_id` must be `>= 1` (id 0 is the
+/// terminator and is appended automatically) and is written with the
+/// 5-bit-base / `variable_bits(5)`-escape form. `payload_bytes.len()`
+/// becomes `emdf_payload_size = variable_bits(8)`. The trailing
+/// `byte_align` is emitted so the writer stops on a byte boundary.
+pub fn write_emdf_payloads_substream(
+    bw: &mut BitWriter,
+    substream: &EmdfPayloadsSubstream,
+) -> Result<()> {
+    if substream.payloads.len() > MAX_EMDF_PAYLOADS {
+        return Err(Error::invalid(
+            "ac4: emdf_payloads_substream exceeds MAX_EMDF_PAYLOADS",
+        ));
+    }
+
+    for payload in &substream.payloads {
+        if payload.emdf_payload_id == 0 {
+            return Err(Error::invalid(
+                "ac4: emdf_payload_id 0 is reserved as the terminator",
+            ));
+        }
+        if payload.payload_bytes.len() > MAX_EMDF_PAYLOAD_BYTES {
+            return Err(Error::invalid(
+                "ac4: emdf_payload_byte[] exceeds MAX_EMDF_PAYLOAD_BYTES",
+            ));
+        }
+
+        // emdf_payload_id: 5-bit base, escape via variable_bits(5) when
+        // the resolved id is >= 31.
+        if payload.emdf_payload_id >= 31 {
+            bw.write_u32(31, 5);
+            write_variable_bits(bw, 5, payload.emdf_payload_id - 31);
+        } else {
+            bw.write_u32(payload.emdf_payload_id, 5);
+        }
+
+        write_emdf_payload_config(bw, &payload.config)?;
+
+        write_variable_bits(bw, 8, payload.payload_bytes.len() as u32);
+        for &b in &payload.payload_bytes {
+            bw.write_u32(b as u32, 8);
+        }
+    }
+
+    // Terminator: emdf_payload_id == 0.
+    bw.write_u32(0, 5);
+    // Trailing byte_align.
+    bw.align_to_byte();
+
+    Ok(())
+}
+
 /// `byte_align` — consume 0..7 zero-fill bits to reach the next byte
 /// boundary.
 fn byte_align(br: &mut BitReader<'_>) -> Result<()> {
@@ -258,35 +388,6 @@ fn byte_align(br: &mut BitReader<'_>) -> Result<()> {
 mod tests {
     use super::*;
     use oxideav_core::bits::BitWriter;
-
-    /// Helper that mirrors `variable_bits(n)` on the encode side.
-    fn write_variable_bits(bw: &mut BitWriter, n_bits: u32, mut value: u32) {
-        // Strip the low chunk; keep dividing the upper bits by chunk
-        // size and accumulating a chain. The standard `variable_bits`
-        // decoder is `value = chunk + ((value + (1 << n)) << n)` so we
-        // invert it to count required chunks first.
-        let chunk_max = 1u32 << n_bits;
-        let mut chunks: Vec<u32> = Vec::new();
-
-        loop {
-            if value < chunk_max {
-                chunks.push(value);
-                break;
-            }
-            // Subtract bias before the shift-down, mirroring decoder's
-            // pre-shift `+ 1u32 << n_bits`.
-            value -= chunk_max;
-            chunks.push(value & (chunk_max - 1));
-            value >>= n_bits;
-        }
-        // Emit oldest (most significant) chunk first; each chunk
-        // followed by 1 (more), terminator chunk followed by 0.
-        for (i, c) in chunks.iter().rev().enumerate() {
-            bw.write_u32(*c, n_bits);
-            let more = i + 1 < chunks.len();
-            bw.write_bit(more);
-        }
-    }
 
     #[test]
     fn variable_bits_round_trip_small_values() {
@@ -487,5 +588,197 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let err = parse_emdf_payloads_substream(&mut br).unwrap_err();
         assert!(err.to_string().contains("MAX_EMDF_PAYLOADS"), "got: {err}");
+    }
+
+    /// Encode a substream, decode it back, assert structural equality.
+    fn assert_substream_round_trips(substream: &EmdfPayloadsSubstream) {
+        let mut bw = BitWriter::new();
+        write_emdf_payloads_substream(&mut bw, substream).unwrap();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let parsed = parse_emdf_payloads_substream(&mut br).unwrap();
+        assert_eq!(&parsed, substream);
+    }
+
+    #[test]
+    fn write_empty_substream_round_trips() {
+        assert_substream_round_trips(&EmdfPayloadsSubstream::default());
+    }
+
+    #[test]
+    fn write_minimal_payload_round_trips() {
+        let substream = EmdfPayloadsSubstream {
+            payloads: vec![EmdfPayload {
+                emdf_payload_id: 7,
+                config: EmdfPayloadConfig {
+                    b_discard_unknown_payload: true,
+                    ..Default::default()
+                },
+                payload_bytes: vec![0xAA, 0xBB, 0xCC],
+            }],
+        };
+        assert_substream_round_trips(&substream);
+    }
+
+    #[test]
+    fn write_extended_id_round_trips() {
+        // id 40 (>= 31) exercises the variable_bits(5) escape on write.
+        let substream = EmdfPayloadsSubstream {
+            payloads: vec![EmdfPayload {
+                emdf_payload_id: 40,
+                config: EmdfPayloadConfig {
+                    b_discard_unknown_payload: true,
+                    ..Default::default()
+                },
+                payload_bytes: Vec::new(),
+            }],
+        };
+        assert_substream_round_trips(&substream);
+    }
+
+    #[test]
+    fn write_full_config_round_trips() {
+        // b_smpoffst gate → priority/proc_allowed present, no
+        // frame-aligned bit.
+        let substream = EmdfPayloadsSubstream {
+            payloads: vec![EmdfPayload {
+                emdf_payload_id: 1,
+                config: EmdfPayloadConfig {
+                    b_smpoffst: true,
+                    smpoffst: Some(5),
+                    b_duration: true,
+                    duration: Some(12),
+                    b_groupid: true,
+                    groupid: Some(2),
+                    b_codecdata: true,
+                    codecdata: Some(0xA5),
+                    b_discard_unknown_payload: false,
+                    b_payload_frame_aligned: None,
+                    b_create_duplicate: None,
+                    b_remove_duplicate: None,
+                    priority: Some(11),
+                    proc_allowed: Some(2),
+                },
+                payload_bytes: vec![0xEE],
+            }],
+        };
+        assert_substream_round_trips(&substream);
+    }
+
+    #[test]
+    fn write_frame_aligned_config_round_trips() {
+        let substream = EmdfPayloadsSubstream {
+            payloads: vec![EmdfPayload {
+                emdf_payload_id: 2,
+                config: EmdfPayloadConfig {
+                    b_discard_unknown_payload: false,
+                    b_payload_frame_aligned: Some(true),
+                    b_create_duplicate: Some(true),
+                    b_remove_duplicate: Some(false),
+                    priority: Some(7),
+                    proc_allowed: Some(1),
+                    ..Default::default()
+                },
+                payload_bytes: Vec::new(),
+            }],
+        };
+        assert_substream_round_trips(&substream);
+    }
+
+    #[test]
+    fn write_frame_aligned_false_no_priority_round_trips() {
+        // !discard, !smpoffst, frame_aligned = 0 → priority/proc_allowed
+        // are NOT in the bitstream.
+        let substream = EmdfPayloadsSubstream {
+            payloads: vec![EmdfPayload {
+                emdf_payload_id: 3,
+                config: EmdfPayloadConfig {
+                    b_discard_unknown_payload: false,
+                    b_payload_frame_aligned: Some(false),
+                    priority: None,
+                    proc_allowed: None,
+                    ..Default::default()
+                },
+                payload_bytes: vec![0x10, 0x20],
+            }],
+        };
+        assert_substream_round_trips(&substream);
+    }
+
+    #[test]
+    fn write_multiple_payloads_round_trips() {
+        let substream = EmdfPayloadsSubstream {
+            payloads: vec![
+                EmdfPayload {
+                    emdf_payload_id: 1,
+                    config: EmdfPayloadConfig {
+                        b_discard_unknown_payload: true,
+                        ..Default::default()
+                    },
+                    payload_bytes: vec![0x01, 0x02],
+                },
+                EmdfPayload {
+                    emdf_payload_id: 5,
+                    config: EmdfPayloadConfig {
+                        b_discard_unknown_payload: true,
+                        ..Default::default()
+                    },
+                    payload_bytes: vec![0xFF],
+                },
+            ],
+        };
+        assert_substream_round_trips(&substream);
+    }
+
+    #[test]
+    fn write_round_trips_against_existing_decoded_fixtures() {
+        // Re-decode each of the hand-built fixtures from the decode tests,
+        // re-encode, and re-decode — asserting the encoder reproduces a
+        // parse-equivalent bitstream (write∘parse∘write∘parse identity).
+        let mut bw = BitWriter::new();
+        bw.write_u32(1, 5);
+        bw.write_bit(true); // b_smpoffst
+        write_variable_bits(&mut bw, 11, 5);
+        bw.write_bit(false); // b_duration
+        bw.write_bit(false); // b_groupid
+        bw.write_bit(false); // b_codecdata
+        bw.write_bit(false); // b_discard_unknown_payload
+        bw.write_u32(11, 5); // priority
+        bw.write_u32(2, 2); // proc_allowed
+        write_variable_bits(&mut bw, 8, 1);
+        bw.write_u32(0xEE, 8);
+        bw.write_u32(0, 5); // terminator
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let first = parse_emdf_payloads_substream(&mut br).unwrap();
+        assert_substream_round_trips(&first);
+    }
+
+    #[test]
+    fn write_rejects_inconsistent_config() {
+        // b_smpoffst set but smpoffst None must error, not panic.
+        let cfg = EmdfPayloadConfig {
+            b_smpoffst: true,
+            smpoffst: None,
+            ..Default::default()
+        };
+        let mut bw = BitWriter::new();
+        let err = write_emdf_payload_config(&mut bw, &cfg).unwrap_err();
+        assert!(err.to_string().contains("smpoffst"), "got: {err}");
+    }
+
+    #[test]
+    fn write_rejects_terminator_id() {
+        let substream = EmdfPayloadsSubstream {
+            payloads: vec![EmdfPayload {
+                emdf_payload_id: 0,
+                config: EmdfPayloadConfig::default(),
+                payload_bytes: Vec::new(),
+            }],
+        };
+        let mut bw = BitWriter::new();
+        let err = write_emdf_payloads_substream(&mut bw, &substream).unwrap_err();
+        assert!(err.to_string().contains("terminator"), "got: {err}");
     }
 }
