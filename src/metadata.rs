@@ -616,6 +616,12 @@ pub struct ExtendedMetadata {
     pub b_vhl_active: Option<bool>,
     pub b_vhr_active: Option<bool>,
     pub b_lfe_active: Option<bool>,
+    /// `b_channels_classifier` (§4.2.14.4) — true when the channels
+    /// classifier block was transmitted. Tracked explicitly because for
+    /// layouts with no classifiable channels (e.g. mono) the block emits
+    /// no inner fields, making its presence otherwise inferrable only
+    /// from this flag.
+    pub b_channels_classifier: bool,
     pub event_probability: Option<u8>,
 }
 
@@ -659,6 +665,7 @@ pub fn parse_extended_metadata(
     }
     if br.read_bit()? {
         // b_channels_classifier.
+        v.b_channels_classifier = true;
         if channel_mode_contains_c(channel_mode) && br.read_bit()? {
             // b_c_active.
             v.b_c_active = Some(true);
@@ -699,6 +706,153 @@ pub fn parse_extended_metadata(
         v.event_probability = Some(br.read_u32(4)? as u8);
     }
     Ok(v)
+}
+
+/// Write `extended_metadata(channel_mode, b_associated, b_dialog)` per
+/// §4.2.14.4 Table 69, the inverse of [`parse_extended_metadata`].
+///
+/// `channel_mode`, `b_associated`, and `b_dialog` MUST match the values
+/// used to decode `v`. The channels-classifier block is emitted iff
+/// `v.b_channels_classifier` is set; within it, the c/l/r channels use
+/// the active-flag / has-dialog nesting while the Ls/Rs and higher pairs
+/// carry an unconditional active bit per their presence in the layout.
+pub fn write_extended_metadata(
+    bw: &mut oxideav_core::bits::BitWriter,
+    v: &ExtendedMetadata,
+    channel_mode: u32,
+    b_associated: bool,
+    b_dialog: bool,
+) -> Result<()> {
+    if b_associated {
+        write_opt_u(bw, v.scale_main.map(|x| x as u32), 8);
+        write_opt_u(bw, v.scale_main_centre.map(|x| x as u32), 8);
+        write_opt_u(bw, v.scale_main_front.map(|x| x as u32), 8);
+        if channel_mode == channel_mode::MONO {
+            bw.write_u32(
+                v.pan_associated
+                    .ok_or_else(|| Error::invalid("ac4: pan_associated required for mono assoc"))?
+                    as u32,
+                8,
+            );
+        }
+    }
+
+    if b_dialog {
+        write_opt_u(bw, v.dialog_max_gain.map(|x| x as u32), 2);
+        // b_pan_dialog gate: present iff pan_dialog (mono) or the pair is
+        // set.
+        let has_pan = v.pan_dialog.is_some() || v.pan_dialog_pair.is_some();
+        bw.write_bit(has_pan);
+        if has_pan {
+            if channel_mode == channel_mode::MONO {
+                bw.write_u32(
+                    v.pan_dialog
+                        .ok_or_else(|| Error::invalid("ac4: pan_dialog required for mono dialog"))?
+                        as u32,
+                    8,
+                );
+            } else {
+                let (a, b) = v
+                    .pan_dialog_pair
+                    .ok_or_else(|| Error::invalid("ac4: pan_dialog_pair required for mc dialog"))?;
+                bw.write_u32(a as u32, 8);
+                bw.write_u32(b as u32, 8);
+                bw.write_u32(
+                    v.pan_signal_selector
+                        .ok_or_else(|| Error::invalid("ac4: pan_signal_selector required"))?
+                        as u32,
+                    2,
+                );
+            }
+        }
+    }
+
+    bw.write_bit(v.b_channels_classifier);
+    if v.b_channels_classifier {
+        if channel_mode_contains_c(channel_mode) {
+            match v.b_c_active {
+                Some(true) => {
+                    bw.write_bit(true);
+                    bw.write_bit(
+                        v.b_c_has_dialog
+                            .ok_or_else(|| Error::invalid("ac4: b_c_has_dialog required"))?,
+                    );
+                }
+                _ => bw.write_bit(false),
+            }
+        }
+        if channel_mode_contains_lr(channel_mode) {
+            match v.b_l_active {
+                Some(true) => {
+                    bw.write_bit(true);
+                    bw.write_bit(
+                        v.b_l_has_dialog
+                            .ok_or_else(|| Error::invalid("ac4: b_l_has_dialog required"))?,
+                    );
+                }
+                _ => bw.write_bit(false),
+            }
+            match v.b_r_active {
+                Some(true) => {
+                    bw.write_bit(true);
+                    bw.write_bit(
+                        v.b_r_has_dialog
+                            .ok_or_else(|| Error::invalid("ac4: b_r_has_dialog required"))?,
+                    );
+                }
+                _ => bw.write_bit(false),
+            }
+        }
+        if channel_mode_contains_lsrs(channel_mode) {
+            bw.write_bit(
+                v.b_ls_active
+                    .ok_or_else(|| Error::invalid("ac4: b_ls_active"))?,
+            );
+            bw.write_bit(
+                v.b_rs_active
+                    .ok_or_else(|| Error::invalid("ac4: b_rs_active"))?,
+            );
+        }
+        if channel_mode_contains_lbrb(channel_mode) {
+            bw.write_bit(
+                v.b_lb_active
+                    .ok_or_else(|| Error::invalid("ac4: b_lb_active"))?,
+            );
+            bw.write_bit(
+                v.b_rb_active
+                    .ok_or_else(|| Error::invalid("ac4: b_rb_active"))?,
+            );
+        }
+        if channel_mode_contains_lwrw(channel_mode) {
+            bw.write_bit(
+                v.b_lw_active
+                    .ok_or_else(|| Error::invalid("ac4: b_lw_active"))?,
+            );
+            bw.write_bit(
+                v.b_rw_active
+                    .ok_or_else(|| Error::invalid("ac4: b_rw_active"))?,
+            );
+        }
+        if channel_mode_contains_tfltfr(channel_mode) {
+            bw.write_bit(
+                v.b_vhl_active
+                    .ok_or_else(|| Error::invalid("ac4: b_vhl_active"))?,
+            );
+            bw.write_bit(
+                v.b_vhr_active
+                    .ok_or_else(|| Error::invalid("ac4: b_vhr_active"))?,
+            );
+        }
+        if channel_mode_contains_lfe(channel_mode) {
+            bw.write_bit(
+                v.b_lfe_active
+                    .ok_or_else(|| Error::invalid("ac4: b_lfe_active"))?,
+            );
+        }
+    }
+
+    write_opt_u(bw, v.event_probability.map(|x| x as u32), 4);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1551,5 +1705,88 @@ mod tests {
         let mut bw = BitWriter::new();
         let err = write_basic_metadata(&mut bw, &v, channel_mode::STEREO).unwrap_err();
         assert!(err.to_string().contains("phase90_info_2ch"), "got: {err}");
+    }
+
+    fn em_round_trips(v: &ExtendedMetadata, channel_mode: u32, assoc: bool, dialog: bool) {
+        let mut bw = BitWriter::new();
+        write_extended_metadata(&mut bw, v, channel_mode, assoc, dialog).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_extended_metadata(&mut br, channel_mode, assoc, dialog).unwrap();
+        assert_eq!(&got, v);
+    }
+
+    #[test]
+    fn write_em_empty_round_trips() {
+        em_round_trips(
+            &ExtendedMetadata::default(),
+            channel_mode::MONO,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn write_em_associated_mono_round_trips() {
+        let v = ExtendedMetadata {
+            scale_main: Some(0xAB),
+            scale_main_centre: Some(0xCD),
+            scale_main_front: None,
+            pan_associated: Some(0x42),
+            ..Default::default()
+        };
+        em_round_trips(&v, channel_mode::MONO, true, false);
+    }
+
+    #[test]
+    fn write_em_dialog_pair_round_trips() {
+        let v = ExtendedMetadata {
+            dialog_max_gain: Some(2),
+            pan_dialog_pair: Some((0x11, 0x22)),
+            pan_signal_selector: Some(1),
+            ..Default::default()
+        };
+        em_round_trips(&v, channel_mode::FIVE_1, false, true);
+    }
+
+    #[test]
+    fn write_em_dialog_mono_pan_round_trips() {
+        let v = ExtendedMetadata {
+            dialog_max_gain: Some(1),
+            pan_dialog: Some(0x77),
+            ..Default::default()
+        };
+        em_round_trips(&v, channel_mode::MONO, false, true);
+    }
+
+    #[test]
+    fn write_em_classifier_51_round_trips() {
+        // 5.1: c/l/r + ls/rs + lfe present.
+        let v = ExtendedMetadata {
+            b_channels_classifier: true,
+            b_c_active: Some(true),
+            b_c_has_dialog: Some(true),
+            b_l_active: None, // inactive
+            b_r_active: Some(true),
+            b_r_has_dialog: Some(false),
+            b_ls_active: Some(true),
+            b_rs_active: Some(false),
+            b_lfe_active: Some(true),
+            event_probability: Some(9),
+            ..Default::default()
+        };
+        em_round_trips(&v, channel_mode::FIVE_1, false, false);
+    }
+
+    #[test]
+    fn write_em_classifier_present_but_empty_for_mono_round_trips() {
+        // Mono has no classifiable channels, so the block emits nothing —
+        // the explicit flag is what carries its presence.
+        let v = ExtendedMetadata {
+            b_channels_classifier: true,
+            ..Default::default()
+        };
+        em_round_trips(&v, channel_mode::MONO, false, false);
     }
 }
