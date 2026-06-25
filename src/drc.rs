@@ -18,7 +18,7 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::drc_huffman::drc_huff_decode_diff;
+use crate::drc_huffman::{drc_huff_decode_diff, write_drc_huff_diff};
 use crate::toc::variable_bits;
 
 /// Maximum number of DRC decoder modes per `drc_decoder_nr_modes` (§4.3.13.2.1):
@@ -776,6 +776,150 @@ pub fn parse_drc_gains(
         drc_gain_val,
         drc_gain: gains,
     })
+}
+
+/// Write `drc_frame()` per §4.2.14.5 Table 70, the inverse of
+/// [`parse_drc_frame`].
+///
+/// `b_iframe` MUST match the value used to decode `frame`: on I-frames the
+/// embedded `drc_config()` is written; on non-I-frames the config is
+/// carried from a prior frame and not re-emitted. `chan_info` describes
+/// the `drc_data()` gain-walk dimensions.
+pub fn write_drc_frame(
+    bw: &mut oxideav_core::bits::BitWriter,
+    frame: &DrcFrame,
+    b_iframe: bool,
+    chan_info: DrcChannelInfo,
+) -> Result<()> {
+    bw.write_bit(frame.b_drc_present);
+    if !frame.b_drc_present {
+        return Ok(());
+    }
+
+    if b_iframe {
+        let cfg = frame
+            .config
+            .as_ref()
+            .ok_or_else(|| Error::invalid("ac4: I-frame drc_frame requires config"))?;
+        write_drc_config(bw, cfg)?;
+    }
+    // The active config (I-frame embedded or caller-carried) drives the
+    // data layout. We need it to know each mode's curve/gainset shape.
+    let active = frame.config.as_ref().ok_or_else(|| {
+        Error::invalid("ac4: write_drc_frame needs the active config to encode data")
+    })?;
+    let data = frame
+        .data
+        .as_ref()
+        .ok_or_else(|| Error::invalid("ac4: drc_frame present but data is None"))?;
+    write_drc_data(bw, active, data, chan_info)
+}
+
+/// Write `drc_data()` per §4.2.14.9 Table 74, the inverse of
+/// [`parse_drc_data`].
+///
+/// Gainset modes are emitted with `drc_version = 0` (no trailing
+/// `drc2_bits` filler) and `drc_gainset_size = 0`; the decoder only
+/// consults `drc_gainset_size` to skip filler when `drc_version >= 1`, so
+/// this canonical form re-decodes identically. Curve-driven modes carry
+/// no per-frame gains. The order of `gainsets` MUST match the order of
+/// the config's non-curve modes.
+pub fn write_drc_data(
+    bw: &mut oxideav_core::bits::BitWriter,
+    config: &DrcConfig,
+    data: &DrcData,
+    chan_info: DrcChannelInfo,
+) -> Result<()> {
+    let mut curve_present = false;
+    let mut gainset_iter = data.gainsets.iter();
+
+    for mode in &config.modes {
+        if !mode.drc_compression_curve_flag {
+            let gains = gainset_iter
+                .next()
+                .ok_or_else(|| Error::invalid("ac4: fewer gainsets than non-curve modes"))?;
+            // drc_gainset_size = 0, b_more_bits = 0, drc_version = 0.
+            bw.write_u32(0, 6);
+            bw.write_bit(false);
+            bw.write_u32(0, 2);
+            write_drc_gains(bw, gains, mode.drc_gains_config.unwrap_or(0), chan_info)?;
+        } else {
+            curve_present = true;
+        }
+    }
+
+    if gainset_iter.next().is_some() {
+        return Err(Error::invalid(
+            "ac4: more gainsets than non-curve modes in config",
+        ));
+    }
+
+    if curve_present != data.curve_present {
+        return Err(Error::invalid(
+            "ac4: data.curve_present disagrees with config's curve modes",
+        ));
+    }
+    if curve_present {
+        bw.write_bit(data.drc_reset_flag);
+        bw.write_u32(data.drc_reserved as u32, 2);
+    }
+    Ok(())
+}
+
+/// Write `drc_gains(mode)` per §4.2.14.10 Table 75, the inverse of
+/// [`parse_drc_gains`].
+///
+/// Re-derives the transmitted Huffman deltas from the reconstructed gain
+/// matrix using the same ch/band/sf walk and per-band / per-channel
+/// reference resets as the decoder.
+pub fn write_drc_gains(
+    bw: &mut oxideav_core::bits::BitWriter,
+    gains: &DrcGains,
+    drc_gains_config_value: u8,
+    chan_info: DrcChannelInfo,
+) -> Result<()> {
+    bw.write_u32(gains.drc_gain_val as u32, 7);
+
+    // drc_gains_config == 0 → single wideband gain, just the 7-bit seed.
+    if drc_gains_config_value == 0 {
+        return Ok(());
+    }
+
+    let nr_ch = chan_info.nr_drc_channels as usize;
+    let nr_sf = chan_info.nr_drc_subframes as usize;
+    let nr_bd = nr_drc_bands(drc_gains_config_value) as usize;
+    if nr_ch == 0 || nr_sf == 0 || nr_bd == 0 {
+        return Err(Error::invalid("ac4: write_drc_gains invalid dimensions"));
+    }
+    let expected = nr_ch * nr_bd * nr_sf;
+    if gains.drc_gain.len() != expected {
+        return Err(Error::invalid(
+            "ac4: drc_gain length mismatches (ch, band, sf) dimensions",
+        ));
+    }
+
+    let idx =
+        |ch: usize, sf: usize, band: usize| -> usize { ch * nr_bd * nr_sf + band * nr_sf + sf };
+
+    let mut ref_gain: i32 = gains.drc_gain_val as i32;
+    let mut first = true;
+    for ch in 0..nr_ch {
+        for band in 0..nr_bd {
+            for sf in 0..nr_sf {
+                let g = gains.drc_gain[idx(ch, sf, band)] as i32;
+                if first {
+                    // Seed slot — already emitted as drc_gain_val.
+                    first = false;
+                } else {
+                    write_drc_huff_diff(bw, g - ref_gain)?;
+                }
+                ref_gain = g;
+            }
+            ref_gain = gains.drc_gain[idx(ch, 0, band)] as i32;
+        }
+        ref_gain = gains.drc_gain[idx(ch, 0, 0)] as i32;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1667,5 +1811,170 @@ mod tests {
         let mut bw = BitWriter::new();
         let err = write_drc_config(&mut bw, &cfg).unwrap_err();
         assert!(err.to_string().contains("modes length"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Write-side round-trips — drc_gains / drc_data / drc_frame
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn write_drc_gains_wideband_round_trips() {
+        // drc_gains_config == 0 → single 7-bit seed only.
+        let chan = DrcChannelInfo::new(1, 1);
+        let gains = DrcGains {
+            mode_id: 0,
+            nr_drc_channels: 1,
+            nr_drc_subframes: 1,
+            nr_drc_bands: 1,
+            drc_gain_val: 70,
+            drc_gain: vec![70],
+        };
+        let mut bw = BitWriter::new();
+        write_drc_gains(&mut bw, &gains, 0, chan).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_drc_gains(&mut br, 0, 0, chan).unwrap();
+        assert_eq!(got, gains);
+    }
+
+    #[test]
+    fn write_drc_gains_multiband_round_trips() {
+        // drc_gains_config == 1 → multi-band per Table; pick 2 ch × 2 sf ×
+        // nr_bands. Reconstruct a gain matrix then round-trip it.
+        let cfg_val = 1u8;
+        let nr_bd = nr_drc_bands(cfg_val) as usize;
+        let chan = DrcChannelInfo::new(2, 2);
+        let nr = 2 * 2 * nr_bd;
+        // Build gains within 0..=127, small deltas to stay in codebook.
+        let mut drc_gain = vec![64u8; nr];
+        for (i, g) in drc_gain.iter_mut().enumerate() {
+            *g = (64 + (i as i32 % 5) - 2) as u8;
+        }
+        // Seed slot drc_gain[0][0][0] must equal drc_gain_val.
+        let seed = drc_gain[0];
+        let gains = DrcGains {
+            mode_id: 1,
+            nr_drc_channels: 2,
+            nr_drc_subframes: 2,
+            nr_drc_bands: nr_drc_bands(cfg_val),
+            drc_gain_val: seed,
+            drc_gain,
+        };
+        let mut bw = BitWriter::new();
+        write_drc_gains(&mut bw, &gains, cfg_val, chan).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_drc_gains(&mut br, 1, cfg_val, chan).unwrap();
+        assert_eq!(got, gains);
+    }
+
+    #[test]
+    fn write_drc_frame_not_present_round_trips() {
+        let chan = DrcChannelInfo::new(1, 1);
+        let frame = DrcFrame {
+            b_drc_present: false,
+            config: None,
+            data: None,
+        };
+        let mut bw = BitWriter::new();
+        write_drc_frame(&mut bw, &frame, true, chan).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_drc_frame(&mut br, true, chan, None).unwrap();
+        assert_eq!(got, frame);
+    }
+
+    #[test]
+    fn write_drc_frame_iframe_gainset_round_trips() {
+        // I-frame, single mode with a gainset (no curve), wideband config.
+        let chan = DrcChannelInfo::new(1, 1);
+        let config = DrcConfig {
+            drc_decoder_nr_modes: 0,
+            drc_eac3_profile: 2,
+            modes: vec![DrcDecoderMode {
+                drc_decoder_mode_id: 1,
+                drc_output_level_from: None,
+                drc_output_level_to: None,
+                drc_repeat_profile_flag: false,
+                drc_repeat_id: None,
+                drc_default_profile_flag: Some(false),
+                drc_compression_curve_flag: false,
+                compression_curve: None,
+                drc_gains_config: Some(0),
+            }],
+        };
+        let frame = DrcFrame {
+            b_drc_present: true,
+            config: Some(config.clone()),
+            data: Some(DrcData {
+                gainsets: vec![DrcGains {
+                    mode_id: 1,
+                    nr_drc_channels: 1,
+                    nr_drc_subframes: 1,
+                    nr_drc_bands: 1,
+                    drc_gain_val: 80,
+                    drc_gain: vec![80],
+                }],
+                curve_present: false,
+                drc_reset_flag: false,
+                drc_reserved: 0,
+            }),
+        };
+        let mut bw = BitWriter::new();
+        write_drc_frame(&mut bw, &frame, true, chan).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_drc_frame(&mut br, true, chan, None).unwrap();
+        assert_eq!(got, frame);
+    }
+
+    #[test]
+    fn write_drc_frame_iframe_curve_mode_round_trips() {
+        // I-frame, single curve-driven mode → no gains, curve_present tail.
+        let chan = DrcChannelInfo::new(2, 4);
+        let curve = DrcCompressionCurve {
+            drc_lev_nullband_low: 1,
+            drc_lev_nullband_high: 2,
+            drc_gain_max_boost: 0,
+            drc_gain_max_cut: 0,
+            drc_tc_default_flag: true,
+            ..Default::default()
+        };
+        let config = DrcConfig {
+            drc_decoder_nr_modes: 0,
+            drc_eac3_profile: 0,
+            modes: vec![DrcDecoderMode {
+                drc_decoder_mode_id: 0,
+                drc_output_level_from: None,
+                drc_output_level_to: None,
+                drc_repeat_profile_flag: false,
+                drc_repeat_id: None,
+                drc_default_profile_flag: Some(false),
+                drc_compression_curve_flag: true,
+                compression_curve: Some(curve),
+                drc_gains_config: None,
+            }],
+        };
+        let frame = DrcFrame {
+            b_drc_present: true,
+            config: Some(config),
+            data: Some(DrcData {
+                gainsets: vec![],
+                curve_present: true,
+                drc_reset_flag: true,
+                drc_reserved: 2,
+            }),
+        };
+        let mut bw = BitWriter::new();
+        write_drc_frame(&mut bw, &frame, true, chan).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_drc_frame(&mut br, true, chan, None).unwrap();
+        assert_eq!(got, frame);
     }
 }

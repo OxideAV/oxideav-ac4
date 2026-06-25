@@ -94,6 +94,24 @@ pub fn drc_huff_decode_diff(br: &mut BitReader<'_>) -> Result<i32> {
     Err(Error::invalid("ac4: no matching DRC_HCB codeword"))
 }
 
+/// Inverse of [`drc_huff_decode_diff`]: encode a diff value in
+/// `-127..=+127` as its `DRC_HCB` codeword (`cb_idx = diff + cb_off`),
+/// emitted MSB-first in `DRC_HCB_LEN[idx]` bits.
+///
+/// `DRC_HCB` is a proven prefix code (no `(len, cw)` collisions), so this
+/// round-trips bit-exactly with the decoder for every in-range diff.
+pub fn write_drc_huff_diff(bw: &mut oxideav_core::bits::BitWriter, diff: i32) -> Result<()> {
+    let idx = diff
+        .checked_add(DRC_HCB_OFFSET)
+        .ok_or_else(|| Error::invalid("ac4: DRC_HCB diff index overflow"))?;
+    if idx < 0 || idx as usize >= DRC_HCB_LEN.len() {
+        return Err(Error::invalid("ac4: DRC_HCB diff out of codebook range"));
+    }
+    let idx = idx as usize;
+    bw.write_u32(DRC_HCB_CW[idx], DRC_HCB_LEN[idx] as u32);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

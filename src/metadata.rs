@@ -29,9 +29,10 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::de::{parse_dialog_enhancement, DeConfig, DialogEnhancement};
+use crate::de::{parse_dialog_enhancement, write_dialog_enhancement, DeConfig, DialogEnhancement};
 use crate::drc::{
-    nr_drc_channels, nr_drc_subframes, parse_drc_frame, DrcChannelInfo, DrcConfig, DrcFrame,
+    nr_drc_channels, nr_drc_subframes, parse_drc_frame, write_drc_frame, DrcChannelInfo, DrcConfig,
+    DrcFrame,
 };
 use crate::emdf::{parse_emdf_payloads_substream, EmdfPayloadsSubstream};
 use crate::toc::variable_bits;
@@ -994,6 +995,82 @@ pub fn parse_metadata(
     })
 }
 
+/// Write `metadata(b_iframe)` per §4.2.14.1 Table 66, the inverse of
+/// [`parse_metadata`].
+///
+/// Reproduces the full element order: `basic_metadata`,
+/// `extended_metadata`, the 7-bit `tools_metadata_size` base plus its
+/// `b_more_bits` / `variable_bits(3) << 7` extension, then `drc_frame` +
+/// `dialog_enhancement` inside the announced size envelope (re-emitting
+/// the recorded `tools_metadata_trailing_bits` of zero filler), and
+/// finally the `b_emdf_payloads_substream` flag + optional
+/// `emdf_payloads_substream()`.
+///
+/// `ctx` MUST match the context used to decode `meta`. The recorded
+/// `tools_metadata_size` is honoured as-is; an inconsistency between the
+/// recorded trailing-bit count and the actual DRC+DE size raises
+/// `Error::invalid`.
+pub fn write_metadata(
+    bw: &mut oxideav_core::bits::BitWriter,
+    meta: &Metadata,
+    ctx: MetadataContext,
+) -> Result<()> {
+    write_basic_metadata(bw, &meta.basic, ctx.channel_mode)?;
+    write_extended_metadata(
+        bw,
+        &meta.extended,
+        ctx.channel_mode,
+        ctx.b_associated,
+        ctx.b_dialog,
+    )?;
+
+    // tools_metadata_size: 7-bit base + optional variable_bits(3) << 7.
+    let tools_size = meta.tools_metadata_size;
+    let base = tools_size & 0x7F;
+    let high = tools_size >> 7;
+    bw.write_u32(base, 7);
+    if high > 0 {
+        bw.write_bit(true);
+        crate::toc::write_variable_bits(bw, 3, high);
+    } else {
+        bw.write_bit(false);
+    }
+
+    let tools_start = bw.bit_position();
+
+    let drc_chan_info = DrcChannelInfo::new(
+        nr_drc_channels(ctx.channel_mode),
+        nr_drc_subframes(ctx.frame_length).unwrap_or(1),
+    );
+    write_drc_frame(bw, &meta.drc, ctx.b_iframe, drc_chan_info)?;
+    write_dialog_enhancement(bw, &meta.dialog_enhancement, ctx.b_iframe)?;
+
+    let consumed = (bw.bit_position() - tools_start) as u32;
+    if consumed + meta.tools_metadata_trailing_bits != tools_size {
+        return Err(Error::invalid(
+            "ac4: write_metadata DRC+DE size + trailing bits != tools_metadata_size",
+        ));
+    }
+    // Emit the trailing reserved (zero) bits to reach the envelope size.
+    let mut trailing = meta.tools_metadata_trailing_bits;
+    while trailing >= 32 {
+        bw.write_u32(0, 32);
+        trailing -= 32;
+    }
+    if trailing > 0 {
+        bw.write_u32(0, trailing);
+    }
+
+    bw.write_bit(meta.emdf_payloads_substream_present);
+    if meta.emdf_payloads_substream_present {
+        let sub = meta.emdf_payloads_substream.as_ref().ok_or_else(|| {
+            Error::invalid("ac4: emdf_payloads_substream_present but substream is None")
+        })?;
+        crate::emdf::write_emdf_payloads_substream(bw, sub)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------
@@ -1788,5 +1865,125 @@ mod tests {
             ..Default::default()
         };
         em_round_trips(&v, channel_mode::MONO, false, false);
+    }
+
+    // ------------------------------------------------------------------
+    // Outer metadata() write-side round-trip — §4.2.14.1 Table 66
+    // ------------------------------------------------------------------
+
+    /// Parse a hand-built metadata bitstream, write it back, re-parse, and
+    /// assert structural equality (write∘parse identity).
+    fn metadata_round_trips(raw: &[u8], ctx: MetadataContext, state: &MetadataState) {
+        let mut br = BitReader::new(raw);
+        let first = parse_metadata(&mut br, ctx, state).unwrap();
+        let mut bw = BitWriter::new();
+        write_metadata(&mut bw, &first, ctx).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br2 = BitReader::new(&bytes);
+        let second = parse_metadata(&mut br2, ctx, state).unwrap();
+        // DrcFrame/Metadata derive PartialEq; compare the load-bearing
+        // fields directly.
+        assert_eq!(first.basic, second.basic);
+        assert_eq!(first.extended, second.extended);
+        assert_eq!(first.tools_metadata_size, second.tools_metadata_size);
+        assert_eq!(first.drc, second.drc);
+        assert_eq!(first.dialog_enhancement, second.dialog_enhancement);
+        assert_eq!(
+            first.emdf_payloads_substream,
+            second.emdf_payloads_substream
+        );
+        assert_eq!(
+            first.tools_metadata_trailing_bits,
+            second.tools_metadata_trailing_bits
+        );
+    }
+
+    #[test]
+    fn write_metadata_minimal_iframe_mono_round_trips() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0x40, 7); // dialnorm
+        bw.write_bit(false); // more_basic_metadata
+        bw.write_bit(false); // b_channels_classifier
+        bw.write_bit(false); // b_event_probability
+        bw.write_u32(2, 7); // tools_metadata_size
+        bw.write_bit(false); // b_more_bits
+        write_minimal_drc_absent(&mut bw);
+        write_minimal_de_absent(&mut bw);
+        bw.write_bit(false); // b_emdf_payloads_substream
+        bw.align_to_byte();
+        let raw = bw.finish();
+        let ctx = MetadataContext {
+            channel_mode: channel_mode::MONO,
+            b_iframe: true,
+            b_associated: false,
+            b_dialog: false,
+            frame_length: 1024,
+        };
+        metadata_round_trips(&raw, ctx, &MetadataState::default());
+    }
+
+    #[test]
+    fn write_metadata_trailing_bits_round_trips() {
+        // tools_metadata_size = 6 → 2 consumed + 4 reserved zero bits.
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 7); // dialnorm
+        bw.write_bit(false); // more
+        bw.write_bit(false); // b_channels_classifier
+        bw.write_bit(false); // b_event_probability
+        bw.write_u32(6, 7); // tools_metadata_size = 6
+        bw.write_bit(false); // b_more_bits
+        write_minimal_drc_absent(&mut bw);
+        write_minimal_de_absent(&mut bw);
+        for _ in 0..4 {
+            bw.write_bit(false); // reserved trailing
+        }
+        bw.write_bit(false); // b_emdf_payloads_substream
+        bw.align_to_byte();
+        let raw = bw.finish();
+        let ctx = MetadataContext {
+            channel_mode: channel_mode::MONO,
+            b_iframe: true,
+            b_associated: false,
+            b_dialog: false,
+            frame_length: 1024,
+        };
+        metadata_round_trips(&raw, ctx, &MetadataState::default());
+    }
+
+    #[test]
+    fn write_metadata_with_emdf_payload_round_trips() {
+        let mut bw = BitWriter::new();
+        bw.write_u32(0x20, 7); // dialnorm
+        bw.write_bit(false); // more
+        bw.write_bit(false); // b_channels_classifier
+        bw.write_bit(false); // b_event_probability
+        bw.write_u32(2, 7); // tools_metadata_size
+        bw.write_bit(false); // b_more_bits
+        write_minimal_drc_absent(&mut bw);
+        write_minimal_de_absent(&mut bw);
+        bw.write_bit(true); // b_emdf_payloads_substream
+                            // emdf_payloads_substream(): one payload id 7, minimal config,
+                            // 1 byte, then terminator + byte_align.
+        bw.write_u32(7, 5); // emdf_payload_id
+        bw.write_bit(false); // b_smpoffst
+        bw.write_bit(false); // b_duration
+        bw.write_bit(false); // b_groupid
+        bw.write_bit(false); // b_codecdata
+        bw.write_bit(true); // b_discard_unknown_payload
+        bw.write_u32(1, 8); // emdf_payload_size = 1 (variable_bits(8))
+        bw.write_bit(false); // continuation for variable_bits
+        bw.write_u32(0xAB, 8); // payload byte
+        bw.write_u32(0, 5); // terminator
+        bw.align_to_byte();
+        let raw = bw.finish();
+        let ctx = MetadataContext {
+            channel_mode: channel_mode::MONO,
+            b_iframe: true,
+            b_associated: false,
+            b_dialog: false,
+            frame_length: 1024,
+        };
+        metadata_round_trips(&raw, ctx, &MetadataState::default());
     }
 }
