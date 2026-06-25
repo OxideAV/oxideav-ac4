@@ -449,6 +449,173 @@ pub fn parse_drc_compression_curve(br: &mut BitReader<'_>) -> Result<DrcCompress
     })
 }
 
+/// Write `drc_config()` per §4.2.14.6 Table 71, the inverse of
+/// [`parse_drc_config`].
+///
+/// `config.modes.len()` MUST equal `drc_decoder_nr_modes + 1`, matching
+/// what the decoder reconstructs; otherwise `Error::invalid` is raised.
+pub fn write_drc_config(bw: &mut oxideav_core::bits::BitWriter, config: &DrcConfig) -> Result<()> {
+    if config.modes.len() != config.drc_decoder_nr_modes as usize + 1 {
+        return Err(Error::invalid(
+            "ac4: drc_config modes length must equal drc_decoder_nr_modes + 1",
+        ));
+    }
+    bw.write_u32(config.drc_decoder_nr_modes as u32, 3);
+    for mode in &config.modes {
+        write_drc_decoder_mode_config(bw, mode)?;
+    }
+    bw.write_u32(config.drc_eac3_profile as u32, 3);
+    Ok(())
+}
+
+/// Write `drc_decoder_mode_config()` per §4.2.14.7 Table 72, the inverse
+/// of `parse_drc_decoder_mode_config`.
+fn write_drc_decoder_mode_config(
+    bw: &mut oxideav_core::bits::BitWriter,
+    mode: &DrcDecoderMode,
+) -> Result<()> {
+    bw.write_u32(mode.drc_decoder_mode_id as u32, 3);
+    if mode.drc_decoder_mode_id > 3 {
+        bw.write_u32(
+            mode.drc_output_level_from.ok_or_else(|| {
+                Error::invalid("ac4: drc_output_level_from required (mode_id > 3)")
+            })? as u32,
+            5,
+        );
+        bw.write_u32(
+            mode.drc_output_level_to
+                .ok_or_else(|| Error::invalid("ac4: drc_output_level_to required (mode_id > 3)"))?
+                as u32,
+            5,
+        );
+    }
+
+    bw.write_bit(mode.drc_repeat_profile_flag);
+    if mode.drc_repeat_profile_flag {
+        bw.write_u32(
+            mode.drc_repeat_id
+                .ok_or_else(|| Error::invalid("ac4: drc_repeat_id required when repeat flag set"))?
+                as u32,
+            3,
+        );
+        return Ok(());
+    }
+
+    let default_flag = mode
+        .drc_default_profile_flag
+        .ok_or_else(|| Error::invalid("ac4: drc_default_profile_flag required (no repeat)"))?;
+    bw.write_bit(default_flag);
+    if default_flag {
+        // Default profile: no further fields (curve flag implicitly 1).
+        return Ok(());
+    }
+
+    bw.write_bit(mode.drc_compression_curve_flag);
+    if mode.drc_compression_curve_flag {
+        let curve = mode
+            .compression_curve
+            .as_ref()
+            .ok_or_else(|| Error::invalid("ac4: compression_curve required when curve flag set"))?;
+        write_drc_compression_curve(bw, curve)?;
+    } else {
+        bw.write_u32(
+            mode.drc_gains_config
+                .ok_or_else(|| Error::invalid("ac4: drc_gains_config required (no curve)"))?
+                as u32,
+            2,
+        );
+    }
+    Ok(())
+}
+
+/// Write `drc_compression_curve()` per §4.2.14.8 Table 73, the inverse of
+/// [`parse_drc_compression_curve`].
+pub fn write_drc_compression_curve(
+    bw: &mut oxideav_core::bits::BitWriter,
+    c: &DrcCompressionCurve,
+) -> Result<()> {
+    bw.write_u32(c.drc_lev_nullband_low as u32, 4);
+    bw.write_u32(c.drc_lev_nullband_high as u32, 4);
+    bw.write_u32(c.drc_gain_max_boost as u32, 4);
+    if c.drc_gain_max_boost > 0 {
+        let lmb = c
+            .drc_lev_max_boost
+            .ok_or_else(|| Error::invalid("ac4: drc_lev_max_boost required (boost > 0)"))?;
+        let nbs = c
+            .drc_nr_boost_sections
+            .ok_or_else(|| Error::invalid("ac4: drc_nr_boost_sections required (boost > 0)"))?;
+        bw.write_u32(lmb as u32, 5);
+        bw.write_u32(nbs as u32, 1);
+        if nbs > 0 {
+            bw.write_u32(
+                c.drc_gain_section_boost
+                    .ok_or_else(|| Error::invalid("ac4: drc_gain_section_boost required"))?
+                    as u32,
+                4,
+            );
+            bw.write_u32(
+                c.drc_lev_section_boost
+                    .ok_or_else(|| Error::invalid("ac4: drc_lev_section_boost required"))?
+                    as u32,
+                5,
+            );
+        }
+    }
+
+    bw.write_u32(c.drc_gain_max_cut as u32, 5);
+    if c.drc_gain_max_cut > 0 {
+        let lmc = c
+            .drc_lev_max_cut
+            .ok_or_else(|| Error::invalid("ac4: drc_lev_max_cut required (cut > 0)"))?;
+        let ncs = c
+            .drc_nr_cut_sections
+            .ok_or_else(|| Error::invalid("ac4: drc_nr_cut_sections required (cut > 0)"))?;
+        bw.write_u32(lmc as u32, 6);
+        bw.write_u32(ncs as u32, 1);
+        if ncs > 0 {
+            bw.write_u32(
+                c.drc_gain_section_cut
+                    .ok_or_else(|| Error::invalid("ac4: drc_gain_section_cut required"))?
+                    as u32,
+                5,
+            );
+            bw.write_u32(
+                c.drc_lev_section_cut
+                    .ok_or_else(|| Error::invalid("ac4: drc_lev_section_cut required"))?
+                    as u32,
+                5,
+            );
+        }
+    }
+
+    bw.write_bit(c.drc_tc_default_flag);
+    if !c.drc_tc_default_flag {
+        let tc = c.time_constants.as_ref().ok_or_else(|| {
+            Error::invalid("ac4: time_constants required when !drc_tc_default_flag")
+        })?;
+        bw.write_u32(tc.drc_tc_attack as u32, 8);
+        bw.write_u32(tc.drc_tc_release as u32, 8);
+        bw.write_u32(tc.drc_tc_attack_fast as u32, 8);
+        bw.write_u32(tc.drc_tc_release_fast as u32, 8);
+        bw.write_bit(tc.drc_adaptive_smoothing_flag);
+        if tc.drc_adaptive_smoothing_flag {
+            bw.write_u32(
+                tc.drc_attack_threshold
+                    .ok_or_else(|| Error::invalid("ac4: drc_attack_threshold required"))?
+                    as u32,
+                5,
+            );
+            bw.write_u32(
+                tc.drc_release_threshold
+                    .ok_or_else(|| Error::invalid("ac4: drc_release_threshold required"))?
+                    as u32,
+                5,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `drc_data()` per §4.2.14.9 Table 74.
 pub fn parse_drc_data(
     br: &mut BitReader<'_>,
@@ -1312,5 +1479,193 @@ mod tests {
         let mut pcm: Vec<Vec<f32>> = vec![vec![1.0f32; 4]]; // only 1 channel
         let err = apply_drc_gains_to_pcm(&mut pcm, &gains, &map, 1.0).unwrap_err();
         assert!(err.to_string().contains("mismatches"));
+    }
+
+    // ------------------------------------------------------------------
+    // Write-side round-trips — drc_config / drc_compression_curve
+    // ------------------------------------------------------------------
+
+    fn curve_round_trips(c: &DrcCompressionCurve) {
+        let mut bw = BitWriter::new();
+        write_drc_compression_curve(&mut bw, c).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_drc_compression_curve(&mut br).unwrap();
+        assert_eq!(&got, c);
+    }
+
+    #[test]
+    fn write_curve_minimal_round_trips() {
+        // No boost, no cut, default time constants.
+        let c = DrcCompressionCurve {
+            drc_lev_nullband_low: 3,
+            drc_lev_nullband_high: 5,
+            drc_gain_max_boost: 0,
+            drc_gain_max_cut: 0,
+            drc_tc_default_flag: true,
+            ..Default::default()
+        };
+        curve_round_trips(&c);
+    }
+
+    #[test]
+    fn write_curve_full_round_trips() {
+        let c = DrcCompressionCurve {
+            drc_lev_nullband_low: 2,
+            drc_lev_nullband_high: 7,
+            drc_gain_max_boost: 9,
+            drc_lev_max_boost: Some(20),
+            drc_nr_boost_sections: Some(1),
+            drc_gain_section_boost: Some(8),
+            drc_lev_section_boost: Some(15),
+            drc_gain_max_cut: 12,
+            drc_lev_max_cut: Some(40),
+            drc_nr_cut_sections: Some(1),
+            drc_gain_section_cut: Some(10),
+            drc_lev_section_cut: Some(18),
+            drc_tc_default_flag: false,
+            time_constants: Some(DrcTimeConstants {
+                drc_tc_attack: 100,
+                drc_tc_release: 150,
+                drc_tc_attack_fast: 50,
+                drc_tc_release_fast: 80,
+                drc_adaptive_smoothing_flag: true,
+                drc_attack_threshold: Some(12),
+                drc_release_threshold: Some(20),
+            }),
+        };
+        curve_round_trips(&c);
+    }
+
+    #[test]
+    fn write_curve_boost_no_sections_round_trips() {
+        // boost > 0 but nr_boost_sections == 0 (no per-section fields).
+        let c = DrcCompressionCurve {
+            drc_gain_max_boost: 5,
+            drc_lev_max_boost: Some(10),
+            drc_nr_boost_sections: Some(0),
+            drc_gain_max_cut: 0,
+            drc_tc_default_flag: false,
+            time_constants: Some(DrcTimeConstants {
+                drc_tc_attack: 1,
+                drc_tc_release: 2,
+                drc_tc_attack_fast: 3,
+                drc_tc_release_fast: 4,
+                drc_adaptive_smoothing_flag: false,
+                drc_attack_threshold: None,
+                drc_release_threshold: None,
+            }),
+            ..Default::default()
+        };
+        curve_round_trips(&c);
+    }
+
+    fn config_round_trips(cfg: &DrcConfig) {
+        let mut bw = BitWriter::new();
+        write_drc_config(&mut bw, cfg).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_drc_config(&mut br).unwrap();
+        assert_eq!(&got, cfg);
+    }
+
+    #[test]
+    fn write_config_single_default_mode_round_trips() {
+        let cfg = DrcConfig {
+            drc_decoder_nr_modes: 0,
+            drc_eac3_profile: 4,
+            modes: vec![DrcDecoderMode {
+                drc_decoder_mode_id: 1,
+                drc_output_level_from: None,
+                drc_output_level_to: None,
+                drc_repeat_profile_flag: false,
+                drc_repeat_id: None,
+                drc_default_profile_flag: Some(true),
+                drc_compression_curve_flag: true,
+                compression_curve: None,
+                drc_gains_config: None,
+            }],
+        };
+        config_round_trips(&cfg);
+    }
+
+    #[test]
+    fn write_config_curve_and_gainset_and_repeat_round_trips() {
+        // Mode 0: high-id with output levels + own curve.
+        // Mode 1: gainset (no curve).
+        // Mode 2: repeats mode 0's profile.
+        let curve = DrcCompressionCurve {
+            drc_lev_nullband_low: 1,
+            drc_lev_nullband_high: 2,
+            drc_gain_max_boost: 0,
+            drc_gain_max_cut: 0,
+            drc_tc_default_flag: true,
+            ..Default::default()
+        };
+        let cfg = DrcConfig {
+            drc_decoder_nr_modes: 2,
+            drc_eac3_profile: 1,
+            modes: vec![
+                DrcDecoderMode {
+                    drc_decoder_mode_id: 4, // > 3 → output levels present
+                    drc_output_level_from: Some(7),
+                    drc_output_level_to: Some(9),
+                    drc_repeat_profile_flag: false,
+                    drc_repeat_id: None,
+                    drc_default_profile_flag: Some(false),
+                    drc_compression_curve_flag: true,
+                    compression_curve: Some(curve.clone()),
+                    drc_gains_config: None,
+                },
+                DrcDecoderMode {
+                    drc_decoder_mode_id: 1,
+                    drc_output_level_from: None,
+                    drc_output_level_to: None,
+                    drc_repeat_profile_flag: false,
+                    drc_repeat_id: None,
+                    drc_default_profile_flag: Some(false),
+                    drc_compression_curve_flag: false,
+                    compression_curve: None,
+                    drc_gains_config: Some(2),
+                },
+                DrcDecoderMode {
+                    drc_decoder_mode_id: 2,
+                    drc_output_level_from: None,
+                    drc_output_level_to: None,
+                    drc_repeat_profile_flag: true,
+                    drc_repeat_id: Some(4), // repeat mode 0 (id 4, curve)
+                    drc_default_profile_flag: None,
+                    // These mirror the referenced mode after decode:
+                    drc_compression_curve_flag: true,
+                    compression_curve: None,
+                    drc_gains_config: None,
+                },
+            ],
+        };
+        config_round_trips(&cfg);
+    }
+
+    #[test]
+    fn write_config_rejects_modes_length_mismatch() {
+        let cfg = DrcConfig {
+            drc_decoder_nr_modes: 2, // claims 3 modes
+            drc_eac3_profile: 0,
+            modes: vec![DrcDecoderMode {
+                drc_decoder_mode_id: 0,
+                drc_output_level_from: None,
+                drc_output_level_to: None,
+                drc_repeat_profile_flag: false,
+                drc_repeat_id: None,
+                drc_default_profile_flag: Some(true),
+                drc_compression_curve_flag: true,
+                compression_curve: None,
+                drc_gains_config: None,
+            }],
+        };
+        let mut bw = BitWriter::new();
+        let err = write_drc_config(&mut bw, &cfg).unwrap_err();
+        assert!(err.to_string().contains("modes length"), "got: {err}");
     }
 }
