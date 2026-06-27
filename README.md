@@ -152,11 +152,21 @@ an S16 `AudioFrame`:
   pair from L, surround pair from Ls, centre from C, and the 7.0
   pure-ASPX back pair from Lb). The 7_X ASPX_ACPL_1 path additionally now
   emits **real** per-sbg SIGNAL/NOISE ASPX envelopes on all three carriers
-  (replacing the round-118 `write_aspx_data_*_minimal` scaffold). Still
-  pending: `add_harmonic` / `fic_used_in_sfb` / `tic_used_in_slot` remain
-  at the all-zero scaffold on every live path, and the 7.X ASPX_ACPL_3
-  path does not yet exist. The `aspx_tna_mode` threshold mapping is an
-  encoder tuning choice (the spec leaves the selection informative); it is
+  (replacing the round-118 `write_aspx_data_*_minimal` scaffold). Every
+  live A-SPX path now also emits a **real `aspx_add_harmonic`** decision:
+  the `aspx_ah_select` module measures each carrier's per-high-res-signal-
+  subband-group HF QMF **spectral crest** (the group's loudest subband
+  energy ÷ its mean per-subband energy) and requests a restored missing
+  harmonic (§4.2.12.6) where a dominant tonal partial is present (the
+  decoder places the §5.7.6.4.2.1 Pseudocode 92 sinusoid at the group's
+  `sb_mid`). This is wired per-channel into the live 5_X ASPX_ACPL_3, 5_X /
+  7_X ASPX_ACPL_2, 7.0 pure-ASPX, and 7_X ASPX_ACPL_1 paths via new
+  `write_aspx_data_{1,2}ch_real_envelope_tna_ah` writers + an
+  `extract_aspx_add_harmonic` per-carrier analysis. Still pending:
+  `fic_used_in_sfb` / `tic_used_in_slot` remain at the all-zero scaffold on
+  every live path, and the 7.X ASPX_ACPL_3 path does not yet exist. The
+  `aspx_tna_mode` / `aspx_add_harmonic` threshold mappings are encoder
+  tuning choices (the spec leaves the selection informative); they are
   calibrated to the live QMF pipeline but not yet tuned against a
   perceptual reference.
 - The live 5_X ASPX_ACPL_3 real-ASPX frame path now selects between a

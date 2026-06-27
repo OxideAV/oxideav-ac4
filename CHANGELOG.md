@@ -23,8 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `write_aspx_data_{1,2}ch_real_envelope_tna_ah` writers + an
   `extract_aspx_add_harmonic` per-carrier analysis, replacing the all-
   `false` `add_harmonic` scaffold the `write_aspx_hfgen_iwc_{1,2}ch`
-  writers previously received. Round-trip + liveness + determinism covered
-  by `tests/round377_5_x_acpl3_aspx_add_harmonic.rs`.
+  writers previously received. Wired per-channel into **every** live A-SPX
+  path: 5_X ASPX_ACPL_3, 5_X / 7_X ASPX_ACPL_2, 7.0 pure-ASPX, and 7_X
+  ASPX_ACPL_1. Round-trip + liveness + determinism covered by
+  `tests/round377_5_x_acpl3_aspx_add_harmonic.rs` (5_X ACPL_3, 5_X ACPL_2,
+  and 7.0 pure-ASPX entry points).
 
 - ac4 round 370 — **metadata write-side (encoder symmetry)**: give every
   `metadata()` parser a bit-exact inverse so a decoded `Metadata`

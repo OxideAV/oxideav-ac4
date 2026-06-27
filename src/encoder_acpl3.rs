@@ -5639,6 +5639,9 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     c_noise: &[i32],
     lr_tna_mode: &[u8],
     c_tna_mode: &[u8],
+    l_ah: &[bool],
+    r_ah: &[bool],
+    c_ah: &[bool],
     acpl_num_param_bands_id: u8,
     acpl_quant_mode: crate::acpl::AcplQuantMode,
     pad_target_bytes: usize,
@@ -5724,7 +5727,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
     if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -5736,9 +5739,11 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 noise: r_noise,
             },
             lr_tna_mode,
+            l_ah,
+            r_ah,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_real_envelope_tna(
+        write_aspx_data_1ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -5746,6 +5751,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 noise: c_noise,
             },
             c_tna_mode,
+            c_ah,
         )
         .expect("encoder: aspx config invalid");
         write_acpl_data_1ch_real_alpha_beta(
@@ -8768,6 +8774,11 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     front_tna_mode: &[u8],
     surround_tna_mode: &[u8],
     c_tna_mode: &[u8],
+    l_ah: &[bool],
+    r_ah: &[bool],
+    ls_ah: &[bool],
+    rs_ah: &[bool],
+    c_ah: &[bool],
     acpl_num_param_bands_id: u8,
     acpl_quant_mode: crate::acpl::AcplQuantMode,
     pad_target_bytes: usize,
@@ -8838,7 +8849,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
     if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -8850,9 +8861,11 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 noise: r_noise,
             },
             front_tna_mode,
+            l_ah,
+            r_ah,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -8864,9 +8877,11 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 noise: rs_noise,
             },
             surround_tna_mode,
+            ls_ah,
+            rs_ah,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_real_envelope_tna(
+        write_aspx_data_1ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -8874,6 +8889,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 noise: c_noise,
             },
             c_tna_mode,
+            c_ah,
         )
         .expect("encoder: aspx config invalid");
         write_acpl_data_1ch_real_alpha_beta(
@@ -9469,9 +9485,17 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
 /// per-noise-subband-group `aspx_tna_mode` field the decoder feeds into
 /// the §5.7.6.4.1.2-4 chirp / order-2 LPC inverse filter.
 ///
+/// `front_ah` / `surround_ah` / `c_ah` carry the per-channel
+/// `aspx_add_harmonic` (§4.2.12.6) decisions (front/surround as `(ch0,
+/// ch1)` tuples since it is signalled independently per channel, the
+/// centre as a single vector) — typically from
+/// [`crate::aspx_ah_select::select_add_harmonic`] over each carrier's HF
+/// QMF band. Empty slices reproduce the all-zero `add_harmonic` scaffold.
+///
 /// Refs ETSI TS 103 190-1 §4.2.6.14 Table 33 (`case ASPX_ACPL_1:`),
 /// §4.2.12.3 Table 51 (`aspx_data_1ch()`), §4.2.12.4 Table 52
-/// (`aspx_data_2ch()`), §4.3.10.6.1 Table 131 (`aspx_tna_mode`).
+/// (`aspx_data_2ch()`), §4.3.10.6.1 Table 131 (`aspx_tna_mode`),
+/// §4.2.12.6 (`aspx_hfgen_iwc`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     transform_length: u32,
@@ -9495,6 +9519,9 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     front_tna_mode: &[u8],
     surround_tna_mode: &[u8],
     c_tna_mode: &[u8],
+    front_ah: (&[bool], &[bool]),
+    surround_ah: (&[bool], &[bool]),
+    c_ah: &[bool],
     pad_target_bytes: usize,
 ) -> Vec<u8> {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
@@ -9578,17 +9605,27 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
     if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna(&mut bw, aspx_cfg, front.0, front.1, front_tna_mode)
-            .expect("encoder: aspx config invalid");
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
+            &mut bw,
+            aspx_cfg,
+            front.0,
+            front.1,
+            front_tna_mode,
+            front_ah.0,
+            front_ah.1,
+        )
+        .expect("encoder: aspx config invalid");
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             surround.0,
             surround.1,
             surround_tna_mode,
+            surround_ah.0,
+            surround_ah.1,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_real_envelope_tna(&mut bw, aspx_cfg, c, c_tna_mode)
+        write_aspx_data_1ch_real_envelope_tna_ah(&mut bw, aspx_cfg, c, c_tna_mode, c_ah)
             .expect("encoder: aspx config invalid");
         write_acpl_data_1ch_real_alpha_beta(
             &mut bw,

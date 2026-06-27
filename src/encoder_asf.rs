@@ -2538,11 +2538,18 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
     surround_tna_mode: &[u8],
     c_tna_mode: &[u8],
     back_tna_mode: &[u8],
+    l_ah: &[bool],
+    r_ah: &[bool],
+    ls_ah: &[bool],
+    rs_ah: &[bool],
+    c_ah: &[bool],
+    lb_ah: &[bool],
+    rb_ah: &[bool],
     pad_target_bytes: usize,
 ) -> Vec<u8> {
     use crate::encoder_acpl3::{
-        write_aspx_config, write_aspx_data_1ch_real_envelope_tna,
-        write_aspx_data_2ch_real_envelope_tna, AspxRealEnvelopeChannel,
+        write_aspx_config, write_aspx_data_1ch_real_envelope_tna_ah,
+        write_aspx_data_2ch_real_envelope_tna_ah, AspxRealEnvelopeChannel,
     };
 
     let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
@@ -2671,7 +2678,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
     // ASPX trailers per Table 33 — the `_tna` variants carry the real
     // per-carrier `aspx_tna_mode` inverse-filtering vector.
     if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -2683,9 +2690,11 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
                 noise: r_noise,
             },
             front_tna_mode,
+            l_ah,
+            r_ah,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -2697,9 +2706,11 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
                 noise: rs_noise,
             },
             surround_tna_mode,
+            ls_ah,
+            rs_ah,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_real_envelope_tna(
+        write_aspx_data_1ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -2707,10 +2718,11 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
                 noise: c_noise,
             },
             c_tna_mode,
+            c_ah,
         )
         .expect("encoder: aspx config invalid");
         // Extra aspx_data_2ch() — the back pair Lb/Rb (Table 202 x3/x4).
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -2722,6 +2734,8 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
                 noise: rb_noise,
             },
             back_tna_mode,
+            lb_ah,
+            rb_ah,
         )
         .expect("encoder: aspx config invalid");
     }

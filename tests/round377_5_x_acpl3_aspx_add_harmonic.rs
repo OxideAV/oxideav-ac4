@@ -237,3 +237,83 @@ fn add_harmonic_path_is_deterministic() {
     let b = enc_b.encode_frame_pcm_5_0_acpl3_real_aspx(&[&l, &r, &c, &ls, &rs], 0.5, 0.1, 1.0, 1.0);
     assert_eq!(a, b, "matched inputs must produce identical bytes");
 }
+
+/// The add_harmonic wiring is live on the 5_X ASPX_ACPL_2 single-envelope
+/// path: a tonal-HF L/R/C input differs from a flat-HF-noise input, and
+/// both round-trip to 5-channel audio.
+#[test]
+fn acpl2_5_0_add_harmonic_is_live_and_round_trips() {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+
+    let c_tone = make_tone_frame(13_500.0, 0.6);
+    let ls = make_tone_frame(880.0, 0.2);
+    let rs = make_tone_frame(1100.0, 0.2);
+
+    let mut enc_tone = Ac4ImsEncoder::new();
+    let bytes_tone = enc_tone.encode_frame_pcm_5_0_acpl2_real_aspx(&[
+        &make_tone_frame(13_000.0, 0.7),
+        &make_tone_frame(12_000.0, 0.6),
+        &c_tone,
+        &ls,
+        &rs,
+    ]);
+    let mut enc_flat = Ac4ImsEncoder::new();
+    let bytes_flat = enc_flat.encode_frame_pcm_5_0_acpl2_real_aspx(&[
+        &make_flat_noise_frame(0.5),
+        &make_flat_noise_frame(0.4),
+        &make_flat_noise_frame(0.45),
+        &ls,
+        &rs,
+    ]);
+    assert_ne!(
+        bytes_tone, bytes_flat,
+        "tonal vs flat HF must differ on 5_X ACPL_2"
+    );
+
+    let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes_tone);
+    dec.send_packet(&pkt).expect("decoder must accept packet");
+    let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+        panic!("expected audio frame");
+    };
+    assert_eq!(af.data[0].len(), 1920 * 5 * 2);
+}
+
+/// The add_harmonic wiring is live on the 7.0 pure-ASPX path: a tonal-HF
+/// input differs from a flat-HF-noise input, and round-trips to 7-channel
+/// audio.
+#[test]
+fn pure_aspx_7_0_add_harmonic_is_live_and_round_trips() {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+
+    let tone7: Vec<Vec<f32>> = [
+        13_000.0, 12_000.0, 13_500.0, 11_000.0, 10_500.0, 14_000.0, 12_500.0,
+    ]
+    .iter()
+    .map(|&f| make_tone_frame(f, 0.6))
+    .collect();
+    let flat7: Vec<Vec<f32>> = (0..7).map(|_| make_flat_noise_frame(0.5)).collect();
+
+    let mut enc_tone = Ac4ImsEncoder::new();
+    let refs_tone: Vec<&[f32]> = tone7.iter().map(|v| v.as_slice()).collect();
+    let bytes_tone =
+        enc_tone.encode_frame_pcm_7_0_aspx_real_aspx(&refs_tone.clone().try_into().unwrap());
+
+    let mut enc_flat = Ac4ImsEncoder::new();
+    let refs_flat: Vec<&[f32]> = flat7.iter().map(|v| v.as_slice()).collect();
+    let bytes_flat =
+        enc_flat.encode_frame_pcm_7_0_aspx_real_aspx(&refs_flat.clone().try_into().unwrap());
+
+    assert_ne!(
+        bytes_tone, bytes_flat,
+        "tonal vs flat HF must differ on 7.0 pure-ASPX"
+    );
+
+    let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes_tone);
+    dec.send_packet(&pkt).expect("decoder must accept packet");
+    let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+        panic!("expected audio frame");
+    };
+    assert_eq!(af.data[0].len(), 1920 * 7 * 2, "7-channel S16 interleaved");
+}

@@ -1314,6 +1314,16 @@ impl Ac4ImsEncoder {
         let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
         let back_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[5]);
 
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for all seven
+        // 7.0 carriers — signalled independently per channel.
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let ls_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[3]);
+        let rs_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[4]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+        let lb_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[5]);
+        let rb_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[6]);
+
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
             21..=40 => 12288,
@@ -1354,6 +1364,13 @@ impl Ac4ImsEncoder {
             &surround_tna_mode,
             &c_tna_mode,
             &back_tna_mode,
+            &l_ah,
+            &r_ah,
+            &ls_ah,
+            &rs_ah,
+            &c_ah,
+            &lb_ah,
+            &rb_ah,
             pad_target_bytes,
         );
 
@@ -3649,6 +3666,12 @@ impl Ac4ImsEncoder {
         let lr_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
         let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
 
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for the L / R
+        // front pair + the centre carrier.
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -3678,6 +3701,9 @@ impl Ac4ImsEncoder {
                 &c_noise,
                 &lr_tna_mode,
                 &c_tna_mode,
+                &l_ah,
+                &r_ah,
+                &c_ah,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
@@ -5138,6 +5164,14 @@ impl Ac4ImsEncoder {
         let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
         let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
 
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for all five
+        // 7_X ACPL_2 A-SPX carriers — signalled independently per channel.
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let ls_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[3]);
+        let rs_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[4]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -5174,6 +5208,11 @@ impl Ac4ImsEncoder {
                 &front_tna_mode,
                 &surround_tna_mode,
                 &c_tna_mode,
+                &l_ah,
+                &r_ah,
+                &ls_ah,
+                &rs_ah,
+                &c_ah,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
@@ -5520,6 +5559,14 @@ impl Ac4ImsEncoder {
         let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
         let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
 
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for all five
+        // 7_X ACPL_2 A-SPX carriers — signalled independently per channel.
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let ls_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[3]);
+        let rs_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[4]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -5556,6 +5603,11 @@ impl Ac4ImsEncoder {
                 &front_tna_mode,
                 &surround_tna_mode,
                 &c_tna_mode,
+                &l_ah,
+                &r_ah,
+                &ls_ah,
+                &rs_ah,
+                &c_ah,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
@@ -5820,6 +5872,15 @@ impl Ac4ImsEncoder {
         let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
         let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
 
+        // Per-carrier (per-channel) real aspx_add_harmonic (§4.2.12.6):
+        // unlike tna_mode it is signalled independently for each channel of
+        // a 2ch element (aspx_balance mirrors framing + tna_mode only).
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let ls_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[3]);
+        let rs_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[4]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
             21..=40 => 12288,
@@ -5871,6 +5932,9 @@ impl Ac4ImsEncoder {
                 &front_tna_mode,
                 &surround_tna_mode,
                 &c_tna_mode,
+                (&l_ah, &r_ah),
+                (&ls_ah, &rs_ah),
+                &c_ah,
                 pad_target_bytes,
             );
 
@@ -6151,6 +6215,15 @@ impl Ac4ImsEncoder {
         let surround_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[3]);
         let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
 
+        // Per-carrier (per-channel) real aspx_add_harmonic (§4.2.12.6):
+        // unlike tna_mode it is signalled independently for each channel of
+        // a 2ch element (aspx_balance mirrors framing + tna_mode only).
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let ls_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[3]);
+        let rs_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[4]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
             21..=40 => 12288,
@@ -6202,6 +6275,9 @@ impl Ac4ImsEncoder {
                 &front_tna_mode,
                 &surround_tna_mode,
                 &c_tna_mode,
+                (&l_ah, &r_ah),
+                (&ls_ah, &rs_ah),
+                &c_ah,
                 pad_target_bytes,
             );
 
