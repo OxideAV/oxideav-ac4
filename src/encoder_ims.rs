@@ -3189,6 +3189,10 @@ impl Ac4ImsEncoder {
         // Fine clamp the multi-envelope writer does not apply).
         let (num_env, rows) =
             self.extract_aspx_lr_multi_env(&aspx_cfg, frame_len, frames[0], frames[1]);
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for the L / R
+        // carriers — carried on the multi-envelope aspx_data_2ch() too.
+        let aspx_l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let aspx_r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
         if num_env <= 1 {
             return self.encode_frame_pcm_5_x_acpl3_real_aspx_with_max_sfb(
                 frames,
@@ -3255,6 +3259,8 @@ impl Ac4ImsEncoder {
                 &aspx_cfg,
                 num_env,
                 &rows,
+                &aspx_l_ah,
+                &aspx_r_ah,
                 acpl_num_param_bands_id,
                 acpl_qm0,
                 acpl_qm1,
@@ -3809,6 +3815,11 @@ impl Ac4ImsEncoder {
         let (l_sig, l_noise, r_sig, r_noise) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
 
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for L / R + centre.
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -3840,6 +3851,9 @@ impl Ac4ImsEncoder {
                 &r_noise,
                 c_num_env,
                 centre,
+                &l_ah,
+                &r_ah,
+                &c_ah,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
@@ -5359,6 +5373,14 @@ impl Ac4ImsEncoder {
         let (ls_sig, ls_noise, rs_sig, rs_noise) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, surround[3], surround[4]);
 
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for all five
+        // 7_X ACPL_2 A-SPX carriers.
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, surround[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, surround[1]);
+        let ls_ah = self.extract_aspx_add_harmonic(&aspx_cfg, surround[3]);
+        let rs_ah = self.extract_aspx_add_harmonic(&aspx_cfg, surround[4]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, surround[2]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
 
@@ -5396,6 +5418,11 @@ impl Ac4ImsEncoder {
                 &rs_noise,
                 c_num_env,
                 centre,
+                &l_ah,
+                &r_ah,
+                &ls_ah,
+                &rs_ah,
+                &c_ah,
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,

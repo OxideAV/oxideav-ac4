@@ -2700,6 +2700,8 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     aspx_cfg: &aspx::AspxConfig,
     aspx_num_env: u32,
     aspx_rows: &AspxMultiEnvelope2chRows,
+    aspx_l_ah: &[bool],
+    aspx_r_ah: &[bool],
     acpl_num_param_bands_id: u8,
     acpl_qm0: crate::acpl::AcplQuantMode,
     acpl_qm1: crate::acpl::AcplQuantMode,
@@ -2839,7 +2841,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     // I-frame: multi-envelope real aspx_data_2ch() + acpl_data_2ch() with
     // real α / β / β₃ / γ₁..γ₆.
     if b_iframe {
-        if write_aspx_data_2ch_multi_envelope(
+        if write_aspx_data_2ch_multi_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             aspx_num_env,
@@ -2851,6 +2853,9 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
                 sig: &aspx_rows.ch1_sig,
                 noise: &aspx_rows.ch1_noise,
             },
+            &[],
+            aspx_l_ah,
+            aspx_r_ah,
         )
         .is_err()
         {
@@ -3962,6 +3967,30 @@ pub fn write_aspx_data_2ch_multi_envelope(
     ch0: AspxMultiEnvelopeChannel<'_>,
     ch1: AspxMultiEnvelopeChannel<'_>,
 ) -> Result<(), &'static str> {
+    write_aspx_data_2ch_multi_envelope_tna_ah(bw, cfg, num_env, ch0, ch1, &[], &[], &[])
+}
+
+/// `aspx_data_2ch()` multi-envelope writer that additionally carries a
+/// real channel-0 `aspx_tna_mode` vector + per-channel `aspx_add_harmonic`
+/// vectors.
+///
+/// Identical framing to [`write_aspx_data_2ch_multi_envelope`] except the
+/// `aspx_hfgen_iwc_2ch(balance = 1)` element is routed through
+/// [`write_aspx_hfgen_iwc_2ch`] with `tna_mode` (channel 0, mirrored to
+/// channel 1 by `aspx_balance = 1`) + per-channel `ah_left` / `ah_right`
+/// `aspx_add_harmonic` slices. Passing empty `tna_mode` / `ah_left` /
+/// `ah_right` reproduces [`write_aspx_data_2ch_multi_envelope`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn write_aspx_data_2ch_multi_envelope_tna_ah(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    num_env: u32,
+    ch0: AspxMultiEnvelopeChannel<'_>,
+    ch1: AspxMultiEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah_left: &[bool],
+    ah_right: &[bool],
+) -> Result<(), &'static str> {
     let tmp_num_env = check_multi_env_cfg(cfg, num_env)?;
     let num_noise = if num_env > 1 { 2 } else { 1 };
 
@@ -3986,15 +4015,22 @@ pub fn write_aspx_data_2ch_multi_envelope(
         .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
     let counts = tables.counts;
 
-    // aspx_hfgen_iwc_2ch(balance = 1): tna_mode (2 b × num_sbg_noise)
-    // + 4 trailer bits.
-    for _ in 0..counts.num_sbg_noise {
-        bw.write_u32(0, 2);
-    }
-    bw.write_bit(false);
-    bw.write_bit(false);
-    bw.write_bit(false);
-    bw.write_bit(false);
+    // aspx_hfgen_iwc_2ch(balance = 1): real tna_mode[0] (mirrored to [1])
+    // + per-channel add_harmonic vectors.
+    let empty: &[u8] = &[];
+    let payload = AspxHfgenIwc2ChPayload {
+        tna_mode: [tna_mode, empty],
+        add_harmonic: [ah_left, ah_right],
+        ..AspxHfgenIwc2ChPayload::default()
+    };
+    write_aspx_hfgen_iwc_2ch(
+        bw,
+        &payload,
+        true,
+        counts.num_sbg_noise,
+        counts.num_sbg_sig_highres,
+        0,
+    );
 
     // SIGNAL band count: high-res (no in-band freq_res bit).
     let num_sbg_sig = counts.num_sbg_sig_highres;
@@ -4051,6 +4087,25 @@ pub fn write_aspx_data_1ch_multi_envelope(
     num_env: u32,
     ch: AspxMultiEnvelopeChannel<'_>,
 ) -> Result<(), &'static str> {
+    write_aspx_data_1ch_multi_envelope_tna_ah(bw, cfg, num_env, ch, &[], &[])
+}
+
+/// `aspx_data_1ch()` multi-envelope writer that additionally carries a real
+/// `aspx_tna_mode` vector + an `aspx_add_harmonic` vector.
+///
+/// Identical framing to [`write_aspx_data_1ch_multi_envelope`] except the
+/// `aspx_hfgen_iwc_1ch()` element is routed through
+/// [`write_aspx_hfgen_iwc_1ch`] with the caller's `tna_mode` + `ah`
+/// slices. Passing empty slices reproduces
+/// [`write_aspx_data_1ch_multi_envelope`] exactly.
+pub fn write_aspx_data_1ch_multi_envelope_tna_ah(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    num_env: u32,
+    ch: AspxMultiEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah: &[bool],
+) -> Result<(), &'static str> {
     let tmp_num_env = check_multi_env_cfg(cfg, num_env)?;
     let num_noise = if num_env > 1 { 2 } else { 1 };
 
@@ -4069,13 +4124,19 @@ pub fn write_aspx_data_1ch_multi_envelope(
         .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
     let counts = tables.counts;
 
-    // aspx_hfgen_iwc_1ch(): tna_mode (2 b × num_sbg_noise) + 3 trailer.
-    for _ in 0..counts.num_sbg_noise {
-        bw.write_u32(0, 2);
-    }
-    bw.write_bit(false);
-    bw.write_bit(false);
-    bw.write_bit(false);
+    // aspx_hfgen_iwc_1ch(): real tna_mode + real add_harmonic; fic/tic 0.
+    let payload = AspxHfgenIwc1ChPayload {
+        tna_mode,
+        add_harmonic: ah,
+        ..AspxHfgenIwc1ChPayload::default()
+    };
+    write_aspx_hfgen_iwc_1ch(
+        bw,
+        &payload,
+        counts.num_sbg_noise,
+        counts.num_sbg_sig_highres,
+        0,
+    );
 
     let num_sbg_sig = counts.num_sbg_sig_highres;
     let num_sbg_noise = counts.num_sbg_noise;
@@ -5830,6 +5891,9 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     r_noise: &[i32],
     c_num_env: u32,
     centre: AspxMultiEnvelopeChannel<'_>,
+    l_ah: &[bool],
+    r_ah: &[bool],
+    c_ah: &[bool],
     acpl_num_param_bands_id: u8,
     acpl_quant_mode: crate::acpl::AcplQuantMode,
     pad_target_bytes: usize,
@@ -5915,7 +5979,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
     if b_iframe {
-        write_aspx_data_2ch_real_envelope(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -5926,12 +5990,24 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
                 sig: r_sig,
                 noise: r_noise,
             },
+            &[],
+            l_ah,
+            r_ah,
         )
         .expect("encoder: aspx config invalid");
         // Multi-envelope centre `aspx_data_1ch()`. A config / num_env
         // rejection signals the caller to fall back to the single-envelope
         // builder (mirrors the round-299 5_X ACPL_3 multi-env path).
-        if write_aspx_data_1ch_multi_envelope(&mut bw, aspx_cfg, c_num_env, centre).is_err() {
+        if write_aspx_data_1ch_multi_envelope_tna_ah(
+            &mut bw,
+            aspx_cfg,
+            c_num_env,
+            centre,
+            &[],
+            c_ah,
+        )
+        .is_err()
+        {
             return Vec::new();
         }
         write_acpl_data_1ch_real_alpha_beta(
@@ -8968,6 +9044,11 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     rs_noise: &[i32],
     c_num_env: u32,
     centre: AspxMultiEnvelopeChannel<'_>,
+    l_ah: &[bool],
+    r_ah: &[bool],
+    ls_ah: &[bool],
+    rs_ah: &[bool],
+    c_ah: &[bool],
     acpl_num_param_bands_id: u8,
     acpl_quant_mode: crate::acpl::AcplQuantMode,
     pad_target_bytes: usize,
@@ -9038,7 +9119,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
     if b_iframe {
-        write_aspx_data_2ch_real_envelope(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -9049,9 +9130,12 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
                 sig: r_sig,
                 noise: r_noise,
             },
+            &[],
+            l_ah,
+            r_ah,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_2ch_real_envelope(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -9062,11 +9146,23 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
                 sig: rs_sig,
                 noise: rs_noise,
             },
+            &[],
+            ls_ah,
+            rs_ah,
         )
         .expect("encoder: aspx config invalid");
         // Multi-envelope centre `aspx_data_1ch()`. A rejection signals the
         // caller to fall back to the single-envelope 7_X builder.
-        if write_aspx_data_1ch_multi_envelope(&mut bw, aspx_cfg, c_num_env, centre).is_err() {
+        if write_aspx_data_1ch_multi_envelope_tna_ah(
+            &mut bw,
+            aspx_cfg,
+            c_num_env,
+            centre,
+            &[],
+            c_ah,
+        )
+        .is_err()
+        {
             return Vec::new();
         }
         write_acpl_data_1ch_real_alpha_beta(

@@ -159,15 +159,22 @@ an S16 `AudioFrame`:
   energy ÷ its mean per-subband energy) and requests a restored missing
   harmonic (§4.2.12.6) where a dominant tonal partial is present (the
   decoder places the §5.7.6.4.2.1 Pseudocode 92 sinusoid at the group's
-  `sb_mid`). This is wired per-channel into the live 5_X ASPX_ACPL_3, 5_X /
-  7_X ASPX_ACPL_2, 7.0 pure-ASPX, and 7_X ASPX_ACPL_1 paths via new
-  `write_aspx_data_{1,2}ch_real_envelope_tna_ah` writers + an
-  `extract_aspx_add_harmonic` per-carrier analysis. Still pending:
-  `fic_used_in_sfb` / `tic_used_in_slot` remain at the all-zero scaffold on
-  every live path, and the 7.X ASPX_ACPL_3 path does not yet exist. The
-  `aspx_tna_mode` / `aspx_add_harmonic` threshold mappings are encoder
-  tuning choices (the spec leaves the selection informative); they are
-  calibrated to the live QMF pipeline but not yet tuned against a
+  `sb_mid`). This is wired per-channel into the live 5_X ASPX_ACPL_3
+  (single- **and** multi-envelope), 5_X / 7_X ASPX_ACPL_2 (single- and
+  centre-multi-envelope), 7.0 pure-ASPX, and 7_X ASPX_ACPL_1 paths via new
+  `write_aspx_data_{1,2}ch_real_envelope_tna_ah` +
+  `write_aspx_data_{1,2}ch_multi_envelope_tna_ah` writers and an
+  `extract_aspx_add_harmonic` per-carrier analysis. The decoder fully
+  consumes `aspx_add_harmonic` (§5.7.6.4.4 tone generator → HF QMF
+  injection), so the decision changes the **decoded PCM**, not just the
+  wire bytes. Still pending: `fic_used_in_sfb` / `tic_used_in_slot` remain
+  at the all-zero scaffold on every live path — they are parsed but not yet
+  driven through the decoder's HF synthesis, so an encoder decision for
+  them would be informative-only (a docs gap on their §5.7.6.4 synthesis
+  semantics blocks a real round-trip). The 7.X ASPX_ACPL_3 path does not
+  yet exist. The `aspx_tna_mode` / `aspx_add_harmonic` threshold mappings
+  are encoder tuning choices (the spec leaves the selection informative);
+  they are calibrated to the live QMF pipeline but not yet tuned against a
   perceptual reference.
 - The live 5_X ASPX_ACPL_3 real-ASPX frame path now selects between a
   single FIXFIX envelope and a `num_env = 2` multi-envelope body per

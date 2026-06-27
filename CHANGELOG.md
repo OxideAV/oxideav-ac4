@@ -24,10 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `extract_aspx_add_harmonic` per-carrier analysis, replacing the all-
   `false` `add_harmonic` scaffold the `write_aspx_hfgen_iwc_{1,2}ch`
   writers previously received. Wired per-channel into **every** live A-SPX
-  path: 5_X ASPX_ACPL_3, 5_X / 7_X ASPX_ACPL_2, 7.0 pure-ASPX, and 7_X
-  ASPX_ACPL_1. Round-trip + liveness + determinism covered by
-  `tests/round377_5_x_acpl3_aspx_add_harmonic.rs` (5_X ACPL_3, 5_X ACPL_2,
-  and 7.0 pure-ASPX entry points).
+  path: 5_X ASPX_ACPL_3 (single + multi-envelope), 5_X / 7_X ASPX_ACPL_2
+  (single + centre-multi-envelope), 7.0 pure-ASPX, and 7_X ASPX_ACPL_1 —
+  also adding `write_aspx_data_{1,2}ch_multi_envelope_tna_ah` writers. The
+  decoder fully consumes `aspx_add_harmonic` (§5.7.6.4.4 tone generator →
+  HF QMF injection), so the decision changes the decoded PCM, not just the
+  wire bytes. Round-trip + liveness + determinism + **end-to-end
+  audibility** covered by `tests/round377_5_x_acpl3_aspx_add_harmonic.rs`
+  (5_X ACPL_3 single + multi-envelope, 5_X ACPL_2, and 7.0 pure-ASPX).
 
 - ac4 round 370 — **metadata write-side (encoder symmetry)**: give every
   `metadata()` parser a bit-exact inverse so a decoded `Metadata`

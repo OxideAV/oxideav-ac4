@@ -423,3 +423,83 @@ fn add_harmonic_changes_decoded_audio() {
         "add_harmonic must change the decoded L-channel PCM (sum|Δ| = {diff})"
     );
 }
+
+/// A transient HF carrier: a high-frequency tone gated almost entirely
+/// into the second half of the frame, so the encoder selects `num_env = 2`
+/// and takes the multi-envelope `aspx_data_2ch()` path.
+fn make_hf_transient_frame(freq: f32, amp: f32) -> Vec<f32> {
+    (0..N)
+        .map(|i| {
+            let t = i as f32 / FS;
+            let gate = if i >= N / 2 { 1.0 } else { 0.02 };
+            gate * amp * (2.0 * std::f32::consts::PI * freq * t).sin()
+        })
+        .collect()
+}
+
+/// The add_harmonic wiring also reaches the **multi-envelope** 5_X
+/// ASPX_ACPL_3 path: a transient tonal-HF input (num_env = 2) differs from
+/// a transient flat-HF input on the wire, and round-trips to 5-channel
+/// audio. Exercises `write_aspx_data_2ch_multi_envelope_tna_ah`.
+#[test]
+fn multi_env_5_0_acpl3_add_harmonic_is_live_and_round_trips() {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+
+    let c = make_tone_frame(660.0, 0.3);
+    let ls = make_tone_frame(880.0, 0.2);
+    let rs = make_tone_frame(1100.0, 0.2);
+
+    // Transient tonal HF carriers — concentrated isolated partials in the
+    // second half → num_env = 2 + at least one add_harmonic flag.
+    let l_tone = make_hf_transient_frame(13_000.0, 0.7);
+    let r_tone = make_hf_transient_frame(12_000.0, 0.6);
+    assert!(
+        add_harmonic_for(&l_tone).iter().any(|&b| b),
+        "transient tonal HF must request a harmonic"
+    );
+
+    let mut enc_t = Ac4ImsEncoder::new();
+    let bytes_tone = enc_t.encode_frame_pcm_5_0_acpl3_real_aspx_multi_env(
+        &[&l_tone, &r_tone, &c, &ls, &rs],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    );
+
+    // Transient flat-noise carrier: still selects num_env = 2 (transient)
+    // but no isolated partial → no harmonic.
+    let mut l_flat = make_flat_noise_frame(0.5);
+    for (i, s) in l_flat.iter_mut().enumerate() {
+        if i < N / 2 {
+            *s *= 0.02;
+        }
+    }
+    let mut r_flat = make_flat_noise_frame(0.4);
+    for (i, s) in r_flat.iter_mut().enumerate() {
+        if i < N / 2 {
+            *s *= 0.02;
+        }
+    }
+    let mut enc_f = Ac4ImsEncoder::new();
+    let bytes_flat = enc_f.encode_frame_pcm_5_0_acpl3_real_aspx_multi_env(
+        &[&l_flat, &r_flat, &c, &ls, &rs],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    );
+
+    assert_ne!(
+        bytes_tone, bytes_flat,
+        "tonal vs flat transient HF must differ on the 5_X ACPL_3 multi-env path"
+    );
+
+    let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes_tone);
+    dec.send_packet(&pkt).expect("decoder must accept packet");
+    let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+        panic!("expected audio frame");
+    };
+    assert_eq!(af.data[0].len(), 1920 * 5 * 2, "5-channel S16 interleaved");
+}
