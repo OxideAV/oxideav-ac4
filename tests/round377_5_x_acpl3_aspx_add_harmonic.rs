@@ -32,8 +32,12 @@
 //!    AudioFrame.
 //! 3. Liveness — a tonal-HF input (flag set) produces a frame whose bytes
 //!    differ from a flat-HF input (flag clear), proving the bit reaches the
-//!    wire.
+//!    wire (5_X ACPL_3, 5_X ACPL_2, and 7.0 pure-ASPX entry points).
 //! 4. Determinism — matched inputs + fresh encoder state are byte-identical.
+//! 5. Audibility — because the decoder fully consumes `aspx_add_harmonic`
+//!    (§5.7.6.4.4 tone generator → HF QMF injection), a tonal-HF frame and
+//!    a flat-HF frame decode to **different** PCM, proving the encoder
+//!    decision reaches the decoded output, not just the wire bytes.
 //!
 //! Refs ETSI TS 103 190-1: §4.2.12.6 (`aspx_hfgen_iwc`), §4.2.12.4
 //! Table 52 (`aspx_data_2ch`), §5.7.6.4.2.1 Pseudocode 92
@@ -316,4 +320,106 @@ fn pure_aspx_7_0_add_harmonic_is_live_and_round_trips() {
         panic!("expected audio frame");
     };
     assert_eq!(af.data[0].len(), 1920 * 7 * 2, "7-channel S16 interleaved");
+}
+
+/// Deinterleave channel `ch` (of `nch`) from an S16LE interleaved buffer
+/// into f32 samples.
+fn deinterleave_s16(data: &[u8], nch: usize, ch: usize) -> Vec<f32> {
+    let frames = data.len() / (2 * nch);
+    (0..frames)
+        .map(|i| {
+            let off = (i * nch + ch) * 2;
+            let s = i16::from_le_bytes([data[off], data[off + 1]]);
+            s as f32
+        })
+        .collect()
+}
+
+/// End-to-end audibility: because the decoder fully consumes
+/// `aspx_add_harmonic` (§5.7.6.4.4 tone generator → HF QMF injection), a
+/// tonal-HF frame (flag set) decodes to **different** L-channel PCM than a
+/// flat-HF frame (flag clear). This proves the encoder decision reaches
+/// the decoded output, not merely the wire bytes.
+#[test]
+fn add_harmonic_changes_decoded_audio() {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+
+    let ls = make_tone_frame(880.0, 0.2);
+    let rs = make_tone_frame(1100.0, 0.2);
+    let c = make_tone_frame(660.0, 0.3);
+
+    // Same low-band L/R content (a mid tone) so the transposed HF baseline
+    // matches; the only HF difference is an added isolated high partial in
+    // the tonal case, which drives add_harmonic.
+    let base = make_tone_frame(2_000.0, 0.5);
+    let mut l_tone = base.clone();
+    let mut r_tone = base.clone();
+    let high = make_tone_frame(13_000.0, 0.6);
+    for (d, h) in l_tone.iter_mut().zip(high.iter()) {
+        *d += *h;
+    }
+    let high_r = make_tone_frame(12_000.0, 0.5);
+    for (d, h) in r_tone.iter_mut().zip(high_r.iter()) {
+        *d += *h;
+    }
+    // Flat case: same low-band tone, no isolated HF partial.
+    let l_flat = base.clone();
+    let r_flat = base.clone();
+
+    assert!(
+        add_harmonic_for(&l_tone).iter().any(|&b| b),
+        "tonal L must request a harmonic"
+    );
+    assert!(
+        !add_harmonic_for(&l_flat).iter().any(|&b| b),
+        "flat L must not request a harmonic"
+    );
+
+    let mut enc_t = Ac4ImsEncoder::new();
+    let mut enc_f = Ac4ImsEncoder::new();
+    let bytes_t = enc_t.encode_frame_pcm_5_0_acpl3_real_aspx(
+        &[&l_tone, &r_tone, &c, &ls, &rs],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    );
+    let bytes_f = enc_f.encode_frame_pcm_5_0_acpl3_real_aspx(
+        &[&l_flat, &r_flat, &c, &ls, &rs],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    );
+
+    let mut dec_t = Ac4Decoder::new(&params);
+    dec_t
+        .send_packet(&Packet::new(0, TimeBase::new(1, 48_000), bytes_t))
+        .unwrap();
+    let Frame::Audio(af_t) = dec_t.receive_frame().unwrap() else {
+        panic!("audio");
+    };
+    let mut dec_f = Ac4Decoder::new(&params);
+    dec_f
+        .send_packet(&Packet::new(0, TimeBase::new(1, 48_000), bytes_f))
+        .unwrap();
+    let Frame::Audio(af_f) = dec_f.receive_frame().unwrap() else {
+        panic!("audio");
+    };
+
+    let l_out_t = deinterleave_s16(&af_t.data[0], 5, 0);
+    let l_out_f = deinterleave_s16(&af_f.data[0], 5, 0);
+    assert_eq!(l_out_t.len(), l_out_f.len());
+
+    // The two decoded L channels must differ — the restored harmonic
+    // changes the HF content. Measure the summed absolute difference.
+    let diff: f64 = l_out_t
+        .iter()
+        .zip(l_out_f.iter())
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .sum();
+    assert!(
+        diff > 1.0,
+        "add_harmonic must change the decoded L-channel PCM (sum|Δ| = {diff})"
+    );
 }
