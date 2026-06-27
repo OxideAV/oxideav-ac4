@@ -200,6 +200,8 @@ fn tna_reaches_the_wire_and_round_trips() {
             &sig,
             &noise_v,
             tna_mode,
+            &[],
+            &[],
             3,
             oxideav_ac4::acpl::AcplQuantMode::Fine,
             oxideav_ac4::acpl::AcplQuantMode::Fine,

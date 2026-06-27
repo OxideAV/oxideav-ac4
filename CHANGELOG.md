@@ -9,18 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- ac4 round 377 — **encoder `aspx_add_harmonic` selection**: new
-  `aspx_ah_select` module derives a real per-high-res-signal-subband-group
-  `aspx_add_harmonic[sbg]` vector (ETSI TS 103 190-1 §4.2.12.6) from the
-  carrier's HF QMF spectral crest. Each group's placement subband
-  `sb_mid = (sba + sbz) / 2` (matching §5.7.6.4.2.1 Pseudocode 92
-  `derive_sine_idx_sb`) is compared against the group's mean per-subband
-  energy; a group spanning ≥ 2 subbands whose crest ≥ `AH_CREST_THRESHOLD`
-  and energy clears the relative `AH_ENERGY_FLOOR` requests a restored
-  harmonic. The measure is level-independent (a ratio of energies within
-  the group), mirroring `aspx_tna_select`. Replaces the all-`false`
-  `add_harmonic` scaffold the `write_aspx_hfgen_iwc_{1,2}ch` writers
-  previously received.
+- ac4 round 377 — **encoder `aspx_add_harmonic` selection + live wiring**:
+  new `aspx_ah_select` module derives a real per-high-res-signal-subband-
+  group `aspx_add_harmonic[sbg]` vector (ETSI TS 103 190-1 §4.2.12.6) from
+  the carrier's HF QMF **spectral crest** — the ratio of the group's
+  loudest per-subband energy to its mean per-subband energy. A group
+  spanning ≥ 2 subbands whose crest ≥ `AH_CREST_THRESHOLD` and whose energy
+  clears the relative `AH_ENERGY_FLOOR` requests a restored harmonic (the
+  decoder places the §5.7.6.4.2.1 Pseudocode 92 sinusoid at the group's
+  `sb_mid`). The measure is level-independent (a ratio of energies within
+  the group), mirroring `aspx_tna_select`. Wired into the live single-
+  envelope 5_X ASPX_ACPL_3 real-ASPX frame path via new
+  `write_aspx_data_{1,2}ch_real_envelope_tna_ah` writers + an
+  `extract_aspx_add_harmonic` per-carrier analysis, replacing the all-
+  `false` `add_harmonic` scaffold the `write_aspx_hfgen_iwc_{1,2}ch`
+  writers previously received. Round-trip + liveness + determinism covered
+  by `tests/round377_5_x_acpl3_aspx_add_harmonic.rs`.
 
 - ac4 round 370 — **metadata write-side (encoder symmetry)**: give every
   `metadata()` parser a bit-exact inverse so a decoded `Metadata`

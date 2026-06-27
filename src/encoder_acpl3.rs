@@ -2417,6 +2417,8 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
         aspx_r_sig,
         aspx_r_noise,
         &[],
+        &[],
+        &[],
         acpl_num_param_bands_id,
         acpl_qm0,
         acpl_qm1,
@@ -2439,7 +2441,10 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
 ///
 /// The `tna_mode` is the encoder's §4.3.10.6.1 inverse-filtering decision
 /// — typically produced by [`crate::aspx_tna_select::select_tna_mode`]
-/// from the L-carrier QMF low band.
+/// from the L-carrier QMF low band. `aspx_l_ah` / `aspx_r_ah` are the
+/// per-channel `aspx_add_harmonic` decisions (§4.2.12.6) — typically from
+/// [`crate::aspx_ah_select::select_add_harmonic`] over each carrier's HF
+/// QMF band; empty slices reproduce the all-zero `add_harmonic` scaffold.
 #[allow(clippy::too_many_arguments)]
 pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna(
     transform_length: u32,
@@ -2458,6 +2463,8 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     aspx_r_sig: &[i32],
     aspx_r_noise: &[i32],
     aspx_tna_mode: &[u8],
+    aspx_l_ah: &[bool],
+    aspx_r_ah: &[bool],
     acpl_num_param_bands_id: u8,
     acpl_qm0: crate::acpl::AcplQuantMode,
     acpl_qm1: crate::acpl::AcplQuantMode,
@@ -2597,7 +2604,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     // I-frame: real-envelope aspx_data_2ch() + acpl_data_2ch() with real
     // α / β / β₃ / γ₁..γ₆.
     if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna(
+        write_aspx_data_2ch_real_envelope_tna_ah(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -2609,6 +2616,8 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
                 noise: aspx_r_noise,
             },
             aspx_tna_mode,
+            aspx_l_ah,
+            aspx_r_ah,
         )
         .expect("encoder: aspx config invalid");
         write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
@@ -3512,6 +3521,32 @@ pub fn write_aspx_data_2ch_real_envelope_tna(
     ch1: AspxRealEnvelopeChannel<'_>,
     tna_mode: &[u8],
 ) -> Result<(), &'static str> {
+    write_aspx_data_2ch_real_envelope_tna_ah(bw, cfg, ch0, ch1, tna_mode, &[], &[])
+}
+
+/// `aspx_data_2ch()` real-envelope + `aspx_tna_mode` writer that
+/// additionally carries a real per-channel `aspx_add_harmonic` vector.
+///
+/// Identical to [`write_aspx_data_2ch_real_envelope_tna`] except the
+/// `aspx_hfgen_iwc_2ch(balance = 1)` element's per-channel
+/// `add_harmonic[0]` / `add_harmonic[1]` slices are populated from
+/// `ah_left` / `ah_right` (each a per-high-res-signal-subband-group
+/// boolean vector, typically from [`crate::aspx_ah_select::select_add_harmonic`]).
+/// The writer's `aspx_ah_left` / `aspx_ah_right` gates auto-collapse to 0
+/// when a slice has no active flag, so passing two empty slices reproduces
+/// the [`write_aspx_data_2ch_real_envelope_tna`] bytes exactly.
+///
+/// `fic_used_in_sfb` / `tic_used_in_slot` stay at the all-zero scaffold.
+#[allow(clippy::too_many_arguments)]
+pub fn write_aspx_data_2ch_real_envelope_tna_ah(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch0: AspxRealEnvelopeChannel<'_>,
+    ch1: AspxRealEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah_left: &[bool],
+    ah_right: &[bool],
+) -> Result<(), &'static str> {
     let xover: u32 = 0;
     bw.write_u32(xover, 3);
 
@@ -3532,10 +3567,12 @@ pub fn write_aspx_data_2ch_real_envelope_tna(
         .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
     let counts = tables.counts;
 
-    // aspx_hfgen_iwc_2ch(balance = 1): real tna_mode[0], mirrored to [1].
+    // aspx_hfgen_iwc_2ch(balance = 1): real tna_mode[0] (mirrored to [1])
+    // plus per-channel add_harmonic vectors.
     let empty: &[u8] = &[];
     let payload = AspxHfgenIwc2ChPayload {
         tna_mode: [tna_mode, empty],
+        add_harmonic: [ah_left, ah_right],
         ..AspxHfgenIwc2ChPayload::default()
     };
     write_aspx_hfgen_iwc_2ch(
@@ -3675,6 +3712,28 @@ pub fn write_aspx_data_1ch_real_envelope_tna(
     ch: AspxRealEnvelopeChannel<'_>,
     tna_mode: &[u8],
 ) -> Result<(), &'static str> {
+    write_aspx_data_1ch_real_envelope_tna_ah(bw, cfg, ch, tna_mode, &[])
+}
+
+/// `aspx_data_1ch()` real-envelope + `aspx_tna_mode` writer that
+/// additionally carries a real `aspx_add_harmonic` vector.
+///
+/// Identical to [`write_aspx_data_1ch_real_envelope_tna`] except the
+/// `aspx_hfgen_iwc_1ch()` element's `add_harmonic` slice is populated from
+/// `ah` (a per-high-res-signal-subband-group boolean vector, typically
+/// from [`crate::aspx_ah_select::select_add_harmonic`]). The writer's
+/// `aspx_ah_present` gate auto-collapses to 0 when the slice has no active
+/// flag, so passing an empty slice reproduces the
+/// [`write_aspx_data_1ch_real_envelope_tna`] bytes exactly.
+///
+/// `fic_used_in_sfb` / `tic_used_in_slot` stay at the all-zero scaffold.
+pub fn write_aspx_data_1ch_real_envelope_tna_ah(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch: AspxRealEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah: &[bool],
+) -> Result<(), &'static str> {
     let xover: u32 = 0;
     bw.write_u32(xover, 3);
 
@@ -3693,9 +3752,11 @@ pub fn write_aspx_data_1ch_real_envelope_tna(
         .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
     let counts = tables.counts;
 
-    // aspx_hfgen_iwc_1ch(): real tna_mode + all-zero ah/fic/tic gates.
+    // aspx_hfgen_iwc_1ch(): real tna_mode + real add_harmonic; fic/tic
+    // gates stay 0.
     let payload = AspxHfgenIwc1ChPayload {
         tna_mode,
+        add_harmonic: ah,
         ..AspxHfgenIwc1ChPayload::default()
     };
     write_aspx_hfgen_iwc_1ch(

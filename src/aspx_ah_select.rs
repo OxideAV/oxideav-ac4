@@ -26,17 +26,22 @@
 //!
 //! A discrete sinusoid in the QMF domain concentrates its energy in a
 //! single subband, so within a high-res signal subband group it shows a
-//! high **spectral crest** — the ratio of the peak (here the decoder's
-//! placement subband `sb_mid`) per-subband energy to the group's mean
-//! per-subband energy. A noise-like (flat) group has a crest near 1; a
-//! group dominated by one tonal partial has a crest equal to the number
-//! of subbands in the group (all energy in one bin). We therefore set
-//! `aspx_add_harmonic[sbg] = true` when:
+//! high **spectral crest** — the ratio of the group's **peak** per-subband
+//! energy to its mean per-subband energy. A noise-like (flat) group has a
+//! crest near 1; a group dominated by one tonal partial has a crest
+//! approaching the number of subbands in the group (all energy in one
+//! bin). The peak is taken over the whole group rather than fixed at the
+//! decoder's placement subband `sb_mid`, because the QMF analysis bank
+//! places a given partial in whichever subband its frequency falls into —
+//! the encoder's job is to **detect** a dominant partial in the group; the
+//! decoder then restores it at `sb_mid` (an in-group approximation, the
+//! groups being narrow). We therefore set `aspx_add_harmonic[sbg] = true`
+//! when:
 //!
 //! * the group spans at least two subbands (a single-subband group has a
 //!   trivial crest of 1 and carries no resolvable "missing harmonic"
 //!   distinct from its own envelope), **and**
-//! * the per-subband energy at `sb_mid` exceeds
+//! * the group's peak per-subband energy exceeds
 //!   [`AH_CREST_THRESHOLD`] × the group's mean per-subband energy, **and**
 //! * the group carries non-trivial energy (above [`AH_ENERGY_FLOOR`]
 //!   relative to the whole A-SPX band peak), so silence / numerical-noise
@@ -56,11 +61,11 @@
 
 /// Crest-factor threshold partitioning a tonal group (request a harmonic)
 /// from a noise-like group (no harmonic). A group's crest is
-/// `energy[sb_mid] / mean(energy over group)`; a perfectly flat group has
-/// crest 1, a single-bin tone has crest = group width. The threshold of
-/// `2.0` requires the placement subband to carry at least twice the
-/// group's average per-subband energy — i.e. a clearly dominant partial —
-/// before signalling a missing harmonic.
+/// `peak(energy over group) / mean(energy over group)`; a perfectly flat
+/// group has crest 1, a single-bin tone has crest = group width. The
+/// threshold of `2.0` requires the group's loudest subband to carry at
+/// least twice the group's average per-subband energy — i.e. a clearly
+/// dominant partial — before signalling a missing harmonic.
 ///
 /// This is an encoder-tuning constant; it does not affect bitstream
 /// validity (the decoder restores a sinusoid wherever the flag is set).
@@ -73,15 +78,15 @@ pub const AH_CREST_THRESHOLD: f64 = 2.0;
 /// otherwise empty band) spuriously setting `aspx_add_harmonic`.
 pub const AH_ENERGY_FLOOR: f64 = 1.0e-4;
 
-/// Per-high-res-signal-subband-group total energy + middle-subband energy,
+/// Per-high-res-signal-subband-group total energy + peak-subband energy,
 /// the two quantities the crest test consumes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SbgTonality {
     /// Sum of per-subband energy across the group (Σ over `[sba, sbz)`).
     pub total_energy: f64,
-    /// Per-subband energy at the decoder's placement subband
-    /// `sb_mid = (sba + sbz) / 2`.
-    pub mid_energy: f64,
+    /// Maximum per-subband energy across the group — the loudest partial's
+    /// bin. A discrete tone concentrates here.
+    pub peak_energy: f64,
     /// Number of subbands in the group (`sbz - sba`, clamped to the A-SPX
     /// range).
     pub num_sb: u32,
@@ -99,16 +104,15 @@ impl SbgTonality {
         }
     }
 
-    /// Spectral crest `mid_energy / mean_energy`. A flat group → ~1; a
-    /// single-bin tone at `sb_mid` → `num_sb`. `0.0` for an empty / silent
-    /// group.
+    /// Spectral crest `peak_energy / mean_energy`. A flat group → ~1; a
+    /// single-bin tone → `num_sb`. `0.0` for an empty / silent group.
     #[inline]
     pub fn crest(&self) -> f64 {
         let mean = self.mean_energy();
         if mean <= 0.0 {
             0.0
         } else {
-            self.mid_energy / mean
+            self.peak_energy / mean
         }
     }
 }
@@ -139,9 +143,11 @@ pub fn per_subband_energy(q_high: &[Vec<(f32, f32)>]) -> Vec<f64> {
 /// cross-over subband; subbands below `sbx` are clamped out (they are not
 /// part of the regenerated band).
 ///
-/// Returns `num_sbg_sig_highres` entries. The placement subband per group
-/// is `sb_mid = (sba + sbz) / 2` (integer-truncated, matching
-/// [`crate::aspx::derive_sine_idx_sb`]).
+/// Returns `num_sbg_sig_highres` entries. The decoder restores any
+/// requested sinusoid at the group's middle subband `sb_mid = (sba + sbz)
+/// / 2` (matching [`crate::aspx::derive_sine_idx_sb`]); the encoder's
+/// detection here uses the group's loudest subband, since the QMF bank
+/// places a partial in whichever subband its frequency falls into.
 pub fn sbg_tonalities(sb_energy: &[f64], sbg_sig_highres: &[u32], sbx: u32) -> Vec<SbgTonality> {
     let num_sbg = sbg_sig_highres.len().saturating_sub(1);
     let mut out = Vec::with_capacity(num_sbg);
@@ -152,17 +158,18 @@ pub fn sbg_tonalities(sb_energy: &[f64], sbg_sig_highres: &[u32], sbx: u32) -> V
             out.push(SbgTonality::default());
             continue;
         }
-        // sb_mid mirrors derive_sine_idx_sb: (sba + sbz) / 2 over the raw
-        // (un-clamped) borders, integer-truncated.
-        let sb_mid = (sbg_sig_highres[sbg] as usize + sbg_sig_highres[sbg + 1] as usize) / 2;
         let mut total = 0.0_f64;
+        let mut peak = 0.0_f64;
         for sb in sba..sbz {
-            total += sb_energy.get(sb).copied().unwrap_or(0.0);
+            let e = sb_energy.get(sb).copied().unwrap_or(0.0);
+            total += e;
+            if e > peak {
+                peak = e;
+            }
         }
-        let mid_energy = sb_energy.get(sb_mid).copied().unwrap_or(0.0);
         out.push(SbgTonality {
             total_energy: total,
-            mid_energy,
+            peak_energy: peak,
             num_sb: (sbz - sba) as u32,
         });
     }
@@ -222,7 +229,7 @@ mod tests {
         // Four subbands, equal energy → crest 1 → no harmonic.
         let t = SbgTonality {
             total_energy: 4.0,
-            mid_energy: 1.0,
+            peak_energy: 1.0,
             num_sb: 4,
         };
         assert!((t.mean_energy() - 1.0).abs() < 1e-12);
@@ -235,7 +242,7 @@ mod tests {
         // All energy at sb_mid over a 4-subband group → crest 4 → harmonic.
         let t = SbgTonality {
             total_energy: 4.0,
-            mid_energy: 4.0,
+            peak_energy: 4.0,
             num_sb: 4,
         };
         assert!((t.crest() - 4.0).abs() < 1e-12);
@@ -247,7 +254,7 @@ mod tests {
         // num_sb == 1 → never flagged even with all energy at the bin.
         let t = SbgTonality {
             total_energy: 5.0,
-            mid_energy: 5.0,
+            peak_energy: 5.0,
             num_sb: 1,
         };
         assert!(!select_add_harmonic_from_tonalities(&[t])[0]);
@@ -257,14 +264,14 @@ mod tests {
     fn silent_group_never_requests() {
         let loud = SbgTonality {
             total_energy: 1000.0,
-            mid_energy: 1000.0,
+            peak_energy: 1000.0,
             num_sb: 2,
         };
         // A second group at the per-subband floor with a "peak" should be
         // gated out by AH_ENERGY_FLOOR relative to the loud group.
         let tiny = SbgTonality {
             total_energy: 1e-9,
-            mid_energy: 1e-9,
+            peak_energy: 1e-9,
             num_sb: 2,
         };
         let sel = select_add_harmonic_from_tonalities(&[loud, tiny]);
@@ -282,15 +289,16 @@ mod tests {
     }
 
     #[test]
-    fn sbg_tonalities_picks_mid_subband() {
-        // Group [4,8): sb_mid = 6. Put a tone at sb 6.
+    fn sbg_tonalities_picks_peak_subband() {
+        // Group [4,8): put a tone at sb 5 (not the middle sb 6) — the
+        // detector tracks the group's peak, wherever the partial lands.
         let mut e = vec![0.1_f64; 16];
-        e[6] = 10.0;
+        e[5] = 10.0;
         let sbg = [4u32, 8];
         let t = sbg_tonalities(&e, &sbg, 4);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].num_sb, 4);
-        assert!((t[0].mid_energy - 10.0).abs() < 1e-9);
+        assert!((t[0].peak_energy - 10.0).abs() < 1e-9);
         // total = 10.0 + 3*0.1 = 10.3, mean = 2.575, crest ≈ 3.88 → harmonic.
         assert!(t[0].crest() > AH_CREST_THRESHOLD);
         assert!(select_add_harmonic_from_tonalities(&t)[0]);

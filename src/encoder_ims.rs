@@ -2801,6 +2801,12 @@ impl Ac4ImsEncoder {
         // band is more tonal (§4.3.10.6.1 / §5.7.6.4.1.3).
         let aspx_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
 
+        // Encoder-side A-SPX missing-harmonic decision per carrier
+        // (§4.2.12.6): a discrete tonal partial in a high-res signal
+        // subband group's HF QMF band requests a restored sinusoid.
+        let aspx_l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let aspx_r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_qm0 = crate::acpl::AcplQuantMode::Fine;
         let acpl_qm1 = crate::acpl::AcplQuantMode::Fine;
@@ -2830,6 +2836,8 @@ impl Ac4ImsEncoder {
                 &r_sig,
                 &r_noise,
                 &aspx_tna_mode,
+                &aspx_l_ah,
+                &aspx_r_ah,
                 acpl_num_param_bands_id,
                 acpl_qm0,
                 acpl_qm1,
@@ -2972,6 +2980,36 @@ impl Ac4ImsEncoder {
             aspx_cfg.master_freq_scale,
             true,
         )
+    }
+
+    /// Compute the per-high-res-signal-subband-group `aspx_add_harmonic`
+    /// vector for one carrier from its HF QMF band, per ETSI TS 103 190-1
+    /// §4.2.12.6 (`aspx_hfgen_iwc`) + the §5.7.6.4.2.1 Pseudocode 92
+    /// `sb_mid` placement it serves.
+    ///
+    /// QMF-analyses the carrier PCM, reduces it to per-high-res-signal-SBG
+    /// spectral crests via [`crate::aspx_ah_select::select_add_harmonic`],
+    /// and returns the boolean `add_harmonic[sbg]` vector. Returns an empty
+    /// vector when the A-SPX frequency tables cannot be derived or the
+    /// carrier is too short to QMF-analyse (the caller then emits the
+    /// all-zero scaffold).
+    fn extract_aspx_add_harmonic(
+        &mut self,
+        aspx_cfg: &crate::aspx::AspxConfig,
+        pcm: &[f32],
+    ) -> Vec<bool> {
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return Vec::new();
+        };
+        let n_slots = pcm.len() / 64;
+        if n_slots == 0 {
+            return Vec::new();
+        }
+        let usable = n_slots * 64;
+        let mut bank = crate::qmf::QmfAnalysisBank::new();
+        let slots = bank.process_block(&pcm[..usable]);
+        let q_high = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
+        crate::aspx_ah_select::select_add_harmonic(&q_high, &tables.sbg_sig_highres, tables.sbx)
     }
 
     /// Multi-envelope counterpart to [`Self::extract_aspx_lr_envelopes`].
