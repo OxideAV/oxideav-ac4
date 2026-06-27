@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 377 — **encoder `aspx_add_harmonic` selection**: new
+  `aspx_ah_select` module derives a real per-high-res-signal-subband-group
+  `aspx_add_harmonic[sbg]` vector (ETSI TS 103 190-1 §4.2.12.6) from the
+  carrier's HF QMF spectral crest. Each group's placement subband
+  `sb_mid = (sba + sbz) / 2` (matching §5.7.6.4.2.1 Pseudocode 92
+  `derive_sine_idx_sb`) is compared against the group's mean per-subband
+  energy; a group spanning ≥ 2 subbands whose crest ≥ `AH_CREST_THRESHOLD`
+  and energy clears the relative `AH_ENERGY_FLOOR` requests a restored
+  harmonic. The measure is level-independent (a ratio of energies within
+  the group), mirroring `aspx_tna_select`. Replaces the all-`false`
+  `add_harmonic` scaffold the `write_aspx_hfgen_iwc_{1,2}ch` writers
+  previously received.
+
 - ac4 round 370 — **metadata write-side (encoder symmetry)**: give every
   `metadata()` parser a bit-exact inverse so a decoded `Metadata`
   round-trips back to a parse-equivalent bitstream. Lands a canonical

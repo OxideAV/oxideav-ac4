@@ -488,6 +488,7 @@ pub mod ajoc;
 pub mod asf;
 pub mod asf_data;
 pub mod aspx;
+pub mod aspx_ah_select;
 pub mod aspx_huffman;
 pub mod aspx_limiter;
 pub mod aspx_noise;
