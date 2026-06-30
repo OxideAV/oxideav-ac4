@@ -492,6 +492,7 @@ pub mod aspx_ah_select;
 pub mod aspx_huffman;
 pub mod aspx_limiter;
 pub mod aspx_noise;
+pub mod aspx_preflat_select;
 pub mod aspx_tna_select;
 pub mod aspx_tns;
 pub mod aspx_tone;
