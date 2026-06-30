@@ -330,3 +330,139 @@ fn preflat_changes_the_decoded_hf_tile() {
         "preflat=1 must produce a different patched HF tile than preflat=0 on a sloped low band"
     );
 }
+
+/// Decode a packet to its first (and only) audio plane.
+fn decode_plane(bytes: Vec<u8>) -> Vec<u8> {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+    dec.send_packet(&pkt).expect("decode");
+    let Frame::Audio(af) = dec.receive_frame().expect("frame") else {
+        panic!("audio");
+    };
+    af.data[0].clone()
+}
+
+/// The preflat wiring is live on the multi-envelope 5_X ASPX_ACPL_3 path:
+/// a sloped-low-band L/R input (flag set) differs from a flat-low-band
+/// input (flag clear), and a sloped frame round-trips to 5-channel audio.
+#[test]
+fn multi_env_5_0_acpl3_preflat_is_live_and_round_trips() {
+    // Transient low tones drive num_env to 2 while keeping a sloped low band.
+    let l = make_low_tone_frame(80.0, 0.9);
+    let r = make_low_tone_frame(95.0, 0.8);
+    let c = make_low_tone_frame(60.0, 0.4);
+    let ls = make_low_tone_frame(110.0, 0.3);
+    let rs = make_low_tone_frame(130.0, 0.3);
+    assert!(preflat_for(&l));
+
+    let mut enc = Ac4ImsEncoder::new();
+    let pcm = decode_plane(enc.encode_frame_pcm_5_0_acpl3_real_aspx_multi_env(
+        &[&l, &r, &c, &ls, &rs],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    ));
+    assert_eq!(pcm.len(), 1920 * 5 * 2, "5-channel S16 interleaved");
+
+    // Liveness: sloped vs flat L/R changes the bytes (centre/surround held).
+    let l_flat = make_flat_noise_frame(0.5);
+    let r_flat = make_flat_noise_frame(0.4);
+    assert!(!preflat_for(&l_flat));
+    let mut e_a = Ac4ImsEncoder::new();
+    let mut e_b = Ac4ImsEncoder::new();
+    let b_tilt = e_a.encode_frame_pcm_5_0_acpl3_real_aspx_multi_env(
+        &[&l, &r, &c, &ls, &rs],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    );
+    let b_flat = e_b.encode_frame_pcm_5_0_acpl3_real_aspx_multi_env(
+        &[&l_flat, &r_flat, &c, &ls, &rs],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    );
+    assert_ne!(b_tilt, b_flat, "preflat must reach the multi-env wire");
+}
+
+/// The preflat wiring is live on the 5_X ASPX_ACPL_2 single-envelope path.
+#[test]
+fn acpl2_5_0_preflat_is_live_and_round_trips() {
+    let l = make_low_tone_frame(80.0, 0.9);
+    let r = make_low_tone_frame(95.0, 0.8);
+    let c = make_low_tone_frame(60.0, 0.4);
+    let ls = make_low_tone_frame(110.0, 0.3);
+    let rs = make_low_tone_frame(130.0, 0.3);
+    assert!(preflat_for(&l));
+
+    let mut enc = Ac4ImsEncoder::new();
+    let pcm = decode_plane(enc.encode_frame_pcm_5_0_acpl2_real_aspx(&[&l, &r, &c, &ls, &rs]));
+    assert_eq!(pcm.len(), 1920 * 5 * 2);
+
+    let l_flat = make_flat_noise_frame(0.5);
+    let r_flat = make_flat_noise_frame(0.4);
+    let mut e_a = Ac4ImsEncoder::new();
+    let mut e_b = Ac4ImsEncoder::new();
+    let b_tilt = e_a.encode_frame_pcm_5_0_acpl2_real_aspx(&[&l, &r, &c, &ls, &rs]);
+    let b_flat = e_b.encode_frame_pcm_5_0_acpl2_real_aspx(&[&l_flat, &r_flat, &c, &ls, &rs]);
+    assert_ne!(b_tilt, b_flat, "preflat must reach the ACPL_2 wire");
+}
+
+/// The preflat wiring is live on the 7.0 pure-ASPX path.
+#[test]
+fn pure_aspx_7_0_preflat_is_live_and_round_trips() {
+    let l = make_low_tone_frame(80.0, 0.9);
+    let r = make_low_tone_frame(95.0, 0.8);
+    let c = make_low_tone_frame(60.0, 0.4);
+    let ls = make_low_tone_frame(110.0, 0.3);
+    let rs = make_low_tone_frame(130.0, 0.3);
+    let lb = make_low_tone_frame(70.0, 0.3);
+    let rb = make_low_tone_frame(85.0, 0.3);
+    assert!(preflat_for(&l));
+
+    let mut enc = Ac4ImsEncoder::new();
+    let pcm =
+        decode_plane(enc.encode_frame_pcm_7_0_aspx_real_aspx(&[&l, &r, &c, &ls, &rs, &lb, &rb]));
+    assert_eq!(pcm.len(), 1920 * 7 * 2, "7-channel S16 interleaved");
+
+    let l_flat = make_flat_noise_frame(0.5);
+    let r_flat = make_flat_noise_frame(0.4);
+    let mut e_a = Ac4ImsEncoder::new();
+    let mut e_b = Ac4ImsEncoder::new();
+    let b_tilt = e_a.encode_frame_pcm_7_0_aspx_real_aspx(&[&l, &r, &c, &ls, &rs, &lb, &rb]);
+    let b_flat =
+        e_b.encode_frame_pcm_7_0_aspx_real_aspx(&[&l_flat, &r_flat, &c, &ls, &rs, &lb, &rb]);
+    assert_ne!(b_tilt, b_flat, "preflat must reach the 7.0 pure-ASPX wire");
+}
+
+/// The preflat wiring is live on the 7_X ASPX_ACPL_1 path.
+#[test]
+fn acpl1_7_0_preflat_is_live_and_round_trips() {
+    let l = make_low_tone_frame(80.0, 0.9);
+    let r = make_low_tone_frame(95.0, 0.8);
+    let c = make_low_tone_frame(60.0, 0.4);
+    let ls = make_low_tone_frame(110.0, 0.3);
+    let rs = make_low_tone_frame(130.0, 0.3);
+    let lb = make_low_tone_frame(70.0, 0.3);
+    let rb = make_low_tone_frame(85.0, 0.3);
+    assert!(preflat_for(&l));
+
+    let mut enc = Ac4ImsEncoder::new();
+    let pcm = decode_plane(
+        enc.encode_frame_pcm_7_0_acpl1_real_alpha_beta(&[&l, &r, &c, &ls, &rs, &lb, &rb]),
+    );
+    assert_eq!(pcm.len(), 1920 * 7 * 2);
+
+    let l_flat = make_flat_noise_frame(0.5);
+    let r_flat = make_flat_noise_frame(0.4);
+    let mut e_a = Ac4ImsEncoder::new();
+    let mut e_b = Ac4ImsEncoder::new();
+    let b_tilt = e_a.encode_frame_pcm_7_0_acpl1_real_alpha_beta(&[&l, &r, &c, &ls, &rs, &lb, &rb]);
+    let b_flat =
+        e_b.encode_frame_pcm_7_0_acpl1_real_alpha_beta(&[&l_flat, &r_flat, &c, &ls, &rs, &lb, &rb]);
+    assert_ne!(b_tilt, b_flat, "preflat must reach the 7_X ACPL_1 wire");
+}

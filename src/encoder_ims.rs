@@ -1280,7 +1280,7 @@ impl Ac4ImsEncoder {
             coeffs_per_channel.push(c);
         }
 
-        let aspx_cfg = crate::aspx::AspxConfig {
+        let mut aspx_cfg = crate::aspx::AspxConfig {
             quant_mode_env: crate::aspx::AspxQuantStep::Fine,
             start_freq: 0,
             stop_freq: 0,
@@ -1292,6 +1292,12 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening decision (Table 121):
+        // one per-`aspx_config` flag governs all four A-SPX elements in this
+        // 7.0 pure-ASPX body, derived from the primary (L) carrier's QMF low
+        // band (§5.7.6.4.1.2 Pseudocode 85).
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
         // Real ASPX envelope extraction over all four ASPX elements: L/R
         // front pair, Ls/Rs surround pair, centre carrier, and the back
@@ -3228,7 +3234,7 @@ impl Ac4ImsEncoder {
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
         let max_sfb = max_sfb.min(n_msfb_cap);
 
-        let aspx_cfg = crate::aspx::AspxConfig {
+        let mut aspx_cfg = crate::aspx::AspxConfig {
             quant_mode_env: crate::aspx::AspxQuantStep::Fine,
             start_freq: 0,
             stop_freq: 0,
@@ -3240,6 +3246,12 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening decision (Table 121):
+        // signal pre-flattening when the L carrier's QMF low band carries a
+        // strong overall spectral tilt (§5.7.6.4.1.2 Pseudocode 85).
+        // Orthogonal to the per-envelope SIGNAL/NOISE extraction below.
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
         // Probe for a transient and build the multi-envelope rows. A
         // stationary frame returns num_env = 1, in which case we delegate
@@ -3718,6 +3730,11 @@ impl Ac4ImsEncoder {
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
 
+        // Encoder-side A-SPX spectral pre-flattening (Table 121), one
+        // per-config flag from the primary (L) carrier (§5.7.6.4.1.2).
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
+
         // Real ASPX envelope extraction over the L / R carrier pair …
         let (l_sig, l_noise, r_sig, r_noise) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
@@ -3840,6 +3857,11 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening (Table 121), one
+        // per-config flag from the primary (L) carrier (§5.7.6.4.1.2).
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
         // Probe the centre carrier for a transient. A stationary carrier
         // returns num_env = 1; delegate to the single-envelope path.
@@ -5221,6 +5243,11 @@ impl Ac4ImsEncoder {
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
 
+        // Encoder-side A-SPX spectral pre-flattening (Table 121), one
+        // per-config flag from the primary (L) carrier (§5.7.6.4.1.2).
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
+
         // Real ASPX envelope extraction: L/R front pair, Ls/Rs surround
         // pair, and the centre carrier (the ACPL_2 body's aspx_data_1ch()).
         let (l_sig, l_noise, r_sig, r_noise) =
@@ -5390,6 +5417,12 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening (Table 121), one
+        // per-config flag from the primary front-L carrier (surround[0])
+        // (§5.7.6.4.1.2).
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, surround[0]);
 
         // Probe the centre carrier (surround[2]) for a transient.
         let (c_num_env, c_sig_rows, c_noise_rows) =
@@ -5631,6 +5664,11 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening (Table 121), one
+        // per-config flag from the primary (L) carrier (§5.7.6.4.1.2).
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
         let (l_sig, l_noise, r_sig, r_noise) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
@@ -5938,6 +5976,11 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening (Table 121), one
+        // per-config flag from the primary (L) carrier (§5.7.6.4.1.2).
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
@@ -6281,6 +6324,11 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening (Table 121), one
+        // per-config flag from the primary (L) carrier (§5.7.6.4.1.2).
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
