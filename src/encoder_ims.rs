@@ -2792,7 +2792,7 @@ impl Ac4ImsEncoder {
         let coeffs_lfe: Option<Vec<f32>> =
             lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
 
-        let aspx_cfg = crate::aspx::AspxConfig {
+        let mut aspx_cfg = crate::aspx::AspxConfig {
             quant_mode_env: crate::aspx::AspxQuantStep::Fine,
             start_freq: 0,
             stop_freq: 0,
@@ -2804,6 +2804,13 @@ impl Ac4ImsEncoder {
             num_env_bits_fixfix: 0,
             freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
         };
+
+        // Encoder-side A-SPX spectral pre-flattening decision (Table 121):
+        // signal pre-flattening when the L carrier's QMF low band — the HF
+        // generation source — carries a strong overall spectral tilt
+        // (§5.7.6.4.1.2 Pseudocode 85). One per-config flag governs the
+        // element; derived from the primary (L) carrier.
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
         // Real ASPX envelope extraction: run the QMF analysis bank over
         // the L / R input PCM, then aggregate the HF energy across the
@@ -2997,6 +3004,57 @@ impl Ac4ImsEncoder {
             aspx_cfg.master_freq_scale,
             true,
         )
+    }
+
+    /// Decide `aspx_preflat` (A-SPX spectral pre-flattening, ETSI TS 103
+    /// 190-1 Table 121 / Table 50) for an A-SPX element from a carrier's
+    /// QMF **low** band — the HF-generation source range whose overall
+    /// spectral tilt pre-flattening de-tilts.
+    ///
+    /// QMF-analyses the carrier PCM, takes the low band (subbands `0..sba`,
+    /// the same source the decoder's HF generator transposes), and runs the
+    /// decoder's exact Pseudocode-85 gain fit
+    /// ([`crate::aspx_preflat_select::select_preflat`]) over a single
+    /// frame-spanning SIGNAL time-slot group, signalling pre-flattening when
+    /// the fitted-slope dB spread clears the threshold. Returns `false` when
+    /// the A-SPX frequency tables cannot be derived or the carrier is too
+    /// short to QMF-analyse (the caller then emits the historical
+    /// `preflat = 0` framing). `aspx_preflat` is a single per-`aspx_config`
+    /// flag, so one primary-carrier decision governs the element.
+    fn extract_aspx_preflat(
+        &mut self,
+        aspx_cfg: &crate::aspx::AspxConfig,
+        frame_len: u32,
+        pcm: &[f32],
+    ) -> bool {
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return false;
+        };
+        let num_ts_in_ats = crate::aspx::num_ts_in_ats(frame_len);
+        let aspx_frame_ts_count = crate::aspx::num_aspx_timeslots(frame_len);
+        if num_ts_in_ats == 0 || aspx_frame_ts_count == 0 || tables.sba == 0 {
+            return false;
+        }
+        let n_slots = pcm.len() / 64;
+        if n_slots == 0 {
+            return false;
+        }
+        let usable = n_slots * 64;
+        let mut bank = crate::qmf::QmfAnalysisBank::new();
+        let slots = bank.process_block(&pcm[..usable]);
+        let q_sb_major = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
+        let sba = tables.sba as usize;
+        let q_low: Vec<Vec<(f32, f32)>> = q_sb_major
+            .iter()
+            .take(sba)
+            .map(|row| row.to_vec())
+            .collect();
+        // A single SIGNAL time-slot group spanning the whole A-SPX frame:
+        // the Pseudocode-85 envelope window is [atsg_sig[0], atsg_sig[end])
+        // QMF time slots. The fitted slope is a frame-level measure, so the
+        // full-frame ATSG is the natural source window.
+        let atsg_sig = [0u32, aspx_frame_ts_count];
+        crate::aspx_preflat_select::select_preflat(&q_low, tables.sba, &atsg_sig, num_ts_in_ats)
     }
 
     /// Compute the per-high-res-signal-subband-group `aspx_add_harmonic`
