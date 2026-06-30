@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 381 — **encoder `aspx_preflat` selection + live wiring**: new
+  `aspx_preflat_select` module derives a real `aspx_preflat` flag (ETSI
+  TS 103 190-1 Table 121 / Table 50) for each A-SPX element. Before the
+  A-SPX subband tonal-to-noise-ratio adjustment the decoder fits a
+  third-order polynomial to the dB spectral envelope of the HF-generation
+  source low band `Q_low` (§5.7.6.4.1.2 Pseudocode 85), turning its overall
+  slope into a per-low-subband gain vector whose inverse it multiplies into
+  the patched high band (§5.7.6.4.1.4 Pseudocode 89) when the flag is set.
+  The selector reuses the decoder's exact gain vector
+  (`aspx_tns::compute_preflat_gains`) as ground truth and thresholds its dB
+  dynamic range — `20·log10(max gain ÷ min gain)`, which equals the fitted
+  slope's peak-to-peak excursion and is level-independent above the
+  Pseudocode-85 `+1` regularizer floor: a spectrally flat source range
+  (~unity gains, ~0 dB spread) is left at `preflat = 0`, a steeply tilted
+  one (≥ `PREFLAT_SLOPE_THRESHOLD_DB`) flips it to `1`. Wired into **every**
+  live A-SPX path via a new `Ac4ImsEncoder::extract_aspx_preflat`
+  per-carrier analysis (one per-`aspx_config` flag from the primary front-L
+  carrier governs all carriers in the element): 5_X ASPX_ACPL_3 (single +
+  multi-envelope), 5_X / 7_X ASPX_ACPL_2 (single + centre-multi-envelope),
+  7.0 pure-ASPX, and 7_X ASPX_ACPL_1. The per-SBG SIGNAL envelope is
+  restored *after* pre-flattening, so the decision re-shapes the patched HF
+  tile within each subband group while the group energy stays pinned to the
+  signalled envelope — i.e. it changes the decoded PCM, not just the
+  framing; `preflat = 0` reproduces the historical body byte-for-byte so all
+  prior round-trips stay green. 8 unit tests (`aspx_preflat_select`: spread
+  math, threshold partition, non-finite skipping, asymptotic
+  level-independence, steep-vs-flat selection) + 10 integration tests
+  (`tests/round381_5_x_acpl3_aspx_preflat.rs`: liveness, 5.0/5.1 round-trip,
+  byte-liveness, determinism, decoder-ground-truth audibility via
+  `hf_tile_tns` with-vs-without the gain, and liveness on the multi-env
+  5_X ACPL_3 / 5_X ACPL_2 / 7.0 pure-ASPX / 7_X ACPL_1 paths). The
+  `aspx_preflat` threshold is an encoder tuning choice (the spec leaves the
+  selection informative); it is calibrated to the live QMF pipeline but not
+  yet tuned against a perceptual reference. (A-JOC `AJOC_HCB_*` codeword
+  decode remains docs-gapped.)
+
 - ac4 round 377 — **encoder `aspx_add_harmonic` selection + live wiring**:
   new `aspx_ah_select` module derives a real per-high-res-signal-subband-
   group `aspx_add_harmonic[sbg]` vector (ETSI TS 103 190-1 §4.2.12.6) from

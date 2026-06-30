@@ -167,7 +167,22 @@ an S16 `AudioFrame`:
   `extract_aspx_add_harmonic` per-carrier analysis. The decoder fully
   consumes `aspx_add_harmonic` (§5.7.6.4.4 tone generator → HF QMF
   injection), so the decision changes the **decoded PCM**, not just the
-  wire bytes. Still pending: `fic_used_in_sfb` / `tic_used_in_slot` remain
+  wire bytes. Every live A-SPX path additionally emits a **real
+  `aspx_preflat`** decision (Table 121): the `aspx_preflat_select` module
+  reuses the decoder's own §5.7.6.4.1.2 Pseudocode 85 gain fit
+  (`compute_preflat_gains`) over the carrier's QMF low band — the
+  HF-generation source range — and signals spectral pre-flattening when the
+  fitted-slope dB dynamic range (`20·log10(max gain ÷ min gain)`, a
+  level-independent measure of the source range's overall tilt) clears a
+  threshold. A spectrally flat source range yields ~unity gains and is left
+  alone; a steeply tilted one flips the per-`aspx_config` flag so the
+  decoder applies the §5.7.6.4.1.4 Pseudocode 89 inverse pre-flatten gain to
+  the patched tile (re-shaping the spectrum within each subband group while
+  the SIGNAL envelope, restored *after* pre-flattening, pins each group's
+  energy). Wired into every live path (5_X ASPX_ACPL_3 single + multi-env,
+  5_X / 7_X ASPX_ACPL_2, 7.0 pure-ASPX, 7_X ASPX_ACPL_1) via an
+  `extract_aspx_preflat` per-carrier analysis. Still pending:
+  `fic_used_in_sfb` / `tic_used_in_slot` remain
   at the all-zero scaffold on every live path — they are parsed but not yet
   driven through the decoder's HF synthesis, so an encoder decision for
   them would be informative-only (a docs gap on their §5.7.6.4 synthesis
