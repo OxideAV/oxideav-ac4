@@ -726,8 +726,20 @@ fn write_aspx_data_2ch_minimal(
     bw: &mut BitWriter,
     cfg: &aspx::AspxConfig,
 ) -> Result<(), &'static str> {
+    write_aspx_data_2ch_minimal_framed(bw, cfg, true)
+}
+
+/// [`write_aspx_data_2ch_minimal`] with an explicit `b_iframe` — Tables 51/52 gate the
+/// leading 3-bit xover offset on I-frames.
+fn write_aspx_data_2ch_minimal_framed(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+) -> Result<(), &'static str> {
     let xover: u32 = 0;
-    bw.write_u32(xover, 3);
+    if b_iframe {
+        bw.write_u32(xover, 3);
+    }
 
     // Channel-0 aspx_framing: FIXFIX, num_env = 1 (tmp_num_env = 0).
     // int_class bits per AspxIntClass::read: prefix '0' for FIXFIX
@@ -3497,8 +3509,20 @@ fn write_aspx_data_1ch_minimal(
     bw: &mut BitWriter,
     cfg: &aspx::AspxConfig,
 ) -> Result<(), &'static str> {
+    write_aspx_data_1ch_minimal_framed(bw, cfg, true)
+}
+
+/// [`write_aspx_data_1ch_minimal`] with an explicit `b_iframe` — Tables 51/52 gate the
+/// leading 3-bit xover offset on I-frames.
+fn write_aspx_data_1ch_minimal_framed(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+) -> Result<(), &'static str> {
     let xover: u32 = 0;
-    bw.write_u32(xover, 3);
+    if b_iframe {
+        bw.write_u32(xover, 3);
+    }
 
     // aspx_framing(0): FIXFIX (int_class prefix '0', 1 b per Table 126),
     // tmp_num_env = 0.
@@ -4066,8 +4090,26 @@ pub fn write_aspx_data_1ch_real_envelope_tna_ah(
     tna_mode: &[u8],
     ah: &[bool],
 ) -> Result<(), &'static str> {
+    write_aspx_data_1ch_real_envelope_tna_ah_framed(bw, cfg, ch, tna_mode, ah, true)
+}
+
+/// [`write_aspx_data_1ch_real_envelope_tna_ah`] with an explicit
+/// `b_iframe` — per ETSI TS 103 190-1 Table 51 the leading 3-bit
+/// `aspx_xover_subband_offset` is only present on I-frames; P-frame
+/// bodies start directly at `aspx_framing(0)` and the decoder reuses
+/// the I-frame-sticky xover (always 0 for this writer family).
+pub fn write_aspx_data_1ch_real_envelope_tna_ah_framed(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch: AspxRealEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah: &[bool],
+    b_iframe: bool,
+) -> Result<(), &'static str> {
     let xover: u32 = 0;
-    bw.write_u32(xover, 3);
+    if b_iframe {
+        bw.write_u32(xover, 3);
+    }
 
     // aspx_framing(0): FIXFIX, num_env = 1.
     bw.write_bit(false);
@@ -4456,11 +4498,28 @@ pub fn write_aspx_data_1ch_multi_envelope_tna_ah(
     tna_mode: &[u8],
     ah: &[bool],
 ) -> Result<(), &'static str> {
+    write_aspx_data_1ch_multi_envelope_tna_ah_framed(bw, cfg, num_env, ch, tna_mode, ah, true)
+}
+
+/// [`write_aspx_data_1ch_multi_envelope_tna_ah`] with an explicit
+/// `b_iframe` — Table 51 gates the leading 3-bit xover offset on
+/// I-frames (see [`write_aspx_data_1ch_real_envelope_tna_ah_framed`]).
+pub fn write_aspx_data_1ch_multi_envelope_tna_ah_framed(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    num_env: u32,
+    ch: AspxMultiEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah: &[bool],
+    b_iframe: bool,
+) -> Result<(), &'static str> {
     let tmp_num_env = check_multi_env_cfg(cfg, num_env)?;
     let num_noise = if num_env > 1 { 2 } else { 1 };
 
     let xover: u32 = 0;
-    bw.write_u32(xover, 3);
+    if b_iframe {
+        bw.write_u32(xover, 3);
+    }
 
     // aspx_framing(0): FIXFIX, tmp_num_env → num_env.
     bw.write_bit(false);
@@ -6268,8 +6327,12 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
-    if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna_ah(
+    // Data elements are present on every frame per Tables 25/33;
+    // only the configs and the per-element 3-bit xover offset are
+    // I-frame-gated (framed writers skip the xover when
+    // b_iframe == 0; the decoder reuses the sticky value).
+    {
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -6283,9 +6346,10 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
             lr_tna_mode,
             l_ah,
             r_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_real_envelope_tna_ah(
+        write_aspx_data_1ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -6294,6 +6358,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
             },
             c_tna_mode,
             c_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
         write_acpl_data_1ch_real_alpha_beta(
@@ -6459,8 +6524,12 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
-    if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna_ah(
+    // Data elements are present on every frame per Tables 25/33;
+    // only the configs and the per-element 3-bit xover offset are
+    // I-frame-gated (framed writers skip the xover when
+    // b_iframe == 0; the decoder reuses the sticky value).
+    {
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -6474,18 +6543,20 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
             &[],
             l_ah,
             r_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
         // Multi-envelope centre `aspx_data_1ch()`. A config / num_env
         // rejection signals the caller to fall back to the single-envelope
         // builder (mirrors the round-299 5_X ACPL_3 multi-env path).
-        if write_aspx_data_1ch_multi_envelope_tna_ah(
+        if write_aspx_data_1ch_multi_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             c_num_env,
             centre,
             &[],
             c_ah,
+            b_iframe,
         )
         .is_err()
         {
@@ -7187,9 +7258,15 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_sap_auto(
     // Cfg0 (coding_config == 0): mono_data(0) — centre carrier.
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
-    if b_iframe {
-        write_aspx_data_2ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_minimal(&mut bw, aspx_cfg).expect("encoder: aspx config invalid");
+    // Data elements are present on every frame per Tables 25/33;
+    // only the configs and the per-element 3-bit xover offset are
+    // I-frame-gated (framed writers skip the xover when
+    // b_iframe == 0; the decoder reuses the sticky value).
+    {
+        write_aspx_data_2ch_minimal_framed(&mut bw, aspx_cfg, b_iframe)
+            .expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_minimal_framed(&mut bw, aspx_cfg, b_iframe)
+            .expect("encoder: aspx config invalid");
         let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
         let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
@@ -9405,8 +9482,12 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
-    if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna_ah(
+    // Data elements are present on every frame per Tables 25/33;
+    // only the configs and the per-element 3-bit xover offset are
+    // I-frame-gated (framed writers skip the xover when
+    // b_iframe == 0; the decoder reuses the sticky value).
+    {
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -9420,9 +9501,10 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
             front_tna_mode,
             l_ah,
             r_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_2ch_real_envelope_tna_ah(
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -9436,9 +9518,10 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
             surround_tna_mode,
             ls_ah,
             rs_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_real_envelope_tna_ah(
+        write_aspx_data_1ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -9447,6 +9530,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
             },
             c_tna_mode,
             c_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
         write_acpl_data_1ch_real_alpha_beta(
@@ -9599,8 +9683,12 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
 
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
-    if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna_ah(
+    // Data elements are present on every frame per Tables 25/33;
+    // only the configs and the per-element 3-bit xover offset are
+    // I-frame-gated (framed writers skip the xover when
+    // b_iframe == 0; the decoder reuses the sticky value).
+    {
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -9614,9 +9702,10 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
             &[],
             l_ah,
             r_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_2ch_real_envelope_tna_ah(
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -9630,17 +9719,19 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
             &[],
             ls_ah,
             rs_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
         // Multi-envelope centre `aspx_data_1ch()`. A rejection signals the
         // caller to fall back to the single-envelope 7_X builder.
-        if write_aspx_data_1ch_multi_envelope_tna_ah(
+        if write_aspx_data_1ch_multi_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             c_num_env,
             centre,
             &[],
             c_ah,
+            b_iframe,
         )
         .is_err()
         {
@@ -10181,8 +10272,12 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
 
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
-    if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna_ah(
+    // Data elements are present on every frame per Tables 25/33;
+    // only the configs and the per-element 3-bit xover offset are
+    // I-frame-gated (framed writers skip the xover when
+    // b_iframe == 0; the decoder reuses the sticky value).
+    {
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             front.0,
@@ -10190,9 +10285,10 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
             front_tna_mode,
             front_ah.0,
             front_ah.1,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_2ch_real_envelope_tna_ah(
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             surround.0,
@@ -10200,10 +10296,13 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
             surround_tna_mode,
             surround_ah.0,
             surround_ah.1,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
-        write_aspx_data_1ch_real_envelope_tna_ah(&mut bw, aspx_cfg, c, c_tna_mode, c_ah)
-            .expect("encoder: aspx config invalid");
+        write_aspx_data_1ch_real_envelope_tna_ah_framed(
+            &mut bw, aspx_cfg, c, c_tna_mode, c_ah, b_iframe,
+        )
+        .expect("encoder: aspx config invalid");
         write_acpl_data_1ch_real_alpha_beta(
             &mut bw,
             acpl_num_bands,
