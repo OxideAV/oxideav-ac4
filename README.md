@@ -1,5 +1,7 @@
 # oxideav-ac4
 
+[![CI](https://github.com/OxideAV/oxideav-ac4/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-ac4/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-ac4.svg)](https://crates.io/crates/oxideav-ac4) [![docs.rs](https://docs.rs/oxideav-ac4/badge.svg)](https://docs.rs/oxideav-ac4) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **Dolby AC-4** audio codec — decoder and encoder per ETSI
 TS 103 190-1 V1.4.1. Zero C dependencies, no FFI, no `*-sys` crates.
 
