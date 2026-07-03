@@ -82,6 +82,17 @@ an S16 `AudioFrame`:
   per-codeword `ajoc_huff_data()` decode that feeds the dequantized
   matrices into `ajoc_reconstruct` is blocked on the missing
   `AJOC_HCB_*` codebook arrays (see "Not yet supported").
+- **P-frames (`b_iframe = 0`)** — full inter-frame decode per §4.2.6.x:
+  a per-substream sticky-config state (`asf::StickyConfig`) carries the
+  I-frame-gated `aspx_config()` / `acpl_config_*()` elements and the
+  Tables 51/52 `aspx_xover_subband_offset` across frames, so non-I-frame
+  substreams parse and synthesise their full A-SPX + A-CPL layer on the
+  mono / stereo / 5_X / 7_X paths. The envelope delta decode is the
+  **full** §5.7.6.3.4 Pseudocode 80/81 — per-envelope frequency
+  resolution with the `high2low` / `low2high` subband-group index maps
+  and the cross-interval `qscf_*_prev` reference carried per channel
+  (`aspx::AspxEnvPrev`); the A-CPL DIFF_TIME chain accumulates across
+  frames via the per-element Pseudocode-121 `AcplDiffState` rows.
 - **SSF** front-end — the §5.2.8 arithmetic decoder + Annex C scalar
   inventory + 37 prediction-coefficient matrices, the bitstream walker,
   the §5.2.3–5.2.7 PCM synthesis chain, and §5.2.5.2.2 heuristic
@@ -119,6 +130,19 @@ an S16 `AudioFrame`:
   the `.1` layouts).
 - 5.X / 7.X ASPX_ACPL_1 / _2 / _3 paths with real per-parameter-band
   α / β extraction from the input channels' MDCT energy / correlation.
+- **P-frames (`b_iframe = 0`)** on every live A-SPX path (5_X ACPL_3
+  single + multi-envelope, 5_X / 7_X ACPL_2, 7_X / 5_X-SAP ACPL_1, 7.0
+  pure-ASPX): setting `b_iframe_global = false` emits the correct
+  Table 25 / Table 33 P-frame body — data elements present, configs +
+  per-element xover omitted — and signals it through the v0/v1/v2 TOC
+  (`b_iframe` / `b_pres_ndot` / `b_audio_ndot`). On the flagship 5_X
+  ACPL_3 path the encoder additionally keeps the previous frame's
+  envelope + parameter rows and switches each of the four A-SPX
+  envelopes (L/R × SIGNAL/NOISE) to **TIME-direction DPCM**
+  (Pseudocodes 80/81) and each of the 11 A-CPL Table 62 elements to
+  **DIFF_TIME** (Table 65) whenever strictly cheaper — a stationary
+  `aspx_data_2ch()` element shrinks 302 → 55 bits (−81%). Chain
+  consistency over I+5×P GOPs is pinned against an all-I reference.
 - 5.X ASPX_ACPL_3 with a **real ASPX SIGNAL / NOISE envelope** on the
   L / R carriers (`encode_frame_pcm_5_{0,1}_acpl3_real_aspx`): the
   encoder QMF-analyses the input PCM, aggregates the HF energy across the
@@ -140,6 +164,15 @@ an S16 `AudioFrame`:
   immersive / OAMD substream machinery (`audio_data_ajoc()`,
   `oamd_dyndata_single()`, `var_channel_element()`).
 - TS 103 190-2 multi-stream / immersive / object-based (IFM) extensions.
+- P-frame refinements: the sticky state carries **one** xover offset per
+  substream, so P-frames assume the I-frame used a single
+  `aspx_xover_subband_offset` across all A-SPX elements of the element
+  (always true for this encoder; per-element sticky xovers would need a
+  per-trailer table). Multi-envelope (`num_env > 1`) P-frame bodies emit
+  FREQ-direction envelopes only (the encoder clears its cross-frame rows
+  after a multi-envelope frame rather than tracking the last envelope).
+  Cross-frame TIME/DIFF_TIME emission is wired on the 5_X ACPL_3 path;
+  the other live paths emit correct P-frame bodies with FREQ rows.
 - Per-`emdf_payload_id` semantic interpretation of EMDF payload bodies
   (captured as raw bytes).
 - Some advanced A-CPL parameters (β3 / γ on certain encoder paths)

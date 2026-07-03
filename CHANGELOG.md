@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 389 — **inter-frame (P-frame, `b_iframe = 0`) support
+  end-to-end** (ETSI TS 103 190-1 §4.2.6.x Tables 25/33, §4.2.12.3/4
+  Tables 51/52, §5.7.6.3.4 Pseudocodes 80/81, §4.2.13.7 Table 65 /
+  Pseudocode 121). Six milestones:
+  1. **Full Pseudocode 80/81 envelope delta decode** — per-envelope
+     frequency resolution with the `high2low` / `low2high` subband-group
+     index maps (`aspx::derive_sbg_res_maps` + `delta_decode_sig_p80`)
+     and a new cross-interval `aspx::AspxEnvPrev` state (previous
+     interval's last SIGNAL/NOISE envelope rows) carried per channel in
+     `AspxChannelExtState` and threaded through
+     `AspxEnvelopeAdjuster::from_deltas_stateful`.
+  2. **I-frame-sticky substream configs** — `asf::StickyConfig`
+     (aspx_config, xover, acpl_config_1ch PARTIAL/FULL, acpl_config_2ch)
+     harvested from every I-frame and seeded into every non-I-frame walk
+     (`walk_ac4_substream_sticky`, carried on `Ac4Decoder`); the
+     Tables 51/52 xover read is now gated on `b_iframe`; mono + stereo
+     CPE elements parse their A-SPX / A-CPL layer on P-frames.
+  3. **5_X / 7_X P-frame decode + live ACPL_3 P-frame encode** — the
+     walkers' `!b_iframe` early-returns removed (data elements are
+     present on every frame; only configs are I-frame-gated), and the
+     live single- + multi-envelope ACPL_3 body builders emit the correct
+     P-frame body (`_framed` xover-optional writers). `b_iframe_global`
+     now drives the v0 TOC `b_iframe` bit too, closing the loop.
+  4. **Encoder cross-frame TIME-direction envelope DPCM** —
+     `choose_envelope_direction` + `Acpl3EnvPrevRows` switch each of the
+     four ACPL_3 envelopes to TIME-direction rows against the previous
+     frame when strictly cheaper
+     (`write_aspx_data_2ch_directional_envelope_tna_ah_framed` +
+     `..._real_aspx_tna_directional` builder; all-FREQ is byte-exact
+     with the historical writers).
+  5. **Encoder A-CPL DIFF_TIME parameter coding** —
+     `choose_acpl_direction` + `Acpl3ParamPrevRows` switch each of the
+     11 Table 62 elements to DIFF_TIME rows
+     (`write_acpl_data_2ch_directional` over the Alpha/Beta/Beta3/Gamma
+     DT codebooks); legacy ACPL_3 paths and multi-envelope bodies reset
+     both encoder-side reference states.
+  6. **P-frame bodies on all remaining live paths** — 5_X/7_X ACPL_2
+     (single + centre-multi-envelope), 7_X ACPL_1, 5_X ACPL_1 SAP, and
+     the 7.0 pure-ASPX Table 33 four-trailer body.
+  Measured: a stationary `aspx_data_2ch()` element shrinks 302 → 55 bits
+  (−81%) in its P-frame TIME form; chained reconstruction over an
+  I + 5×P GOP is exactly equal to a parallel all-I encode for both the
+  A-SPX qscf and all 11 A-CPL element chains. 17 new unit tests + 15 new
+  integration tests across `tests/round389_5_x_acpl3_pframe.rs`,
+  `tests/round389_multipath_pframe.rs`, `tests/round389_pframe_gop.rs`;
+  suite total 1172. Known simplification: one sticky xover per substream
+  (per-element sticky xovers would need a per-trailer table).
+
 - ac4 round 381 — **encoder `aspx_preflat` selection + live wiring**: new
   `aspx_preflat_select` module derives a real `aspx_preflat` flag (ETSI
   TS 103 190-1 Table 121 / Table 50) for each A-SPX element. Before the
