@@ -131,6 +131,12 @@ pub struct Ac4ImsEncoder {
     /// cleared when a multi-envelope body is emitted (its last-envelope
     /// rows are not tracked, so the next frame safely stays FREQ).
     pub acpl3_env_prev: Option<crate::encoder_acpl3::Acpl3EnvPrevRows>,
+    /// Previous frame's absolute A-CPL quantized parameter rows on the
+    /// live 5_X ACPL_3 single-envelope path — drives the P-frame
+    /// DIFF_TIME decision (Table 65 / Pseudocode 121). Unprimed until
+    /// an ACPL_3 single-envelope frame has been emitted; reset when a
+    /// multi-envelope body is emitted.
+    pub acpl3_param_prev: crate::encoder_acpl3::Acpl3ParamPrevRows,
 }
 
 impl Ac4ImsEncoder {
@@ -151,6 +157,7 @@ impl Ac4ImsEncoder {
             mdct_state_r: None,
             mdct_states_multi: Vec::new(),
             acpl3_env_prev: None,
+            acpl3_param_prev: crate::encoder_acpl3::Acpl3ParamPrevRows::default(),
         }
     }
 
@@ -1714,6 +1721,12 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         // sequence_counter wraps at 1024.
+        // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
+        // envelope + ACPL q_prev references without tracking the rows, so
+        // reset the encoder-side P-frame reference states (next non-I
+        // frame stays FREQ / always-decodable).
+        self.acpl3_env_prev = None;
+        self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
@@ -1868,6 +1881,12 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
+        // envelope + ACPL q_prev references without tracking the rows, so
+        // reset the encoder-side P-frame reference states (next non-I
+        // frame stays FREQ / always-decodable).
+        self.acpl3_env_prev = None;
+        self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -2040,6 +2059,12 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
+        // envelope + ACPL q_prev references without tracking the rows, so
+        // reset the encoder-side P-frame reference states (next non-I
+        // frame stays FREQ / always-decodable).
+        self.acpl3_env_prev = None;
+        self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -2220,6 +2245,12 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
+        // envelope + ACPL q_prev references without tracking the rows, so
+        // reset the encoder-side P-frame reference states (next non-I
+        // frame stays FREQ / always-decodable).
+        self.acpl3_env_prev = None;
+        self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -2426,6 +2457,12 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
+        // envelope + ACPL q_prev references without tracking the rows, so
+        // reset the encoder-side P-frame reference states (next non-I
+        // frame stays FREQ / always-decodable).
+        self.acpl3_env_prev = None;
+        self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -2612,6 +2649,12 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
+        // envelope + ACPL q_prev references without tracking the rows, so
+        // reset the encoder-side P-frame reference states (next non-I
+        // frame stays FREQ / always-decodable).
+        self.acpl3_env_prev = None;
+        self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -2918,6 +2961,7 @@ impl Ac4ImsEncoder {
                 gamma_scale,
                 beta3_scale,
                 pad_target_bytes,
+                Some(&mut self.acpl3_param_prev),
             );
 
         // The transmitted rows become the next frame's Pseudocode 80/81
@@ -3408,8 +3452,12 @@ impl Ac4ImsEncoder {
         // A multi-envelope body was emitted: its last-envelope rows are
         // not tracked here, so clear the single-envelope P-frame
         // reference — the next frame emits FREQ (always decodable)
-        // rather than TIME against a stale row.
+        // rather than TIME against a stale row. The A-CPL parameter
+        // rows the multi-envelope body transmitted DO advance the
+        // decoder's Pseudocode-121 q_prev, so the encoder-side rows are
+        // reset (unprimed) for the same reason.
         self.acpl3_env_prev = None;
+        self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
 
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);

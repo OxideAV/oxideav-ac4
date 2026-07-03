@@ -417,3 +417,140 @@ fn changed_signal_p_frame_keeps_freq_direction() {
         "a collapsed envelope must stay FREQ-direction"
     );
 }
+
+/// A stationary I,P sequence also switches the A-CPL parameter layer to
+/// DIFF_TIME (Table 65) on the P-frame, and the decoder's
+/// Pseudocode-121 chain recovers rows identical to the I-frame's.
+#[test]
+fn stationary_p_frame_uses_acpl_diff_time() {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let mut enc = Ac4ImsEncoder::new();
+
+    let l = multitone(0.3);
+    let r = multitone(0.25);
+    let c = tone(660.0, 0.2);
+    let ls = tone(880.0, 0.2);
+    let rs = tone(1100.0, 0.2);
+    let chans: [&[f32]; 5] = [&l, &r, &c, &ls, &rs];
+
+    enc.b_iframe_global = true;
+    let f_i = enc.encode_frame_pcm_5_0_acpl3_real_aspx(&chans, 0.5, 0.1, 1.0, 1.0);
+    let _ = decode_one(&mut dec, f_i, 0);
+    let acpl_i = dec
+        .last_substream
+        .as_ref()
+        .unwrap()
+        .tools
+        .acpl_data_2ch
+        .clone()
+        .expect("I-frame acpl data");
+    assert!(
+        !acpl_i.alpha1[0].direction_time,
+        "I-frame ACPL rows must be DIFF_FREQ"
+    );
+
+    enc.b_iframe_global = false;
+    let f_p = enc.encode_frame_pcm_5_0_acpl3_real_aspx(&chans, 0.5, 0.1, 1.0, 1.0);
+    let _ = decode_one(&mut dec, f_p, 1920);
+    let acpl_p = dec
+        .last_substream
+        .as_ref()
+        .unwrap()
+        .tools
+        .acpl_data_2ch
+        .clone()
+        .expect("P-frame acpl data");
+
+    // At least one element switched to DIFF_TIME (stationary input →
+    // zero deltas are strictly cheaper wherever the row is non-trivial).
+    let elements_p = [
+        &acpl_p.alpha1,
+        &acpl_p.alpha2,
+        &acpl_p.beta1,
+        &acpl_p.beta2,
+        &acpl_p.beta3,
+        &acpl_p.gamma1,
+        &acpl_p.gamma2,
+        &acpl_p.gamma3,
+        &acpl_p.gamma4,
+        &acpl_p.gamma5,
+        &acpl_p.gamma6,
+    ];
+    let n_time = elements_p
+        .iter()
+        .filter(|rows| rows[0].direction_time)
+        .count();
+    assert!(
+        n_time > 0,
+        "a stationary P-frame must pick DIFF_TIME for at least one A-CPL element"
+    );
+
+    // Ground truth for the P-frame's absolute rows: a parallel encoder
+    // fed the same two frames but emitting frame 2 as an I-frame
+    // (extraction depends only on the MDCT/QMF input history, which is
+    // identical — only the packaging differs). The Pseudocode-121
+    // chain over (I rows, P rows) must recover exactly those rows.
+    let mut enc_ref = Ac4ImsEncoder::new();
+    let mut dec_ref = Ac4Decoder::new(&params);
+    enc_ref.b_iframe_global = true;
+    let g1 = enc_ref.encode_frame_pcm_5_0_acpl3_real_aspx(&chans, 0.5, 0.1, 1.0, 1.0);
+    let _ = decode_one(&mut dec_ref, g1, 0);
+    let g2 = enc_ref.encode_frame_pcm_5_0_acpl3_real_aspx(&chans, 0.5, 0.1, 1.0, 1.0);
+    let _ = decode_one(&mut dec_ref, g2, 1920);
+    let acpl_ref = dec_ref
+        .last_substream
+        .as_ref()
+        .unwrap()
+        .tools
+        .acpl_data_2ch
+        .clone()
+        .expect("reference frame-2 acpl data");
+    let elements_i = [
+        &acpl_i.alpha1,
+        &acpl_i.alpha2,
+        &acpl_i.beta1,
+        &acpl_i.beta2,
+        &acpl_i.beta3,
+        &acpl_i.gamma1,
+        &acpl_i.gamma2,
+        &acpl_i.gamma3,
+        &acpl_i.gamma4,
+        &acpl_i.gamma5,
+        &acpl_i.gamma6,
+    ];
+    let elements_ref = [
+        &acpl_ref.alpha1,
+        &acpl_ref.alpha2,
+        &acpl_ref.beta1,
+        &acpl_ref.beta2,
+        &acpl_ref.beta3,
+        &acpl_ref.gamma1,
+        &acpl_ref.gamma2,
+        &acpl_ref.gamma3,
+        &acpl_ref.gamma4,
+        &acpl_ref.gamma5,
+        &acpl_ref.gamma6,
+    ];
+    let num_bands = 7u32; // live path: acpl_num_param_bands_id = 3 → 7 bands (Table 143)
+    for (idx, ((ei, ep), eref)) in elements_i
+        .iter()
+        .zip(elements_p.iter())
+        .zip(elements_ref.iter())
+        .enumerate()
+    {
+        assert!(
+            !eref[0].direction_time,
+            "element {idx}: reference I-frame rows must be DIFF_FREQ"
+        );
+        let mut st_ref = oxideav_ac4::acpl_synth::AcplDiffState::new();
+        let q_ref = oxideav_ac4::acpl_synth::differential_decode(eref, num_bands, &mut st_ref);
+        let mut st = oxideav_ac4::acpl_synth::AcplDiffState::new();
+        let _qi = oxideav_ac4::acpl_synth::differential_decode(ei, num_bands, &mut st);
+        let qp = oxideav_ac4::acpl_synth::differential_decode(ep, num_bands, &mut st);
+        assert_eq!(
+            qp[0], q_ref[0],
+            "element {idx}: chained P-frame rows must equal the frame-2 I-frame rows"
+        );
+    }
+}

@@ -1313,6 +1313,108 @@ fn write_acpl_data_2ch_real_alpha_beta_full_gamma(
 /// codewords are exactly the `write_acpl_f0_zero` / `write_acpl_df_zero`
 /// picks).
 #[allow(clippy::too_many_arguments)]
+/// Write one ACPL DT codeword (`symbol_index = delta_q + cb_off`) for
+/// the given data-type family — the DIFF_TIME dual of the per-family
+/// F0 / DF value writers.
+fn write_acpl_dt_value(
+    bw: &mut BitWriter,
+    data_type: crate::acpl::AcplDataType,
+    qm: crate::acpl::AcplQuantMode,
+    delta_q: i32,
+) {
+    let (len, cw, cb_off) = acpl_hcb_arrays(data_type, qm, crate::acpl::AcplHcbType::Dt);
+    let idx = (delta_q + cb_off).clamp(0, (len.len() as i32) - 1) as usize;
+    bw.write_u32(cw[idx], len[idx] as u32);
+}
+
+/// Emit one ACPL F0 codeword for the given family (dispatch over the
+/// per-family value writers).
+fn write_acpl_f0_value_for(
+    bw: &mut BitWriter,
+    data_type: crate::acpl::AcplDataType,
+    qm: crate::acpl::AcplQuantMode,
+    q: i32,
+) {
+    match data_type {
+        crate::acpl::AcplDataType::Alpha => write_acpl_alpha_f0_value(bw, qm, q),
+        crate::acpl::AcplDataType::Beta => write_acpl_beta_f0_value(bw, qm, q),
+        crate::acpl::AcplDataType::Beta3 => write_acpl_beta3_f0_value(bw, qm, q),
+        crate::acpl::AcplDataType::Gamma => write_acpl_gamma_f0_value(bw, qm, q),
+    }
+}
+
+/// Emit one ACPL DF codeword for the given family.
+fn write_acpl_df_value_for(
+    bw: &mut BitWriter,
+    data_type: crate::acpl::AcplDataType,
+    qm: crate::acpl::AcplQuantMode,
+    delta: i32,
+) {
+    match data_type {
+        crate::acpl::AcplDataType::Alpha => write_acpl_alpha_df_value(bw, qm, delta),
+        crate::acpl::AcplDataType::Beta => write_acpl_beta_df_value(bw, qm, delta),
+        crate::acpl::AcplDataType::Beta3 => write_acpl_beta3_df_value(bw, qm, delta),
+        crate::acpl::AcplDataType::Gamma => write_acpl_gamma_df_value(bw, qm, delta),
+    }
+}
+
+/// Table 62 element order → (data type, quant-mode selector) map.
+/// `false` selects `quant_mode_0`, `true` selects `quant_mode_1`.
+const ACPL_2CH_ELEMENT_TYPES: [(crate::acpl::AcplDataType, bool); 11] = [
+    (crate::acpl::AcplDataType::Alpha, false),
+    (crate::acpl::AcplDataType::Alpha, false),
+    (crate::acpl::AcplDataType::Beta, false),
+    (crate::acpl::AcplDataType::Beta, false),
+    (crate::acpl::AcplDataType::Beta3, false),
+    (crate::acpl::AcplDataType::Gamma, true),
+    (crate::acpl::AcplDataType::Gamma, true),
+    (crate::acpl::AcplDataType::Gamma, true),
+    (crate::acpl::AcplDataType::Gamma, true),
+    (crate::acpl::AcplDataType::Gamma, true),
+    (crate::acpl::AcplDataType::Gamma, true),
+];
+
+/// `acpl_data_2ch()` writer with **per-element transmission
+/// directions** (Table 65 `diff_type`) — the P-frame generalisation of
+/// [`write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3`]. `params`
+/// holds the 11 elements in Table 62 order (α₁, α₂, β₁, β₂, β₃,
+/// γ₁..γ₆); all-FREQ rows reproduce the legacy writer byte-for-byte.
+fn write_acpl_data_2ch_directional(
+    bw: &mut BitWriter,
+    num_bands: u32,
+    quant_mode_0: crate::acpl::AcplQuantMode,
+    quant_mode_1: crate::acpl::AcplQuantMode,
+    params: &[AcplEncodedParam; 11],
+) {
+    // acpl_framing_data(): smooth interp (1 b) + num_param_sets_cod = 0 (1 b).
+    bw.write_bit(false);
+    bw.write_bit(false);
+    for (elem, (data_type, use_qm1)) in params.iter().zip(ACPL_2CH_ELEMENT_TYPES.iter()) {
+        let qm = if *use_qm1 { quant_mode_1 } else { quant_mode_0 };
+        bw.write_bit(elem.direction_time); // diff_type
+        if elem.direction_time {
+            // DIFF_TIME: one DT codeword per band.
+            for pb in 0..num_bands {
+                let d = elem.values.get(pb as usize).copied().unwrap_or(0);
+                write_acpl_dt_value(bw, *data_type, qm, d);
+            }
+        } else {
+            // DIFF_FREQ: F0 + band-to-band DF deltas from the absolute row.
+            let mut prev_q: i32 = 0;
+            for pb in 0..num_bands {
+                let q = elem.values.get(pb as usize).copied().unwrap_or(0);
+                if pb == 0 {
+                    write_acpl_f0_value_for(bw, *data_type, qm, q);
+                } else {
+                    write_acpl_df_value_for(bw, *data_type, qm, q - prev_q);
+                }
+                prev_q = q;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
     bw: &mut BitWriter,
     num_bands: u32,
@@ -2505,6 +2607,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
         gamma_scale,
         beta3_scale,
         pad_target_bytes,
+        None,
     )
 }
 
@@ -2544,6 +2647,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     gamma_scale: f32,
     beta3_scale: f32,
     pad_target_bytes: usize,
+    acpl_prev: Option<&mut Acpl3ParamPrevRows>,
 ) -> Vec<u8> {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
 
@@ -2690,23 +2794,35 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
             b_iframe,
         )
         .expect("encoder: aspx config invalid");
-        write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
-            &mut bw,
-            acpl_num_bands,
-            acpl_qm0,
-            acpl_qm1,
-            &alpha_q,
-            &alpha_q,
-            &beta1_q,
-            &beta2_q,
-            &beta3_q,
-            &g1_q,
-            &g2_q,
-            &g3_q,
-            &g4_q,
-            &g5_q,
+        // A-CPL parameter layer: on P-frames with a primed previous-row
+        // state each Table 62 element may switch to DIFF_TIME (Table 65)
+        // against the previous frame's row — the decoder's per-element
+        // AcplDiffState accumulates it per Pseudocode 121. I-frames and
+        // unprimed states emit DIFF_FREQ rows (byte-identical to the
+        // legacy writer).
+        let cur_rows: [&[i32]; 11] = [
+            &alpha_q, &alpha_q, &beta1_q, &beta2_q, &beta3_q, &g1_q, &g2_q, &g3_q, &g4_q, &g5_q,
             &g6_q,
-        );
+        ];
+        let use_prev = !b_iframe && acpl_prev.as_ref().map(|st| st.primed).unwrap_or(false);
+        let params: [AcplEncodedParam; 11] = std::array::from_fn(|i| {
+            let prev = if use_prev {
+                acpl_prev.as_ref().map(|st| st.rows[i].as_slice())
+            } else {
+                None
+            };
+            choose_acpl_direction(cur_rows[i], prev)
+        });
+        write_acpl_data_2ch_directional(&mut bw, acpl_num_bands, acpl_qm0, acpl_qm1, &params);
+        // The transmitted absolute rows become the next frame's
+        // Pseudocode 121 q_prev reference.
+        if let Some(st) = acpl_prev {
+            for (slot, row) in st.rows.iter_mut().zip(cur_rows.iter()) {
+                slot.clear();
+                slot.extend_from_slice(row);
+            }
+            st.primed = true;
+        }
     }
 
     bw.align_to_byte();
@@ -4678,6 +4794,73 @@ pub struct Acpl3EnvPrevRows {
     pub r_sig: Vec<i32>,
     /// R carrier NOISE row.
     pub r_noise: Vec<i32>,
+}
+
+/// One A-CPL parameter element's encoded row + transmission direction
+/// (ETSI TS 103 190-1 §4.2.13.7 Table 65 `acpl_huff_data()`):
+///
+/// * `direction_time == false` (DIFF_FREQ): `values` holds the
+///   **absolute** per-band quantized indices; the writer derives the
+///   F0 + DF codewords.
+/// * `direction_time == true` (DIFF_TIME): `values` holds the per-band
+///   DT deltas against the previous frame's row (the decoder's
+///   Pseudocode 121 `q_prev`, carried in
+///   [`crate::acpl_synth::AcplDiffState`]).
+#[derive(Debug, Clone, Default)]
+pub struct AcplEncodedParam {
+    /// Per-parameter-band values (see direction semantics above).
+    pub values: Vec<i32>,
+    /// `false = DIFF_FREQ`, `true = DIFF_TIME`.
+    pub direction_time: bool,
+}
+
+/// P-frame A-CPL parameter direction decision (Table 65): transmit
+/// DIFF_TIME when its delta magnitudes against the previous frame's
+/// row are strictly cheaper than the DIFF_FREQ band-to-band DPCM
+/// (`|q0| + Σ|q_i − q_{i−1}|`). FREQ wins ties; `None` previous rows
+/// (I-frame, first frame, path switch) always select FREQ.
+pub fn choose_acpl_direction(q_cur: &[i32], prev_row: Option<&[i32]>) -> AcplEncodedParam {
+    if let Some(prev) = prev_row {
+        let dt: Vec<i32> = q_cur
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| c - prev.get(i).copied().unwrap_or(0))
+            .collect();
+        let time_cost: i64 = dt.iter().map(|&d| (d as i64).abs()).sum();
+        let mut freq_cost: i64 = 0;
+        let mut prev_q = 0i32;
+        for (i, &q) in q_cur.iter().enumerate() {
+            freq_cost += if i == 0 {
+                (q as i64).abs()
+            } else {
+                ((q - prev_q) as i64).abs()
+            };
+            prev_q = q;
+        }
+        if time_cost < freq_cost {
+            return AcplEncodedParam {
+                values: dt,
+                direction_time: true,
+            };
+        }
+    }
+    AcplEncodedParam {
+        values: q_cur.to_vec(),
+        direction_time: false,
+    }
+}
+
+/// Previous-frame absolute A-CPL quantized parameter rows for the live
+/// 5_X ACPL_3 path — the encoder-side mirror of the decoder's
+/// per-element [`crate::acpl_synth::AcplDiffState`] `q_prev` rows
+/// (element order: α₁, α₂, β₁, β₂, β₃, γ₁..γ₆ per Table 62).
+#[derive(Debug, Clone, Default)]
+pub struct Acpl3ParamPrevRows {
+    /// The 11 per-element rows in Table 62 order.
+    pub rows: [Vec<i32>; 11],
+    /// True once a frame has primed the rows (a fresh / cleared state
+    /// never drives a DIFF_TIME decision).
+    pub primed: bool,
 }
 
 /// Encode a full multi-envelope `qscf[sbg][atsg]` matrix into a sequence
@@ -10072,6 +10255,100 @@ mod tests {
             num_env_bits_fixfix: 0,
             freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
         }
+    }
+
+    #[test]
+    fn choose_acpl_direction_partition() {
+        // Stationary rows → all-zero DT, strictly cheaper.
+        let q = [3, 3, 4, -2];
+        let env = choose_acpl_direction(&q, Some(&q));
+        assert!(env.direction_time);
+        assert_eq!(env.values, vec![0, 0, 0, 0]);
+        // No prev → FREQ absolute row verbatim.
+        let env_i = choose_acpl_direction(&q, None);
+        assert!(!env_i.direction_time);
+        assert_eq!(env_i.values, q.to_vec());
+        // Distant prev → FREQ.
+        let env_f = choose_acpl_direction(&q, Some(&[50, 50, 50, 50]));
+        assert!(!env_f.direction_time);
+        // Tie (all zero) → FREQ.
+        let env_t = choose_acpl_direction(&[0, 0], Some(&[0, 0]));
+        assert!(!env_t.direction_time);
+    }
+
+    #[test]
+    fn directional_acpl_writer_all_freq_matches_legacy() {
+        let num_bands = 12u32;
+        let qm = crate::acpl::AcplQuantMode::Fine;
+        let rows: Vec<Vec<i32>> = (0i32..11)
+            .map(|e| (0..num_bands as i32).map(|b| (e + b) % 5 - 2).collect())
+            .collect();
+        let mut bw_a = BitWriter::new();
+        write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
+            &mut bw_a, num_bands, qm, qm, &rows[0], &rows[1], &rows[2], &rows[3], &rows[4],
+            &rows[5], &rows[6], &rows[7], &rows[8], &rows[9], &rows[10],
+        );
+        let params: [AcplEncodedParam; 11] = std::array::from_fn(|i| AcplEncodedParam {
+            values: rows[i].clone(),
+            direction_time: false,
+        });
+        let mut bw_b = BitWriter::new();
+        write_acpl_data_2ch_directional(&mut bw_b, num_bands, qm, qm, &params);
+        assert_eq!(
+            bw_a.into_bytes(),
+            bw_b.into_bytes(),
+            "all-FREQ directional ACPL writer must match the legacy writer"
+        );
+    }
+
+    #[test]
+    fn directional_acpl_dt_rows_chain_through_decoder_diff_state() {
+        // Frame 1: FREQ rows. Frame 2: stationary → DT zero rows. The
+        // decoder's Pseudocode-121 chain (differential_decode +
+        // AcplDiffState) must recover the same absolute rows on both
+        // frames.
+        let num_bands = 12u32;
+        let qm = crate::acpl::AcplQuantMode::Fine;
+        let rows: Vec<Vec<i32>> = (0i32..11)
+            .map(|e| (0..num_bands as i32).map(|b| (e * 2 + b) % 4 - 1).collect())
+            .collect();
+        // Frame 1: all FREQ.
+        let params_f: [AcplEncodedParam; 11] = std::array::from_fn(|i| AcplEncodedParam {
+            values: rows[i].clone(),
+            direction_time: false,
+        });
+        let mut bw1 = BitWriter::new();
+        write_acpl_data_2ch_directional(&mut bw1, num_bands, qm, qm, &params_f);
+        bw1.align_to_byte();
+        let f1 = bw1.into_bytes();
+        // Frame 2: all TIME with zero deltas (stationary).
+        let params_t: [AcplEncodedParam; 11] = std::array::from_fn(|_| AcplEncodedParam {
+            values: vec![0; num_bands as usize],
+            direction_time: true,
+        });
+        let mut bw2 = BitWriter::new();
+        write_acpl_data_2ch_directional(&mut bw2, num_bands, qm, qm, &params_t);
+        bw2.align_to_byte();
+        let f2 = bw2.into_bytes();
+
+        let mut br1 = BitReader::new(&f1);
+        let d1 = crate::acpl::parse_acpl_data_2ch(&mut br1, num_bands, 0, qm, qm)
+            .expect("frame-1 parse");
+        let mut br2 = BitReader::new(&f2);
+        let d2 = crate::acpl::parse_acpl_data_2ch(&mut br2, num_bands, 0, qm, qm)
+            .expect("frame-2 parse");
+        assert!(!d1.alpha1[0].direction_time);
+        assert!(d2.alpha1[0].direction_time);
+
+        // Chain alpha1 through the decoder's diff state.
+        let mut st = crate::acpl_synth::AcplDiffState::new();
+        let q1 = crate::acpl_synth::differential_decode(&d1.alpha1, num_bands, &mut st);
+        let q2 = crate::acpl_synth::differential_decode(&d2.alpha1, num_bands, &mut st);
+        assert_eq!(q1[0], rows[0], "frame-1 FREQ decode");
+        assert_eq!(
+            q2[0], rows[0],
+            "frame-2 DT decode must inherit frame-1 rows"
+        );
     }
 
     #[test]
