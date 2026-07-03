@@ -2631,6 +2631,163 @@ pub fn derive_atsg_borders(
 // Pseudocodes 80 / 81 delta-decode, Pseudocodes 82 / 83 dequantize.
 // ---------------------------------------------------------------------
 
+/// Cross-interval envelope scale-factor state per ETSI TS 103 190-1
+/// §5.7.6.3.4 — the Pseudocode 80 / 81 "previous A-SPX interval" inputs
+/// (`qscf_sig_sbg_prev[.][num_atsg_sig_prev - 1]` and the noise
+/// `qscf_prev[.][num_atsg_noise_prev - 1]`).
+///
+/// The signal row is stored **expanded to the high-resolution
+/// subband-group grid** regardless of the resolution the last envelope
+/// was transmitted at. This is loss-free for the Pseudocode-80
+/// reference lookups: with `high2low` / `low2high` the index maps from
+/// Pseudocode 80,
+///
+/// * previous envelope high-res, current high-res: direct index;
+/// * previous low, current high: `prev_low[high2low[sbg]]`, which is
+///   exactly the expanded row at `sbg`;
+/// * previous high, current low: `prev_high[low2high[sbg]]`;
+/// * previous low, current low: `prev_low[sbg]
+///   = expanded[low2high[sbg]]` (since `high2low ∘ low2high` is the
+///   identity — low-res borders are a subset of high-res borders per
+///   Pseudocode 69).
+///
+/// so every case reduces to "index the expanded row at `sbg` (current
+/// high-res) or `low2high[sbg]` (current low-res)".
+///
+/// Empty vectors carry first-frame / post-reset semantics: a TIME
+/// reference into an empty row reads 0, matching the historical
+/// behaviour for streams that (correctly) only use FREQ direction on
+/// the first envelope after an I-frame.
+#[derive(Debug, Clone, Default)]
+pub struct AspxEnvPrev {
+    /// Last signal envelope's quantized scale factors, expanded to the
+    /// high-resolution subband-group grid.
+    pub qscf_sig_last: Vec<i32>,
+    /// Last noise envelope's quantized scale factors (noise
+    /// subband-group grid — resolution-independent per Pseudocode 70).
+    pub qscf_noise_last: Vec<i32>,
+}
+
+impl AspxEnvPrev {
+    /// First-frame / master-reset semantics.
+    pub fn reset(&mut self) {
+        self.qscf_sig_last.clear();
+        self.qscf_noise_last.clear();
+    }
+}
+
+/// Derive the Pseudocode-80 `sbg_idx_high2low` / `sbg_idx_low2high`
+/// index maps between the high- and low-resolution signal
+/// subband-group tables (border vectors, per Pseudocodes 68 / 69).
+///
+/// `high2low[sbg_hi]` is the low-res group containing high-res group
+/// `sbg_hi`; `low2high[sbg_lo]` is the first high-res group inside
+/// low-res group `sbg_lo`.
+pub fn derive_sbg_res_maps(
+    sbg_sig_highres: &[u32],
+    sbg_sig_lowres: &[u32],
+) -> (Vec<usize>, Vec<usize>) {
+    let num_high = sbg_sig_highres.len().saturating_sub(1);
+    let num_low = sbg_sig_lowres.len().saturating_sub(1);
+    let mut high2low = vec![0usize; num_high];
+    let mut low2high = vec![0usize; num_low];
+    let mut sbg_low = 0usize;
+    // ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80 index-mapping prologue.
+    #[allow(clippy::needless_range_loop)]
+    for sbg in 0..num_high {
+        if sbg_low + 1 < sbg_sig_lowres.len() && sbg_sig_lowres[sbg_low + 1] == sbg_sig_highres[sbg]
+        {
+            sbg_low += 1;
+            if sbg_low < low2high.len() {
+                low2high[sbg_low] = sbg;
+            }
+        }
+        high2low[sbg] = sbg_low.min(num_low.saturating_sub(1));
+    }
+    (high2low, low2high)
+}
+
+/// Delta-decode the signal envelope scale factors per the **full**
+/// ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80, including the
+/// per-envelope frequency resolution (`atsg_freqres`) handling and the
+/// cross-interval `qscf_sig_sbg_prev` reference.
+///
+/// * `deltas[atsg]` — the Huffman-decoded per-envelope value vectors
+///   (sized to that envelope's own resolution by
+///   [`parse_aspx_ec_data`]).
+/// * `freq_res[atsg]` — `aspx_freq_res[ch][atsg]` (`true` = high
+///   resolution). Missing entries default to high resolution, matching
+///   [`parse_aspx_ec_data`].
+/// * `prev_sig_last` — the previous interval's last signal envelope on
+///   the expanded high-res grid (see [`AspxEnvPrev`]); empty on the
+///   first interval.
+///
+/// Returns `qscf[sbg][atsg]` on the high-resolution grid (low-res
+/// envelopes have each low-res value replicated across its child
+/// high-res groups — loss-free for the §5.7.6.3.5 dequantization and
+/// the §5.7.6.4.2.1 subband mapping, both of which resolve values per
+/// QMF subband).
+pub fn delta_decode_sig_p80(
+    deltas: &[AspxHuffEnv],
+    freq_res: &[bool],
+    sbg_sig_highres: &[u32],
+    sbg_sig_lowres: &[u32],
+    prev_sig_last: &[i32],
+    delta: i32,
+) -> Vec<Vec<i32>> {
+    let num_high = sbg_sig_highres.len().saturating_sub(1);
+    let num_low = sbg_sig_lowres.len().saturating_sub(1);
+    let num_env = deltas.len();
+    let mut qscf: Vec<Vec<i32>> = vec![vec![0_i32; num_env]; num_high];
+    if num_high == 0 {
+        return qscf;
+    }
+    let (high2low, low2high) = derive_sbg_res_maps(sbg_sig_highres, sbg_sig_lowres);
+    // Rolling "previous envelope" row on the expanded high-res grid.
+    let mut prev_expanded: Vec<i32> = prev_sig_last.to_vec();
+    for (atsg, env) in deltas.iter().enumerate() {
+        let cur_high = freq_res.get(atsg).copied().unwrap_or(true);
+        let n_cur = if cur_high { num_high } else { num_low.max(1) };
+        let mut row_native = vec![0_i32; n_cur];
+        if env.direction_time {
+            // TIME: qscf[sbg][atsg] = qscf_prev[sbg][atsg] + delta·d.
+            #[allow(clippy::needless_range_loop)]
+            for sbg in 0..n_cur {
+                let ref_idx = if cur_high {
+                    sbg
+                } else {
+                    low2high.get(sbg).copied().unwrap_or(0)
+                };
+                let prev = prev_expanded.get(ref_idx).copied().unwrap_or(0);
+                let d = env.values.get(sbg).copied().unwrap_or(0);
+                row_native[sbg] = prev + delta * d;
+            }
+        } else {
+            // FREQ: running sum over the envelope's own grid.
+            let mut acc: i32 = 0;
+            #[allow(clippy::needless_range_loop)]
+            for sbg in 0..n_cur {
+                let d = env.values.get(sbg).copied().unwrap_or(0);
+                acc += delta * d;
+                row_native[sbg] = acc;
+            }
+        }
+        // Expand to the high-res grid and store.
+        let expanded: Vec<i32> = if cur_high {
+            row_native
+        } else {
+            (0..num_high)
+                .map(|h| row_native.get(high2low[h]).copied().unwrap_or(0))
+                .collect()
+        };
+        for (h, row) in qscf.iter_mut().enumerate() {
+            row[atsg] = expanded.get(h).copied().unwrap_or(0);
+        }
+        prev_expanded = expanded;
+    }
+    qscf
+}
+
 /// Delta-decode the signal envelope scale factors per ETSI TS 103 190-1
 /// §5.7.6.3.4 Pseudocode 80.
 pub fn delta_decode_sig(
@@ -3210,12 +3367,75 @@ impl AspxEnvelopeAdjuster {
         num_ts_in_ats: u32,
         aspx_interpolation: bool,
     ) -> Self {
+        let mut no_prev = AspxEnvPrev::default();
+        Self::from_deltas_stateful(
+            q_high,
+            tables,
+            sig_deltas,
+            noise_deltas,
+            qmode_env,
+            delta_dir_sig,
+            &[],
+            atsg_sig,
+            atsg_noise,
+            num_ts_in_ats,
+            aspx_interpolation,
+            &mut no_prev,
+        )
+    }
+
+    /// Stateful variant of [`Self::from_deltas`] — runs the **full**
+    /// Pseudocode 80 / 81 delta decode with the previous A-SPX
+    /// interval's last-envelope scale factors (`env_prev`, cross-frame
+    /// TIME-direction references) and the per-envelope frequency
+    /// resolution vector `freq_res` (`aspx_freq_res[ch][env]`; empty =
+    /// all high-res). `env_prev` is updated to this interval's last
+    /// signal / noise envelope rows so the next frame's TIME references
+    /// resolve per §5.7.6.3.4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_deltas_stateful(
+        q_high: &[Vec<(f32, f32)>],
+        tables: &AspxFrequencyTables,
+        sig_deltas: &[AspxHuffEnv],
+        noise_deltas: &[AspxHuffEnv],
+        qmode_env: AspxQuantStep,
+        delta_dir_sig: &[bool],
+        freq_res: &[bool],
+        atsg_sig: &[u32],
+        atsg_noise: &[u32],
+        num_ts_in_ats: u32,
+        aspx_interpolation: bool,
+        env_prev: &mut AspxEnvPrev,
+    ) -> Self {
         let sbg_sig = &tables.sbg_sig_highres;
         let sbg_noise = &tables.sbg_noise;
-        let num_sbg_sig = (sbg_sig.len() as u32).saturating_sub(1);
         let num_sbg_noise = (sbg_noise.len() as u32).saturating_sub(1);
-        let qscf_sig = delta_decode_sig(sig_deltas, num_sbg_sig, &[], 1);
-        let qscf_noise = delta_decode_noise(noise_deltas, num_sbg_noise, &[], 1);
+        let qscf_sig = delta_decode_sig_p80(
+            sig_deltas,
+            freq_res,
+            sbg_sig,
+            &tables.sbg_sig_lowres,
+            &env_prev.qscf_sig_last,
+            1,
+        );
+        let qscf_noise =
+            delta_decode_noise(noise_deltas, num_sbg_noise, &env_prev.qscf_noise_last, 1);
+        // Snapshot the last envelope rows for the next interval's
+        // Pseudocode 80 / 81 `qscf_*_prev` references. Empty envelope
+        // sets keep the previous snapshot (the "previous interval" is
+        // then still the last one that carried envelopes).
+        if !sig_deltas.is_empty() {
+            env_prev.qscf_sig_last = qscf_sig
+                .iter()
+                .map(|row| row.last().copied().unwrap_or(0))
+                .collect();
+        }
+        if !noise_deltas.is_empty() {
+            env_prev.qscf_noise_last = qscf_noise
+                .iter()
+                .map(|row| row.last().copied().unwrap_or(0))
+                .collect();
+        }
         let scf_sig_sbg = dequantize_sig_scf(&qscf_sig, qmode_env, delta_dir_sig, 64);
         let scf_noise_sbg = dequantize_noise_scf(&qscf_noise);
         let est_sig_sb = estimate_envelope_energy(
@@ -3300,6 +3520,11 @@ pub struct AspxChannelExtState {
     /// `TS_OFFSET_HFADJ` slots of `Q_low_ext` come from the tail of
     /// this matrix.
     pub q_low_prev: Vec<Vec<(f32, f32)>>,
+    /// Previous interval's last signal / noise envelope scale factors
+    /// for the §5.7.6.3.4 Pseudocode 80 / 81 cross-interval
+    /// TIME-direction references (P-frames and intra-stream envelopes
+    /// alike).
+    pub env_prev: AspxEnvPrev,
 }
 
 impl AspxChannelExtState {
@@ -3317,6 +3542,7 @@ impl AspxChannelExtState {
         self.num_atsg_sig_prev = 0;
         self.tns.reset();
         self.q_low_prev.clear();
+        self.env_prev.reset();
     }
 }
 
@@ -5367,6 +5593,214 @@ mod tests {
         assert_eq!(tab_border_fixfix(16, 3), None);
         // Out-of-range num_aspx_timeslots.
         assert_eq!(tab_border_fixfix(10, 2), None);
+    }
+
+    #[test]
+    fn derive_sbg_res_maps_subset_borders() {
+        // Low-res borders are every other high-res border (Pseudocode
+        // 69 shape): high = [10, 12, 14, 16, 18], low = [10, 14, 18].
+        // high2low: groups 0,1 → low 0; groups 2,3 → low 1.
+        // low2high: low 0 → high 0; low 1 → high 2.
+        let high = [10u32, 12, 14, 16, 18];
+        let low = [10u32, 14, 18];
+        let (h2l, l2h) = derive_sbg_res_maps(&high, &low);
+        assert_eq!(h2l, vec![0, 0, 1, 1]);
+        assert_eq!(l2h, vec![0, 2]);
+        // high2low ∘ low2high must be the identity on low groups.
+        for (lo, &hi) in l2h.iter().enumerate() {
+            assert_eq!(h2l[hi], lo);
+        }
+    }
+
+    #[test]
+    fn delta_decode_sig_p80_matches_legacy_all_highres() {
+        // With all-high-res envelopes and no previous interval the full
+        // Pseudocode 80 must reproduce the legacy walk exactly.
+        let deltas = vec![
+            AspxHuffEnv {
+                values: vec![4, -1, 2, 0],
+                direction_time: false,
+            },
+            AspxHuffEnv {
+                values: vec![1, 1, 1, 1],
+                direction_time: true,
+            },
+        ];
+        let high = [10u32, 12, 14, 16, 18];
+        let low = [10u32, 14, 18];
+        let legacy = delta_decode_sig(&deltas, 4, &[], 1);
+        let full = delta_decode_sig_p80(&deltas, &[true, true], &high, &low, &[], 1);
+        assert_eq!(legacy, full);
+    }
+
+    #[test]
+    fn delta_decode_sig_p80_cross_frame_time_reference() {
+        // A single TIME-direction envelope on the first frame of a
+        // P-frame chain: qscf = prev_last + delta.
+        let deltas = vec![AspxHuffEnv {
+            values: vec![2, -3, 0, 1],
+            direction_time: true,
+        }];
+        let high = [10u32, 12, 14, 16, 18];
+        let low = [10u32, 14, 18];
+        let prev_last = vec![10, 20, 30, 40];
+        let qscf = delta_decode_sig_p80(&deltas, &[true], &high, &low, &prev_last, 1);
+        assert_eq!(qscf[0][0], 12);
+        assert_eq!(qscf[1][0], 17);
+        assert_eq!(qscf[2][0], 30);
+        assert_eq!(qscf[3][0], 41);
+        // Empty prev (I-frame semantics) references 0.
+        let qscf0 = delta_decode_sig_p80(&deltas, &[true], &high, &low, &[], 1);
+        assert_eq!(qscf0[0][0], 2);
+        assert_eq!(qscf0[1][0], -3);
+    }
+
+    #[test]
+    fn delta_decode_sig_p80_lowres_envelope_expansion_and_mapping() {
+        // Envelope 0 is low-res FREQ over 2 low groups: values [5, 2]
+        // → native row [5, 7], expanded to high grid [5, 5, 7, 7].
+        // Envelope 1 is high-res TIME: each high group references the
+        // expanded previous row (cur high / prev low case of
+        // Pseudocode 80: prev_low[high2low[sbg]]).
+        let deltas = vec![
+            AspxHuffEnv {
+                values: vec![5, 2],
+                direction_time: false,
+            },
+            AspxHuffEnv {
+                values: vec![1, 0, -1, 2],
+                direction_time: true,
+            },
+        ];
+        let high = [10u32, 12, 14, 16, 18];
+        let low = [10u32, 14, 18];
+        let qscf = delta_decode_sig_p80(&deltas, &[false, true], &high, &low, &[], 1);
+        // Envelope 0 expanded.
+        assert_eq!(qscf[0][0], 5);
+        assert_eq!(qscf[1][0], 5);
+        assert_eq!(qscf[2][0], 7);
+        assert_eq!(qscf[3][0], 7);
+        // Envelope 1 = expanded prev + deltas.
+        assert_eq!(qscf[0][1], 6);
+        assert_eq!(qscf[1][1], 5);
+        assert_eq!(qscf[2][1], 6);
+        assert_eq!(qscf[3][1], 9);
+    }
+
+    #[test]
+    fn delta_decode_sig_p80_time_into_lowres_uses_low2high() {
+        // Envelope 0 high-res FREQ: [1, 2, 3, 4] → row [1, 3, 6, 10].
+        // Envelope 1 low-res TIME over 2 groups: references
+        // prev_high[low2high[sbg]] = row[0]=1 and row[2]=6
+        // (cur low / prev high case of Pseudocode 80).
+        let deltas = vec![
+            AspxHuffEnv {
+                values: vec![1, 2, 3, 4],
+                direction_time: false,
+            },
+            AspxHuffEnv {
+                values: vec![10, 100],
+                direction_time: true,
+            },
+        ];
+        let high = [10u32, 12, 14, 16, 18];
+        let low = [10u32, 14, 18];
+        let qscf = delta_decode_sig_p80(&deltas, &[true, false], &high, &low, &[], 1);
+        // Envelope 1 native: [1+10, 6+100] = [11, 106], expanded
+        // [11, 11, 106, 106].
+        assert_eq!(qscf[0][1], 11);
+        assert_eq!(qscf[1][1], 11);
+        assert_eq!(qscf[2][1], 106);
+        assert_eq!(qscf[3][1], 106);
+    }
+
+    #[test]
+    fn from_deltas_stateful_chains_env_prev_across_intervals() {
+        // Two consecutive intervals through the adjuster: interval 1
+        // establishes qscf_sig_last / qscf_noise_last; interval 2 uses
+        // TIME direction against them. Verify the state snapshot and
+        // that the second interval's dequantized envelope reflects the
+        // cross-interval reference (louder prev → louder current under
+        // identical deltas).
+        let cfg = AspxConfig {
+            quant_mode_env: AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: AspxFreqResMode::Signalled,
+        };
+        let tables = derive_aspx_frequency_tables(&cfg, 0).expect("tables");
+        let num_sbg = tables.sbg_sig_highres.len() - 1;
+        let num_sbg_noise = tables.sbg_noise.len() - 1;
+        let n_slots = 32usize;
+        let q: Vec<Vec<(f32, f32)>> = vec![vec![(0.1, 0.0); n_slots]; 64];
+        let atsg_sig = vec![0u32, n_slots as u32 / 2];
+        let atsg_noise = vec![0u32, n_slots as u32 / 2];
+        let mut prev = AspxEnvPrev::default();
+        // Interval 1: FREQ, F0 = 8, flat.
+        let mut sig_values = vec![0i32; num_sbg];
+        sig_values[0] = 8;
+        let sig1 = vec![AspxHuffEnv {
+            values: sig_values,
+            direction_time: false,
+        }];
+        let mut noise_values = vec![0i32; num_sbg_noise];
+        noise_values[0] = 3;
+        let noise1 = vec![AspxHuffEnv {
+            values: noise_values,
+            direction_time: false,
+        }];
+        let _ = AspxEnvelopeAdjuster::from_deltas_stateful(
+            &q,
+            &tables,
+            &sig1,
+            &noise1,
+            AspxQuantStep::Fine,
+            &[false],
+            &[],
+            &atsg_sig,
+            &atsg_noise,
+            2,
+            false,
+            &mut prev,
+        );
+        assert_eq!(prev.qscf_sig_last, vec![8i32; num_sbg]);
+        assert_eq!(prev.qscf_noise_last, vec![3i32; num_sbg_noise]);
+        // Interval 2: TIME with zero deltas — must inherit the prev
+        // rows verbatim.
+        let sig2 = vec![AspxHuffEnv {
+            values: vec![0i32; num_sbg],
+            direction_time: true,
+        }];
+        let noise2 = vec![AspxHuffEnv {
+            values: vec![0i32; num_sbg_noise],
+            direction_time: true,
+        }];
+        let _ = AspxEnvelopeAdjuster::from_deltas_stateful(
+            &q,
+            &tables,
+            &sig2,
+            &noise2,
+            AspxQuantStep::Fine,
+            &[true],
+            &[],
+            &atsg_sig,
+            &atsg_noise,
+            2,
+            false,
+            &mut prev,
+        );
+        assert_eq!(prev.qscf_sig_last, vec![8i32; num_sbg]);
+        assert_eq!(prev.qscf_noise_last, vec![3i32; num_sbg_noise]);
+        // Reset clears to first-frame semantics.
+        prev.reset();
+        assert!(prev.qscf_sig_last.is_empty());
+        assert!(prev.qscf_noise_last.is_empty());
     }
 
     #[test]

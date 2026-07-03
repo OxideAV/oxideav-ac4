@@ -408,17 +408,19 @@ impl Ac4Decoder {
             // Pseudocode 77 (FIXVAR / VARFIX / VARVAR) border derivation.
             if let Some((atsg_sig, atsg_noise)) = aspx::derive_atsg_borders(num_aspx_ts, frm) {
                 if sig.len() as u32 == frm.num_env {
-                    let adjuster = aspx::AspxEnvelopeAdjuster::from_deltas(
+                    let adjuster = aspx::AspxEnvelopeAdjuster::from_deltas_stateful(
                         &q,
                         tables,
                         sig,
                         noise,
                         qm,
                         &dd.sig_delta_dir,
+                        &frm.freq_res,
                         &atsg_sig,
                         &atsg_noise,
                         num_ts_in_ats,
                         cfg.interpolation,
+                        &mut state.env_prev,
                     );
                     // Noise + tone injection on top of the
                     // envelope-adjusted HF. `add_harmonic` is sized
@@ -483,6 +485,7 @@ impl Ac4Decoder {
             state.sine_idx_sb_prev = None;
             state.tsg_ptr_prev = 0;
             state.num_atsg_sig_prev = 0;
+            state.env_prev.reset();
         }
         // Phase-1 returns the post-extension QMF matrix + the (sbx,
         // sbz) the §5.7.5 companding tool will need. Companding +
