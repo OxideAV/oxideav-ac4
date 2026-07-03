@@ -124,6 +124,13 @@ pub struct Ac4ImsEncoder {
     /// overlap continuity is preserved per channel across frames. Lazy-
     /// initialised on first use; grown to the required channel count.
     pub mdct_states_multi: Vec<EncoderMdctState>,
+    /// Previous frame's absolute A-SPX envelope rows on the live 5_X
+    /// ACPL_3 single-envelope path — drives the P-frame TIME-direction
+    /// DPCM decision (§5.7.6.3.4 Pseudocodes 80 / 81 `qscf_*_prev`).
+    /// `None` until an ACPL_3 single-envelope frame has been emitted;
+    /// cleared when a multi-envelope body is emitted (its last-envelope
+    /// rows are not tracked, so the next frame safely stays FREQ).
+    pub acpl3_env_prev: Option<crate::encoder_acpl3::Acpl3EnvPrevRows>,
 }
 
 impl Ac4ImsEncoder {
@@ -143,6 +150,7 @@ impl Ac4ImsEncoder {
             mdct_state: None,
             mdct_state_r: None,
             mdct_states_multi: Vec::new(),
+            acpl3_env_prev: None,
         }
     }
 
@@ -2848,8 +2856,42 @@ impl Ac4ImsEncoder {
             _ => 32768,
         };
 
+        // P-frame TIME-direction decision (§5.7.6.3.4 Pseudocodes
+        // 80 / 81): when the previous frame's envelope rows are known
+        // and this is a non-I-frame, each of the four envelopes
+        // (L/R × SIGNAL/NOISE) may switch to TIME-direction DPCM
+        // against the previous frame when strictly cheaper. I-frames
+        // and first frames always emit FREQ.
+        let cur_rows = crate::encoder_acpl3::Acpl3EnvPrevRows {
+            l_sig: crate::encoder_acpl3::qscf_row_from_freq_dpcm(&l_sig),
+            l_noise: crate::encoder_acpl3::qscf_row_from_freq_dpcm(&l_noise),
+            r_sig: crate::encoder_acpl3::qscf_row_from_freq_dpcm(&r_sig),
+            r_noise: crate::encoder_acpl3::qscf_row_from_freq_dpcm(&r_noise),
+        };
+        let prev_rows = if self.b_iframe_global {
+            None
+        } else {
+            self.acpl3_env_prev.as_ref()
+        };
+        let env_l_sig = crate::encoder_acpl3::choose_envelope_direction(
+            &l_sig,
+            prev_rows.map(|p| p.l_sig.as_slice()),
+        );
+        let env_l_noise = crate::encoder_acpl3::choose_envelope_direction(
+            &l_noise,
+            prev_rows.map(|p| p.l_noise.as_slice()),
+        );
+        let env_r_sig = crate::encoder_acpl3::choose_envelope_direction(
+            &r_sig,
+            prev_rows.map(|p| p.r_sig.as_slice()),
+        );
+        let env_r_noise = crate::encoder_acpl3::choose_envelope_direction(
+            &r_noise,
+            prev_rows.map(|p| p.r_noise.as_slice()),
+        );
+
         let body =
-            crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna(
+            crate::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna_directional(
                 frame_len,
                 max_sfb,
                 max_sfb_lfe,
@@ -2861,10 +2903,10 @@ impl Ac4ImsEncoder {
                 Some(&coeffs_per_channel[4]),
                 coeffs_lfe.as_deref(),
                 &aspx_cfg,
-                &l_sig,
-                &l_noise,
-                &r_sig,
-                &r_noise,
+                &env_l_sig,
+                &env_l_noise,
+                &env_r_sig,
+                &env_r_noise,
                 &aspx_tna_mode,
                 &aspx_l_ah,
                 &aspx_r_ah,
@@ -2877,6 +2919,11 @@ impl Ac4ImsEncoder {
                 beta3_scale,
                 pad_target_bytes,
             );
+
+        // The transmitted rows become the next frame's Pseudocode 80/81
+        // `qscf_*_prev` reference (mirrors the decoder's per-channel
+        // AspxEnvPrev update).
+        self.acpl3_env_prev = Some(cur_rows);
 
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);
@@ -3357,6 +3404,12 @@ impl Ac4ImsEncoder {
                 beta3_scale,
             );
         }
+
+        // A multi-envelope body was emitted: its last-envelope rows are
+        // not tracked here, so clear the single-envelope P-frame
+        // reference — the next frame emits FREQ (always decodable)
+        // rather than TIME against a stale row.
+        self.acpl3_env_prev = None;
 
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);

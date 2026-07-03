@@ -2474,6 +2474,77 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     beta3_scale: f32,
     pad_target_bytes: usize,
 ) -> Vec<u8> {
+    let freq = |v: &[i32]| AspxEncodedEnvelope {
+        values: v.to_vec(),
+        direction_time: false,
+    };
+    build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna_directional(
+        transform_length,
+        max_sfb,
+        max_sfb_lfe,
+        b_iframe,
+        coeffs_l,
+        coeffs_r,
+        coeffs_c,
+        coeffs_ls,
+        coeffs_rs,
+        coeffs_lfe,
+        aspx_cfg,
+        &freq(aspx_l_sig),
+        &freq(aspx_l_noise),
+        &freq(aspx_r_sig),
+        &freq(aspx_r_noise),
+        aspx_tna_mode,
+        aspx_l_ah,
+        aspx_r_ah,
+        acpl_num_param_bands_id,
+        acpl_qm0,
+        acpl_qm1,
+        alpha_scale,
+        beta_scale,
+        gamma_scale,
+        beta3_scale,
+        pad_target_bytes,
+    )
+}
+
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna`]
+/// with **per-channel, per-data-type A-SPX envelope transmission
+/// directions** ([`AspxEncodedEnvelope`] rows instead of raw FREQ-DPCM
+/// slices) — the P-frame builder: TIME-direction rows delta-code
+/// against the previous frame's last envelope (§5.7.6.3.4 Pseudocodes
+/// 80 / 81 `qscf_*_prev`), which the decoder reconstructs from its
+/// per-channel [`crate::aspx::AspxEnvPrev`] state. All-FREQ rows
+/// reproduce the plain `_real_aspx_tna` builder byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna_directional(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    aspx_l_sig: &AspxEncodedEnvelope,
+    aspx_l_noise: &AspxEncodedEnvelope,
+    aspx_r_sig: &AspxEncodedEnvelope,
+    aspx_r_noise: &AspxEncodedEnvelope,
+    aspx_tna_mode: &[u8],
+    aspx_l_ah: &[bool],
+    aspx_r_ah: &[bool],
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    beta3_scale: f32,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
 
     let alpha_q = extract_alpha_q_per_band_carrier_correlation(
@@ -2606,17 +2677,13 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     // on every frame; only the configs above and the 3-bit xover offset
     // inside aspx_data_2ch() are I-frame-gated.
     {
-        write_aspx_data_2ch_real_envelope_tna_ah_framed(
+        write_aspx_data_2ch_directional_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
-            AspxRealEnvelopeChannel {
-                sig: aspx_l_sig,
-                noise: aspx_l_noise,
-            },
-            AspxRealEnvelopeChannel {
-                sig: aspx_r_sig,
-                noise: aspx_r_noise,
-            },
+            aspx_l_sig,
+            aspx_l_noise,
+            aspx_r_sig,
+            aspx_r_noise,
             aspx_tna_mode,
             aspx_l_ah,
             aspx_r_ah,
@@ -3650,6 +3717,121 @@ pub fn write_aspx_data_2ch_real_envelope_tna_ah_framed(
     Ok(())
 }
 
+/// Single-envelope `aspx_data_2ch()` writer with **per-channel,
+/// per-data-type transmission directions** (ETSI TS 103 190-1
+/// §4.2.12.5 Table 54 `aspx_delta_dir()` + §4.2.12.9 Table 58) — the
+/// P-frame generalisation of
+/// [`write_aspx_data_2ch_real_envelope_tna_ah_framed`].
+///
+/// Each of the four envelope payloads (`ch0_sig`, `ch0_noise`,
+/// `ch1_sig`, `ch1_noise`) is an [`AspxEncodedEnvelope`] carrying its
+/// chosen FREQ / TIME direction:
+///
+/// * FREQ rows hold `[F0, DF₁, …]` (frequency-DPCM, decoded by the
+///   Pseudocode 80/81 FREQ branch);
+/// * TIME rows hold per-subband-group `DT` deltas against the
+///   **previous frame's last envelope** (`qscf_prev` — the decoder's
+///   [`crate::aspx::AspxEnvPrev`] carries it across frames).
+///
+/// With all-FREQ rows this reproduces
+/// [`write_aspx_data_2ch_real_envelope_tna_ah_framed`] byte-for-byte.
+/// Framing is FIXFIX `num_env = 1`, `aspx_balance = 1` (ch1 BALANCE
+/// coded, framing + tna mirrored from ch0), matching the live 5_X
+/// ACPL_3 path.
+#[allow(clippy::too_many_arguments)]
+pub fn write_aspx_data_2ch_directional_envelope_tna_ah_framed(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch0_sig: &AspxEncodedEnvelope,
+    ch0_noise: &AspxEncodedEnvelope,
+    ch1_sig: &AspxEncodedEnvelope,
+    ch1_noise: &AspxEncodedEnvelope,
+    tna_mode: &[u8],
+    ah_left: &[bool],
+    ah_right: &[bool],
+    b_iframe: bool,
+) -> Result<(), &'static str> {
+    let xover: u32 = 0;
+    if b_iframe {
+        bw.write_u32(xover, 3);
+    }
+
+    bw.write_bit(false);
+    let envbits = cfg.fixfix_tmp_num_env_bits();
+    bw.write_u32(0, envbits);
+    if cfg.signals_freq_res() {
+        bw.write_bit(false);
+    }
+    // aspx_balance = 1 → channel-1 reuses channel-0's framing + tna_mode.
+    bw.write_bit(true);
+    // aspx_delta_dir(0) + aspx_delta_dir(1): 1 sig + 1 noise bit each
+    // (num_env = 1, num_noise = 1) per Table 54.
+    bw.write_bit(ch0_sig.direction_time);
+    bw.write_bit(ch0_noise.direction_time);
+    bw.write_bit(ch1_sig.direction_time);
+    bw.write_bit(ch1_noise.direction_time);
+
+    let tables = aspx::derive_aspx_frequency_tables(cfg, xover)
+        .map_err(|_| "encoder: aspx frequency-tables derivation failed")?;
+    let counts = tables.counts;
+
+    let empty: &[u8] = &[];
+    let payload = AspxHfgenIwc2ChPayload {
+        tna_mode: [tna_mode, empty],
+        add_harmonic: [ah_left, ah_right],
+        ..AspxHfgenIwc2ChPayload::default()
+    };
+    write_aspx_hfgen_iwc_2ch(
+        bw,
+        &payload,
+        true, // aspx_balance = 1
+        counts.num_sbg_noise,
+        counts.num_sbg_sig_highres,
+        0,
+    );
+
+    let num_sbg_sig = if cfg.signals_freq_res() {
+        counts.num_sbg_sig_lowres
+    } else {
+        counts.num_sbg_sig_highres
+    };
+    let num_sbg_noise = counts.num_sbg_noise;
+
+    let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+        aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+
+    write_aspx_sig_envelope_directional(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Level,
+        ch0_sig,
+        num_sbg_sig,
+    );
+    write_aspx_sig_envelope_directional(
+        bw,
+        qmode_sig,
+        aspx::AspxStereoMode::Balance,
+        ch1_sig,
+        num_sbg_sig,
+    );
+    write_aspx_noise_envelope_directional(
+        bw,
+        aspx::AspxStereoMode::Level,
+        ch0_noise,
+        num_sbg_noise,
+    );
+    write_aspx_noise_envelope_directional(
+        bw,
+        aspx::AspxStereoMode::Balance,
+        ch1_noise,
+        num_sbg_noise,
+    );
+    Ok(())
+}
+
 /// Emit an `aspx_data_1ch()` body per ETSI TS 103 190-1 §4.2.12.3
 /// Table 51 with caller-provided real envelope quant indices, mirroring
 /// the [`write_aspx_data_1ch_minimal`] framing skeleton:
@@ -4432,6 +4614,70 @@ pub struct AspxEncodedEnvelope {
     pub values: Vec<i32>,
     /// Transmission direction (false = FREQ, true = TIME).
     pub direction_time: bool,
+}
+
+/// Reconstruct the absolute quantized scale-factor row from a packed
+/// FREQ-DPCM vector `[F0, DF₁, …]` — the running sum the decoder's
+/// Pseudocode 80/81 FREQ branch accumulates (`delta = 1` domain).
+pub fn qscf_row_from_freq_dpcm(packed: &[i32]) -> Vec<i32> {
+    let mut acc = 0i32;
+    packed
+        .iter()
+        .map(|&d| {
+            acc += d;
+            acc
+        })
+        .collect()
+}
+
+/// P-frame envelope direction decision for a single FIXFIX envelope
+/// (ETSI TS 103 190-1 §4.2.12.5 / §5.7.6.3.4): given the current
+/// envelope's packed FREQ-DPCM vector and the previous frame's last
+/// envelope row (`qscf_prev`, same `delta = 1` domain), transmit in the
+/// TIME direction when its delta magnitudes are strictly cheaper
+/// (`Σ|qscf_cur − qscf_prev| < Σ|freq values|`; FREQ wins ties so
+/// I-frame-shaped output is preferred). `None` / absent previous rows
+/// (first frame, I-frame, path switch) always select FREQ.
+pub fn choose_envelope_direction(
+    packed_freq: &[i32],
+    prev_row: Option<&[i32]>,
+) -> AspxEncodedEnvelope {
+    if let Some(prev) = prev_row {
+        let cur = qscf_row_from_freq_dpcm(packed_freq);
+        let dt: Vec<i32> = cur
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| c - prev.get(i).copied().unwrap_or(0))
+            .collect();
+        let time_cost: i64 = dt.iter().map(|&d| (d as i64).abs()).sum();
+        let freq_cost: i64 = packed_freq.iter().map(|&d| (d as i64).abs()).sum();
+        if time_cost < freq_cost {
+            return AspxEncodedEnvelope {
+                values: dt,
+                direction_time: true,
+            };
+        }
+    }
+    AspxEncodedEnvelope {
+        values: packed_freq.to_vec(),
+        direction_time: false,
+    }
+}
+
+/// Previous-frame absolute envelope rows for the live 5_X ACPL_3
+/// L / R carrier pair — the encoder-side mirror of the decoder's
+/// per-channel [`crate::aspx::AspxEnvPrev`], used to drive
+/// [`choose_envelope_direction`] on P-frames.
+#[derive(Debug, Clone, Default)]
+pub struct Acpl3EnvPrevRows {
+    /// L carrier SIGNAL row (`delta = 1` accumulation domain).
+    pub l_sig: Vec<i32>,
+    /// L carrier NOISE row.
+    pub l_noise: Vec<i32>,
+    /// R carrier SIGNAL row (BALANCE-coded transmitted values).
+    pub r_sig: Vec<i32>,
+    /// R carrier NOISE row.
+    pub r_noise: Vec<i32>,
 }
 
 /// Encode a full multi-envelope `qscf[sbg][atsg]` matrix into a sequence
@@ -9812,6 +10058,170 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
 mod tests {
     use super::*;
     use oxideav_core::bits::BitReader;
+
+    fn r389_test_cfg() -> aspx::AspxConfig {
+        aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        }
+    }
+
+    #[test]
+    fn qscf_row_from_freq_dpcm_running_sum() {
+        assert_eq!(qscf_row_from_freq_dpcm(&[4, -1, 2, 0]), vec![4, 3, 5, 5]);
+        assert!(qscf_row_from_freq_dpcm(&[]).is_empty());
+    }
+
+    #[test]
+    fn choose_envelope_direction_picks_time_when_stationary() {
+        // Current == previous → all-zero DT row, strictly cheaper than
+        // the non-trivial FREQ row.
+        let packed = [4, -1, 2, 0];
+        let prev = qscf_row_from_freq_dpcm(&packed);
+        let env = choose_envelope_direction(&packed, Some(&prev));
+        assert!(env.direction_time);
+        assert_eq!(env.values, vec![0, 0, 0, 0]);
+        // No previous rows (I-frame / first frame) → FREQ verbatim.
+        let env_i = choose_envelope_direction(&packed, None);
+        assert!(!env_i.direction_time);
+        assert_eq!(env_i.values, packed.to_vec());
+        // A distant previous row keeps FREQ (time_cost >= freq_cost).
+        let far = vec![100, 100, 100, 100];
+        let env_f = choose_envelope_direction(&packed, Some(&far));
+        assert!(!env_f.direction_time);
+        // Zero-vs-zero tie resolves to FREQ.
+        let env_t = choose_envelope_direction(&[0, 0], Some(&[0, 0]));
+        assert!(!env_t.direction_time);
+    }
+
+    #[test]
+    fn directional_writer_all_freq_matches_tna_ah_framed_writer() {
+        // The directional single-envelope 2ch writer with all-FREQ rows
+        // must be byte-identical to the historical framed writer, on
+        // both I- and P-frame forms.
+        let cfg = r389_test_cfg();
+        let counts = aspx::derive_aspx_frequency_tables(&cfg, 0)
+            .expect("tables")
+            .counts;
+        let sig: Vec<i32> = (0..counts.num_sbg_sig_highres as i32)
+            .map(|i| i % 3 - 1)
+            .collect();
+        let noise: Vec<i32> = vec![1; counts.num_sbg_noise as usize];
+        let tna: Vec<u8> = vec![2; counts.num_sbg_noise as usize];
+        for b_iframe in [true, false] {
+            let mut bw_a = BitWriter::new();
+            write_aspx_data_2ch_real_envelope_tna_ah_framed(
+                &mut bw_a,
+                &cfg,
+                AspxRealEnvelopeChannel {
+                    sig: &sig,
+                    noise: &noise,
+                },
+                AspxRealEnvelopeChannel {
+                    sig: &sig,
+                    noise: &noise,
+                },
+                &tna,
+                &[],
+                &[],
+                b_iframe,
+            )
+            .unwrap();
+            let mut bw_b = BitWriter::new();
+            let f = |v: &[i32]| AspxEncodedEnvelope {
+                values: v.to_vec(),
+                direction_time: false,
+            };
+            write_aspx_data_2ch_directional_envelope_tna_ah_framed(
+                &mut bw_b,
+                &cfg,
+                &f(&sig),
+                &f(&noise),
+                &f(&sig),
+                &f(&noise),
+                &tna,
+                &[],
+                &[],
+                b_iframe,
+            )
+            .unwrap();
+            assert_eq!(
+                bw_a.into_bytes(),
+                bw_b.into_bytes(),
+                "all-FREQ directional writer must match (b_iframe={b_iframe})"
+            );
+        }
+    }
+
+    #[test]
+    fn directional_writer_time_rows_round_trip_through_parser() {
+        // A P-frame body with TIME-direction SIGNAL rows parses through
+        // parse_aspx_data_2ch_body and the recovered deltas +
+        // directions match what was written.
+        let cfg = r389_test_cfg();
+        let counts = aspx::derive_aspx_frequency_tables(&cfg, 0)
+            .expect("tables")
+            .counts;
+        let n_sig = counts.num_sbg_sig_highres as usize;
+        let n_noise = counts.num_sbg_noise as usize;
+        let dt_sig: Vec<i32> = (0..n_sig as i32).map(|i| (i % 3) - 1).collect();
+        let noise_freq: Vec<i32> = vec![2; n_noise];
+        let mut bw = BitWriter::new();
+        write_aspx_data_2ch_directional_envelope_tna_ah_framed(
+            &mut bw,
+            &cfg,
+            &AspxEncodedEnvelope {
+                values: dt_sig.clone(),
+                direction_time: true,
+            },
+            &AspxEncodedEnvelope {
+                values: noise_freq.clone(),
+                direction_time: false,
+            },
+            &AspxEncodedEnvelope {
+                values: vec![0; n_sig],
+                direction_time: true,
+            },
+            &AspxEncodedEnvelope {
+                values: noise_freq.clone(),
+                direction_time: false,
+            },
+            &[],
+            &[],
+            &[],
+            false, // P-frame form: no xover
+        )
+        .unwrap();
+        bw.align_to_byte();
+        let bytes = bw.into_bytes();
+        let mut tools = crate::asf::SubstreamTools {
+            aspx_xover_subband_offset: Some(0),
+            ..Default::default()
+        };
+        let mut br = BitReader::new(&bytes);
+        crate::asf::parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, false, 1920)
+            .expect("P-frame parse");
+        let dd = tools.aspx_delta_dir_primary.as_ref().expect("delta dir");
+        assert_eq!(dd.sig_delta_dir, vec![true]);
+        assert_eq!(dd.noise_delta_dir, vec![false]);
+        let sig = tools.aspx_data_sig_primary.as_ref().expect("sig data");
+        assert_eq!(sig.len(), 1);
+        assert!(sig[0].direction_time);
+        assert_eq!(sig[0].values, dt_sig);
+        let dd1 = tools
+            .aspx_delta_dir_secondary
+            .as_ref()
+            .expect("ch1 delta dir");
+        assert_eq!(dd1.sig_delta_dir, vec![true]);
+    }
 
     /// `pick_min_len_cw` returns the smallest-length entry. Verified
     /// against ASPX_HCB_ENV_LEVEL_15_F0 whose min-length entry is index

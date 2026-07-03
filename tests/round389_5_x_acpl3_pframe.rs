@@ -287,3 +287,133 @@ fn p_frame_emission_is_deterministic() {
     assert_eq!(p1, p2);
     assert_ne!(i1, p1, "I and P frames must differ on the wire");
 }
+
+/// A stationary signal encoded as I,P selects the **TIME direction**
+/// (§5.7.6.3.4 Pseudocode 80) for the P-frame's envelopes — the DT row
+/// against the previous frame is all-zero, strictly cheaper than
+/// re-sending the FREQ envelope — and the decoder reconstructs the
+/// same absolute qscf rows from its cross-frame `AspxEnvPrev` state.
+#[test]
+fn stationary_p_frame_selects_time_direction_and_reconstructs() {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let mut enc = Ac4ImsEncoder::new();
+
+    let l = multitone(0.3);
+    let r = multitone(0.25);
+    let c = tone(660.0, 0.2);
+    let ls = tone(880.0, 0.2);
+    let rs = tone(1100.0, 0.2);
+    let chans: [&[f32]; 5] = [&l, &r, &c, &ls, &rs];
+
+    enc.b_iframe_global = true;
+    let f_i = enc.encode_frame_pcm_5_0_acpl3_real_aspx(&chans, 0.5, 0.1, 1.0, 1.0);
+    let _ = decode_one(&mut dec, f_i, 0);
+    let sig_i = dec
+        .last_substream
+        .as_ref()
+        .unwrap()
+        .tools
+        .aspx_data_sig_primary
+        .clone()
+        .expect("I-frame sig data");
+    assert!(
+        !sig_i[0].direction_time,
+        "I-frame envelope must be FREQ-direction"
+    );
+
+    // Same stationary input on the P-frame.
+    enc.b_iframe_global = false;
+    let f_p = enc.encode_frame_pcm_5_0_acpl3_real_aspx(&chans, 0.5, 0.1, 1.0, 1.0);
+    let _ = decode_one(&mut dec, f_p, 1920);
+    let tools_p = &dec.last_substream.as_ref().unwrap().tools;
+    let dd_p = tools_p
+        .aspx_delta_dir_primary
+        .as_ref()
+        .expect("P delta dir");
+    assert_eq!(
+        dd_p.sig_delta_dir,
+        vec![true],
+        "stationary P-frame must select TIME direction for the SIGNAL envelope"
+    );
+    let sig_p = tools_p
+        .aspx_data_sig_primary
+        .clone()
+        .expect("P-frame sig data");
+    assert!(sig_p[0].direction_time);
+    assert!(
+        sig_p[0].values.iter().all(|&v| v == 0),
+        "stationary TIME row must be all-zero deltas, got {:?}",
+        sig_p[0].values
+    );
+
+    // Decoder-side reconstruction: Pseudocode 80 with the I-frame's
+    // last envelope as prev reproduces the I-frame's absolute rows.
+    let cfg = live_cfg();
+    let tables = oxideav_ac4::aspx::derive_aspx_frequency_tables(&cfg, 0).expect("tables");
+    let qscf_i = oxideav_ac4::aspx::delta_decode_sig_p80(
+        &sig_i,
+        &[],
+        &tables.sbg_sig_highres,
+        &tables.sbg_sig_lowres,
+        &[],
+        1,
+    );
+    let prev_last: Vec<i32> = qscf_i.iter().map(|row| *row.last().unwrap()).collect();
+    let qscf_p = oxideav_ac4::aspx::delta_decode_sig_p80(
+        &sig_p,
+        &[],
+        &tables.sbg_sig_highres,
+        &tables.sbg_sig_lowres,
+        &prev_last,
+        1,
+    );
+    for (sbg, row) in qscf_p.iter().enumerate() {
+        assert_eq!(
+            row[0], qscf_i[sbg][0],
+            "P-frame TIME reconstruction must equal the I-frame row at sbg {sbg}"
+        );
+    }
+}
+
+/// A P-frame whose signal changed sharply keeps the FREQ direction
+/// (time deltas are not cheaper), so the decision is signal-driven.
+#[test]
+fn changed_signal_p_frame_keeps_freq_direction() {
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let mut enc = Ac4ImsEncoder::new();
+
+    let l = multitone(0.3);
+    let r = multitone(0.25);
+    let c = tone(660.0, 0.2);
+    let ls = tone(880.0, 0.2);
+    let rs = tone(1100.0, 0.2);
+    enc.b_iframe_global = true;
+    let f_i = enc.encode_frame_pcm_5_0_acpl3_real_aspx(&[&l, &r, &c, &ls, &rs], 0.5, 0.1, 1.0, 1.0);
+    let _ = decode_one(&mut dec, f_i, 0);
+
+    // P-frame: HF content vanishes (silence) — envelope collapses, and
+    // the FREQ row of a silent envelope is cheaper than the TIME drop
+    // from the loud previous frame.
+    let silence = vec![0.0f32; N];
+    enc.b_iframe_global = false;
+    let f_p = enc.encode_frame_pcm_5_0_acpl3_real_aspx(
+        &[&silence, &silence, &silence, &silence, &silence],
+        0.5,
+        0.1,
+        1.0,
+        1.0,
+    );
+    let _ = decode_one(&mut dec, f_p, 1920);
+    let tools_p = &dec.last_substream.as_ref().unwrap().tools;
+    let dd_p = tools_p
+        .aspx_delta_dir_primary
+        .as_ref()
+        .expect("P delta dir");
+    assert_eq!(
+        dd_p.sig_delta_dir,
+        vec![false],
+        "a collapsed envelope must stay FREQ-direction"
+    );
+}
