@@ -83,6 +83,12 @@ pub struct Ac4Decoder {
     /// fresh per-frame state and dropped it. Grown on demand to match
     /// the channel count seen on the latest frame.
     ssf_walker_state: Vec<ssf::SsfChannelState>,
+    /// I-frame-sticky substream configuration (aspx_config /
+    /// acpl_config_* / aspx_xover_subband_offset) carried across
+    /// frames so `b_iframe == 0` (P-frame) substreams parse per
+    /// §4.2.6.x. Harvested from every I-frame, seeded into every
+    /// non-I-frame walk.
+    sticky: asf::StickyConfig,
 }
 
 /// Phase-1 result of [`Ac4Decoder::aspx_extend_to_qmf`]:
@@ -157,6 +163,7 @@ impl Ac4Decoder {
             acpl_5x_mch_state: acpl_synth::Acpl5xMchPcmState::new(),
             ssf_synth_state: Vec::new(),
             ssf_walker_state: Vec::new(),
+            sticky: asf::StickyConfig::default(),
         }
     }
 
@@ -1826,12 +1833,13 @@ impl Decoder for Ac4Decoder {
                 .first()
                 .map(|p| p.b_iframe)
                 .unwrap_or(info.b_iframe_global);
-            asf::walk_ac4_substream_stateful(
+            asf::walk_ac4_substream_sticky(
                 sb,
                 channels_u16,
                 b_iframe,
                 info.frame_length,
                 Some(&mut self.ssf_walker_state[..channels as usize]),
+                Some(&mut self.sticky),
             )
             .ok()
         });

@@ -1287,6 +1287,55 @@ pub fn select_alpha_q_for_pair(
     (alpha_q_out, used_out)
 }
 
+/// I-frame-sticky per-substream configuration, carried across frames
+/// so `b_iframe = 0` (P-frame) substreams can be parsed and decoded.
+///
+/// Per ETSI TS 103 190-1 §4.2.6.1 / §4.2.6.3 / §4.2.6.6 / §4.2.6.14
+/// the `aspx_config()` / `acpl_config_1ch()` / `acpl_config_2ch()`
+/// elements — and per Tables 51 / 52 the `aspx_xover_subband_offset`
+/// field — are only transmitted inside `if (b_iframe) { … }` blocks;
+/// every non-I-frame reuses the values from the most recent I-frame.
+/// The decoder harvests this struct from the parsed
+/// [`SubstreamTools`] after each I-frame and seeds the next frame's
+/// tools from it when `b_iframe == 0`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StickyConfig {
+    /// `aspx_config()` from the last I-frame.
+    pub aspx_config: Option<aspx::AspxConfig>,
+    /// `aspx_xover_subband_offset` (3 bits, Tables 51 / 52) from the
+    /// last I-frame.
+    pub aspx_xover: Option<u8>,
+    /// `acpl_config_1ch(PARTIAL)` from the last I-frame
+    /// (ASPX_ACPL_1 modes).
+    pub acpl_config_1ch_partial: Option<crate::acpl::AcplConfig1ch>,
+    /// `acpl_config_1ch(FULL)` from the last I-frame
+    /// (ASPX_ACPL_2 modes).
+    pub acpl_config_1ch_full: Option<crate::acpl::AcplConfig1ch>,
+    /// `acpl_config_2ch()` from the last I-frame (5_X ASPX_ACPL_3).
+    pub acpl_config_2ch: Option<crate::acpl::AcplConfig2ch>,
+}
+
+impl StickyConfig {
+    /// Seed a fresh frame's [`SubstreamTools`] with the sticky configs
+    /// ahead of a `b_iframe == 0` parse.
+    pub fn seed(&self, tools: &mut SubstreamTools) {
+        tools.aspx_config = self.aspx_config;
+        tools.aspx_xover_subband_offset = self.aspx_xover;
+        tools.acpl_config_1ch_partial = self.acpl_config_1ch_partial;
+        tools.acpl_config_1ch_full = self.acpl_config_1ch_full;
+        tools.acpl_config_2ch = self.acpl_config_2ch;
+    }
+
+    /// Harvest the sticky configs from a parsed I-frame's tools.
+    pub fn harvest(&mut self, tools: &SubstreamTools) {
+        self.aspx_config = tools.aspx_config;
+        self.aspx_xover = tools.aspx_xover_subband_offset;
+        self.acpl_config_1ch_partial = tools.acpl_config_1ch_partial;
+        self.acpl_config_1ch_full = tools.acpl_config_1ch_full;
+        self.acpl_config_2ch = tools.acpl_config_2ch;
+    }
+}
+
 /// Per-substream tool summary — what the decoder can learn by walking
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
@@ -1814,14 +1863,15 @@ pub fn parse_mono_audio_data_outer_stateful(
             }
             // §4.2.6.1: for the ASPX path, aspx_data_1ch() follows
             // mono_data(0). Parse its leading xover-subband-offset +
-            // aspx_framing(0) here. Only runs when:
-            //   * we're on an I-frame — both xover-subband-offset and
-            //     aspx_config (which drives aspx_framing) are I-frame-
-            //     sticky;
+            // aspx_framing(0) here. Runs when:
             //   * mono_data(0) was fully decoded, so the bitreader sits
             //     at the start of aspx_data_1ch();
-            //   * aspx_config was parsed into tools above.
-            if mode != MonoCodecMode::Simple && b_iframe && body_ok {
+            //   * aspx_config is available — parsed above on I-frames,
+            //     pre-seeded from the sticky state ([`StickyConfig`])
+            //     on non-I-frames (the xover-subband-offset is likewise
+            //     I-frame-sticky; `parse_aspx_data_1ch_body` skips its
+            //     3-bit read when `b_iframe == 0`).
+            if mode != MonoCodecMode::Simple && body_ok {
                 if let Some(cfg) = tools.aspx_config {
                     parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
                 }
@@ -1851,8 +1901,18 @@ pub(crate) fn parse_aspx_data_1ch_body(
     b_iframe: bool,
     frame_len_base: u32,
 ) -> Result<()> {
-    let xover = br.read_u32(3)? as u8;
-    tools.aspx_xover_subband_offset = Some(xover);
+    // Table 51: `if (b_iframe) aspx_xover_subband_offset;` — non-I-
+    // frames reuse the sticky value from the last I-frame, which the
+    // caller pre-seeds into `tools` (see [`StickyConfig::seed`]).
+    let xover = if b_iframe {
+        let x = br.read_u32(3)? as u8;
+        tools.aspx_xover_subband_offset = Some(x);
+        x
+    } else {
+        tools.aspx_xover_subband_offset.ok_or_else(|| {
+            Error::invalid("ac4: non-iframe aspx_data_1ch without sticky xover offset")
+        })?
+    };
     let nats = aspx::num_aspx_timeslots(frame_len_base);
     let framing = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
     let qmode = if matches!(framing.int_class, aspx::AspxIntClass::FixFix) && framing.num_env == 1 {
@@ -1923,8 +1983,18 @@ pub(crate) fn parse_aspx_data_2ch_body(
     b_iframe: bool,
     frame_len_base: u32,
 ) -> Result<()> {
-    let xover = br.read_u32(3)? as u8;
-    tools.aspx_xover_subband_offset = Some(xover);
+    // Table 52: `if (b_iframe) aspx_xover_subband_offset;` — non-I-
+    // frames reuse the sticky value from the last I-frame, which the
+    // caller pre-seeds into `tools` (see [`StickyConfig::seed`]).
+    let xover = if b_iframe {
+        let x = br.read_u32(3)? as u8;
+        tools.aspx_xover_subband_offset = Some(x);
+        x
+    } else {
+        tools.aspx_xover_subband_offset.ok_or_else(|| {
+            Error::invalid("ac4: non-iframe aspx_data_2ch without sticky xover offset")
+        })?
+    };
     let nats = aspx::num_aspx_timeslots(frame_len_base);
     let framing_ch0 = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
     // Per Table 52: `aspx_qmode_env[0] = aspx_qmode_env[1]
@@ -2992,6 +3062,15 @@ pub fn parse_stereo_audio_data_outer_stateful(
                 }
                 _ => {}
             }
+        } else {
+            // Non-I-frame: the configs are I-frame-sticky (§4.2.6.3
+            // Table 22 gates them on b_iframe) — reuse the values the
+            // caller pre-seeded into `tools` from [`StickyConfig`].
+            acpl_cfg_active = match mode {
+                StereoCodecMode::AspxAcpl1 => tools.acpl_config_1ch_partial,
+                StereoCodecMode::AspxAcpl2 => tools.acpl_config_1ch_full,
+                _ => None,
+            };
         }
         let nc = match mode {
             StereoCodecMode::Aspx => 2,
@@ -3020,7 +3099,7 @@ pub fn parse_stereo_audio_data_outer_stateful(
                 StereoCodecMode::AspxAcpl2 => parse_aspx_acpl2_mdct_body(br, tools, frame_len_base),
                 _ => false,
             };
-            if b_iframe && body_ok {
+            if body_ok {
                 if let Some(cfg) = tools.aspx_config {
                     if parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base).is_ok() {
                         if let Some(acfg) = acpl_cfg_active {
@@ -3051,11 +3130,11 @@ pub fn parse_stereo_audio_data_outer_stateful(
         // body follows companding_control(2), then aspx_data_2ch()
         // closes the element. We parse stereo_data() with the same
         // shared decoder as SIMPLE, then attempt to read the leading
-        // xover-offset + aspx_framing(0)[ + aspx_balance + framing(1)]
-        // of aspx_data_2ch(). Only runs when:
-        //   * we're on an I-frame, and
-        //   * the stereo_data() body decoded cleanly (bitreader is at
-        //     the right place).
+        // [xover-offset (I-frames only) +] aspx_framing(0)[ +
+        // aspx_balance + framing(1)] of aspx_data_2ch(). Runs when the
+        // stereo_data() body decoded cleanly (bitreader is at the
+        // right place) and an aspx_config is available (parsed above
+        // on I-frames, sticky-seeded on non-I-frames).
         if matches!(mode, StereoCodecMode::Aspx) {
             let body_ok = parse_stereo_data_body_stateful(
                 br,
@@ -3063,7 +3142,7 @@ pub fn parse_stereo_audio_data_outer_stateful(
                 frame_len_base,
                 ssf_states.as_deref_mut(),
             );
-            if b_iframe && body_ok {
+            if body_ok {
                 if let Some(cfg) = tools.aspx_config {
                     parse_aspx_data_2ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
                 }
@@ -3388,7 +3467,33 @@ pub fn walk_ac4_substream_stateful(
     channels: u16,
     b_iframe: bool,
     frame_len_base: u32,
+    ssf_states: Option<&mut [crate::ssf::SsfChannelState]>,
+) -> Result<Ac4SubstreamInfo> {
+    walk_ac4_substream_sticky(
+        substream_bytes,
+        channels,
+        b_iframe,
+        frame_len_base,
+        ssf_states,
+        None,
+    )
+}
+
+/// Sticky-config variant of [`walk_ac4_substream_stateful`] — accepts a
+/// `&mut` [`StickyConfig`] carried across frames so `b_iframe == 0`
+/// (P-frame) substreams can be parsed: the I-frame-gated
+/// `aspx_config()` / `acpl_config_*()` elements and the
+/// `aspx_xover_subband_offset` field are seeded into the frame's
+/// [`SubstreamTools`] before the walk, and re-harvested from every
+/// I-frame after it. Pass `None` for the historical I-frame-only
+/// behaviour.
+pub fn walk_ac4_substream_sticky(
+    substream_bytes: &[u8],
+    channels: u16,
+    b_iframe: bool,
+    frame_len_base: u32,
     mut ssf_states: Option<&mut [crate::ssf::SsfChannelState]>,
+    sticky: Option<&mut StickyConfig>,
 ) -> Result<Ac4SubstreamInfo> {
     if substream_bytes.is_empty() {
         return Err(Error::invalid("ac4: empty substream"));
@@ -3414,6 +3519,13 @@ pub fn walk_ac4_substream_stateful(
         channel_mode_channels: channels,
         ..Default::default()
     };
+    // Non-I-frames reuse the I-frame-sticky configs (aspx_config /
+    // acpl_config_* / xover offset) from the last I-frame.
+    if !b_iframe {
+        if let Some(st) = sticky.as_ref() {
+            st.seed(&mut tools);
+        }
+    }
     match channels {
         1 => parse_mono_audio_data_outer_stateful(
             &mut br,
@@ -3485,6 +3597,14 @@ pub fn walk_ac4_substream_stateful(
         _ => {}
     }
 
+    // Every I-frame refreshes the sticky configs for the P-frames that
+    // follow it (§4.2.6.x: configs are only transmitted on I-frames).
+    if b_iframe {
+        if let Some(st) = sticky {
+            st.harvest(&tools);
+        }
+    }
+
     Ok(Ac4SubstreamInfo {
         audio_size,
         audio_data_offset,
@@ -3496,6 +3616,187 @@ pub fn walk_ac4_substream_stateful(
 mod tests {
     use super::*;
     use oxideav_core::bits::BitWriter;
+
+    /// Repack `bytes` dropping the first `skip_bits` bits — used to turn
+    /// an I-frame `aspx_data_*` body (leading 3-bit xover offset) into
+    /// its P-frame form (xover omitted per Tables 51 / 52).
+    fn strip_leading_bits(bytes: &[u8], skip_bits: u32, total_bits: u32) -> Vec<u8> {
+        let mut br = BitReader::new(bytes);
+        for _ in 0..skip_bits {
+            let _ = br.read_bit();
+        }
+        let mut bw = BitWriter::new();
+        for _ in 0..(total_bits - skip_bits) {
+            bw.write_bit(br.read_bit().unwrap_or(false));
+        }
+        bw.into_bytes()
+    }
+
+    fn p_frame_test_aspx_config() -> aspx::AspxConfig {
+        aspx::AspxConfig {
+            quant_mode_env: aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: aspx::AspxFreqResMode::Signalled,
+        }
+    }
+
+    #[test]
+    fn aspx_data_1ch_p_frame_parses_with_sticky_xover() {
+        // Build an I-frame aspx_data_1ch() body, parse it, then strip
+        // the leading 3-bit xover offset (its only I-frame-gated field
+        // per Table 51) and re-parse as a P-frame with the sticky
+        // xover pre-seeded — the recovered framing + envelopes must be
+        // identical.
+        let cfg = p_frame_test_aspx_config();
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).expect("tables");
+        let num_sig = tables.counts.num_sbg_sig_lowres as usize;
+        let num_noise = tables.counts.num_sbg_noise as usize;
+        let sig: Vec<i32> = (0..num_sig as i32).map(|i| (i % 3) - 1).collect();
+        let noise: Vec<i32> = vec![1; num_noise];
+        let mut bw = BitWriter::new();
+        crate::encoder_acpl3::write_aspx_data_1ch_real_envelope(
+            &mut bw,
+            &cfg,
+            crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                sig: &sig,
+                noise: &noise,
+            },
+        )
+        .expect("write 1ch body");
+        let total_bits = bw.bit_position() as u32;
+        let i_bytes = bw.into_bytes();
+
+        let mut tools_i = SubstreamTools::default();
+        let mut br = BitReader::new(&i_bytes);
+        parse_aspx_data_1ch_body(&mut br, &mut tools_i, &cfg, true, 2048).expect("iframe parse");
+        assert_eq!(tools_i.aspx_xover_subband_offset, Some(0));
+
+        let p_bytes = strip_leading_bits(&i_bytes, 3, total_bits);
+        let mut tools_p = SubstreamTools {
+            aspx_xover_subband_offset: Some(0),
+            ..Default::default()
+        };
+        let mut br = BitReader::new(&p_bytes);
+        parse_aspx_data_1ch_body(&mut br, &mut tools_p, &cfg, false, 2048).expect("pframe parse");
+
+        assert_eq!(tools_i.aspx_framing_primary, tools_p.aspx_framing_primary);
+        assert_eq!(tools_i.aspx_data_sig_primary, tools_p.aspx_data_sig_primary);
+        assert_eq!(
+            tools_i.aspx_data_noise_primary,
+            tools_p.aspx_data_noise_primary
+        );
+        assert_eq!(tools_i.aspx_hfgen_iwc_1ch, tools_p.aspx_hfgen_iwc_1ch);
+    }
+
+    #[test]
+    fn aspx_data_1ch_p_frame_without_sticky_xover_errors() {
+        let cfg = p_frame_test_aspx_config();
+        let mut tools = SubstreamTools::default();
+        let bytes = [0u8; 8];
+        let mut br = BitReader::new(&bytes);
+        assert!(parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, false, 2048).is_err());
+    }
+
+    #[test]
+    fn aspx_data_2ch_p_frame_parses_with_sticky_xover() {
+        let cfg = p_frame_test_aspx_config();
+        let tables = aspx::derive_aspx_frequency_tables(&cfg, 0).expect("tables");
+        let num_sig = tables.counts.num_sbg_sig_lowres as usize;
+        let num_noise = tables.counts.num_sbg_noise as usize;
+        let sig0: Vec<i32> = (0..num_sig as i32).map(|i| (i % 4) - 2).collect();
+        let sig1: Vec<i32> = (0..num_sig as i32).map(|i| 1 - (i % 2)).collect();
+        let noise0: Vec<i32> = vec![2; num_noise];
+        let noise1: Vec<i32> = vec![-1; num_noise];
+        let mut bw = BitWriter::new();
+        crate::encoder_acpl3::write_aspx_data_2ch_real_envelope(
+            &mut bw,
+            &cfg,
+            crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                sig: &sig0,
+                noise: &noise0,
+            },
+            crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                sig: &sig1,
+                noise: &noise1,
+            },
+        )
+        .expect("write 2ch body");
+        let total_bits = bw.bit_position() as u32;
+        let i_bytes = bw.into_bytes();
+
+        let mut tools_i = SubstreamTools::default();
+        let mut br = BitReader::new(&i_bytes);
+        parse_aspx_data_2ch_body(&mut br, &mut tools_i, &cfg, true, 2048).expect("iframe parse");
+
+        let p_bytes = strip_leading_bits(&i_bytes, 3, total_bits);
+        let mut tools_p = SubstreamTools::default();
+        let sticky = StickyConfig {
+            aspx_config: Some(cfg),
+            aspx_xover: Some(0),
+            ..Default::default()
+        };
+        sticky.seed(&mut tools_p);
+        let mut br = BitReader::new(&p_bytes);
+        parse_aspx_data_2ch_body(&mut br, &mut tools_p, &cfg, false, 2048).expect("pframe parse");
+
+        assert_eq!(tools_i.aspx_framing_primary, tools_p.aspx_framing_primary);
+        assert_eq!(
+            tools_i.aspx_framing_secondary,
+            tools_p.aspx_framing_secondary
+        );
+        assert_eq!(tools_i.aspx_balance, tools_p.aspx_balance);
+        assert_eq!(tools_i.aspx_data_sig_primary, tools_p.aspx_data_sig_primary);
+        assert_eq!(
+            tools_i.aspx_data_sig_secondary,
+            tools_p.aspx_data_sig_secondary
+        );
+        assert_eq!(
+            tools_i.aspx_data_noise_primary,
+            tools_p.aspx_data_noise_primary
+        );
+        assert_eq!(
+            tools_i.aspx_data_noise_secondary,
+            tools_p.aspx_data_noise_secondary
+        );
+        assert_eq!(tools_i.aspx_hfgen_iwc_2ch, tools_p.aspx_hfgen_iwc_2ch);
+        // Harvesting the I-frame tools must reproduce the seeded state.
+        let mut harvested = StickyConfig::default();
+        harvested.harvest(&tools_i);
+        assert_eq!(harvested.aspx_xover, Some(0));
+    }
+
+    #[test]
+    fn sticky_config_seed_harvest_round_trip() {
+        let cfg = p_frame_test_aspx_config();
+        let acpl1 = crate::acpl::AcplConfig1ch {
+            num_param_bands_id: 2,
+            num_param_bands: 12,
+            quant_mode: crate::acpl::AcplQuantMode::Fine,
+            qmf_band: 5,
+        };
+        let tools = SubstreamTools {
+            aspx_config: Some(cfg),
+            aspx_xover_subband_offset: Some(3),
+            acpl_config_1ch_partial: Some(acpl1),
+            ..Default::default()
+        };
+        let mut sticky = StickyConfig::default();
+        sticky.harvest(&tools);
+        let mut seeded = SubstreamTools::default();
+        sticky.seed(&mut seeded);
+        assert_eq!(seeded.aspx_config, Some(cfg));
+        assert_eq!(seeded.aspx_xover_subband_offset, Some(3));
+        assert_eq!(seeded.acpl_config_1ch_partial, Some(acpl1));
+        assert_eq!(seeded.acpl_config_1ch_full, None);
+        assert_eq!(seeded.acpl_config_2ch, None);
+    }
 
     #[test]
     fn resolve_transf_length_long_frame_table_99() {
