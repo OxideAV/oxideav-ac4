@@ -713,7 +713,15 @@ pub fn parse_5x_audio_data_outer(
             // dispatch side currently consumes only the cfg2 mapping
             // so the cfg0 / cfg1 / cfg3 trailer fields capture data
             // for a future round to wire.
-            if matches!(mode, FiveXCodecMode::Aspx) && b_iframe && tools.aspx_config.is_some() {
+            // P-frames (b_iframe == 0) parse too: the aspx_config and
+            // per-element xover offsets are I-frame-sticky and arrive
+            // pre-seeded in `tools` (see [`crate::asf::StickyConfig`]).
+            // NOTE: `tools` carries a single sticky xover slot, so a
+            // P-frame assumes the I-frame used one xover across all
+            // trailers of the element (always true for streams from
+            // our encoder; per-element sticky xovers would need a
+            // per-trailer sticky table).
+            if matches!(mode, FiveXCodecMode::Aspx) && tools.aspx_config.is_some() {
                 let aspx_cfg = tools.aspx_config.unwrap();
                 let lr = crate::asf::capture_aspx_data_2ch_trailer(
                     br,
@@ -808,7 +816,9 @@ pub fn parse_5x_audio_data_outer(
             // acpl_config_2ch() doesn't carry a qmf_band field
             // (acpl_data_2ch always covers all parameter bands).
             let body_ok = crate::asf::parse_stereo_data_body(br, tools, frame_len_base);
-            if b_iframe && body_ok {
+            // Runs on P-frames as well — aspx_config / acpl_config_2ch
+            // are I-frame-sticky and pre-seeded into `tools`.
+            if body_ok {
                 if let Some(cfg) = tools.aspx_config {
                     crate::asf::parse_aspx_data_2ch_body(
                         br,
@@ -987,11 +997,10 @@ fn parse_aspx_acpl_1_2_inner_body(
         }
     }
 
-    // 4) ASPX trailers + ACPL pair are I-frame-gated and need a parsed
-    //    aspx_config in scope — same gate as ASPX_ACPL_3 (round 24).
-    if !b_iframe {
-        return Ok(());
-    }
+    // 4) ASPX trailers + ACPL pair need an aspx_config in scope — parsed
+    //    from this frame's I-frame config block, or pre-seeded from the
+    //    sticky state on P-frames (§4.2.6.6 Table 25 gates only the
+    //    *configs* on b_iframe; the data elements are always present).
     let Some(aspx_cfg) = tools.aspx_config else {
         return Ok(());
     };
@@ -1382,11 +1391,11 @@ pub fn parse_7x_audio_data_outer(
         }
     }
 
-    // ASPX trailers + ACPL pair: gated on b_iframe + aspx_config in
-    // scope. Same gate as the 5_X ASPX_ACPL_{1,2,3} walkers.
-    if !b_iframe {
-        return Ok(());
-    }
+    // ASPX trailers + ACPL pair: need an aspx_config in scope — parsed
+    // from this frame's I-frame config block or pre-seeded from the
+    // sticky state on P-frames (§4.2.6.14 Table 33 gates only the
+    // configs on b_iframe; the data elements are always present). Same
+    // gate as the 5_X ASPX_ACPL_{1,2,3} walkers.
     let Some(aspx_cfg) = tools.aspx_config else {
         return Ok(());
     };

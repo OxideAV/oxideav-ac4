@@ -312,7 +312,7 @@ impl Ac4ImsEncoder {
         bw.write_u32(0, 1); // b_sf_multiplier
         bw.write_u32(0, 1); // b_bitrate_info
         bw.write_u32(0, 1); // b_content_type
-        bw.write_u32(1, 1); // b_iframe
+        bw.write_u32(if self.b_iframe_global { 1 } else { 0 }, 1); // b_iframe
         bw.write_u32(0, 2); // substream_index
         bw.write_u32(0, 1); // b_pre_virtualized
         bw.write_u32(0, 1); // b_add_emdf_substreams

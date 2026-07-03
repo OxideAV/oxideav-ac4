@@ -2601,10 +2601,12 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
 
-    // I-frame: real-envelope aspx_data_2ch() + acpl_data_2ch() with real
-    // α / β / β₃ / γ₁..γ₆.
-    if b_iframe {
-        write_aspx_data_2ch_real_envelope_tna_ah(
+    // Real-envelope aspx_data_2ch() + acpl_data_2ch() with real
+    // α / β / β₃ / γ₁..γ₆. Per Table 25 both data elements are present
+    // on every frame; only the configs above and the 3-bit xover offset
+    // inside aspx_data_2ch() are I-frame-gated.
+    {
+        write_aspx_data_2ch_real_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             AspxRealEnvelopeChannel {
@@ -2618,6 +2620,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
             aspx_tna_mode,
             aspx_l_ah,
             aspx_r_ah,
+            b_iframe,
         )
         .expect("encoder: aspx config invalid");
         write_acpl_data_2ch_real_alpha_beta_full_gamma_beta3(
@@ -2838,10 +2841,11 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
 
-    // I-frame: multi-envelope real aspx_data_2ch() + acpl_data_2ch() with
-    // real α / β / β₃ / γ₁..γ₆.
-    if b_iframe {
-        if write_aspx_data_2ch_multi_envelope_tna_ah(
+    // Multi-envelope real aspx_data_2ch() + acpl_data_2ch() with real
+    // α / β / β₃ / γ₁..γ₆. Present on every frame per Table 25; only
+    // the 3-bit xover offset inside aspx_data_2ch() is I-frame-gated.
+    {
+        if write_aspx_data_2ch_multi_envelope_tna_ah_framed(
             &mut bw,
             aspx_cfg,
             aspx_num_env,
@@ -2856,6 +2860,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
             &[],
             aspx_l_ah,
             aspx_r_ah,
+            b_iframe,
         )
         .is_err()
         {
@@ -3552,8 +3557,32 @@ pub fn write_aspx_data_2ch_real_envelope_tna_ah(
     ah_left: &[bool],
     ah_right: &[bool],
 ) -> Result<(), &'static str> {
+    write_aspx_data_2ch_real_envelope_tna_ah_framed(
+        bw, cfg, ch0, ch1, tna_mode, ah_left, ah_right, true,
+    )
+}
+
+/// [`write_aspx_data_2ch_real_envelope_tna_ah`] with an explicit
+/// `b_iframe` — per ETSI TS 103 190-1 Table 52 the leading 3-bit
+/// `aspx_xover_subband_offset` is only present on I-frames; P-frame
+/// (`b_iframe = false`) bodies start directly at `aspx_framing(0)` and
+/// the decoder reuses the I-frame-sticky xover (always 0 for this
+/// writer family).
+#[allow(clippy::too_many_arguments)]
+pub fn write_aspx_data_2ch_real_envelope_tna_ah_framed(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    ch0: AspxRealEnvelopeChannel<'_>,
+    ch1: AspxRealEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah_left: &[bool],
+    ah_right: &[bool],
+    b_iframe: bool,
+) -> Result<(), &'static str> {
     let xover: u32 = 0;
-    bw.write_u32(xover, 3);
+    if b_iframe {
+        bw.write_u32(xover, 3);
+    }
 
     bw.write_bit(false);
     let envbits = cfg.fixfix_tmp_num_env_bits();
@@ -3991,11 +4020,34 @@ pub fn write_aspx_data_2ch_multi_envelope_tna_ah(
     ah_left: &[bool],
     ah_right: &[bool],
 ) -> Result<(), &'static str> {
+    write_aspx_data_2ch_multi_envelope_tna_ah_framed(
+        bw, cfg, num_env, ch0, ch1, tna_mode, ah_left, ah_right, true,
+    )
+}
+
+/// [`write_aspx_data_2ch_multi_envelope_tna_ah`] with an explicit
+/// `b_iframe` — Table 52 gates the leading 3-bit xover offset on
+/// I-frames (see
+/// [`write_aspx_data_2ch_real_envelope_tna_ah_framed`]).
+#[allow(clippy::too_many_arguments)]
+pub fn write_aspx_data_2ch_multi_envelope_tna_ah_framed(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    num_env: u32,
+    ch0: AspxMultiEnvelopeChannel<'_>,
+    ch1: AspxMultiEnvelopeChannel<'_>,
+    tna_mode: &[u8],
+    ah_left: &[bool],
+    ah_right: &[bool],
+    b_iframe: bool,
+) -> Result<(), &'static str> {
     let tmp_num_env = check_multi_env_cfg(cfg, num_env)?;
     let num_noise = if num_env > 1 { 2 } else { 1 };
 
     let xover: u32 = 0;
-    bw.write_u32(xover, 3);
+    if b_iframe {
+        bw.write_u32(xover, 3);
+    }
 
     // aspx_framing(0): FIXFIX prefix `0`, tmp_num_env → num_env.
     bw.write_bit(false);
