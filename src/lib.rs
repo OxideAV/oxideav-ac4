@@ -505,6 +505,7 @@ pub mod drc;
 pub mod drc_huffman;
 pub mod emdf;
 pub mod encoder_acpl3;
+pub mod encoder_ajoc;
 pub mod encoder_asf;
 pub mod encoder_ims;
 pub mod encoder_mdct;
