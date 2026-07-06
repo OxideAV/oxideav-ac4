@@ -694,6 +694,369 @@ pub fn ajcc_full_decode(
     Ok(z)
 }
 
+// ---------------------------------------------------------------------
+// §5.6.3.5.3 — A-JCC core decoding mode (Tables 39-41)
+// ---------------------------------------------------------------------
+
+/// Interpolation tails for the twelve Table 40 / 41 coefficient
+/// tracks (d0..d5, w0..w5).
+#[derive(Clone, Debug)]
+pub struct AjccModule34State {
+    prev: Vec<Vec<f64>>,
+}
+
+impl Default for AjccModule34State {
+    fn default() -> Self {
+        AjccModule34State {
+            prev: vec![vec![0.0; NUM_QMF_SUBBANDS]; 12],
+        }
+    }
+}
+
+/// Table 40 `ajcc_module_3()` — the `b_5fronts` core-decoding module:
+/// two core channels (front / back) + two ducked decorrelator outputs
+/// → three output channels. Tracks d0..d2 / w0..w2 follow the *front*
+/// framing group, d3..d5 / w3..w5 the *back* one.
+#[allow(clippy::too_many_arguments)]
+pub fn ajcc_module_3(
+    _dry1f: &[Vec<f64>],
+    dry2f: &[Vec<f64>],
+    // Table 40's front rows only combine wet2f/wet3f and its back rows
+    // only wet1b/wet3b; the full quintuple signature is kept for parity
+    // with the spec's parameter listing.
+    _wet1f: &[Vec<f64>],
+    wet2f: &[Vec<f64>],
+    wet3f: &[Vec<f64>],
+    dry1b: &[Vec<f64>],
+    dry2b: &[Vec<f64>],
+    wet1b: &[Vec<f64>],
+    _wet2b: &[Vec<f64>],
+    wet3b: &[Vec<f64>],
+    framing_f: &AjccFramingData,
+    framing_b: &AjccFramingData,
+    num_bands: u32,
+    x0: &[QmfCol],
+    x1: &[QmfCol],
+    y0: &[QmfCol],
+    y1: &[QmfCol],
+    state: &mut AjccModule34State,
+) -> (Vec<QmfCol>, Vec<QmfCol>, Vec<QmfCol>) {
+    let num_ts = x0.len();
+    let nb = num_bands as usize;
+    let at = |m: &[Vec<f64>], ps: usize, pb: usize| -> f64 {
+        m.get(ps).and_then(|r| r.get(pb)).copied().unwrap_or(0.0)
+    };
+    let derive = |nps: u32, f: &dyn Fn(usize, usize) -> f64| -> Vec<Vec<f64>> {
+        (0..nps as usize)
+            .map(|ps| (0..nb).map(|pb| f(ps, pb)).collect())
+            .collect()
+    };
+    let wf = |ps: usize, pb: usize| -> f64 {
+        let w3 = at(wet3f, ps, pb);
+        let w2 = at(wet2f, ps, pb);
+        (0.5 * w3 * w3 + 0.5 * w2 * w2).sqrt()
+    };
+    let wb = |ps: usize, pb: usize| -> f64 {
+        let w1 = at(wet1b, ps, pb);
+        let w3 = at(wet3b, ps, pb);
+        (0.5 * w1 * w1 + 0.5 * w3 * w3).sqrt()
+    };
+    let nf = framing_f.num_param_sets;
+    let nbk = framing_b.num_param_sets;
+    // Track order: d0..d5 then w0..w5; front group = indices
+    // {0,1,2,6,7,8}, back group = {3,4,5,9,10,11}.
+    let tracks_param: Vec<(Vec<Vec<f64>>, &AjccFramingData)> = vec![
+        (derive(nf, &|ps, pb| 1.0 - at(dry2f, ps, pb)), framing_f), // d0
+        (derive(nf, &|_, _| 0.0), framing_f),                       // d1
+        (derive(nf, &|ps, pb| at(dry2f, ps, pb)), framing_f),       // d2
+        (derive(nbk, &|_, _| 0.0), framing_b),                      // d3
+        (
+            derive(nbk, &|ps, pb| at(dry1b, ps, pb) + at(dry2b, ps, pb)),
+            framing_b,
+        ), // d4
+        (
+            derive(nbk, &|ps, pb| 1.0 - at(dry1b, ps, pb) - at(dry2b, ps, pb)),
+            framing_b,
+        ), // d5
+        (derive(nf, &|ps, pb| -wf(ps, pb)), framing_f),             // w0
+        (derive(nf, &|_, _| 0.0), framing_f),                       // w1
+        (derive(nf, &|ps, pb| wf(ps, pb)), framing_f),              // w2
+        (derive(nbk, &|_, _| 0.0), framing_b),                      // w3
+        (derive(nbk, &|ps, pb| -wb(ps, pb)), framing_b),            // w4
+        (derive(nbk, &|ps, pb| wb(ps, pb)), framing_b),             // w5
+    ];
+    module_34_mix(tracks_param, num_bands, x0, x1, y0, y1, state, num_ts)
+}
+
+/// Table 41 `ajcc_module_4()` — the core-layout core-decoding module
+/// (alpha mid/side when `core_mode == 0`, top fold-down when 1).
+#[allow(clippy::too_many_arguments)]
+pub fn ajcc_module_4(
+    alpha: &[Vec<f64>],
+    beta: &[Vec<f64>],
+    dry1: &[Vec<f64>],
+    dry2: &[Vec<f64>],
+    wet1: &[Vec<f64>],
+    wet2: &[Vec<f64>],
+    wet3: &[Vec<f64>],
+    framing: &AjccFramingData,
+    num_bands: u32,
+    core_mode: bool,
+    x0: &[QmfCol],
+    x1: &[QmfCol],
+    y0: &[QmfCol],
+    y1: &[QmfCol],
+    state: &mut AjccModule34State,
+) -> (Vec<QmfCol>, Vec<QmfCol>, Vec<QmfCol>) {
+    let num_ts = x0.len();
+    let nb = num_bands as usize;
+    let nps = framing.num_param_sets;
+    let at = |m: &[Vec<f64>], ps: usize, pb: usize| -> f64 {
+        m.get(ps).and_then(|r| r.get(pb)).copied().unwrap_or(0.0)
+    };
+    let derive = |f: &dyn Fn(usize, usize) -> f64| -> Vec<Vec<f64>> {
+        (0..nps as usize)
+            .map(|ps| (0..nb).map(|pb| f(ps, pb)).collect())
+            .collect()
+    };
+    let rows: Vec<Vec<Vec<f64>>> = if !core_mode {
+        let w45 = |ps: usize, pb: usize| -> f64 {
+            let w1 = at(wet1, ps, pb);
+            let w3 = at(wet3, ps, pb);
+            (0.5 * w1 * w1 + 0.5 * w3 * w3).sqrt()
+        };
+        vec![
+            derive(&|ps, pb| (1.0 + at(alpha, ps, pb)) / 2.0), // d0
+            derive(&|_, _| 0.0),                               // d1
+            derive(&|ps, pb| (1.0 - at(alpha, ps, pb)) / 2.0), // d2
+            derive(&|_, _| 0.0),                               // d3
+            derive(&|ps, pb| at(dry1, ps, pb) + at(dry2, ps, pb)), // d4
+            derive(&|ps, pb| 1.0 - at(dry1, ps, pb) - at(dry2, ps, pb)), // d5
+            derive(&|ps, pb| at(beta, ps, pb) / 2.0),          // w0
+            derive(&|_, _| 0.0),                               // w1
+            derive(&|ps, pb| -at(beta, ps, pb) / 2.0),         // w2
+            derive(&|_, _| 0.0),                               // w3
+            derive(&|ps, pb| -w45(ps, pb)),                    // w4
+            derive(&|ps, pb| w45(ps, pb)),                     // w5
+        ]
+    } else {
+        let w01 = |ps: usize, pb: usize| -> f64 {
+            let a = at(wet1, ps, pb) + at(wet3, ps, pb);
+            let b = at(wet3, ps, pb) + at(wet2, ps, pb);
+            (0.5 * a * a + 0.5 * b * b).sqrt()
+        };
+        vec![
+            derive(&|ps, pb| at(dry1, ps, pb)),       // d0
+            derive(&|ps, pb| 1.0 - at(dry1, ps, pb)), // d1
+            derive(&|_, _| 0.0),                      // d2
+            derive(&|_, _| 0.0),                      // d3
+            derive(&|_, _| 0.0),                      // d4
+            derive(&|_, _| 1.0),                      // d5
+            derive(&|ps, pb| w01(ps, pb)),            // w0
+            derive(&|ps, pb| -w01(ps, pb)),           // w1
+            derive(&|_, _| 0.0),                      // w2
+            derive(&|_, _| 0.0),                      // w3
+            derive(&|_, _| 0.0),                      // w4
+            derive(&|_, _| 0.0),                      // w5
+        ]
+    };
+    let tracks_param: Vec<(Vec<Vec<f64>>, &AjccFramingData)> =
+        rows.into_iter().map(|p| (p, framing)).collect();
+    module_34_mix(tracks_param, num_bands, x0, x1, y0, y1, state, num_ts)
+}
+
+/// Shared Table 40 / 41 mixing loop: interpolate the twelve tracks per
+/// `(sb, ts)` and form the three output rows
+/// `z_r = d_r·x0 + d_{r+3}·x1 + w_r·y0 + w_{r+3}·y1`.
+#[allow(clippy::too_many_arguments)]
+fn module_34_mix(
+    tracks_param: Vec<(Vec<Vec<f64>>, &AjccFramingData)>,
+    num_bands: u32,
+    x0: &[QmfCol],
+    x1: &[QmfCol],
+    y0: &[QmfCol],
+    y1: &[QmfCol],
+    state: &mut AjccModule34State,
+    num_ts: usize,
+) -> (Vec<QmfCol>, Vec<QmfCol>, Vec<QmfCol>) {
+    let mut tracks: Vec<(Track<'_>, &AjccFramingData)> = tracks_param
+        .into_iter()
+        .zip(state.prev.iter_mut())
+        .map(|((param, fd), prev)| (Track { param, prev }, fd))
+        .collect();
+
+    let zero = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+    let mut z0 = zero.clone();
+    let mut z1 = zero.clone();
+    let mut z2 = zero;
+    for sb in 0..NUM_QMF_SUBBANDS {
+        for ts in 0..num_ts {
+            let iv: Vec<f64> = tracks
+                .iter()
+                .map(|(t, fd)| t.interp(fd, num_bands, sb, ts, num_ts))
+                .collect();
+            let cx0 = x0[ts][sb];
+            let cx1 = x1[ts][sb];
+            let cy0 = y0[ts][sb];
+            let cy1 = y1[ts][sb];
+            let mix = |r: usize| -> (f32, f32) {
+                (
+                    (iv[r] * cx0.0 as f64
+                        + iv[r + 3] * cx1.0 as f64
+                        + iv[6 + r] * cy0.0 as f64
+                        + iv[6 + r + 3] * cy1.0 as f64) as f32,
+                    (iv[r] * cx0.1 as f64
+                        + iv[r + 3] * cx1.1 as f64
+                        + iv[6 + r] * cy0.1 as f64
+                        + iv[6 + r + 3] * cy1.1 as f64) as f32,
+                )
+            };
+            z0[ts][sb] = mix(0);
+            z1[ts][sb] = mix(1);
+            z2[ts][sb] = mix(2);
+        }
+    }
+    for (t, _) in tracks.drain(..) {
+        t.finish(num_bands);
+    }
+    (z0, z1, z2)
+}
+
+/// Persistent A-JCC *core decoding mode* synthesis state: the four
+/// Table 39 decorrelator instances (`x0in D0, x3in D2, x1in D0,
+/// x4in D2`), their duckers and the two module track states.
+pub struct AjccCoreSynthState {
+    decorr: Vec<InputSignalModifier>,
+    duckers: Vec<TransientDucker>,
+    modules: Vec<AjccModule34State>,
+}
+
+impl AjccCoreSynthState {
+    /// Fresh core-decoding state (layout-independent: both layouts use
+    /// four instances and two modules).
+    pub fn new() -> Self {
+        let ids = [
+            DecorrelatorId::D0,
+            DecorrelatorId::D2,
+            DecorrelatorId::D0,
+            DecorrelatorId::D2,
+        ];
+        AjccCoreSynthState {
+            decorr: ids.iter().map(|&d| InputSignalModifier::new(d)).collect(),
+            duckers: (0..ids.len()).map(|_| TransientDucker::new()).collect(),
+            modules: vec![AjccModule34State::default(); 2],
+        }
+    }
+}
+
+impl Default for AjccCoreSynthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// §5.6.3.5.3 core decoding mode (Table 39): reconstruct the seven
+/// output channels `[L, R, C, Ls, Rs, Lt, Rt]` from the five core QMF
+/// inputs. No √2 output scaling in this mode; `z2 = x2in`.
+pub fn ajcc_core_decode(
+    x: &[&[QmfCol]; 5],
+    params: &AjccFrameParams<'_>,
+    state: &mut AjccCoreSynthState,
+) -> Result<Vec<Vec<QmfCol>>> {
+    let num_ts = x[0].len();
+    if x.iter().any(|m| m.len() != num_ts) {
+        return Err(Error::invalid("ac4: A-JCC input timeslot mismatch"));
+    }
+    let nb = params.num_bands;
+
+    let x0in = scale_input(x[0]);
+    let x1in = scale_input(x[1]);
+    let x2in = scale_input(x[2]);
+    let x3in = scale_input(x[3]);
+    let x4in = scale_input(x[4]);
+
+    // u0..u3 / y0..y3 per Table 39.
+    let feeds: [&[QmfCol]; 4] = [&x0in, &x3in, &x1in, &x4in];
+    let mut y: Vec<Vec<QmfCol>> = Vec::with_capacity(4);
+    for (i, feed) in feeds.iter().enumerate() {
+        let u = decorrelate(&mut state.decorr[i], feed);
+        y.push(duck(&mut state.duckers[i], &u, nb));
+    }
+
+    let mut z: Vec<Vec<QmfCol>> = vec![Vec::new(); 7];
+    if params.b_5fronts {
+        if params.framing.len() != 4 || params.dry_dq.len() != 8 || params.wet_dq.len() != 12 {
+            return Err(Error::invalid("ac4: A-JCC 5-fronts roster mismatch"));
+        }
+        // (z0, z3, z5) from the left pair, (z1, z4, z6) from the right.
+        #[allow(clippy::type_complexity)]
+        let calls: [(usize, [usize; 3], usize, usize, usize, usize, usize, usize); 2] = [
+            // (module, z-map, dry_f base, wet_f base, framing f, framing b, x pair, y pair)
+            (0, [0, 3, 5], 0, 0, 0, 2, 0, 0),
+            (1, [1, 4, 6], 2, 3, 1, 3, 1, 2),
+        ];
+        for (m, zi, dfb, wfb, ff, fb, xp, yp) in calls {
+            let (za, zb, zc) = ajcc_module_3(
+                &params.dry_dq[dfb],
+                &params.dry_dq[dfb + 1],
+                &params.wet_dq[wfb],
+                &params.wet_dq[wfb + 1],
+                &params.wet_dq[wfb + 2],
+                &params.dry_dq[dfb + 4],
+                &params.dry_dq[dfb + 5],
+                &params.wet_dq[wfb + 6],
+                &params.wet_dq[wfb + 7],
+                &params.wet_dq[wfb + 8],
+                &params.framing[ff],
+                &params.framing[fb],
+                nb,
+                if xp == 0 { &x0in } else { &x1in },
+                if xp == 0 { &x3in } else { &x4in },
+                &y[yp],
+                &y[yp + 1],
+                &mut state.modules[m],
+            );
+            z[zi[0]] = za;
+            z[zi[1]] = zb;
+            z[zi[2]] = zc;
+        }
+    } else {
+        if params.framing.len() != 2
+            || params.dry_dq.len() != 4
+            || params.wet_dq.len() != 6
+            || params.alpha_dq.len() != 2
+            || params.beta_dq.len() != 2
+        {
+            return Err(Error::invalid("ac4: A-JCC core-layout roster mismatch"));
+        }
+        let calls: [(usize, [usize; 3], usize); 2] = [(0, [0, 3, 5], 0), (1, [1, 4, 6], 1)];
+        for (m, zi, fi) in calls {
+            let (za, zb, zc) = ajcc_module_4(
+                &params.alpha_dq[m],
+                &params.beta_dq[m],
+                &params.dry_dq[2 * m],
+                &params.dry_dq[2 * m + 1],
+                &params.wet_dq[3 * m],
+                &params.wet_dq[3 * m + 1],
+                &params.wet_dq[3 * m + 2],
+                &params.framing[fi],
+                nb,
+                params.core_mode,
+                if m == 0 { &x0in } else { &x1in },
+                if m == 0 { &x3in } else { &x4in },
+                &y[2 * m],
+                &y[2 * m + 1],
+                &mut state.modules[m],
+            );
+            z[zi[0]] = za;
+            z[zi[1]] = zb;
+            z[zi[2]] = zc;
+        }
+    }
+    z[2] = x2in;
+    Ok(z)
+}
+
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
@@ -936,5 +1299,177 @@ mod tests {
         // Channels fed only from other cores stay silent.
         assert!(z[1][num_ts - 1][3].0.abs() < 1e-6, "R silent");
         assert!(z[6][num_ts - 1][3].0.abs() < 1e-6, "Rs silent");
+    }
+
+    #[test]
+    fn module_3_front_back_dry_split() {
+        // Front: dry2f = 0.25 → d0 = 0.75, d2 = 0.25 on x0.
+        // Back: dry1b = dry2b = 0.3 → d4 = 0.6, d5 = 0.4 on x1.
+        // Wet all zero → pure dry mixing after ramp convergence.
+        let nb = 7usize;
+        let num_ts = 32;
+        let fd = framing(false, 1, &[]);
+        let x0 = vec![[(4.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x1 = vec![[(2.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let y = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut st = AjccModule34State::default();
+        let zero = const_set(0.0, nb);
+        let (z0, z1, z2) = ajcc_module_3(
+            &const_set(0.0, nb),
+            &const_set(0.25, nb),
+            &zero,
+            &zero,
+            &zero,
+            &const_set(0.3, nb),
+            &const_set(0.3, nb),
+            &zero,
+            &zero,
+            &zero,
+            &fd,
+            &fd,
+            nb as u32,
+            &x0,
+            &x1,
+            &y,
+            &y,
+            &mut st,
+        );
+        let last = num_ts - 1;
+        // z0 = d0·x0 = 0.75·4 = 3; z1 = d4·x1 = 0.6·2 = 1.2;
+        // z2 = d2·x0 + d5·x1 = 0.25·4 + 0.4·2 = 1.8.
+        assert!((z0[last][9].0 - 3.0).abs() < 1e-5, "{}", z0[last][9].0);
+        assert!((z1[last][9].0 - 1.2).abs() < 1e-5, "{}", z1[last][9].0);
+        assert!((z2[last][9].0 - 1.8).abs() < 1e-5, "{}", z2[last][9].0);
+    }
+
+    #[test]
+    fn module_4_core_mode1_top_folddown() {
+        // Core mode 1: d0 = dry1, d1 = 1 − dry1, d5 = 1 → z0 = dry1·x0,
+        // z1 = (1−dry1)·x0, z2 = x1 (wet zero).
+        let nb = 7usize;
+        let num_ts = 32;
+        let fd = framing(false, 1, &[]);
+        let x0 = vec![[(1.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let x1 = vec![[(5.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let y = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut st = AjccModule34State::default();
+        let zero = const_set(0.0, nb);
+        let (z0, z1, z2) = ajcc_module_4(
+            &zero,
+            &zero,
+            &const_set(0.8, nb),
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+            &fd,
+            nb as u32,
+            true,
+            &x0,
+            &x1,
+            &y,
+            &y,
+            &mut st,
+        );
+        let last = num_ts - 1;
+        assert!((z0[last][2].0 - 0.8).abs() < 1e-5);
+        assert!((z1[last][2].0 - 0.2).abs() < 1e-5);
+        assert!((z2[last][2].0 - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn core_decode_centre_passthrough_and_shapes() {
+        // Both layouts produce 7 channels; centre is (2+1/√2)·x2 and
+        // no √2 gain is applied in core mode.
+        let num_ts = 8;
+        let silent = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut centre = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            centre[ts][20] = (2.0, -1.0);
+        }
+        for b_5fronts in [true, false] {
+            let (n_framing, n_dry, n_wet, n_ab) = if b_5fronts {
+                (4, 8, 12, 0)
+            } else {
+                (2, 4, 6, 2)
+            };
+            let framing_v = vec![framing(false, 1, &[]); n_framing];
+            let dry = vec![const_set(0.2, 9); n_dry];
+            let wet = vec![const_set(0.1, 9); n_wet];
+            let ab = vec![const_set(0.0, 9); n_ab];
+            let params = AjccFrameParams {
+                b_5fronts,
+                core_mode: true,
+                num_bands: 9,
+                framing: &framing_v,
+                alpha_dq: &ab,
+                beta_dq: &ab,
+                dry_dq: &dry,
+                wet_dq: &wet,
+            };
+            let mut state = AjccCoreSynthState::new();
+            let x: [&[QmfCol]; 5] = [&silent, &silent, &centre, &silent, &silent];
+            let z = ajcc_core_decode(&x, &params, &mut state).unwrap();
+            assert_eq!(z.len(), 7);
+            let k = (2.0 + 1.0 / std::f64::consts::SQRT_2) as f32;
+            for ts in 0..num_ts {
+                assert!((z[2][ts][20].0 - 2.0 * k).abs() < 1e-5);
+                assert!((z[2][ts][20].1 + k).abs() < 1e-5);
+            }
+            for (i, zi) in z.iter().enumerate() {
+                assert_eq!(zi.len(), num_ts, "z{i} shape (b_5fronts={b_5fronts})");
+                if i == 2 {
+                    continue;
+                }
+                for col in zi {
+                    for sb in 0..NUM_QMF_SUBBANDS {
+                        assert!(col[sb].0.abs() < 1e-6, "z{i} sb{sb} leaked");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn core_decode_routes_front_and_back_energy() {
+        // 5-fronts core mode: x0 (front-left core) feeds z0 via d0 and
+        // z2 (= Ls slot z3? No: module output c goes to z5) — check the
+        // documented z-map: (z0, z3, z5) from the first module call.
+        let num_ts = 32;
+        let silent = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        let mut x3 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            x0[ts][5] = (1.0, 0.0);
+            x3[ts][5] = (1.0, 0.0);
+        }
+        let framing_v = vec![framing(false, 1, &[]); 4];
+        let dry = vec![const_set(0.25, 7); 8];
+        let wet = vec![const_set(0.0, 7); 12];
+        let params = AjccFrameParams {
+            b_5fronts: true,
+            core_mode: true,
+            num_bands: 7,
+            framing: &framing_v,
+            alpha_dq: &[],
+            beta_dq: &[],
+            dry_dq: &dry,
+            wet_dq: &wet,
+        };
+        let mut state = AjccCoreSynthState::new();
+        let x: [&[QmfCol]; 5] = [&x0, &silent, &silent, &x3, &silent];
+        let z = ajcc_core_decode(&x, &params, &mut state).unwrap();
+        let last = num_ts - 1;
+        let k = 2.0 + 1.0 / std::f64::consts::SQRT_2;
+        // z0 = (1 − dry2f)·x0in = 0.75·k.
+        assert!((z[0][last][5].0 as f64 - 0.75 * k).abs() < 1e-4);
+        // z3 = (dry1b + dry2b)·x3in = 0.5·k.
+        assert!((z[3][last][5].0 as f64 - 0.5 * k).abs() < 1e-4);
+        // z5 = dry2f·x0in + (1 − dry1b − dry2b)·x3in = 0.25k + 0.5k.
+        assert!((z[5][last][5].0 as f64 - 0.75 * k).abs() < 1e-4);
+        // Right-side channels stay silent.
+        assert!(z[1][last][5].0.abs() < 1e-6);
+        assert!(z[4][last][5].0.abs() < 1e-6);
+        assert!(z[6][last][5].0.abs() < 1e-6);
     }
 }
