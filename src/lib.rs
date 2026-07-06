@@ -484,6 +484,7 @@
 pub mod acpl;
 pub mod acpl_huffman;
 pub mod acpl_synth;
+pub mod ajcc;
 pub mod ajoc;
 pub mod ajoc_data;
 pub mod ajoc_huffman;

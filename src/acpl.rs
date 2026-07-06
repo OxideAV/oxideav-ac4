@@ -61,6 +61,13 @@ pub enum AcplQuantMode {
     Coarse,
 }
 
+impl Default for AcplQuantMode {
+    /// Bit value `0` (Fine) per the Table 144 mapping.
+    fn default() -> Self {
+        AcplQuantMode::Fine
+    }
+}
+
 impl AcplQuantMode {
     /// Spec mapping per Table 144: bit value `0` → Fine, `1` → Coarse.
     pub fn from_bit(b: bool) -> Self {
