@@ -514,6 +514,67 @@ pub struct AjccFrameParams<'a> {
     pub wet_dq: &'a [Vec<Vec<f64>>],
 }
 
+/// Owned bridge from a [`crate::ajcc::AjccDecoded`] parameter decode
+/// to the synthesis inputs (converts the f32 alpha / beta tables to
+/// the f64 track domain and clones the framing / dry / wet rosters).
+pub struct AjccOwnedParams {
+    /// See [`AjccFrameParams::b_5fronts`].
+    pub b_5fronts: bool,
+    /// See [`AjccFrameParams::core_mode`].
+    pub core_mode: bool,
+    /// See [`AjccFrameParams::num_bands`].
+    pub num_bands: u32,
+    /// Framing groups in transmission order.
+    pub framing: Vec<AjccFramingData>,
+    /// Dequantized alpha SETs.
+    pub alpha_dq: Vec<Vec<Vec<f64>>>,
+    /// Dequantized beta SETs.
+    pub beta_dq: Vec<Vec<Vec<f64>>>,
+    /// Dequantized dry SETs.
+    pub dry_dq: Vec<Vec<Vec<f64>>>,
+    /// Dequantized wet SETs.
+    pub wet_dq: Vec<Vec<Vec<f64>>>,
+}
+
+impl AjccOwnedParams {
+    /// Build from a completed `ajcc_data()` decode.
+    pub fn from_decoded(d: &crate::ajcc::AjccDecoded) -> Self {
+        let widen = |m: &[Vec<Vec<f32>>]| -> Vec<Vec<Vec<f64>>> {
+            m.iter()
+                .map(|s| {
+                    s.iter()
+                        .map(|ps| ps.iter().map(|&v| v as f64).collect())
+                        .collect()
+                })
+                .collect()
+        };
+        AjccOwnedParams {
+            b_5fronts: d.data.b_5fronts,
+            core_mode: d.data.core_mode,
+            num_bands: d.data.num_bands,
+            framing: d.data.framing.clone(),
+            alpha_dq: widen(&d.alpha_dq),
+            beta_dq: widen(&d.beta_dq),
+            dry_dq: d.dry_dq.clone(),
+            wet_dq: d.wet_dq.clone(),
+        }
+    }
+
+    /// Borrow as the synthesis parameter view.
+    pub fn params(&self) -> AjccFrameParams<'_> {
+        AjccFrameParams {
+            b_5fronts: self.b_5fronts,
+            core_mode: self.core_mode,
+            num_bands: self.num_bands,
+            framing: &self.framing,
+            alpha_dq: &self.alpha_dq,
+            beta_dq: &self.beta_dq,
+            dry_dq: &self.dry_dq,
+            wet_dq: &self.wet_dq,
+        }
+    }
+}
+
 fn scale_input(x: &[QmfCol]) -> Vec<QmfCol> {
     let k = input_scale();
     x.iter()
@@ -1471,5 +1532,122 @@ mod tests {
         assert!(z[1][last][5].0.abs() < 1e-6);
         assert!(z[4][last][5].0.abs() < 1e-6);
         assert!(z[6][last][5].0.abs() < 1e-6);
+    }
+
+    #[test]
+    fn bitstream_to_qmf_end_to_end_gop() {
+        // Full chain over a 2-frame GOP on the core layout:
+        // ajcc_data() bitstream → decode_ajcc → AjccOwnedParams →
+        // ajcc_full_decode. Frame 0 (b_no_dt, freq) ramps toward the
+        // targets; frame 1 repeats the same quantised values coded
+        // DIFF_TIME (all-zero deltas), so the interpolation tails match
+        // the targets and the output is exactly flat.
+        use crate::acpl::AcplQuantMode;
+        use crate::ajcc::{
+            decode_ajcc, encode_ajcc_deltas_freq, write_ajcc_data, AjccData, AjccState,
+        };
+        use crate::ajoc::AjocDiffType;
+        use oxideav_core::bits::{BitReader, BitWriter};
+
+        let nb = 9usize; // num_param_bands_id = 2
+        let fine = AcplQuantMode::Fine;
+        // Quantised targets: dry q = 8 → 0,8·0,1 − 0,6 = 0,2;
+        // wet q = 20 → 2,0 − 2,0 = 0; alpha centre lane 16 → α = 0;
+        // beta 0 → β row 0.
+        let dry_q = vec![8i32; nb];
+        let wet_q = vec![20i32; nb];
+        let alpha_q = vec![16i32; nb];
+        let beta_q = vec![0i32; nb];
+        let freq_row = |q: &[i32]| vec![(AjocDiffType::Freq, encode_ajcc_deltas_freq(q))];
+        let time_zero_row = || vec![(AjocDiffType::Time, vec![0i32; nb])];
+
+        let mk_frame = |iframe: bool| -> AjccData {
+            let row = |q: &[i32]| {
+                if iframe {
+                    freq_row(q)
+                } else {
+                    time_zero_row()
+                }
+            };
+            AjccData {
+                b_5fronts: false,
+                b_no_dt: iframe,
+                num_param_bands_id: 2,
+                num_bands: nb as u32,
+                core_mode: false,
+                qm_f: AcplQuantMode::default(),
+                qm_b: AcplQuantMode::default(),
+                qm_ab: fine,
+                qm_dw: fine,
+                framing: vec![
+                    AjccFramingData {
+                        steep: false,
+                        num_param_sets: 1,
+                        param_timeslot: vec![],
+                    };
+                    2
+                ],
+                alpha: vec![row(&alpha_q), row(&alpha_q)],
+                beta: vec![row(&beta_q), row(&beta_q)],
+                dry: vec![row(&dry_q); 4],
+                wet: vec![row(&wet_q); 6],
+            }
+        };
+
+        let num_ts = 16;
+        let mut x0 = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+        for ts in 0..num_ts {
+            x0[ts][7] = (1.0, 0.0);
+        }
+        let silent = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
+
+        let mut param_state = AjccState::new(false);
+        let mut synth_state = AjccSynthState::new(false);
+        let k = 2.0 + 1.0 / std::f64::consts::SQRT_2;
+        // Module 2, core mode 0: z0 coefficient d0 = (1+α)/2 = 0,5 on
+        // x0; wet and beta terms vanish.
+        let want = (0.5 * k) as f32;
+
+        for frame in 0..2 {
+            let data = mk_frame(frame == 0);
+            let mut bw = BitWriter::new();
+            write_ajcc_data(&mut bw, &data).unwrap();
+            let bytes = bw.finish();
+            let mut br = BitReader::new(&bytes);
+            let decoded = decode_ajcc(&mut br, false, &mut param_state).unwrap();
+
+            // Dequantized values are the intended ones.
+            assert!((decoded.dry_dq[0][0][0] - 0.2).abs() < 1e-12);
+            assert!(decoded.wet_dq[0][0][0].abs() < 1e-12);
+            assert!(decoded.alpha_dq[0][0][0].abs() < 1e-6);
+
+            let owned = AjccOwnedParams::from_decoded(&decoded);
+            let x: [&[QmfCol]; 5] = [&x0, &silent, &silent, &silent, &silent];
+            let z = ajcc_full_decode(&x, &owned.params(), &mut synth_state).unwrap();
+
+            if frame == 0 {
+                // Ramp: last slot reaches the target exactly.
+                assert!(
+                    (z[0][num_ts - 1][7].0 - want).abs() < 1e-5,
+                    "frame 0 plateau {} vs {want}",
+                    z[0][num_ts - 1][7].0
+                );
+                assert!(z[0][0][7].0 < want, "frame 0 must ramp up");
+            } else {
+                // Tails equal targets → flat output on every slot.
+                for ts in 0..num_ts {
+                    assert!(
+                        (z[0][ts][7].0 - want).abs() < 1e-5,
+                        "frame 1 ts {ts}: {}",
+                        z[0][ts][7].0
+                    );
+                }
+            }
+            // z9 (√2-scaled) carries d3 = (1−α)/2 = 0,5 of x0.
+            let want9 = (0.5 * k * std::f64::consts::SQRT_2) as f32;
+            assert!((z[9][num_ts - 1][7].0 - want9).abs() < 1e-5);
+            // The right-hand module never sees x0.
+            assert!(z[1][num_ts - 1][7].0.abs() < 1e-6);
+        }
     }
 }
