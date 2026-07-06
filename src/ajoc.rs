@@ -59,9 +59,7 @@
 //!   [`crate::acpl_synth::InputSignalModifier`]), and sums the dry
 //!   (`x · mtx_dry`) + wet (`y · mtx_wet`) contributions into the
 //!   reconstructed output objects `z[ts][sb][o]`. This closes the A-JOC
-//!   decode chain from dequantized matrices to output QMF objects; what
-//!   remains upstream is the per-codeword `ajoc_huff_data()` decode (see
-//!   the docs gap below) that produces those quantised matrices.
+//!   decode chain from dequantized matrices to output QMF objects.
 //!
 //! Config-layer bitstream parsers ([`parse_ajoc_ctrl_info`],
 //! [`parse_ajoc_data_point_info`], [`parse_ajoc_bed_info`],
@@ -69,15 +67,11 @@
 //! side-information that does not depend on the per-codeword Huffman
 //! codebooks.
 //!
-//! **Docs gap (not yet landed):** the actual `ajoc_huff_data()`
-//! codeword decode (§6.2.5.5) needs the twelve `AJOC_HCB_*` Huffman
-//! `_LEN` / `_CW` arrays (Annex A.1.1 Tables A.1-A.12). The PDF names
-//! the twelve codebooks and gives each a `codebook_length` and
-//! `cb_off` but does **not** list the codeword / length values, and the
-//! part-1 accompaniment table file carries only the part-1 (ASF / DRC /
-//! DE) codebooks. Once the A-JOC `_LEN` / `_CW` arrays are available the
-//! `ajoc_huff_data` decode drops straight into the differential decoder
-//! below. See the crate README "Not yet supported" tail.
+//! The per-codeword `ajoc_huff_data()` decode (§6.2.5.5) lives in
+//! [`crate::ajoc_huffman`] over the Annex A.1.1 `AJOC_HCB_*` codebooks
+//! (formerly a docs gap; the numeric arrays landed from the ETSI Part 2
+//! electronic-attachment table file). Its `(diff_type, a_huff_data)`
+//! output drops straight into the differential decoder below.
 
 #![allow(clippy::excessive_precision, clippy::needless_range_loop)]
 
