@@ -81,9 +81,38 @@ an S16 `AudioFrame`:
   §6.2.5 config-layer parsers (`ajoc_ctrl_info`, `ajoc_data_point_info`,
   `ajoc_bed_info`, `ajoc_dmx_de_data` with the Table 106
   `de_dlg_dmx_coeff` prefix code) walk the side-information. The
-  per-codeword `ajoc_huff_data()` decode that feeds the dequantized
-  matrices into `ajoc_reconstruct` is blocked on the missing
-  `AJOC_HCB_*` codebook arrays (see "Not yet supported").
+  **§6.2.5.5 `ajoc_huff_data()` codeword layer** (`ajoc_huffman`)
+  decodes over the twelve Annex A.1.1 `AJOC_HCB_*` codebooks
+  (transcribed from the ETSI Part 2 electronic-attachment table file,
+  verified in-tree as complete prefix codes) with the §6.3.6.5.2
+  Table 104 `get_ajoc_hcb()` selection, and `ajoc_data::decode_ajoc()`
+  joins the halves: a complete §6.2.5.1 `ajoc()` element goes ctrl-info
+  → Huffman rows → Table 43 differential decode (cross-frame
+  `mtx_*_q_prev` state) → dequantized matrices, straight into
+  `ajoc_reconstruct`. The **A-JOC parameter encoder** (`encoder_ajoc`)
+  quantises real-valued dry / wet matrices (Tables 44-47 inverses),
+  prices every matrix row with the real codeword lengths to pick
+  DIFF_FREQ vs DIFF_TIME, and emits GOP-chained `ajoc()` elements whose
+  decode is exact on the quantised grid (verified over I/P/P/P GOPs
+  with measured P-frame row-bit savings).
+- **A-JCC** (Advanced Joint Channel Coding, TS 103 190-2 §5.6 + §6.2.6 /
+  §6.3.7) — the complete parameter + synthesis chain for both layouts
+  (`b_5fronts` and the 5-channel core layout): the twelve Annex A.1.2
+  `AJCC_HCB_*` codebooks plus the §6.3.7.3.2 Table 116 `get_ajcc_hcb()`
+  selection (ALPHA / BETA delegate to the Part 1 A-CPL books),
+  `ajcc_huff_data()` / `ajcc_framing_data()` / `ajced()` / `ajcc_data()`
+  parsers with exact writer inverses, the §5.6.3.2 Table 29 differential
+  decode (plain running sums, `ajcc_<SET>_q_prev` chained across
+  parameter sets and frames) and Table 30/31 dry (`q·Δ−0,6`) / wet
+  (`q·Δ−2,0`) dequantizers with alpha / beta through the Part 1
+  Tables 202-205 `ibeta`-coupled machinery. `ajcc_synth` lands the
+  §5.6.3.3 Table 32 smooth / steep interpolator (Table 33 tails), the
+  Table 36 core-mode crossfade, all four reconstruction modules
+  (Tables 37/38 full-mode, Tables 40/41 core-mode) and both drivers:
+  `ajcc_full_decode()` (Table 35 — 13/11 output channels, per-instance
+  D0/D1/D2 decorrelators + Part 1 transient ducking, √2 output gains)
+  and `ajcc_core_decode()` (Table 39 — 7 channels), with a
+  bitstream-to-QMF end-to-end GOP test through `AjccOwnedParams`.
 - **P-frames (`b_iframe = 0`)** — full inter-frame decode per §4.2.6.x:
   a per-substream sticky-config state (`asf::StickyConfig`) carries the
   I-frame-gated `aspx_config()` / `acpl_config_*()` elements and the
@@ -154,17 +183,12 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **A-JOC per-codeword Huffman decode** (`ajoc_huff_data()`, §6.2.5.5) —
-  blocked on a docs gap: the twelve `AJOC_HCB_*` Huffman `_LEN` / `_CW`
-  arrays (Annex A.1.1 Tables A.1-A.12) are named in the spec with their
-  `codebook_length` / `cb_off` metadata, but the actual codeword and
-  length values are not listed in the TS 103 190-2 PDF and are not in
-  the part-1 accompaniment table file (which carries only the part-1
-  ASF / DRC / DE codebooks). The `ajoc` module's differential decoder
-  consumes those deltas directly the moment the arrays are supplied; the
-  full end-to-end A-JOC object decode also needs the surrounding
-  immersive / OAMD substream machinery (`audio_data_ajoc()`,
-  `oamd_dyndata_single()`, `var_channel_element()`).
+- **Immersive / OAMD substream wiring** — the A-JOC and A-JCC parameter
+  + reconstruction chains are complete, but hooking them into the frame
+  decoder needs the surrounding TS 103 190-2 substream elements:
+  `audio_data_ajoc()` (§6.2.3.4 — `var_channel_element()`,
+  `oamd_timing_data()`, `oamd_dyndata_single()`, OAMD extensions) and
+  the `immersive_channel_element()` (§6.2.4.1) core that feeds A-JCC.
 - TS 103 190-2 multi-stream / immersive / object-based (IFM) extensions.
 - P-frame refinements: the sticky state carries **one** xover offset per
   substream, so P-frames assume the I-frame used a single

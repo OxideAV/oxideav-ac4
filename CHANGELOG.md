@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 392 — **A-JOC Huffman layer + full `ajoc()` decode/encode,
+  and the complete A-JCC subsystem** (ETSI TS 103 190-2). Seven
+  milestones:
+  1. **A-JOC codebooks + §6.2.5.5 `ajoc_huff_data()`**
+     (`ajoc_huffman` / `ajoc_hcb_tables`): the twelve Annex A.1.1
+     `AJOC_HCB_<DRY|WET>_<COARSE|FINE>_<F0|DF|DT>` `_LEN`/`_CW` arrays
+     transcribed from the ETSI Part 2 electronic-attachment table file
+     (verified complete prefix codes: Kraft sum == 1, pairwise
+     prefix-freedom, Annex metadata match), the §6.3.6.5.2 Table 104
+     `get_ajoc_hcb()` selection, `huff_decode_diff()` (Part 1
+     §4.3.10.8.3) and the exact `write_ajoc_huff_data` inverse. Closes
+     the crate's long-standing A-JOC Huffman docs gap.
+  2. **§6.2.5.1/§6.2.5.3 `ajoc()` / `ajoc_data()`** (`ajoc_data`):
+     payload parse with sparse gating + `b_dfonly` constraint,
+     `decode_ajoc()` through Table 43 differential decode (cross-frame
+     `AjocDiffState`) and §5.7.3.3 dequantization into
+     `AjocDequantMatrices` feeding `ajoc_reconstruct`; exact writers;
+     bitstream→QMF-objects end-to-end test.
+  3. **A-JOC parameter encoder** (`encoder_ajoc`): Table 44-47 inverse
+     quantizers, per-row DIFF_FREQ vs DIFF_TIME selection by real
+     codeword bit cost, GOP-chained emission with encoder/decoder
+     prev-state lockstep (exact-on-grid over I/P/P/P, measured P-frame
+     row-bit savings).
+  4. **A-JCC codebooks + §6.2.6 bitstream layer** (`ajcc` /
+     `ajcc_hcb_tables`): Annex A.1.2 Tables A.13-A.24 arrays, Table 116
+     `get_ajcc_hcb()` (ALPHA/BETA → Part 1 A-CPL books),
+     `ajcc_huff_data` / `ajcc_framing_data` / `ajced` / `ajcc_data` for
+     both layouts with exact writer inverses; §5.6.3.2 Table 29
+     differential decode + Table 30/31 dry/wet dequantizers + the
+     Part 1 Tables 202-205 ibeta-coupled alpha/beta path.
+  5. **A-JCC full decoding mode** (`ajcc_synth`): §5.6.3.3 Table 32
+     smooth/steep interpolation (Table 33 tails), Table 36 core-mode
+     crossfade, Tables 37/38 modules and the Table 35
+     `ajcc_full_decode()` driver (D0/D1/D2 instance assignment,
+     transient ducking, √2 output gains).
+  6. **A-JCC core decoding mode**: Tables 40/41 `ajcc_module_3/4` and
+     the Table 39 `ajcc_core_decode()` 7-channel driver.
+  7. **Bridge + end-to-end**: `AjccOwnedParams` decode→synthesis bridge
+     and a 2-frame I/P GOP test through the whole chain (bitstream →
+     Huffman → Table 29 → dequant → interpolate → reconstruct) with
+     bit-flat P-frame output verification.
 - ac4 round 389 — **inter-frame (P-frame, `b_iframe = 0`) support
   end-to-end** (ETSI TS 103 190-1 §4.2.6.x Tables 25/33, §4.2.12.3/4
   Tables 51/52, §5.7.6.3.4 Pseudocodes 80/81, §4.2.13.7 Table 65 /
