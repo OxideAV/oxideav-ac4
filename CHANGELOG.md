@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 406 — **OAMD (object audio metadata) element layer** (ETSI
+  TS 103 190-2 §6.2.8 + §6.3.9): new `oamd` module with bit-exact
+  parsers **and** exact writer inverses for `oamd_timing_data()`
+  (Tables 125-129 sample-offset / ramp-duration prefix codes),
+  `object_info_block()` / `object_basic_info()` (Tables 134-136 gain +
+  priority codes) / `object_render_info()` (room-anchored §6.3.9.8.4
+  absolute + differential positions, zone masks, width / screen /
+  distance / divergence property groups), `add_per_object_md()` +
+  `ext_prec_pos()` (Tables 146m-o extended-precision refinements, incl.
+  the size-announced `add_table_data` envelope reconciliation),
+  `oamd_dyndata_single()` (per-object block grids + the `b_alternative`
+  data-set tail with common-data / ISF point folding and the
+  `ext_prec_alt_pos()` additional-data envelope), `oamd_dyndata_multi()`
+  (A-JOC-coded object skipping), and `oamd_common_data()` (screen-size
+  ratio, `trim()` §6.2.8.9 with all nine trim configs, and
+  `bed_render_info()` §6.2.8.8 with the four `tool_t{b,f}_to_f_s[_b]()`
+  routing elements, inside the byte-envelope with filler
+  reconciliation). 22 round-trip unit tests pin every branch incl. the
+  I-frame/P-frame reuse ladders and the semantics tables. One published
+  gap surfaced precisely: `stereo_dmx_coeff()` (called from
+  `bed_render_info()`) has no syntax box anywhere in the TS —
+  encountering `b_stereo_dmx_coeff == 1` raises a bounded
+  `unsupported` error instead of a guessed layout.
 - ac4 round 392 — **A-JOC Huffman layer + full `ajoc()` decode/encode,
   and the complete A-JCC subsystem** (ETSI TS 103 190-2). Seven
   milestones:
