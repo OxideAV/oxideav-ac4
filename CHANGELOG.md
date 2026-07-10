@@ -75,6 +75,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      `raw_ac4_frame` (v2 TOC + SIMPLE A-JOC substream). A
      decoder-level test drives three frames packet-to-PCM and pins
      per-object signal energy.
+  6. **`sus_ver = 1` metadata element layer** (§6.2.7):
+     `parse/write_metadata_v2` with `basic_metadata(…, 1)` (no
+     dialnorm, `substream_loudness_bits` +
+     `b_further_substream_loudness_info` pair, no `sus_ver = 0`
+     stereo-dmx block), `further_loudness_info(1, b_presentation_ldn)`
+     (headerless `b_loudcorr_dialgate` form, `prgmbndy` gating, the
+     `rtll_comp` tail), the `extended_metadata` leading-`b_dialog`
+     form, and the drc-frame-free tools envelope — all with exact
+     writer inverses and round-trip tests. (The decoder route still
+     skips post-audio metadata: the spec does not state which
+     `channel_mode` binds `basic_metadata`'s layout gates for an
+     object substream — left as a docs question rather than guessed.)
 - ac4 round 392 — **A-JOC Huffman layer + full `ajoc()` decode/encode,
   and the complete A-JCC subsystem** (ETSI TS 103 190-2). Seven
   milestones:

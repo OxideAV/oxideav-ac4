@@ -209,9 +209,11 @@ an S16 `AudioFrame`:
   dynamic SIMPLE downmix form; the `b_static_dmx` 5.X core and the
   A-SPX `var_channel_element` mode are parsed but not yet driven
   through the object PCM path (the A-JOC LFE output slot is emitted
-  silent), and the part-2 `sus_ver = 1` `metadata()` variant
-  (§6.2.7 — substream-loudness form, no `drc_frame`) after the audio
-  data is skipped rather than parsed.
+  silent). The part-2 `sus_ver = 1` `metadata()` variant (§6.2.7 —
+  substream-loudness form, no `drc_frame`) is fully parsed/written as
+  an element (`parse_metadata_v2`), but the decoder route skips it:
+  the TS does not say which `channel_mode` binds `basic_metadata`'s
+  layout gates for an object substream.
 - **`immersive_channel_element()`** (§6.2.4.1) — the core that feeds
   the complete A-JCC parameter + reconstruction chain, and the
   standalone `oamd_substream()` (§6.2.2.4).

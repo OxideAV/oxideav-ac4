@@ -1088,6 +1088,528 @@ fn skip_n_bits(br: &mut BitReader<'_>, mut n: u32) -> Result<()> {
     Ok(())
 }
 
+// =====================================================================
+// sus_ver = 1 metadata variants — ETSI TS 103 190-2 §6.2.7
+// =====================================================================
+
+/// Decoded `further_loudness_info(sus_ver = 1, b_presentation_ldn)`
+/// (TS 103 190-2 §6.2.7.3). The version/practice header and the
+/// `prgmbndy` block only exist when `b_presentation_ldn`; otherwise a
+/// bare `b_loudcorr_dialgate` replaces the header. The `sus_ver >= 1`
+/// tail carries `rtll_comp`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FurtherLoudnessInfoV2 {
+    /// The `b_presentation_ldn` context this element was coded with.
+    pub b_presentation_ldn: bool,
+    /// Bare `b_loudcorr_dialgate` (headerless form,
+    /// `b_presentation_ldn == false`).
+    pub b_loudcorr_dialgate: Option<bool>,
+    /// The shared field set (header + measures + prgmbndy where the
+    /// context admits them).
+    pub info: FurtherLoudnessInfo,
+    /// 8-bit `rtll_comp` (`sus_ver >= 1` tail, `b_rtllcomp` gate).
+    pub rtll_comp: Option<u8>,
+}
+
+/// Walk `further_loudness_info(sus_ver = 1, b_presentation_ldn)` per
+/// TS 103 190-2 §6.2.7.3.
+pub fn parse_further_loudness_info_v2(
+    br: &mut BitReader<'_>,
+    b_presentation_ldn: bool,
+) -> Result<FurtherLoudnessInfoV2> {
+    let mut v = FurtherLoudnessInfoV2 {
+        b_presentation_ldn,
+        ..Default::default()
+    };
+    if b_presentation_ldn {
+        let mut lv = br.read_u32(2)? as u8;
+        if lv == 3 {
+            lv = lv.wrapping_add(br.read_u32(4)? as u8);
+        }
+        v.info.loudness_version = lv;
+        v.info.loud_prac_type = br.read_u32(4)? as u8;
+        if v.info.loud_prac_type != 0 {
+            if br.read_bit()? {
+                v.info.dialgate_prac_type = Some(br.read_u32(3)? as u8);
+            }
+            v.info.loudcorr_type = Some(br.read_bit()?);
+        }
+    } else {
+        v.b_loudcorr_dialgate = Some(br.read_bit()?);
+    }
+    if br.read_bit()? {
+        v.info.loudrelgat = Some(br.read_u32(11)? as u16);
+    }
+    if br.read_bit()? {
+        v.info.loudspchgat = Some(br.read_u32(11)? as u16);
+        v.info.loudspchgat_dialgate_prac_type = Some(br.read_u32(3)? as u8);
+    }
+    if br.read_bit()? {
+        v.info.loudstrm3s = Some(br.read_u32(11)? as u16);
+    }
+    if br.read_bit()? {
+        v.info.max_loudstrm3s = Some(br.read_u32(11)? as u16);
+    }
+    if br.read_bit()? {
+        v.info.truepk = Some(br.read_u32(11)? as u16);
+    }
+    if br.read_bit()? {
+        v.info.max_truepk = Some(br.read_u32(11)? as u16);
+    }
+    if b_presentation_ldn && br.read_bit()? {
+        let mut prgmbndy: u32 = 1;
+        loop {
+            if br.read_u32(1)? == 1 {
+                break;
+            }
+            prgmbndy <<= 1;
+            if prgmbndy > (1u32 << 30) {
+                return Err(Error::invalid("ac4: v2 prgmbndy unary overflow"));
+            }
+        }
+        v.info.prgmbndy = Some(prgmbndy);
+        v.info.b_end_or_start = Some(br.read_bit()?);
+        if br.read_bit()? {
+            v.info.prgmbndy_offset = Some(br.read_u32(11)? as u16);
+        }
+    }
+    if br.read_bit()? {
+        v.info.lra = Some(br.read_u32(10)? as u16);
+        v.info.lra_prac_type = Some(br.read_u32(3)? as u8);
+    }
+    if br.read_bit()? {
+        v.info.loudmntry = Some(br.read_u32(11)? as u16);
+    }
+    if br.read_bit()? {
+        v.info.max_loudmntry = Some(br.read_u32(11)? as u16);
+    }
+    // sus_ver >= 1 tail: b_rtllcomp + b_extension.
+    if br.read_bit()? {
+        v.rtll_comp = Some(br.read_u32(8)? as u8);
+    }
+    if br.read_bit()? {
+        let mut sz = br.read_u32(5)?;
+        if sz == 31 {
+            sz = sz
+                .checked_add(variable_bits(br, 4)?)
+                .ok_or_else(|| Error::invalid("ac4: v2 loudness extension size overflow"))?;
+        }
+        skip_n_bits(br, sz)?;
+    }
+    Ok(v)
+}
+
+/// Write `further_loudness_info(sus_ver = 1, b_presentation_ldn)` —
+/// exact inverse of [`parse_further_loudness_info_v2`] (canonical
+/// extension-free form).
+pub fn write_further_loudness_info_v2(
+    bw: &mut oxideav_core::bits::BitWriter,
+    v: &FurtherLoudnessInfoV2,
+) -> Result<()> {
+    if v.b_presentation_ldn {
+        if v.info.loudness_version >= 3 {
+            let extra = v.info.loudness_version - 3;
+            if extra > 0x0F {
+                return Err(Error::invalid("ac4: loudness_version extension too big"));
+            }
+            bw.write_u32(3, 2);
+            bw.write_u32(extra as u32, 4);
+        } else {
+            bw.write_u32(v.info.loudness_version as u32, 2);
+        }
+        bw.write_u32(v.info.loud_prac_type as u32, 4);
+        if v.info.loud_prac_type != 0 {
+            match v.info.dialgate_prac_type {
+                Some(d) => {
+                    bw.write_bit(true);
+                    bw.write_u32(d as u32, 3);
+                }
+                None => bw.write_bit(false),
+            }
+            let corr = v
+                .info
+                .loudcorr_type
+                .ok_or_else(|| Error::invalid("ac4: loudcorr_type required"))?;
+            bw.write_bit(corr);
+        }
+    } else {
+        let dg = v
+            .b_loudcorr_dialgate
+            .ok_or_else(|| Error::invalid("ac4: headerless form needs b_loudcorr_dialgate"))?;
+        bw.write_bit(dg);
+    }
+    write_opt_u(bw, v.info.loudrelgat.map(|x| x as u32), 11);
+    match (v.info.loudspchgat, v.info.loudspchgat_dialgate_prac_type) {
+        (Some(g), Some(d)) => {
+            bw.write_bit(true);
+            bw.write_u32(g as u32, 11);
+            bw.write_u32(d as u32, 3);
+        }
+        (None, None) => bw.write_bit(false),
+        _ => return Err(Error::invalid("ac4: loudspchgat pair mismatch")),
+    }
+    write_opt_u(bw, v.info.loudstrm3s.map(|x| x as u32), 11);
+    write_opt_u(bw, v.info.max_loudstrm3s.map(|x| x as u32), 11);
+    write_opt_u(bw, v.info.truepk.map(|x| x as u32), 11);
+    write_opt_u(bw, v.info.max_truepk.map(|x| x as u32), 11);
+    if v.b_presentation_ldn {
+        match v.info.prgmbndy {
+            Some(p) => {
+                if !p.is_power_of_two() {
+                    return Err(Error::invalid("ac4: prgmbndy must be a power of two"));
+                }
+                bw.write_bit(true);
+                for _ in 0..p.trailing_zeros() {
+                    bw.write_bit(false);
+                }
+                bw.write_bit(true);
+                let eos = v
+                    .info
+                    .b_end_or_start
+                    .ok_or_else(|| Error::invalid("ac4: b_end_or_start required"))?;
+                bw.write_bit(eos);
+                write_opt_u(bw, v.info.prgmbndy_offset.map(|x| x as u32), 11);
+            }
+            None => bw.write_bit(false),
+        }
+    } else if v.info.prgmbndy.is_some() {
+        return Err(Error::invalid(
+            "ac4: prgmbndy only valid with b_presentation_ldn",
+        ));
+    }
+    match (v.info.lra, v.info.lra_prac_type) {
+        (Some(lra), Some(pt)) => {
+            bw.write_bit(true);
+            bw.write_u32(lra as u32, 10);
+            bw.write_u32(pt as u32, 3);
+        }
+        (None, None) => bw.write_bit(false),
+        _ => return Err(Error::invalid("ac4: lra pair mismatch")),
+    }
+    write_opt_u(bw, v.info.loudmntry.map(|x| x as u32), 11);
+    write_opt_u(bw, v.info.max_loudmntry.map(|x| x as u32), 11);
+    match v.rtll_comp {
+        Some(r) => {
+            bw.write_bit(true);
+            bw.write_u32(r as u32, 8);
+        }
+        None => bw.write_bit(false),
+    }
+    bw.write_bit(false); // b_extension: canonical extension-free form.
+    Ok(())
+}
+
+/// Decoded `basic_metadata(channel_mode, sus_ver = 1)`
+/// (TS 103 190-2 §6.2.7.2). The `sus_ver = 1` form has no `dialnorm`
+/// and replaces `b_further_loudness_info` with the substream-loudness
+/// pair; the `b_stereo_dmx_coeff` downmix block is `sus_ver = 0` only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BasicMetadataV2 {
+    /// `b_more_basic_metadata`.
+    pub more_basic_metadata: bool,
+    /// 8-bit `substream_loudness_bits` (`b_substream_loudness_info`).
+    pub substream_loudness_bits: Option<u8>,
+    /// `further_loudness_info(1, 0)`
+    /// (`b_further_substream_loudness_info`).
+    pub further_loudness_info: Option<FurtherLoudnessInfoV2>,
+    /// Stereo branch: `pre_dmixtyp_2ch` + `phase90_info_2ch`.
+    pub pre_dmixtyp_2ch: Option<u8>,
+    /// See [`BasicMetadataV2::pre_dmixtyp_2ch`].
+    pub phase90_info_2ch: Option<u8>,
+    /// 5.X branch.
+    pub pre_dmixtyp_5ch: Option<u8>,
+    /// 5.X branch.
+    pub pre_upmixtyp_5ch: Option<u8>,
+    /// 7.X (3/4/0) branch.
+    pub pre_upmixtyp_3_4: Option<u8>,
+    /// 7.X (3/2/2) branch.
+    pub pre_upmixtyp_3_2_2: Option<u8>,
+    /// Multichannel tail.
+    pub phase90_info_mc: Option<u8>,
+    /// Multichannel tail.
+    pub b_surround_attenuation_known: Option<bool>,
+    /// Multichannel tail.
+    pub b_lfe_attenuation_known: Option<bool>,
+    /// `b_dc_blocking` payload.
+    pub dc_block_on: Option<bool>,
+}
+
+/// Walk `basic_metadata(channel_mode, sus_ver = 1)` per TS 103 190-2
+/// §6.2.7.2.
+pub fn parse_basic_metadata_v2(
+    br: &mut BitReader<'_>,
+    channel_mode: u32,
+) -> Result<BasicMetadataV2> {
+    let mut v = BasicMetadataV2 {
+        more_basic_metadata: br.read_bit()?,
+        ..Default::default()
+    };
+    if !v.more_basic_metadata {
+        return Ok(v);
+    }
+    if br.read_bit()? {
+        // b_substream_loudness_info.
+        v.substream_loudness_bits = Some(br.read_u32(8)? as u8);
+        if br.read_bit()? {
+            // b_further_substream_loudness_info.
+            v.further_loudness_info = Some(parse_further_loudness_info_v2(br, false)?);
+        }
+    }
+    if channel_mode == channel_mode::STEREO {
+        if br.read_bit()? {
+            v.pre_dmixtyp_2ch = Some(br.read_u32(3)? as u8);
+            v.phase90_info_2ch = Some(br.read_u32(2)? as u8);
+        }
+    } else if channel_mode > channel_mode::STEREO {
+        // (The b_stereo_dmx_coeff block is sus_ver == 0 only.)
+        if matches!(channel_mode, channel_mode::FIVE_0 | channel_mode::FIVE_1) {
+            if br.read_bit()? {
+                v.pre_dmixtyp_5ch = Some(br.read_u32(3)? as u8);
+            }
+            if br.read_bit()? {
+                v.pre_upmixtyp_5ch = Some(br.read_u32(4)? as u8);
+            }
+        }
+        if (channel_mode::SEVEN_X_FIRST..=channel_mode::SEVEN_X_LAST).contains(&channel_mode)
+            && br.read_bit()?
+        {
+            if channel_mode <= 6 {
+                v.pre_upmixtyp_3_4 = Some(br.read_u32(2)? as u8);
+            } else if (9..=10).contains(&channel_mode) {
+                v.pre_upmixtyp_3_2_2 = Some(br.read_u32(1)? as u8);
+            }
+        }
+        v.phase90_info_mc = Some(br.read_u32(2)? as u8);
+        v.b_surround_attenuation_known = Some(br.read_bit()?);
+        v.b_lfe_attenuation_known = Some(br.read_bit()?);
+    }
+    if br.read_bit()? {
+        v.dc_block_on = Some(br.read_bit()?);
+    }
+    Ok(v)
+}
+
+/// Write `basic_metadata(channel_mode, sus_ver = 1)` — exact inverse of
+/// [`parse_basic_metadata_v2`].
+pub fn write_basic_metadata_v2(
+    bw: &mut oxideav_core::bits::BitWriter,
+    v: &BasicMetadataV2,
+    channel_mode: u32,
+) -> Result<()> {
+    bw.write_bit(v.more_basic_metadata);
+    if !v.more_basic_metadata {
+        return Ok(());
+    }
+    match v.substream_loudness_bits {
+        Some(bits) => {
+            bw.write_bit(true);
+            bw.write_u32(bits as u32, 8);
+            match &v.further_loudness_info {
+                Some(f) => {
+                    bw.write_bit(true);
+                    write_further_loudness_info_v2(bw, f)?;
+                }
+                None => bw.write_bit(false),
+            }
+        }
+        None => {
+            if v.further_loudness_info.is_some() {
+                return Err(Error::invalid(
+                    "ac4: v2 further loudness needs substream_loudness_bits",
+                ));
+            }
+            bw.write_bit(false);
+        }
+    }
+    if channel_mode == channel_mode::STEREO {
+        match (v.pre_dmixtyp_2ch, v.phase90_info_2ch) {
+            (Some(d), Some(p)) => {
+                bw.write_bit(true);
+                bw.write_u32(d as u32, 3);
+                bw.write_u32(p as u32, 2);
+            }
+            (None, None) => bw.write_bit(false),
+            _ => return Err(Error::invalid("ac4: stereo prev-dmx pair mismatch")),
+        }
+    } else if channel_mode > channel_mode::STEREO {
+        if matches!(channel_mode, channel_mode::FIVE_0 | channel_mode::FIVE_1) {
+            match v.pre_dmixtyp_5ch {
+                Some(d) => {
+                    bw.write_bit(true);
+                    bw.write_u32(d as u32, 3);
+                }
+                None => bw.write_bit(false),
+            }
+            match v.pre_upmixtyp_5ch {
+                Some(u) => {
+                    bw.write_bit(true);
+                    bw.write_u32(u as u32, 4);
+                }
+                None => bw.write_bit(false),
+            }
+        }
+        if (channel_mode::SEVEN_X_FIRST..=channel_mode::SEVEN_X_LAST).contains(&channel_mode) {
+            if channel_mode <= 6 {
+                match v.pre_upmixtyp_3_4 {
+                    Some(u) => {
+                        bw.write_bit(true);
+                        bw.write_u32(u as u32, 2);
+                    }
+                    None => bw.write_bit(false),
+                }
+            } else if (9..=10).contains(&channel_mode) {
+                match v.pre_upmixtyp_3_2_2 {
+                    Some(u) => {
+                        bw.write_bit(true);
+                        bw.write_u32(u as u32, 1);
+                    }
+                    None => bw.write_bit(false),
+                }
+            } else {
+                bw.write_bit(false);
+            }
+        }
+        let p90 = v
+            .phase90_info_mc
+            .ok_or_else(|| Error::invalid("ac4: phase90_info_mc required"))?;
+        bw.write_u32(p90 as u32, 2);
+        bw.write_bit(v.b_surround_attenuation_known.unwrap_or(false));
+        bw.write_bit(v.b_lfe_attenuation_known.unwrap_or(false));
+    }
+    match v.dc_block_on {
+        Some(on) => {
+            bw.write_bit(true);
+            bw.write_bit(on);
+        }
+        None => bw.write_bit(false),
+    }
+    Ok(())
+}
+
+/// Decoded `metadata(b_alternative, b_ajoc, b_iframe, sus_ver = 1)`
+/// (TS 103 190-2 §6.2.7.1) — the object-substream metadata form: no
+/// `drc_frame()`, `extended_metadata` carries its own `b_dialog` flag,
+/// and the `b_alternative && !b_ajoc` OAMD branch is not taken on
+/// A-JOC substreams.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataV2 {
+    /// `basic_metadata(channel_mode, 1)`.
+    pub basic: BasicMetadataV2,
+    /// The `b_dialog` flag read at the head of
+    /// `extended_metadata(…, sus_ver = 1)`.
+    pub b_dialog: bool,
+    /// `extended_metadata` payload.
+    pub extended: ExtendedMetadata,
+    /// Announced tools envelope size in bits.
+    pub tools_metadata_size: u32,
+    /// `dialog_enhancement(b_iframe)`.
+    pub dialog_enhancement: DialogEnhancement,
+    /// Announced-but-unparsed trailing tools bits.
+    pub tools_metadata_trailing_bits: u32,
+    /// `b_emdf_payloads_substream` + payload.
+    pub emdf_payloads_substream: Option<EmdfPayloadsSubstream>,
+}
+
+/// Walk `metadata(b_alternative = 0 | b_ajoc = 1, b_iframe,
+/// sus_ver = 1)` per TS 103 190-2 §6.2.7.1 for an A-JOC object
+/// substream. (The `b_alternative && !b_ajoc` inline
+/// `oamd_dyndata_single()` branch needs the direct-coded object
+/// context and is rejected here.)
+pub fn parse_metadata_v2(
+    br: &mut BitReader<'_>,
+    channel_mode: u32,
+    b_iframe: bool,
+    b_alternative_and_not_ajoc: bool,
+    prev_de: Option<crate::de::DeConfig>,
+) -> Result<MetadataV2> {
+    if b_alternative_and_not_ajoc {
+        return Err(Error::unsupported(
+            "ac4: metadata v2 inline OAMD for direct-coded alternative substreams",
+        ));
+    }
+    let basic = parse_basic_metadata_v2(br, channel_mode)?;
+    // extended_metadata(…, sus_ver = 1): leading b_dialog flag, no
+    // b_associated block.
+    let b_dialog = br.read_bit()?;
+    let extended = parse_extended_metadata(br, channel_mode, false, b_dialog)?;
+    let mut tools_size = br.read_u32(7)?;
+    if br.read_bit()? {
+        let extra = variable_bits(br, 3)?;
+        tools_size = tools_size
+            .checked_add(
+                extra
+                    .checked_shl(7)
+                    .ok_or_else(|| Error::invalid("ac4: tools size shift overflow"))?,
+            )
+            .ok_or_else(|| Error::invalid("ac4: tools size overflow"))?;
+    }
+    let tools_start = br.bit_position();
+    // sus_ver == 1: no drc_frame().
+    let dialog_enhancement = parse_dialog_enhancement(br, b_iframe, prev_de)?;
+    let consumed = (br.bit_position() - tools_start) as u32;
+    if consumed > tools_size {
+        return Err(Error::invalid(
+            "ac4: v2 dialog_enhancement consumed more than tools_metadata_size",
+        ));
+    }
+    let trailing = tools_size - consumed;
+    skip_n_bits(br, trailing)?;
+    let emdf_payloads_substream = if br.read_bit()? {
+        Some(parse_emdf_payloads_substream(br)?)
+    } else {
+        None
+    };
+    Ok(MetadataV2 {
+        basic,
+        b_dialog,
+        extended,
+        tools_metadata_size: tools_size,
+        dialog_enhancement,
+        tools_metadata_trailing_bits: trailing,
+        emdf_payloads_substream,
+    })
+}
+
+/// Write `metadata(…, sus_ver = 1)` — exact inverse of
+/// [`parse_metadata_v2`].
+pub fn write_metadata_v2(
+    bw: &mut oxideav_core::bits::BitWriter,
+    meta: &MetadataV2,
+    channel_mode: u32,
+    b_iframe: bool,
+) -> Result<()> {
+    write_basic_metadata_v2(bw, &meta.basic, channel_mode)?;
+    bw.write_bit(meta.b_dialog);
+    write_extended_metadata(bw, &meta.extended, channel_mode, false, meta.b_dialog)?;
+    if meta.tools_metadata_size < (1 << 7) {
+        bw.write_u32(meta.tools_metadata_size, 7);
+        bw.write_bit(false);
+    } else {
+        bw.write_u32(meta.tools_metadata_size & 0x7F, 7);
+        bw.write_bit(true);
+        crate::toc::write_variable_bits(bw, 3, meta.tools_metadata_size >> 7);
+    }
+    let start = bw.bit_position();
+    write_dialog_enhancement(bw, &meta.dialog_enhancement, b_iframe)?;
+    let used = (bw.bit_position() - start) as u32;
+    if used + meta.tools_metadata_trailing_bits != meta.tools_metadata_size {
+        return Err(Error::invalid(
+            "ac4: v2 tools envelope inconsistent with recorded trailing bits",
+        ));
+    }
+    for _ in 0..meta.tools_metadata_trailing_bits {
+        bw.write_bit(false);
+    }
+    match &meta.emdf_payloads_substream {
+        Some(e) => {
+            bw.write_bit(true);
+            crate::emdf::write_emdf_payloads_substream(bw, e)?;
+        }
+        None => bw.write_bit(false),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,6 +1792,150 @@ mod tests {
     fn write_minimal_de_absent(bw: &mut BitWriter) {
         // b_de_data_present = 0.
         bw.write_bit(false);
+    }
+
+    // -----------------------------------------------------------------
+    // sus_ver = 1 (TS 103 190-2 §6.2.7) variants
+    // -----------------------------------------------------------------
+
+    fn v2_round_trips(raw: &[u8], channel_mode: u32, b_iframe: bool) -> MetadataV2 {
+        let mut br = BitReader::new(raw);
+        let meta = parse_metadata_v2(&mut br, channel_mode, b_iframe, false, None).unwrap();
+        let mut bw = BitWriter::new();
+        write_metadata_v2(&mut bw, &meta, channel_mode, b_iframe).unwrap();
+        bw.align_to_byte();
+        let rebuilt = bw.finish();
+        let mut br2 = BitReader::new(&rebuilt);
+        let meta2 = parse_metadata_v2(&mut br2, channel_mode, b_iframe, false, None).unwrap();
+        assert_eq!(meta, meta2);
+        meta
+    }
+
+    #[test]
+    fn metadata_v2_minimal_mono_round_trips() {
+        // basic_metadata v2: NO dialnorm — b_more = 0 is the first bit.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_more_basic_metadata
+        bw.write_bit(false); // extended: b_dialog = 0
+        bw.write_bit(false); // b_channels_classifier
+        bw.write_bit(false); // b_event_probability
+        bw.write_u32(1, 7); // tools_metadata_size = 1 (DE only — no DRC)
+        bw.write_bit(false); // b_more_bits
+        write_minimal_de_absent(&mut bw);
+        bw.write_bit(false); // b_emdf_payloads_substream
+        bw.align_to_byte();
+        let raw = bw.finish();
+        let meta = v2_round_trips(&raw, channel_mode::MONO, true);
+        assert!(!meta.basic.more_basic_metadata);
+        assert!(!meta.b_dialog);
+        assert_eq!(meta.tools_metadata_size, 1);
+    }
+
+    #[test]
+    fn metadata_v2_substream_loudness_and_rtll_round_trips() {
+        // Stereo, b_more = 1 with the substream-loudness pair and the
+        // headerless further_loudness_info(1, 0) carrying rtll_comp.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_more_basic_metadata
+        bw.write_bit(true); // b_substream_loudness_info
+        bw.write_u32(0xA5, 8); // substream_loudness_bits
+        bw.write_bit(true); // b_further_substream_loudness_info
+                            // further_loudness_info(sus_ver = 1, b_presentation_ldn = 0):
+        bw.write_bit(true); // b_loudcorr_dialgate (headerless form)
+        bw.write_bit(false); // b_loudrelgat
+        bw.write_bit(false); // b_loudspchgat
+        bw.write_bit(true); // b_loudstrm3s
+        bw.write_u32(321, 11);
+        bw.write_bit(false); // b_max_loudstrm3s
+        bw.write_bit(false); // b_truepk
+        bw.write_bit(false); // b_max_truepk
+                             // (no prgmbndy block — b_presentation_ldn = 0)
+        bw.write_bit(false); // b_lra
+        bw.write_bit(false); // b_loudmntry
+        bw.write_bit(false); // b_max_loudmntry
+        bw.write_bit(true); // b_rtllcomp
+        bw.write_u32(77, 8); // rtll_comp
+        bw.write_bit(false); // b_extension
+                             // stereo branch: b_prev_dmx_info = 1.
+        bw.write_bit(true);
+        bw.write_u32(5, 3); // pre_dmixtyp_2ch
+        bw.write_u32(2, 2); // phase90_info_2ch
+        bw.write_bit(false); // b_dc_blocking
+                             // extended_metadata v2: b_dialog = 1 with a max gain.
+        bw.write_bit(true); // b_dialog
+        bw.write_bit(true); // b_dialog_max_gain
+        bw.write_u32(2, 2); // dialog_max_gain
+        bw.write_bit(false); // b_pan_dialog_present
+        bw.write_bit(false); // b_channels_classifier
+        bw.write_bit(false); // b_event_probability
+        bw.write_u32(1, 7); // tools_metadata_size
+        bw.write_bit(false); // b_more_bits
+        write_minimal_de_absent(&mut bw);
+        bw.write_bit(false); // b_emdf_payloads_substream
+        bw.align_to_byte();
+        let raw = bw.finish();
+        let meta = v2_round_trips(&raw, channel_mode::STEREO, true);
+        assert_eq!(meta.basic.substream_loudness_bits, Some(0xA5));
+        let fli = meta.basic.further_loudness_info.as_ref().unwrap();
+        assert!(!fli.b_presentation_ldn);
+        assert_eq!(fli.b_loudcorr_dialgate, Some(true));
+        assert_eq!(fli.info.loudstrm3s, Some(321));
+        assert_eq!(fli.rtll_comp, Some(77));
+        assert_eq!(meta.basic.pre_dmixtyp_2ch, Some(5));
+        assert!(meta.b_dialog);
+        assert_eq!(meta.extended.dialog_max_gain, Some(2));
+    }
+
+    #[test]
+    fn further_loudness_info_v2_presentation_form_round_trips() {
+        // b_presentation_ldn = 1: full header + prgmbndy + rtll tail.
+        let v = FurtherLoudnessInfoV2 {
+            b_presentation_ldn: true,
+            b_loudcorr_dialgate: None,
+            info: FurtherLoudnessInfo {
+                loudness_version: 5,
+                loud_prac_type: 2,
+                dialgate_prac_type: Some(3),
+                loudcorr_type: Some(true),
+                loudrelgat: Some(1000),
+                prgmbndy: Some(8),
+                b_end_or_start: Some(true),
+                prgmbndy_offset: Some(99),
+                lra: Some(500),
+                lra_prac_type: Some(1),
+                ..Default::default()
+            },
+            rtll_comp: Some(200),
+        };
+        let mut bw = BitWriter::new();
+        write_further_loudness_info_v2(&mut bw, &v).unwrap();
+        bw.write_u32(0, 7);
+        let raw = bw.into_bytes();
+        let mut br = BitReader::new(&raw);
+        let got = parse_further_loudness_info_v2(&mut br, true).unwrap();
+        assert_eq!(got, v);
+    }
+
+    #[test]
+    fn basic_metadata_v2_multichannel_tail_round_trips() {
+        // 5.1: no stereo-dmx block (sus_ver = 1), 5.X types + tail.
+        let v = BasicMetadataV2 {
+            more_basic_metadata: true,
+            pre_dmixtyp_5ch: Some(4),
+            pre_upmixtyp_5ch: Some(9),
+            phase90_info_mc: Some(3),
+            b_surround_attenuation_known: Some(true),
+            b_lfe_attenuation_known: Some(false),
+            dc_block_on: Some(true),
+            ..Default::default()
+        };
+        let mut bw = BitWriter::new();
+        write_basic_metadata_v2(&mut bw, &v, channel_mode::FIVE_1).unwrap();
+        bw.write_u32(0, 7);
+        let raw = bw.into_bytes();
+        let mut br = BitReader::new(&raw);
+        let got = parse_basic_metadata_v2(&mut br, channel_mode::FIVE_1).unwrap();
+        assert_eq!(got, v);
     }
 
     #[test]
