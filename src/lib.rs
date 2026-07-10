@@ -489,6 +489,7 @@ pub mod ajcc_synth;
 pub mod ajoc;
 pub mod ajoc_data;
 pub mod ajoc_huffman;
+pub mod ajoc_substream;
 pub mod asf;
 pub mod asf_data;
 pub mod aspx;
