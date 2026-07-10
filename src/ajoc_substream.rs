@@ -924,6 +924,105 @@ pub fn write_ajoc_substream_simple(
     Ok(out)
 }
 
+/// Emit a complete v2 `raw_ac4_frame()` carrying one A-JOC object
+/// substream: `ac4_toc()` (single presentation, single substream
+/// group, `b_channel_coded = 0`, `b_ajoc = 1` with an all-dynamic
+/// `ac4_substream_info_ajoc()`) followed by the byte-aligned
+/// `ac4_substream()` from [`write_ajoc_substream_simple`].
+///
+/// Fixed shape: `fs_index = 1` (48 kHz), `frame_rate_index = 1`
+/// (1920-sample frames), no LFE, no HSF extension.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ajoc_raw_frame(
+    sequence_counter: u32,
+    params: &AjocBodyParams,
+    dmx_spectra: &[&[f32]],
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+) -> Result<Vec<u8>> {
+    if params.b_lfe || params.b_static_dmx {
+        return Err(Error::invalid(
+            "ac4: frame writer covers the dynamic non-LFE A-JOC form",
+        ));
+    }
+    if params.n_fullband_upmix_signals >= 16 || params.n_fullband_dmx_signals > 16 {
+        return Err(Error::invalid("ac4: frame writer signal-count limits"));
+    }
+    let mut bw = BitWriter::new();
+    // ---- ac4_toc() (§6.2.1.1) ----
+    bw.write_u32(2, 2); // bitstream_version = 2
+    bw.write_u32(sequence_counter & 0x3FF, 10);
+    bw.write_bit(false); // b_wait_frames
+    bw.write_u32(1, 1); // fs_index = 48 kHz
+    bw.write_u32(1, 4); // frame_rate_index = 1 (1920 samples)
+    bw.write_bit(b_iframe); // b_iframe_global
+    bw.write_bit(true); // b_single_presentation
+    bw.write_bit(false); // b_payload_base
+    bw.write_bit(false); // b_program_id
+                         // ---- ac4_presentation_v1_info() (§6.2.1.3) ----
+    bw.write_bit(true); // b_single_substream_group
+    bw.write_bit(false); // presentation_version() = 0
+    bw.write_u32(0, 3); // mdcompat
+    bw.write_bit(false); // b_presentation_id
+    bw.write_bit(false); // frame_rate_multiply_info: b_multiplier = 0
+                         // emdf_info(): version 0, key_id 0, no payloads-substream, no more.
+    bw.write_u32(0, 2);
+    bw.write_u32(0, 3);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false); // b_presentation_filter
+    bw.write_u32(0, 3); // ac4_sgi_specifier(): group_index = 0
+    bw.write_bit(false); // b_pre_virtualized
+    bw.write_bit(false); // b_add_emdf_substreams
+                         // ac4_presentation_substream_info(): b_alternative = 0,
+                         // b_pres_ndot = !b_iframe, substream_index = 0.
+    bw.write_bit(false);
+    bw.write_bit(!b_iframe);
+    bw.write_u32(0, 2);
+    // ---- ac4_substream_group_info() (§6.2.1.6) ----
+    bw.write_bit(true); // b_substreams_present
+    bw.write_bit(false); // b_hsf_ext
+    bw.write_bit(true); // b_single_substream
+    bw.write_bit(false); // b_channel_coded
+    bw.write_bit(false); // b_oamd_substream
+    bw.write_bit(true); // b_ajoc
+                        // ac4_substream_info_ajoc() (§6.2.1.9):
+    bw.write_bit(false); // b_lfe
+    bw.write_bit(false); // b_static_dmx
+    bw.write_u32(params.n_fullband_dmx_signals - 1, 4);
+    bw.write_bit(true); // dmx bed_dyn_obj_assignment: b_dyn_objects_only
+    bw.write_bit(false); // b_oamd_common_data_present
+    bw.write_u32(params.n_fullband_upmix_signals - 1, 4);
+    bw.write_bit(true); // umx bed_dyn_obj_assignment: b_dyn_objects_only
+    bw.write_bit(false); // b_sf_multiplier (fs_index == 1)
+    bw.write_bit(false); // b_bitrate_info
+    bw.write_bit(!b_iframe); // b_audio_ndot (frame_rate_factor = 1)
+    bw.write_u32(0, 2); // substream_index
+    bw.write_bit(false); // b_content_type
+                         // ---- substream_index_table() ----
+    bw.write_u32(1, 2); // n_substreams = 1
+    bw.write_bit(false); // b_size_present = 0 (spans to frame end)
+    bw.align_to_byte();
+    let mut frame = bw.into_bytes();
+    let substream = write_ajoc_substream_simple(
+        params,
+        dmx_spectra,
+        1920,
+        max_sfb,
+        num_decorr,
+        ctrl,
+        qmats,
+        b_iframe,
+        enc_state,
+    )?;
+    frame.extend_from_slice(&substream);
+    Ok(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
