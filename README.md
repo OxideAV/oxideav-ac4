@@ -94,7 +94,29 @@ an S16 `AudioFrame`:
   prices every matrix row with the real codeword lengths to pick
   DIFF_FREQ vs DIFF_TIME, and emits GOP-chained `ajoc()` elements whose
   decode is exact on the quantised grid (verified over I/P/P/P GOPs
-  with measured P-frame row-bit savings).
+  with measured P-frame row-bit savings). The chain is now **wired
+  end-to-end into the frame decoder**: the v2 TOC parses
+  `ac4_substream_info_ajoc()` / `ac4_substream_info_obj()`
+  (§6.2.1.9-11, `bed_dyn_obj_assignment` with all five
+  position-signalling forms and Table 83-86 static-object counts), the
+  `ajoc_substream` module walks `audio_data_ajoc()` (§6.2.3.4) with its
+  `var_channel_element()` downmix (§6.2.4.4 — SIMPLE + A-SPX modes,
+  all odd-count tails) and OAMD side information, and
+  `AjocSubstreamDecoder` drives IMDCT → QMF analysis → Table 49
+  reconstruction → per-object QMF synthesis with all cross-frame state
+  persistent. `Ac4Decoder` routes v2 A-JOC frames to this chain
+  automatically, and `encode_ajoc_raw_frame` emits complete matching
+  frames (decoder-level packet-to-PCM tests pin per-object energy and
+  a < 0,5 %-of-peak settled reconstruction error).
+- **OAMD** (object audio metadata, TS 103 190-2 §6.2.8 + §6.3.9) —
+  the `oamd` module parses and re-emits (exact writer inverses)
+  `oamd_timing_data()`, `object_info_block()` with basic / render info
+  and the full property groups, `add_per_object_md()` /
+  `ext_prec_pos()` extended-precision refinements,
+  `oamd_dyndata_single()` (incl. the `b_alternative` data-set tail) /
+  `oamd_dyndata_multi()`, and `oamd_common_data()` (trim,
+  bed-render-info, tool elements) with all size-announced envelopes
+  reconciled.
 - **A-JCC** (Advanced Joint Channel Coding, TS 103 190-2 §5.6 + §6.2.6 /
   §6.3.7) — the complete parameter + synthesis chain for both layouts
   (`b_5fronts` and the 5-channel core layout): the twelve Annex A.1.2
@@ -183,12 +205,20 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **Immersive / OAMD substream wiring** — the A-JOC and A-JCC parameter
-  + reconstruction chains are complete, but hooking them into the frame
-  decoder needs the surrounding TS 103 190-2 substream elements:
-  `audio_data_ajoc()` (§6.2.3.4 — `var_channel_element()`,
-  `oamd_timing_data()`, `oamd_dyndata_single()`, OAMD extensions) and
-  the `immersive_channel_element()` (§6.2.4.1) core that feeds A-JCC.
+- **A-JOC decode-path remainders** — the frame-decoder route covers the
+  dynamic SIMPLE downmix form; the `b_static_dmx` 5.X core and the
+  A-SPX `var_channel_element` mode are parsed but not yet driven
+  through the object PCM path (the A-JOC LFE output slot is emitted
+  silent), and the part-2 `sus_ver = 1` `metadata()` variant
+  (§6.2.7 — substream-loudness form, no `drc_frame`) after the audio
+  data is skipped rather than parsed.
+- **`immersive_channel_element()`** (§6.2.4.1) — the core that feeds
+  the complete A-JCC parameter + reconstruction chain, and the
+  standalone `oamd_substream()` (§6.2.2.4).
+- `stereo_dmx_coeff()` inside `bed_render_info()` has no syntax box in
+  the published TS (both parts) — the parser raises a bounded
+  `unsupported` error on `b_stereo_dmx_coeff == 1` rather than guess a
+  bit layout.
 - TS 103 190-2 multi-stream / immersive / object-based (IFM) extensions.
 - P-frame refinements: the sticky state carries **one** xover offset per
   substream, so P-frames assume the I-frame used a single

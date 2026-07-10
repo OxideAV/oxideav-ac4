@@ -9,29 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- ac4 round 406 — **OAMD (object audio metadata) element layer** (ETSI
-  TS 103 190-2 §6.2.8 + §6.3.9): new `oamd` module with bit-exact
-  parsers **and** exact writer inverses for `oamd_timing_data()`
-  (Tables 125-129 sample-offset / ramp-duration prefix codes),
-  `object_info_block()` / `object_basic_info()` (Tables 134-136 gain +
-  priority codes) / `object_render_info()` (room-anchored §6.3.9.8.4
-  absolute + differential positions, zone masks, width / screen /
-  distance / divergence property groups), `add_per_object_md()` +
-  `ext_prec_pos()` (Tables 146m-o extended-precision refinements, incl.
-  the size-announced `add_table_data` envelope reconciliation),
-  `oamd_dyndata_single()` (per-object block grids + the `b_alternative`
-  data-set tail with common-data / ISF point folding and the
-  `ext_prec_alt_pos()` additional-data envelope), `oamd_dyndata_multi()`
-  (A-JOC-coded object skipping), and `oamd_common_data()` (screen-size
-  ratio, `trim()` §6.2.8.9 with all nine trim configs, and
-  `bed_render_info()` §6.2.8.8 with the four `tool_t{b,f}_to_f_s[_b]()`
-  routing elements, inside the byte-envelope with filler
-  reconciliation). 22 round-trip unit tests pin every branch incl. the
-  I-frame/P-frame reuse ladders and the semantics tables. One published
-  gap surfaced precisely: `stereo_dmx_coeff()` (called from
-  `bed_render_info()`) has no syntax box anywhere in the TS —
-  encountering `b_stereo_dmx_coeff == 1` raises a bounded
-  `unsupported` error instead of a guessed layout.
+- ac4 round 406 — **A-JOC object substream wired end-to-end: OAMD layer
+  + object TOC descriptors + `audio_data_ajoc()` body + frame-decoder
+  route** (ETSI TS 103 190-2). Five milestones close the README's
+  "immersive / OAMD substream wiring" gap for A-JOC:
+  1. **OAMD element layer** (§6.2.8 + §6.3.9, new `oamd` module):
+     bit-exact parsers **and** exact writer inverses for
+     `oamd_timing_data()` (Tables 125-129 sample-offset /
+     ramp-duration prefix codes), `object_info_block()` /
+     `object_basic_info()` (Tables 134-136 gain + priority codes) /
+     `object_render_info()` (room-anchored §6.3.9.8.4 absolute +
+     differential positions, zone masks, width / screen / distance /
+     divergence property groups), `add_per_object_md()` +
+     `ext_prec_pos()` (Tables 146m-o, incl. the size-announced
+     `add_table_data` envelope reconciliation),
+     `oamd_dyndata_single()` (per-object block grids + the
+     `b_alternative` data-set tail with common-data / ISF point
+     folding and the `ext_prec_alt_pos()` additional-data envelope),
+     `oamd_dyndata_multi()` (A-JOC-coded object skipping), and
+     `oamd_common_data()` (screen-size ratio, `trim()` §6.2.8.9 with
+     all nine trim configs, `bed_render_info()` §6.2.8.8 with the
+     four `tool_t{b,f}_to_f_s[_b]()` routing elements, inside the
+     byte-envelope with filler reconciliation). 22 round-trip unit
+     tests pin every branch incl. the I-/P-frame reuse ladders. One
+     published gap surfaced precisely: `stereo_dmx_coeff()` (called
+     from `bed_render_info()`) has **no syntax box anywhere in the
+     TS** — hitting `b_stereo_dmx_coeff == 1` raises a bounded
+     `unsupported` error instead of a guessed layout.
+  2. **v2 TOC object descriptors** (§6.2.1.9-11):
+     `parse_substream_info_ajoc` (`b_static_dmx`, dmx + umx
+     `bed_dyn_obj_assignment`, inline `oamd_common_data`, upmix-count
+     escape), `bed_dyn_obj_assignment` with all five
+     position-signalling forms + Table 83/84/85/86 static counts and
+     the §6.3.2.8.0 static-before-dynamic object typing,
+     `parse_substream_info_obj` (Table 82 `n_objects`, bed / ISF /
+     reserved start forms), and the §6.2.1.6 non-channel-coded
+     substream-group loop replacing the historical `Unsupported`
+     bail; descriptors surface on `Ac4FrameInfo` (`ajoc_substreams` /
+     `obj_substreams`).
+  3. **Substream body** (§6.2.3.4 / §6.2.4.4, new `ajoc_substream`
+     module): `parse_var_channel_element` (SIMPLE + A-SPX modes, LFE
+     `mono_data(1)`, `two_channel_data` pairs, all three odd-count
+     tails, per-pair `aspx_data_2ch` + odd `aspx_data_1ch` with
+     sticky-config P-frame support) and `parse_audio_data_ajoc`
+     (static-downmix 5_X delegation and the dynamic form:
+     `dmx_active_signals_mask`, core/full OAMD timing + dyndata,
+     `ajoc_bed_info` OAMD-extension envelope, `decode_ajoc`
+     Huffman-to-dequantized-matrices, `ajoc_dmx_de_data`), plus
+     SIMPLE write-side inverses; the written body parses back with
+     bit-exact dequantized dry matrices.
+  4. **Bitstream → object-PCM decode chain** (§4.8.3.13 + §5.7):
+     `AjocSubstreamDecoder` carries the cross-frame state quartet
+     (differential reference, interpolator + decorrelator
+     reconstruction state, per-channel IMDCT overlap tails,
+     per-object QMF synthesis banks) and drives audio_size envelope →
+     body parse → IMDCT → QMF analysis → Table 49 `ajoc_reconstruct`
+     → per-object QMF synthesis. An end-to-end test decodes four
+     encoded frames and pins the settled output against a reference
+     selector chain to < 0,5 % of peak (exercising the Table-48
+     one-extra-increment plateau convergence).
+  5. **Frame-decoder route + full-frame encoder**: `Ac4Decoder`
+     detects a v2 TOC carrying `ac4_substream_info_ajoc` and decodes
+     the object substream to interleaved PCM via the persistent
+     chain; `encode_ajoc_raw_frame` emits the matching complete
+     `raw_ac4_frame` (v2 TOC + SIMPLE A-JOC substream). A
+     decoder-level test drives three frames packet-to-PCM and pins
+     per-object signal energy.
 - ac4 round 392 — **A-JOC Huffman layer + full `ajoc()` decode/encode,
   and the complete A-JCC subsystem** (ETSI TS 103 190-2). Seven
   milestones:
