@@ -439,6 +439,198 @@ pub fn parse_audio_data_ajoc(
 }
 
 // =====================================================================
+// Bitstream → object-PCM decode chain (§4.8.3.13 + §5.7)
+// =====================================================================
+
+/// Persistent A-JOC object-substream decoder state: the §5.7.3.2
+/// differential reference, the §5.7.3.4-6 reconstruction state
+/// (interpolators + decorrelator histories), the per-downmix-channel
+/// IMDCT overlap-add tails, and the per-object QMF synthesis banks.
+pub struct AjocSubstreamDecoder {
+    diff_state: AjocDiffState,
+    recon: Option<(crate::ajoc::AjocGeometry, crate::ajoc::AjocReconState)>,
+    overlap: Vec<Vec<f32>>,
+    prev_transform_length: u32,
+    analysis: Vec<crate::qmf::QmfAnalysisBank>,
+    synthesis: Vec<crate::qmf::QmfSynthesisBank>,
+    num_dmx: usize,
+    num_umx: usize,
+}
+
+impl AjocSubstreamDecoder {
+    /// Allocate decoder state for `num_dmx` fullband downmix signals
+    /// and `num_umx` reconstructed objects (from the TOC descriptor).
+    pub fn new(num_dmx: usize, num_umx: usize) -> Self {
+        AjocSubstreamDecoder {
+            // ajoc_num_decorr is a 3-bit field — size the differential
+            // state to its maximum so any frame fits.
+            diff_state: crate::ajoc_data::new_ajoc_diff_state(num_umx, num_dmx, 7),
+            recon: None,
+            overlap: Vec::new(),
+            prev_transform_length: 0,
+            analysis: (0..num_dmx)
+                .map(|_| crate::qmf::QmfAnalysisBank::new())
+                .collect(),
+            synthesis: (0..num_umx)
+                .map(|_| crate::qmf::QmfSynthesisBank::new())
+                .collect(),
+            num_dmx,
+            num_umx,
+        }
+    }
+
+    /// Access the parse-side differential state (for feeding
+    /// [`parse_audio_data_ajoc`] directly).
+    pub fn diff_state_mut(&mut self) -> &mut AjocDiffState {
+        &mut self.diff_state
+    }
+
+    fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
+        if self.prev_transform_length != n as u32 {
+            self.overlap.clear();
+            self.prev_transform_length = n as u32;
+        }
+        while self.overlap.len() <= ch {
+            self.overlap.push(vec![0.0f32; n]);
+        }
+        if self.overlap[ch].len() != n {
+            self.overlap[ch] = vec![0.0f32; n];
+        }
+        let mut x = vec![0.0f32; n];
+        let copy = scaled.len().min(n);
+        x[..copy].copy_from_slice(&scaled[..copy]);
+        let y = crate::mdct::imdct(&x);
+        let window = crate::mdct::kbd_window(n as u32);
+        crate::mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
+    }
+
+    /// Decode one parsed `audio_data_ajoc()` frame to reconstructed
+    /// object PCM (`[o][samples]`, `num_umx` fullband objects).
+    ///
+    /// Covers the dynamic SIMPLE downmix form: per-channel IMDCT →
+    /// QMF analysis → §5.7.3.6 Table 49 spatial reconstruction →
+    /// per-object QMF synthesis. The A-SPX downmix layer and the
+    /// `b_static_dmx` 5.X core are parsed upstream but not yet driven
+    /// through this PCM path.
+    pub fn decode_frame_pcm(
+        &mut self,
+        ajoc: &AudioDataAjoc,
+        frame_len_base: u32,
+    ) -> Result<Vec<Vec<f32>>> {
+        let elem = ajoc.var_element.as_ref().ok_or_else(|| {
+            Error::unsupported("ac4: static-downmix A-JOC PCM decode not wired yet")
+        })?;
+        let spectra = elem.fullband_spectra();
+        if spectra.len() != self.num_dmx {
+            return Err(Error::invalid("ac4: downmix channel count mismatch"));
+        }
+        let n = frame_len_base as usize;
+        // 1. IMDCT each downmix channel.
+        let mut pcm_dmx: Vec<Vec<f32>> = Vec::with_capacity(self.num_dmx);
+        for (ch, spec) in spectra.iter().enumerate() {
+            let spec =
+                spec.ok_or_else(|| Error::unsupported("ac4: undecodable downmix channel body"))?;
+            pcm_dmx.push(self.imdct_channel_f32(ch, spec, n));
+        }
+        // 2. QMF-analyse each channel into x[ts][sb][ch].
+        let num_sb = crate::qmf::NUM_QMF_SUBBANDS;
+        let num_ts = n / num_sb;
+        let mut x = vec![vec![vec![(0.0f64, 0.0f64); self.num_dmx]; num_sb]; num_ts];
+        for ch in 0..self.num_dmx {
+            let slots = self.analysis[ch].process_block(&pcm_dmx[ch]);
+            for (ts, slot) in slots.iter().take(num_ts).enumerate() {
+                for (sb, &(re, im)) in slot.iter().enumerate() {
+                    x[ts][sb][ch] = (re as f64, im as f64);
+                }
+            }
+        }
+        // 3. Spatial reconstruction.
+        let frame = &ajoc.ajoc_frame;
+        let geom = crate::ajoc::AjocGeometry {
+            num_dmx: self.num_dmx,
+            num_umx: self.num_umx,
+            num_decorr: frame.num_decorr as usize,
+            num_timeslots: num_ts,
+            num_subbands: num_sb,
+        };
+        let state_matches = matches!(
+            &self.recon,
+            Some((g, _)) if g.num_dmx == geom.num_dmx
+                && g.num_umx == geom.num_umx
+                && g.num_decorr == geom.num_decorr
+                && g.num_subbands == geom.num_subbands
+        );
+        if !state_matches {
+            self.recon = Some((geom, crate::ajoc::AjocReconState::new(&geom)));
+        }
+        let recon = &mut self.recon.as_mut().expect("recon state just ensured").1;
+        let z = crate::ajoc::ajoc_reconstruct(
+            &x,
+            &frame.matrices,
+            &frame.ctrl.data_point_info,
+            &frame.ctrl.object_present,
+            &geom,
+            recon,
+        );
+        // 4. QMF-synthesise each object.
+        let mut out = Vec::with_capacity(self.num_umx);
+        for o in 0..self.num_umx {
+            let mut pcm = Vec::with_capacity(num_ts * num_sb);
+            for z_ts in z.iter().take(num_ts) {
+                let mut slot = [(0.0f32, 0.0f32); crate::qmf::NUM_QMF_SUBBANDS];
+                for (sb, s) in slot.iter_mut().enumerate() {
+                    let (re, im) = z_ts[sb][o];
+                    *s = (re as f32, im as f32);
+                }
+                let row = self.synthesis[o].process_slot(&slot);
+                pcm.extend_from_slice(&row);
+            }
+            out.push(pcm);
+        }
+        Ok(out)
+    }
+
+    /// Parse + decode one complete part-2 `ac4_substream()` body
+    /// (§6.2.2.2: `audio_size` + byte-aligned `audio_data_ajoc()`) to
+    /// object PCM. Returns the PCM grid plus the parsed body.
+    pub fn decode_substream_pcm(
+        &mut self,
+        substream_bytes: &[u8],
+        params: &AjocBodyParams,
+        b_iframe: bool,
+        b_alternative: bool,
+        frame_len_base: u32,
+    ) -> Result<(Vec<Vec<f32>>, AudioDataAjoc)> {
+        let mut br = BitReader::new(substream_bytes);
+        // §6.2.2.2: audio_size_value (15) + b_more_bits escape.
+        let mut audio_size = br.read_u32(15)?;
+        if br.read_bit()? {
+            audio_size += variable_bits(&mut br, 7)? << 15;
+        }
+        br.align_to_byte();
+        let audio_start = br.byte_position();
+        let ajoc = parse_audio_data_ajoc(
+            &mut br,
+            params,
+            b_iframe,
+            b_alternative,
+            frame_len_base,
+            &mut self.diff_state,
+        )?;
+        // The walk must stay inside the announced audio_size envelope
+        // (the remainder up to it is fill_bits + byte_align).
+        let consumed = br.bit_position().div_ceil(8) - audio_start as u64;
+        if consumed > audio_size as u64 {
+            return Err(Error::invalid(
+                "ac4: audio_data_ajoc overran the announced audio_size",
+            ));
+        }
+        let pcm = self.decode_frame_pcm(&ajoc, frame_len_base)?;
+        Ok((pcm, ajoc))
+    }
+}
+
+// =====================================================================
 // Write-side helpers (SIMPLE downmix form)
 // =====================================================================
 
@@ -688,6 +880,50 @@ pub fn write_audio_data_ajoc_simple(
     Ok(())
 }
 
+/// Assemble a complete part-2 `ac4_substream()` (§6.2.2.2) around a
+/// SIMPLE `audio_data_ajoc()` body: `audio_size` header, byte-aligned
+/// audio data, zero fill to `audio_size`. See
+/// [`write_audio_data_ajoc_simple`] for the body arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn write_ajoc_substream_simple(
+    params: &AjocBodyParams,
+    dmx_spectra: &[&[f32]],
+    transform_length: u32,
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+) -> Result<Vec<u8>> {
+    let mut body = BitWriter::new();
+    write_audio_data_ajoc_simple(
+        &mut body,
+        params,
+        dmx_spectra,
+        transform_length,
+        max_sfb,
+        num_decorr,
+        ctrl,
+        qmats,
+        b_iframe,
+        enc_state,
+    )?;
+    body.align_to_byte();
+    let body_bytes = body.into_bytes();
+    let audio_size = body_bytes.len() as u32;
+    if audio_size >= 1 << 15 {
+        return Err(Error::invalid("ac4: A-JOC audio_data too large"));
+    }
+    let mut bw = BitWriter::new();
+    bw.write_u32(audio_size, 15);
+    bw.write_bit(false); // b_more_bits
+    bw.align_to_byte();
+    let mut out = bw.into_bytes();
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +1122,142 @@ mod tests {
                     "dry[{o}][{ch}] got {got} want {want}"
                 );
             }
+        }
+    }
+
+    /// Full bitstream-to-PCM chain: two encoded I-frames through
+    /// `AjocSubstreamDecoder`, with a dry selector matrix routing
+    /// downmix channel `o % num_dmx` to object `o`. Frame 2 (all
+    /// interpolators settled at target) must match a reference chain
+    /// built from the same downmix PCM through identical QMF banks
+    /// scaled by the dequantized coefficient.
+    #[test]
+    fn ajoc_substream_end_to_end_bitstream_to_object_pcm() {
+        let num_dmx = 2usize;
+        let num_umx = 3usize;
+        let num_decorr = 1usize;
+        let params = AjocBodyParams {
+            b_lfe: false,
+            b_static_dmx: false,
+            n_fullband_dmx_signals: num_dmx as u32,
+            n_fullband_upmix_signals: num_umx as u32,
+            obj_type_dmx: vec![ObjType::Dyn; num_dmx],
+            obj_type_umx: vec![ObjType::Dyn; num_umx],
+        };
+        let ctrl = simple_ctrl(num_umx, num_dmx, num_decorr);
+        // Selector dry matrix (object o <- channel o % num_dmx); wet 0.
+        let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|o| {
+                vec![(0..num_dmx)
+                    .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
+                    .collect()]
+            })
+            .collect();
+        let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|_| vec![vec![vec![0.0]; num_decorr]])
+            .collect();
+        let qmats = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
+        // The dequantized selector gains actually applied per object.
+        let gain: Vec<f64> = (0..num_umx)
+            .map(|o| {
+                crate::ajoc::dequantize_dry(
+                    qmats.dry_q[o][0][o % num_dmx][0] as u32,
+                    AjocQuantMode::Fine,
+                )
+            })
+            .collect();
+
+        let s: Vec<Vec<f32>> = (0..num_dmx)
+            .map(|i| tone_spectrum(18 + 25 * i, 35.0))
+            .collect();
+        let spectra: Vec<&[f32]> = s.iter().map(|v| v.as_slice()).collect();
+
+        let mut enc_state = new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let mut dec = AjocSubstreamDecoder::new(num_dmx, num_umx);
+
+        // Reference chain state: IMDCT overlap + QMF banks per dmx
+        // channel (analysis -> synthesis identity, then scale).
+        let mut ref_overlap = vec![vec![0.0f32; TL as usize]; num_dmx];
+        let mut ref_analysis: Vec<_> = (0..num_dmx)
+            .map(|_| crate::qmf::QmfAnalysisBank::new())
+            .collect();
+        let mut ref_synthesis: Vec<_> = (0..num_dmx)
+            .map(|_| crate::qmf::QmfSynthesisBank::new())
+            .collect();
+        let window = crate::mdct::kbd_window(TL);
+
+        let mut last_objects: Vec<Vec<f32>> = Vec::new();
+        let mut last_reference: Vec<Vec<f32>> = Vec::new();
+        for _frame in 0..4 {
+            let bytes = write_ajoc_substream_simple(
+                &params,
+                &spectra,
+                TL,
+                MAX_SFB,
+                num_decorr as u32,
+                &ctrl,
+                &qmats,
+                true,
+                &mut enc_state,
+            )
+            .unwrap();
+            let (objects, parsed) = dec
+                .decode_substream_pcm(&bytes, &params, true, false, TL)
+                .unwrap();
+            assert_eq!(objects.len(), num_umx);
+
+            // Reference: the DECODED downmix spectra (post ASF
+            // quantisation) -> IMDCT -> QMF round trip.
+            let elem = parsed.var_element.as_ref().unwrap();
+            let dec_spectra: Vec<Vec<f32>> = elem
+                .fullband_spectra()
+                .iter()
+                .map(|sp| sp.unwrap().to_vec())
+                .collect();
+            let mut ref_ch: Vec<Vec<f32>> = Vec::with_capacity(num_dmx);
+            for ch in 0..num_dmx {
+                let y = crate::mdct::imdct(&{
+                    let mut x = vec![0.0f32; TL as usize];
+                    let copy = dec_spectra[ch].len().min(x.len());
+                    x[..copy].copy_from_slice(&dec_spectra[ch][..copy]);
+                    x
+                });
+                let pcm = crate::mdct::imdct_olap_symmetric(&y, &window, &mut ref_overlap[ch]);
+                let slots = ref_analysis[ch].process_block(&pcm);
+                let mut out = Vec::with_capacity(pcm.len());
+                for slot in &slots {
+                    out.extend_from_slice(&ref_synthesis[ch].process_slot(slot));
+                }
+                ref_ch.push(out);
+            }
+            last_reference = (0..num_umx)
+                .map(|o| {
+                    ref_ch[o % num_dmx]
+                        .iter()
+                        .map(|&v| v * gain[o] as f32)
+                        .collect()
+                })
+                .collect();
+            last_objects = objects;
+        }
+
+        // Frame 4: interpolators settled (the Table-48 one-extra-
+        // increment plateau decays geometrically across frames) —
+        // decoder output equals the reference selector chain.
+        for o in 0..num_umx {
+            let obj = &last_objects[o];
+            let refo = &last_reference[o];
+            assert_eq!(obj.len(), TL as usize);
+            let peak = refo.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            assert!(peak > 1e-4, "reference object {o} is silent");
+            let mut max_err = 0.0f32;
+            for (a, b) in obj.iter().zip(refo.iter()) {
+                max_err = max_err.max((a - b).abs());
+            }
+            assert!(
+                max_err < peak * 5e-3,
+                "object {o}: max_err {max_err} vs peak {peak}"
+            );
         }
     }
 }
