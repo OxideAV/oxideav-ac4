@@ -19,7 +19,10 @@ covers the channel-based layouts.
 ### Bitstream framing and TOC
 
 - **Sync framing** (`sync`) — `0xAC40` plain / `0xAC41` CRC-protected,
-  16-bit `frame_size()` with 24-bit escape, plus a CRC-16 helper.
+  16-bit `frame_size()` with 24-bit escape. The Annex G.4.2 `crc_word`
+  is verified on every 0xAC41 frame (protected payload = `frame_size` +
+  `raw_ac4_frame`); the decoder rejects mismatching frames, and
+  `wrap_sync_frame` emits both framing forms.
 - **Table of contents** (`toc`) — the full `ac4_toc()` walker:
   bitstream_version, sequence_counter, fs_index, frame_rate_index,
   `b_iframe_global`, payload_base, per-presentation
@@ -28,7 +31,33 @@ covers the channel-based layouts.
   EMDF substreams), per-substream `ac4_substream_info()` (channel-mode
   prefix decoder, sf_multiplier, bitrate_indicator, content_type with
   language tag, b_iframe), the substream index table, and the
-  `variable_bits(n)` codec. Surfaced on a parsed `Ac4FrameInfo`.
+  `variable_bits(n)` codec. Surfaced on a parsed `Ac4FrameInfo`
+  (including the part-2 A-JOC / object / OAMD substream descriptors).
+  The v2 `b_pres_ndot` / `b_audio_ndot` / `b_oamd_ndot` flags follow
+  the §6.3.2.11.2 "no dependency over time" polarity — ndot **is** the
+  I-frame flag (a long-standing inversion on both the parse and write
+  sides was fixed in r411).
+- **Presentation substream** (`pres_data`) — the complete part-2
+  `ac4_presentation_substream()` (§6.2.2.3): alternative-presentation
+  names + targets with per-substream activation maps, the
+  additional-data envelope, presentation dialnorm +
+  `further_loudness_info(1, 1)`, the `drc_metadata_size` envelope
+  around `drc_frame(b_pres_ndot)`, substream-group gains, the
+  associated-audio scale block, and the §6.2.9 presentation data:
+  `custom_dmx_data()` (bs_ch_config decision tree, `cdmx_parameters()`
+  with all six `tool_*()` elements) and `loud_corr()` (the full gate
+  ladder incl. the object corrections) — every parser with an exact
+  writer inverse.
+- **Stereo downmix coefficients** (`dmx_coeff`) — `stereo_dmx_coeff()`
+  (the factored-out `custom_dmx_data()` block, also invoked from
+  `bed_render_info()`) with the TS 103 190-1 §4.3.12.2 code → gain
+  mappings (Tables 149/149a quarter-power-of-two steps, the LFE
+  `5,5 − code` dB rule, dmx loudness corrections, Table 150 preferred
+  method).
+- **OAMD substream** — the standalone `oamd_substream()` (§6.2.2.4):
+  optional `oamd_common_data()` / `oamd_timing_data()` and the
+  `b_alternative == 0` `oamd_dyndata_multi()` walk, with
+  `oamd_substream_info()` surfaced from the TOC.
 
 ### Decoder
 
@@ -107,7 +136,14 @@ an S16 `AudioFrame`:
   persistent. `Ac4Decoder` routes v2 A-JOC frames to this chain
   automatically, and `encode_ajoc_raw_frame` emits complete matching
   frames (decoder-level packet-to-PCM tests pin per-object energy and
-  a < 0,5 %-of-peak settled reconstruction error).
+  a < 0,5 %-of-peak settled reconstruction error). The **LFE channel**
+  (coded directly in the downmix as a Table 21 `mono_data(1)` body,
+  bypassing the spatial reconstruction) is decoded to PCM and emitted
+  on the leading LFE output slot, and the §6.2.2.2 post-audio
+  `metadata(…, sus_ver = 1)` element is parsed on the route (with
+  `de_config()` carried across frames; per §6.2.7.2 an object
+  substream opens no channel-gated `basic_metadata` field and carries
+  no stereo-dmx block — the bed/custom downmix data is authoritative).
 - **OAMD** (object audio metadata, TS 103 190-2 §6.2.8 + §6.3.9) —
   the `oamd` module parses and re-emits (exact writer inverses)
   `oamd_timing_data()`, `object_info_block()` with basic / render info
@@ -206,22 +242,14 @@ an S16 `AudioFrame`:
 ## Not yet supported
 
 - **A-JOC decode-path remainders** — the frame-decoder route covers the
-  dynamic SIMPLE downmix form; the `b_static_dmx` 5.X core and the
-  A-SPX `var_channel_element` mode are parsed but not yet driven
-  through the object PCM path (the A-JOC LFE output slot is emitted
-  silent). The part-2 `sus_ver = 1` `metadata()` variant (§6.2.7 —
-  substream-loudness form, no `drc_frame`) is fully parsed/written as
-  an element (`parse_metadata_v2`), but the decoder route skips it:
-  the TS does not say which `channel_mode` binds `basic_metadata`'s
-  layout gates for an object substream.
+  dynamic SIMPLE downmix form (incl. LFE); the `b_static_dmx` 5.X core
+  and the A-SPX `var_channel_element` mode are parsed but not yet
+  driven through the object PCM path.
 - **`immersive_channel_element()`** (§6.2.4.1) — the core that feeds
-  the complete A-JCC parameter + reconstruction chain, and the
-  standalone `oamd_substream()` (§6.2.2.4).
-- `stereo_dmx_coeff()` inside `bed_render_info()` has no syntax box in
-  the published TS (both parts) — the parser raises a bounded
-  `unsupported` error on `b_stereo_dmx_coeff == 1` rather than guess a
-  bit layout.
-- TS 103 190-2 multi-stream / immersive / object-based (IFM) extensions.
+  the complete A-JCC parameter + reconstruction chain.
+- Remaining TS 103 190-2 multi-stream / immersive / object-based (IFM)
+  extensions beyond the parsed presentation / OAMD / object substream
+  surfaces.
 - P-frame refinements: the sticky state carries **one** xover offset per
   substream, so P-frames assume the I-frame used a single
   `aspx_xover_subband_offset` across all A-SPX elements of the element

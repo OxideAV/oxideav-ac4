@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 411 — **presentation/OAMD substream surfaces + stereo-dmx
+  coefficients + A-JOC LFE/metadata decode + CRC + ndot polarity fix**
+  (ETSI TS 103 190-1/-2). Eight landings:
+  1. **`stereo_dmx_coeff()`** (new `dmx_coeff` module): the element
+     invoked from `bed_render_info()` has no dedicated syntax box in
+     the TS — the staged clean-room trace identifies its field layout
+     as the factored-out `custom_dmx_data()` `b_stereo_dmx_coeff`
+     block (TS 103 190-2 §6.2.9.2). Parse + exact writer (LFE
+     sub-block gated on the invoking context's LFE presence) plus the
+     TS 103 190-1 §4.3.12.2 code → gain maps: Tables 149/149a
+     (quarter-power-of-two linear steps, validated against the
+     documented columns), `Lfe_mg = 5,5 − code` dB, the
+     `(15 − code)/2` dB loudness corrections, and the Table 150
+     preferred-method resolution. `bed_render_info()` /
+     `oamd_common_data()` now parse it instead of raising a bounded
+     `unsupported` (the r406 gap), with the A-JOC TOC descriptor
+     threading its `b_lfe` as the bed context.
+  2. **§6.2.9 presentation data** (new `pres_data` module):
+     `loud_corr()` (full gate ladder — obj/immersive-out flags,
+     loro/ltrt corrections, the 5_X/5_X_2/7_X/7_X_4/7_X_2/5_X_4
+     output-config corrections, core corrections, object 9_X_4),
+     `custom_dmx_data()` (bs_ch_config decision tree over
+     pres_ch_mode 11..14 × top-channel-pairs × 4-back, up to four
+     `cdmx_parameters()` rows, inline stereo-dmx block) and all six
+     `tool_*()` elements — exact writer inverses + round-trips over
+     every bs/out config combination.
+  3. **`ac4_presentation_substream()`** (§6.2.2.3): alternative
+     presentations (names, targets, per-substream activation +
+     alt_data_set_index escapes), additional-data envelope, dialnorm +
+     `further_loudness_info(1, 1)`, the `drc_metadata_size` envelope
+     around `drc_frame(b_pres_ndot)` with trailing-bit reconciliation
+     and cross-frame `drc_config`, substream-group gains (`b_keep`),
+     the associated-audio scale block, `custom_dmx_data()` +
+     `loud_corr()` tail, closing `byte_align`.
+  4. **`oamd_substream()`** (§6.2.2.4) + `oamd_substream_info()`
+     (§6.2.1.13) surfaced on `Ac4FrameInfo` (`b_oamd_ndot` + substream
+     index) — closes the README's standalone-OAMD gap.
+  5. **ndot polarity fix** — §6.3.2.11.2 defines ndot as "no
+     dependency over time": true = independently decodable = I-frame.
+     The v2 TOC read `b_pres_ndot`/`b_audio_ndot` as the *inverse* of
+     `b_iframe` and the IMS/A-JOC writers emitted the matching
+     inverted bits, so self round-trips passed while every v2 frame
+     signalled the opposite frame type on the wire. Both sides
+     flipped; fixture tests updated to spec polarity.
+  6. **A-JOC LFE decode path**: the LFE `mono_data(1)` body (long-frame
+     ASF, Table 21 `sf_info_lfe`) is IMDCT'd on a dedicated overlap
+     slot and emitted on the leading LFE output channel (previously
+     silent). Write side gains the exact duals
+     (`write_mono_data_lfe_simple` with the Table 106 `n_msfbl_bits`
+     width, LFE-aware `write_var_channel_element_simple_lfe` /
+     `write_audio_data_ajoc_simple` / `encode_ajoc_raw_frame`); a
+     decoder-level test pins non-silent LFE + object energy over a
+     3-frame packet-to-PCM run.
+  7. **`sus_ver = 1` metadata on the A-JOC route** (§6.2.2.2): the
+     route now parses the post-audio `metadata(…, 1)` element past the
+     audio_size envelope, carrying `de_config()` across frames.
+     Channel-mode binding per the staged §6.2.7.2 ruling: an object
+     substream signals no channel mode, so no channel-gated
+     `basic_metadata` field opens (MONO walk) and the stereo-dmx block
+     is absent by definition. The substream writer emits the matching
+     minimal metadata tail so encoded substreams are complete per
+     §6.2.2.2 — closes the r406 "decoder route skips it" note.
+  8. **0xAC41 CRC verification** (Annex G.4.2): `find_sync_frame`
+     verifies `crc_word` over `frame_size` + `raw_ac4_frame` and the
+     decoder rejects corrupt sync frames; `wrap_sync_frame` emits both
+     framing forms (incl. the 0xFFFF escape).
+  Suite grows 1253 → 1284 tests, all green.
 - ac4 round 406 — **A-JOC object substream wired end-to-end: OAMD layer
   + object TOC descriptors + `audio_data_ajoc()` body + frame-decoder
   route** (ETSI TS 103 190-2). Five milestones close the README's
