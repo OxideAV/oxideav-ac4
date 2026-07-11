@@ -504,6 +504,7 @@ pub mod aspx_tone;
 pub mod de;
 pub mod de_huffman;
 pub mod decoder;
+pub mod dmx_coeff;
 pub mod drc;
 pub mod drc_huffman;
 pub mod emdf;

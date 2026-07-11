@@ -19,11 +19,13 @@
 //! (§6.3.9.7.6), room-anchored positions (§6.3.9.8.4), alternative
 //! gains (Table 131), and extended-precision offsets (Tables 146m-o).
 //!
-//! One element is structurally unparseable from the published text: the
-//! `stereo_dmx_coeff()` call inside `bed_render_info()` (§6.2.8.8) has
-//! no syntax box of its own anywhere in the TS. Hitting
-//! `b_stereo_dmx_coeff == 1` raises a bounded `Error::unsupported`
-//! rather than guessing a bit layout.
+//! The `stereo_dmx_coeff()` call inside `bed_render_info()` (§6.2.8.8)
+//! has no syntax box of its own; its field layout is the factored-out
+//! form of the identical inline `b_stereo_dmx_coeff` block in
+//! `custom_dmx_data()` (§6.2.9.2) and is handled by
+//! [`crate::dmx_coeff`]. Because its LFE sub-block is gated on the
+//! invoking context's LFE presence, `parse_bed_render_info` /
+//! `parse_oamd_common_data` take a `bed_has_lfe` argument.
 
 use crate::toc::{variable_bits, write_variable_bits};
 use oxideav_core::bits::{BitReader, BitWriter};
@@ -1671,25 +1673,32 @@ pub struct BedCdmxData {
 /// Parsed `bed_render_info()` (§6.2.8.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BedRenderInfo {
+    /// `stereo_dmx_coeff()` when `b_stereo_dmx_coeff == 1` (only
+    /// meaningful when [`BedRenderInfo::payload`] is present).
+    pub stereo_dmx_coeff: Option<crate::dmx_coeff::StereoDmxCoeff>,
     /// Present when `b_bed_render_info == 1`.
     pub payload: Option<BedCdmxData>,
 }
 
 /// Parse `bed_render_info()` per §6.2.8.8.
 ///
-/// The `stereo_dmx_coeff()` sub-element has **no syntax box anywhere in
-/// the TS** (§6.3.9.9.1 only cross-references the §6.3.10.3 semantics);
-/// encountering `b_stereo_dmx_coeff == 1` is a bounded unsupported
-/// error rather than a guessed layout.
-pub fn parse_bed_render_info(br: &mut BitReader<'_>) -> Result<BedRenderInfo> {
+/// The `stereo_dmx_coeff()` sub-element has no dedicated syntax box in
+/// the TS; the field layout is the factored-out form of the identical
+/// inline `b_stereo_dmx_coeff` block in `custom_dmx_data()` (§6.2.9.2)
+/// — see [`crate::dmx_coeff`]. Its LFE sub-block is gated on the bed's
+/// LFE presence, passed as `bed_has_lfe`.
+pub fn parse_bed_render_info(br: &mut BitReader<'_>, bed_has_lfe: bool) -> Result<BedRenderInfo> {
     if !br.read_bit()? {
-        return Ok(BedRenderInfo { payload: None });
+        return Ok(BedRenderInfo {
+            stereo_dmx_coeff: None,
+            payload: None,
+        });
     }
-    if br.read_bit()? {
-        return Err(Error::unsupported(
-            "ac4: bed_render_info stereo_dmx_coeff() has no published syntax box",
-        ));
-    }
+    let stereo_dmx_coeff = if br.read_bit()? {
+        Some(crate::dmx_coeff::parse_stereo_dmx_coeff(br, bed_has_lfe)?)
+    } else {
+        None
+    };
     let mut data = BedCdmxData::default();
     if br.read_bit()? {
         // b_cdmx_data_present.
@@ -1746,18 +1755,36 @@ pub fn parse_bed_render_info(br: &mut BitReader<'_>) -> Result<BedRenderInfo> {
         }
     }
     Ok(BedRenderInfo {
+        stereo_dmx_coeff,
         payload: Some(data),
     })
 }
 
 /// Write `bed_render_info()` — exact inverse of
-/// [`parse_bed_render_info`] (always emits `b_stereo_dmx_coeff = 0`).
-pub fn write_bed_render_info(bw: &mut BitWriter, b: &BedRenderInfo) -> Result<()> {
+/// [`parse_bed_render_info`] under the same `bed_has_lfe` context.
+pub fn write_bed_render_info(
+    bw: &mut BitWriter,
+    b: &BedRenderInfo,
+    bed_has_lfe: bool,
+) -> Result<()> {
     match &b.payload {
-        None => bw.write_bit(false),
+        None => {
+            if b.stereo_dmx_coeff.is_some() {
+                return Err(Error::invalid(
+                    "ac4: stereo_dmx_coeff requires b_bed_render_info",
+                ));
+            }
+            bw.write_bit(false);
+        }
         Some(data) => {
             bw.write_bit(true);
-            bw.write_bit(false); // b_stereo_dmx_coeff — see parse note.
+            match &b.stereo_dmx_coeff {
+                Some(c) => {
+                    bw.write_bit(true);
+                    crate::dmx_coeff::write_stereo_dmx_coeff(bw, c, bed_has_lfe)?;
+                }
+                None => bw.write_bit(false),
+            }
             let has_cdmx = data.gain_w_to_f.is_some()
                 || data.gain_b4_to_b2.is_some()
                 || data.tm.is_some()
@@ -1848,8 +1875,9 @@ pub struct OamdCommonData {
     pub add_data: Option<CommonAddData>,
 }
 
-/// Parse `oamd_common_data()` per §6.2.8.1.
-pub fn parse_oamd_common_data(br: &mut BitReader<'_>) -> Result<OamdCommonData> {
+/// Parse `oamd_common_data()` per §6.2.8.1. `bed_has_lfe` gates the
+/// LFE sub-block of `bed_render_info()`'s `stereo_dmx_coeff()`.
+pub fn parse_oamd_common_data(br: &mut BitReader<'_>, bed_has_lfe: bool) -> Result<OamdCommonData> {
     let b_default_ratio = br.read_bit()?;
     let master_screen_size_ratio_code = if !b_default_ratio {
         Some(br.read_u32(5)? as u8)
@@ -1865,7 +1893,7 @@ pub fn parse_oamd_common_data(br: &mut BitReader<'_>) -> Result<OamdCommonData> 
         let total = add_data_bytes * 8;
         let start = br.bit_position();
         let trim = parse_trim(br)?;
-        let bed_render_info = parse_bed_render_info(br)?;
+        let bed_render_info = parse_bed_render_info(br, bed_has_lfe)?;
         let used = (br.bit_position() - start) as u32;
         if used > total {
             return Err(Error::invalid(
@@ -1892,8 +1920,12 @@ pub fn parse_oamd_common_data(br: &mut BitReader<'_>) -> Result<OamdCommonData> 
 }
 
 /// Write `oamd_common_data()` — exact inverse of
-/// [`parse_oamd_common_data`].
-pub fn write_oamd_common_data(bw: &mut BitWriter, c: &OamdCommonData) -> Result<()> {
+/// [`parse_oamd_common_data`] under the same `bed_has_lfe` context.
+pub fn write_oamd_common_data(
+    bw: &mut BitWriter,
+    c: &OamdCommonData,
+    bed_has_lfe: bool,
+) -> Result<()> {
     match c.master_screen_size_ratio_code {
         None => bw.write_bit(true),
         Some(code) => {
@@ -1908,7 +1940,7 @@ pub fn write_oamd_common_data(bw: &mut BitWriter, c: &OamdCommonData) -> Result<
             bw.write_bit(true);
             let mut probe = BitWriter::new();
             write_trim(&mut probe, &a.trim)?;
-            write_bed_render_info(&mut probe, &a.bed_render_info)?;
+            write_bed_render_info(&mut probe, &a.bed_render_info, bed_has_lfe)?;
             let used = probe.bit_position() as u32;
             let total = used + a.filler_bits;
             if total == 0 || total % 8 != 0 {
@@ -1927,7 +1959,7 @@ pub fn write_oamd_common_data(bw: &mut BitWriter, c: &OamdCommonData) -> Result<
                 write_variable_bits(bw, 2, add_data_bytes - 2);
             }
             write_trim(bw, &a.trim)?;
-            write_bed_render_info(bw, &a.bed_render_info)?;
+            write_bed_render_info(bw, &a.bed_render_info, bed_has_lfe)?;
             for _ in 0..a.filler_bits {
                 bw.write_bit(false);
             }
@@ -2552,37 +2584,65 @@ mod tests {
 
     #[test]
     fn bed_render_info_round_trips() {
-        for b in [
-            BedRenderInfo { payload: None },
-            BedRenderInfo {
-                payload: Some(BedCdmxData::default()),
-            },
-            BedRenderInfo {
-                payload: Some(BedCdmxData {
-                    gain_w_to_f: Some(3),
-                    gain_b4_to_b2: None,
-                    tm: Some((Some(ToolThreeWay::Front(1)), Some(ToolTwoWay::Other(2)))),
-                    tb: Some((Some(ToolThreeWay::Side(5)), None)),
-                    tf: Some((None, Some(ToolTwoWay::Front(7)))),
-                    gain_tfb_to_tm: Some(4),
-                }),
-            },
-        ] {
-            let mut bw = BitWriter::new();
-            write_bed_render_info(&mut bw, &b).unwrap();
-            bw.write_u32(0, 7);
-            let bytes = bw.into_bytes();
-            let mut br = BitReader::new(&bytes);
-            assert_eq!(parse_bed_render_info(&mut br).unwrap(), b);
+        for bed_has_lfe in [false, true] {
+            for b in [
+                BedRenderInfo {
+                    stereo_dmx_coeff: None,
+                    payload: None,
+                },
+                BedRenderInfo {
+                    stereo_dmx_coeff: None,
+                    payload: Some(BedCdmxData::default()),
+                },
+                BedRenderInfo {
+                    stereo_dmx_coeff: Some(crate::dmx_coeff::StereoDmxCoeff {
+                        loro_centre_mixgain: 4,
+                        loro_surround_mixgain: 2,
+                        ltrt_mixgains: Some((1, 6)),
+                        lfe_mixgain: if bed_has_lfe { Some(9) } else { None },
+                        preferred_dmx_method: 1,
+                    }),
+                    payload: Some(BedCdmxData::default()),
+                },
+                BedRenderInfo {
+                    stereo_dmx_coeff: None,
+                    payload: Some(BedCdmxData {
+                        gain_w_to_f: Some(3),
+                        gain_b4_to_b2: None,
+                        tm: Some((Some(ToolThreeWay::Front(1)), Some(ToolTwoWay::Other(2)))),
+                        tb: Some((Some(ToolThreeWay::Side(5)), None)),
+                        tf: Some((None, Some(ToolTwoWay::Front(7)))),
+                        gain_tfb_to_tm: Some(4),
+                    }),
+                },
+            ] {
+                let mut bw = BitWriter::new();
+                write_bed_render_info(&mut bw, &b, bed_has_lfe).unwrap();
+                bw.write_u32(0, 7);
+                let bytes = bw.into_bytes();
+                let mut br = BitReader::new(&bytes);
+                assert_eq!(parse_bed_render_info(&mut br, bed_has_lfe).unwrap(), b);
+            }
         }
     }
 
     #[test]
-    fn bed_render_info_stereo_dmx_coeff_is_bounded_unsupported() {
-        // b_bed_render_info = 1, b_stereo_dmx_coeff = 1.
-        let bytes = [0b1100_0000u8];
+    #[allow(clippy::unusual_byte_groupings)] // groups mirror the field widths
+    fn bed_render_info_stereo_dmx_coeff_parses_custom_dmx_form() {
+        // b_bed_render_info = 1, b_stereo_dmx_coeff = 1, then the
+        // §6.2.9.2 inline block: loro_centre = 0b010, loro_surround =
+        // 0b100, b_ltrt_mixinfo = 0, (no LFE context), preferred = 0b01,
+        // then b_cdmx_data_present = 0.
+        let bytes = [0b11_010_100u8, 0b0_01_0_0000];
         let mut br = BitReader::new(&bytes);
-        assert!(parse_bed_render_info(&mut br).is_err());
+        let b = parse_bed_render_info(&mut br, false).unwrap();
+        let c = b.stereo_dmx_coeff.expect("stereo_dmx_coeff present");
+        assert_eq!(c.loro_centre_mixgain, 2);
+        assert_eq!(c.loro_surround_mixgain, 4);
+        assert!(c.ltrt_mixgains.is_none());
+        assert!(c.lfe_mixgain.is_none());
+        assert_eq!(c.preferred_dmx_method, 1);
+        assert_eq!(b.payload, Some(BedCdmxData::default()));
     }
 
     #[test]
@@ -2599,7 +2659,10 @@ mod tests {
                 b_bed_object_chan_distribute: false,
                 add_data: Some(CommonAddData {
                     trim: Trim { payload: None },
-                    bed_render_info: BedRenderInfo { payload: None },
+                    bed_render_info: BedRenderInfo {
+                        stereo_dmx_coeff: None,
+                        payload: None,
+                    },
                     // 2 bits used → 8-bit envelope leaves 6 filler bits.
                     filler_bits: 6,
                 }),
@@ -2617,6 +2680,7 @@ mod tests {
                         }),
                     },
                     bed_render_info: BedRenderInfo {
+                        stereo_dmx_coeff: None,
                         payload: Some(BedCdmxData {
                             gain_w_to_f: Some(1),
                             ..Default::default()
@@ -2632,11 +2696,43 @@ mod tests {
             },
         ] {
             let mut bw = BitWriter::new();
-            write_oamd_common_data(&mut bw, &c).unwrap();
+            write_oamd_common_data(&mut bw, &c, false).unwrap();
             bw.write_u32(0, 7);
             let bytes = bw.into_bytes();
             let mut br = BitReader::new(&bytes);
-            assert_eq!(parse_oamd_common_data(&mut br).unwrap(), c);
+            assert_eq!(parse_oamd_common_data(&mut br, false).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn oamd_common_data_round_trips_stereo_dmx_coeff_with_lfe() {
+        // trim absent (1 bit) + bed_render_info with stereo_dmx_coeff
+        // under an LFE-carrying bed.
+        let c = OamdCommonData {
+            master_screen_size_ratio_code: None,
+            b_bed_object_chan_distribute: false,
+            add_data: Some(CommonAddData {
+                trim: Trim { payload: None },
+                bed_render_info: BedRenderInfo {
+                    stereo_dmx_coeff: Some(crate::dmx_coeff::StereoDmxCoeff {
+                        loro_centre_mixgain: 4,
+                        loro_surround_mixgain: 4,
+                        ltrt_mixgains: None,
+                        lfe_mixgain: Some(21),
+                        preferred_dmx_method: 2,
+                    }),
+                    payload: Some(BedCdmxData::default()),
+                },
+                // trim 1 + bri (1 + 1 + 15-bit sdc + 1 cdmx=0) = 19
+                // bits → 24-bit envelope leaves 5 filler bits.
+                filler_bits: 5,
+            }),
+        };
+        let mut bw = BitWriter::new();
+        write_oamd_common_data(&mut bw, &c, true).unwrap();
+        bw.write_u32(0, 7);
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(parse_oamd_common_data(&mut br, true).unwrap(), c);
     }
 }

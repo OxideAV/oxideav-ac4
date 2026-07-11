@@ -1328,7 +1328,9 @@ pub fn parse_substream_info_ajoc(
         (n, Some(a))
     };
     let oamd_common_data = if br.read_bit()? {
-        Some(crate::oamd::parse_oamd_common_data(br)?)
+        // The bed context's LFE presence (gating the stereo_dmx_coeff
+        // LFE sub-block) is the substream's b_lfe.
+        Some(crate::oamd::parse_oamd_common_data(br, b_lfe)?)
     } else {
         None
     };
