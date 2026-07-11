@@ -442,6 +442,14 @@ pub fn parse_audio_data_ajoc(
 // Bitstream → object-PCM decode chain (§4.8.3.13 + §5.7)
 // =====================================================================
 
+/// Reconstructed A-JOC PCM: the `num_umx` fullband objects
+/// (`[o][samples]`) plus the decoded LFE PCM when the substream
+/// carries one.
+pub type AjocObjectPcm = (Vec<Vec<f32>>, Option<Vec<f32>>);
+
+/// [`AjocObjectPcm`] plus the parsed `audio_data_ajoc()` body.
+pub type AjocSubstreamDecode = (Vec<Vec<f32>>, Option<Vec<f32>>, AudioDataAjoc);
+
 /// Persistent A-JOC object-substream decoder state: the §5.7.3.2
 /// differential reference, the §5.7.3.4-6 reconstruction state
 /// (interpolators + decorrelator histories), the per-downmix-channel
@@ -505,7 +513,10 @@ impl AjocSubstreamDecoder {
     }
 
     /// Decode one parsed `audio_data_ajoc()` frame to reconstructed
-    /// object PCM (`[o][samples]`, `num_umx` fullband objects).
+    /// object PCM (`[o][samples]`, `num_umx` fullband objects) plus
+    /// the decoded LFE PCM when the substream carries one (the LFE is
+    /// coded directly in the downmix `mono_data(1)` and bypasses the
+    /// A-JOC spatial reconstruction).
     ///
     /// Covers the dynamic SIMPLE downmix form: per-channel IMDCT →
     /// QMF analysis → §5.7.3.6 Table 49 spatial reconstruction →
@@ -516,7 +527,7 @@ impl AjocSubstreamDecoder {
         &mut self,
         ajoc: &AudioDataAjoc,
         frame_len_base: u32,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<AjocObjectPcm> {
         let elem = ajoc.var_element.as_ref().ok_or_else(|| {
             Error::unsupported("ac4: static-downmix A-JOC PCM decode not wired yet")
         })?;
@@ -525,6 +536,22 @@ impl AjocSubstreamDecoder {
             return Err(Error::invalid("ac4: downmix channel count mismatch"));
         }
         let n = frame_len_base as usize;
+        // 0. The LFE channel (when present) is carried directly as a
+        // long-frame ASF mono body: IMDCT it on its dedicated overlap
+        // slot (index num_dmx). An undecodable LFE body degrades to
+        // silence (`None`) like the channel-based paths.
+        let lfe_pcm = match (&elem.lfe, elem.lfe_spectrum()) {
+            (Some(lfe), Some(spec))
+                if lfe
+                    .transform_info
+                    .as_ref()
+                    .is_some_and(|ti| ti.transform_length_0 as usize == n) =>
+            {
+                let slot = self.num_dmx;
+                Some(self.imdct_channel_f32(slot, spec, n))
+            }
+            _ => None,
+        };
         // 1. IMDCT each downmix channel.
         let mut pcm_dmx: Vec<Vec<f32>> = Vec::with_capacity(self.num_dmx);
         for (ch, spec) in spectra.iter().enumerate() {
@@ -587,12 +614,13 @@ impl AjocSubstreamDecoder {
             }
             out.push(pcm);
         }
-        Ok(out)
+        Ok((out, lfe_pcm))
     }
 
     /// Parse + decode one complete part-2 `ac4_substream()` body
     /// (§6.2.2.2: `audio_size` + byte-aligned `audio_data_ajoc()`) to
-    /// object PCM. Returns the PCM grid plus the parsed body.
+    /// object PCM. Returns the PCM grid, the decoded LFE PCM (when
+    /// the substream carries an LFE), and the parsed body.
     pub fn decode_substream_pcm(
         &mut self,
         substream_bytes: &[u8],
@@ -600,7 +628,7 @@ impl AjocSubstreamDecoder {
         b_iframe: bool,
         b_alternative: bool,
         frame_len_base: u32,
-    ) -> Result<(Vec<Vec<f32>>, AudioDataAjoc)> {
+    ) -> Result<AjocSubstreamDecode> {
         let mut br = BitReader::new(substream_bytes);
         // §6.2.2.2: audio_size_value (15) + b_more_bits escape.
         let mut audio_size = br.read_u32(15)?;
@@ -625,8 +653,8 @@ impl AjocSubstreamDecoder {
                 "ac4: audio_data_ajoc overran the announced audio_size",
             ));
         }
-        let pcm = self.decode_frame_pcm(&ajoc, frame_len_base)?;
-        Ok((pcm, ajoc))
+        let (pcm, lfe) = self.decode_frame_pcm(&ajoc, frame_len_base)?;
+        Ok((pcm, lfe, ajoc))
     }
 }
 
@@ -732,6 +760,59 @@ pub fn write_mono_data_simple(
     Ok(())
 }
 
+/// Write a SIMPLE long-frame LFE `mono_data(1)` (Table 21): no
+/// `spec_frontend` bit, `sf_info_lfe()` with the Table 106
+/// `n_msfbl_bits` width for `max_sfb`, then the standard long-frame
+/// ASF body.
+pub fn write_mono_data_lfe_simple(
+    bw: &mut BitWriter,
+    coeffs: &[f32],
+    transform_length: u32,
+    max_sfb_lfe: u32,
+) -> Result<()> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .ok_or_else(|| Error::invalid("ac4: unsupported transform_length"))?;
+    let (_nm, _ns, n_msfbl_bits) = crate::tables::n_msfb_bits_48(transform_length)
+        .ok_or_else(|| Error::invalid("ac4: unsupported transform_length"))?;
+    if n_msfbl_bits == 0 {
+        return Err(Error::invalid(
+            "ac4: transform_length not permitted for LFE",
+        ));
+    }
+    if max_sfb_lfe >= (1 << n_msfbl_bits) {
+        return Err(Error::invalid("ac4: LFE max_sfb out of range"));
+    }
+    // asf_transform_info(): b_long_frame = 1 (forced for LFE).
+    bw.write_bit(true);
+    // sf_info_lfe(): max_sfb (n_msfbl_bits wide).
+    bw.write_u32(max_sfb_lfe, n_msfbl_bits);
+    write_asf_body_from_spectrum(bw, coeffs, sfbo, max_sfb_lfe);
+    Ok(())
+}
+
+/// Write a SIMPLE `var_channel_element()` (§6.2.4.4,
+/// `var_codec_mode = 0`) for `spectra.len()` fullband signals, with an
+/// optional leading LFE `mono_data(1)` — `lfe` is
+/// `(coeffs, max_sfb_lfe)` and must match the descriptor's `b_lfe`.
+pub fn write_var_channel_element_simple_lfe(
+    bw: &mut BitWriter,
+    lfe: Option<(&[f32], u32)>,
+    spectra: &[&[f32]],
+    transform_length: u32,
+    max_sfb: u32,
+) -> Result<()> {
+    let n = spectra.len();
+    if n == 0 {
+        return Err(Error::invalid("ac4: var_channel_element needs signals"));
+    }
+    // var_codec_mode = Simple.
+    bw.write_bit(false);
+    if let Some((coeffs, max_sfb_lfe)) = lfe {
+        write_mono_data_lfe_simple(bw, coeffs, transform_length, max_sfb_lfe)?;
+    }
+    write_var_channel_element_simple_tail(bw, spectra, transform_length, max_sfb)
+}
+
 /// Write a SIMPLE `var_channel_element()` (§6.2.4.4,
 /// `var_codec_mode = 0`, no LFE) for `spectra.len()` fullband signals.
 pub fn write_var_channel_element_simple(
@@ -746,6 +827,16 @@ pub fn write_var_channel_element_simple(
     }
     // var_codec_mode = Simple.
     bw.write_bit(false);
+    write_var_channel_element_simple_tail(bw, spectra, transform_length, max_sfb)
+}
+
+fn write_var_channel_element_simple_tail(
+    bw: &mut BitWriter,
+    spectra: &[&[f32]],
+    transform_length: u32,
+    max_sfb: u32,
+) -> Result<()> {
+    let n = spectra.len();
     let n_pairs = n / 2;
     if n % 2 == 1 {
         if n == 1 {
@@ -818,14 +909,15 @@ pub fn inactive_dyndata(n_objs: usize, n_blocks: usize) -> OamdDynDataSingle {
 /// downmix, minimal OAMD (one inactive info block per object), no DE
 /// coefficients, and the given `ajoc()` element payload.
 ///
-/// `dmx_spectra` carries the fullband downmix MDCT spectra
-/// (`params.b_lfe` must be false — the SIMPLE writer does not emit an
-/// LFE `mono_data(1)`).
+/// `dmx_spectra` carries the fullband downmix MDCT spectra. When
+/// `params.b_lfe` is set, `lfe` supplies the LFE `mono_data(1)` MDCT
+/// spectrum plus its `max_sfb` (Table 106 `n_msfbl_bits` domain).
 #[allow(clippy::too_many_arguments)]
 pub fn write_audio_data_ajoc_simple(
     bw: &mut BitWriter,
     params: &AjocBodyParams,
     dmx_spectra: &[&[f32]],
+    lfe: Option<(&[f32], u32)>,
     transform_length: u32,
     max_sfb: u32,
     num_decorr: u32,
@@ -834,9 +926,14 @@ pub fn write_audio_data_ajoc_simple(
     b_iframe: bool,
     enc_state: &mut AjocDiffState,
 ) -> Result<()> {
-    if params.b_static_dmx || params.b_lfe {
+    if params.b_static_dmx {
         return Err(Error::invalid(
-            "ac4: SIMPLE audio_data_ajoc writer covers the dynamic non-LFE form",
+            "ac4: SIMPLE audio_data_ajoc writer covers the dynamic form",
+        ));
+    }
+    if params.b_lfe != lfe.is_some() {
+        return Err(Error::invalid(
+            "ac4: LFE spectrum presence must match the descriptor's b_lfe",
         ));
     }
     if dmx_spectra.len() != params.n_fullband_dmx_signals as usize {
@@ -844,13 +941,13 @@ pub fn write_audio_data_ajoc_simple(
     }
     // b_some_signals_inactive = 0.
     bw.write_bit(false);
-    write_var_channel_element_simple(bw, dmx_spectra, transform_length, max_sfb)?;
+    write_var_channel_element_simple_lfe(bw, lfe, dmx_spectra, transform_length, max_sfb)?;
     // b_dmx_timing = 1 + minimal timing (1 block).
     bw.write_bit(true);
     let timing = minimal_oamd_timing();
     write_oamd_timing_data(bw, &timing)?;
-    let n_dmx = params.n_fullband_dmx_signals as usize;
-    let is_lfe_dmx = vec![false; n_dmx];
+    let n_dmx = params.n_fullband_dmx_signals as usize + usize::from(params.b_lfe);
+    let is_lfe_dmx = params.is_lfe(n_dmx);
     write_oamd_dyndata_single(
         bw,
         &inactive_dyndata(n_dmx, 1),
@@ -868,8 +965,8 @@ pub fn write_audio_data_ajoc_simple(
     // b_umx_timing = 0, b_derive_timing_from_dmx = 1.
     bw.write_bit(false);
     bw.write_bit(true);
-    let n_umx = params.n_fullband_upmix_signals as usize;
-    let is_lfe_umx = vec![false; n_umx];
+    let n_umx = params.n_fullband_upmix_signals as usize + usize::from(params.b_lfe);
+    let is_lfe_umx = params.is_lfe(n_umx);
     write_oamd_dyndata_single(
         bw,
         &inactive_dyndata(n_umx, 1),
@@ -888,6 +985,7 @@ pub fn write_audio_data_ajoc_simple(
 pub fn write_ajoc_substream_simple(
     params: &AjocBodyParams,
     dmx_spectra: &[&[f32]],
+    lfe: Option<(&[f32], u32)>,
     transform_length: u32,
     max_sfb: u32,
     num_decorr: u32,
@@ -901,6 +999,7 @@ pub fn write_ajoc_substream_simple(
         &mut body,
         params,
         dmx_spectra,
+        lfe,
         transform_length,
         max_sfb,
         num_decorr,
@@ -937,6 +1036,7 @@ pub fn encode_ajoc_raw_frame(
     sequence_counter: u32,
     params: &AjocBodyParams,
     dmx_spectra: &[&[f32]],
+    lfe: Option<(&[f32], u32)>,
     max_sfb: u32,
     num_decorr: u32,
     ctrl: &crate::ajoc::AjocCtrlInfo,
@@ -944,9 +1044,14 @@ pub fn encode_ajoc_raw_frame(
     b_iframe: bool,
     enc_state: &mut AjocDiffState,
 ) -> Result<Vec<u8>> {
-    if params.b_lfe || params.b_static_dmx {
+    if params.b_static_dmx {
         return Err(Error::invalid(
-            "ac4: frame writer covers the dynamic non-LFE A-JOC form",
+            "ac4: frame writer covers the dynamic A-JOC form",
+        ));
+    }
+    if params.b_lfe != lfe.is_some() {
+        return Err(Error::invalid(
+            "ac4: LFE spectrum presence must match the descriptor's b_lfe",
         ));
     }
     if params.n_fullband_upmix_signals >= 16 || params.n_fullband_dmx_signals > 16 {
@@ -992,7 +1097,7 @@ pub fn encode_ajoc_raw_frame(
     bw.write_bit(false); // b_oamd_substream
     bw.write_bit(true); // b_ajoc
                         // ac4_substream_info_ajoc() (§6.2.1.9):
-    bw.write_bit(false); // b_lfe
+    bw.write_bit(params.b_lfe); // b_lfe
     bw.write_bit(false); // b_static_dmx
     bw.write_u32(params.n_fullband_dmx_signals - 1, 4);
     bw.write_bit(true); // dmx bed_dyn_obj_assignment: b_dyn_objects_only
@@ -1012,6 +1117,7 @@ pub fn encode_ajoc_raw_frame(
     let substream = write_ajoc_substream_simple(
         params,
         dmx_spectra,
+        lfe,
         1920,
         max_sfb,
         num_decorr,
@@ -1172,6 +1278,7 @@ mod tests {
             &mut bw,
             &params,
             &spectra,
+            None,
             TL,
             MAX_SFB,
             num_decorr as u32,
@@ -1292,6 +1399,7 @@ mod tests {
             let bytes = write_ajoc_substream_simple(
                 &params,
                 &spectra,
+                None,
                 TL,
                 MAX_SFB,
                 num_decorr as u32,
@@ -1301,7 +1409,7 @@ mod tests {
                 &mut enc_state,
             )
             .unwrap();
-            let (objects, parsed) = dec
+            let (objects, _lfe, parsed) = dec
                 .decode_substream_pcm(&bytes, &params, true, false, TL)
                 .unwrap();
             assert_eq!(objects.len(), num_umx);

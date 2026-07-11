@@ -1733,8 +1733,7 @@ impl Ac4Decoder {
     /// object substream (TS 103 190-2 §6.2.3.4): run the
     /// [`crate::ajoc_substream::AjocSubstreamDecoder`] chain and emit
     /// the reconstructed objects as interleaved S16 output channels
-    /// (LFE slot first when signalled, silent until the LFE path is
-    /// wired).
+    /// (decoded LFE slot first when signalled).
     fn receive_frame_ajoc(
         &mut self,
         raw: &[u8],
@@ -1768,7 +1767,7 @@ impl Ac4Decoder {
             ));
         }
         let dec = &mut self.ajoc_dec.as_mut().expect("ajoc decoder ensured").2;
-        let (objects, _body) = dec.decode_substream_pcm(
+        let (objects, lfe, _body) = dec.decode_substream_pcm(
             substream,
             &params,
             desc.b_iframe(),
@@ -1776,13 +1775,12 @@ impl Ac4Decoder {
             info.frame_length,
         )?;
         let samples = info.frame_length;
-        // Output layout mirrors the upmix signal set: optional LFE slot
-        // first (silent — SIMPLE chain), then the fullband objects.
+        // Output layout mirrors the upmix signal set: decoded LFE slot
+        // first when signalled, then the fullband objects.
         let channels_out = desc.n_umx_signals() as usize;
         let lfe_slots = usize::from(desc.b_lfe);
         let mut buf = vec![0u8; samples as usize * channels_out * 2];
-        for (o, pcm) in objects.iter().enumerate() {
-            let c = o + lfe_slots;
+        let write_channel = |buf: &mut [u8], c: usize, pcm: &[f32]| {
             for (i, &v) in pcm.iter().take(samples as usize).enumerate() {
                 let s = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
                 let le = s.to_le_bytes();
@@ -1790,6 +1788,12 @@ impl Ac4Decoder {
                 buf[off] = le[0];
                 buf[off + 1] = le[1];
             }
+        };
+        if let (true, Some(lfe_pcm)) = (desc.b_lfe, lfe.as_ref()) {
+            write_channel(&mut buf, 0, lfe_pcm);
+        }
+        for (o, pcm) in objects.iter().enumerate() {
+            write_channel(&mut buf, o + lfe_slots, pcm);
         }
         self.last_info = Some(info);
         Ok(Frame::Audio(AudioFrame {
@@ -6073,6 +6077,7 @@ mod tests {
                 seq,
                 &params,
                 &spectra,
+                None,
                 20,
                 num_decorr as u32,
                 &ctrl,
@@ -6111,5 +6116,120 @@ mod tests {
             (0.9..=1.1).contains(&ratio),
             "objects 0/2 share a source; energy ratio {ratio}"
         );
+    }
+
+    /// A-JOC frame with `b_lfe = 1`: the LFE `mono_data(1)` body is
+    /// decoded to PCM and emitted on the leading LFE output slot (it
+    /// bypasses the spatial reconstruction), while the reconstructed
+    /// objects still land on the trailing slots.
+    #[test]
+    fn decoder_ajoc_lfe_slot_carries_decoded_pcm() {
+        use crate::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
+        use crate::ajoc_substream::{encode_ajoc_raw_frame, AjocBodyParams};
+        use crate::encoder_ajoc::AjocQuantMatrices;
+        use crate::oamd::ObjType;
+
+        let num_dmx = 2usize;
+        let num_umx = 2usize;
+        let num_decorr = 1usize;
+        // LFE-first object typing (LFE occupies slot 0 of both sets).
+        let params = AjocBodyParams {
+            b_lfe: true,
+            b_static_dmx: false,
+            n_fullband_dmx_signals: num_dmx as u32,
+            n_fullband_upmix_signals: num_umx as u32,
+            obj_type_dmx: vec![ObjType::Dyn; num_dmx + 1],
+            obj_type_umx: vec![ObjType::Dyn; num_umx + 1],
+        };
+        let ctrl = AjocCtrlInfo {
+            decorr_enable: vec![true; num_decorr],
+            object_present: vec![true; num_umx],
+            data_point_info: AjocDataPointInfo {
+                num_dpoints: 1,
+                start_pos: vec![0],
+                ramp_len: vec![16],
+            },
+            num_bands_code: vec![7; num_umx],
+            num_bands: vec![1; num_umx],
+            quant_select: vec![AjocQuantMode::Fine; num_umx],
+            sparse_select: vec![false; num_umx],
+            mix_mtx_dry_present: vec![vec![true; num_dmx]; num_umx],
+            mix_mtx_wet_present: vec![vec![true; num_decorr]; num_umx],
+        };
+        let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|o| {
+                vec![(0..num_dmx)
+                    .map(|ch| vec![if ch == o { 1.0 } else { 0.0 }])
+                    .collect()]
+            })
+            .collect();
+        let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|_| vec![vec![vec![0.0]; num_decorr]])
+            .collect();
+        let qmats = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
+
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let end = sfbo[20] as usize;
+        let mk = |bin: usize| {
+            let mut v = vec![0.0f32; end];
+            v[bin] = 40.0;
+            v
+        };
+        let s0 = mk(24);
+        let s1 = mk(60);
+        let spectra: Vec<&[f32]> = vec![&s0, &s1];
+        // LFE spectrum: energy in the lowest bins (max_sfb_lfe = 4).
+        let lfe_end = sfbo[4] as usize;
+        let mut lfe_spec = vec![0.0f32; lfe_end];
+        lfe_spec[1] = 60.0;
+        lfe_spec[3] = 30.0;
+
+        let mut enc_state = crate::ajoc_data::new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let dec_params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&dec_params);
+        let channels_out = num_umx + 1;
+        let mut last_energy = vec![0.0f64; channels_out];
+        for seq in 0..3u32 {
+            let frame = encode_ajoc_raw_frame(
+                seq,
+                &params,
+                &spectra,
+                Some((&lfe_spec, 4)),
+                20,
+                num_decorr as u32,
+                &ctrl,
+                &qmats,
+                true,
+                &mut enc_state,
+            )
+            .unwrap();
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                panic!("expected an audio frame");
+            };
+            assert_eq!(af.samples, 1920);
+            let buf = &af.data[0];
+            assert_eq!(buf.len(), 1920 * channels_out * 2);
+            for (c, slot) in last_energy.iter_mut().enumerate() {
+                let mut e = 0.0f64;
+                for i in 0..1920usize {
+                    let off = (i * channels_out + c) * 2;
+                    let s = i16::from_le_bytes([buf[off], buf[off + 1]]) as f64;
+                    e += s * s;
+                }
+                *slot = e;
+            }
+        }
+        // Slot 0 is the decoded LFE, no longer silent.
+        assert!(
+            last_energy[0] > 1e4,
+            "LFE slot is silent: energy {}",
+            last_energy[0]
+        );
+        // The reconstructed objects still carry their signal.
+        for (o, &e) in last_energy.iter().enumerate().skip(1) {
+            assert!(e > 1e4, "object slot {o} is silent: energy {e}");
+        }
     }
 }
