@@ -5,8 +5,8 @@
 //! `max_sfb_master`, and the section-length-increment width.
 //!
 //! The tables are verbatim transcriptions of the spec — no processing,
-//! no FFmpeg / reference-code influence. The comments cite the table
-//! numbers so an auditor can cross-check.
+//! no influence from anything outside the staged ETSI documents. The
+//! comments cite the table numbers so an auditor can cross-check.
 
 /// `num_sfb` for 44.1 kHz or 48 kHz sampling frequency (Table B.1).
 ///
