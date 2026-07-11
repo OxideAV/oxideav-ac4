@@ -173,11 +173,18 @@ impl Ac4Decoder {
         }
     }
 
-    fn extract_raw_frame<'a>(&self, pkt: &'a Packet) -> (&'a [u8], bool) {
+    fn extract_raw_frame<'a>(&self, pkt: &'a Packet) -> Result<(&'a [u8], bool)> {
         if let Some(f) = sync::find_sync_frame(&pkt.data) {
-            (f.payload, true)
+            // Annex G.4.2: verify the 0xAC41 crc_word over frame_size +
+            // raw_ac4_frame; a mismatch means the frame is corrupt.
+            if f.crc_valid == Some(false) {
+                return Err(Error::invalid(
+                    "ac4 decoder: sync-frame CRC mismatch (0xAC41)",
+                ));
+            }
+            Ok((f.payload, true))
         } else {
-            (pkt.data.as_slice(), false)
+            Ok((pkt.data.as_slice(), false))
         }
     }
 
@@ -1836,7 +1843,7 @@ impl Decoder for Ac4Decoder {
                 data: vec![Vec::new()],
             }));
         }
-        let (raw, _had_sync) = self.extract_raw_frame(&pkt);
+        let (raw, _had_sync) = self.extract_raw_frame(&pkt)?;
         let info = toc::parse_ac4_toc(raw)
             .map_err(|e| Error::invalid(format!("ac4 decoder: TOC parse failed: {e}")))?;
         // A-JOC object substream (TS 103 190-2 §6.2.3.4): route to the
@@ -3876,6 +3883,28 @@ mod tests {
             panic!("expected audio");
         };
         assert_eq!(af.samples, 1_920);
+    }
+
+    #[test]
+    fn decoder_verifies_ac41_crc() {
+        let raw = build_minimal_toc();
+        // Valid 0xAC41 framing decodes.
+        let wrapped = crate::sync::wrap_sync_frame(&raw, true);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), wrapped.clone());
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio");
+        };
+        assert_eq!(af.samples, 1_920);
+        // Corrupting a payload byte trips the Annex G.4.2 check.
+        let mut bad = wrapped;
+        bad[6] ^= 0x40;
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bad);
+        dec.send_packet(&pkt).unwrap();
+        let err = dec.receive_frame().unwrap_err();
+        assert!(format!("{err}").contains("CRC"), "unexpected error: {err}");
     }
 
     /// Round-31: end-to-end SSF synthesis test. Builds a synthetic

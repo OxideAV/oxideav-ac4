@@ -28,6 +28,13 @@ pub struct SyncFrame<'a> {
     pub payload: &'a [u8],
     /// True when the sync word was `0xAC41` (CRC-protected).
     pub crc_protected: bool,
+    /// The transmitted `crc_word` (0xAC41 frames only).
+    pub crc_word: Option<u16>,
+    /// CRC verification per Annex G.4.2 — the protected payload is
+    /// `frame_size` + `raw_ac4_frame` (the sync word is excluded);
+    /// processing it followed by `crc_word` through the register must
+    /// yield 0x0000. `None` for unprotected (0xAC40) frames.
+    pub crc_valid: Option<bool>,
     /// Offset of the sync word within the input slice.
     pub sync_offset: usize,
     /// Total bytes consumed starting at `sync_offset`.
@@ -81,12 +88,53 @@ fn try_parse_frame_at(data: &[u8], offset: usize) -> Result<SyncFrame<'_>> {
     if payload_end + crc_len > data.len() {
         return Err(Error::invalid("ac4: payload extends past buffer"));
     }
+    let (crc_word, crc_valid) = if crc_protected {
+        let word = u16::from_be_bytes([data[payload_end], data[payload_end + 1]]);
+        // Annex G.4.2: the protected payload is the frame_size element
+        // + raw_ac4_frame; feeding it followed by crc_word through the
+        // register yields 0x0000 ⇔ crc16(protected) == crc_word.
+        let computed = crc16(&data[offset + 2..payload_end]);
+        (Some(word), Some(computed == word))
+    } else {
+        (None, None)
+    };
     Ok(SyncFrame {
         payload: &data[payload_start..payload_end],
         crc_protected,
+        crc_word,
+        crc_valid,
         sync_offset: offset,
         total_len: payload_end + crc_len - offset,
     })
+}
+
+/// Wrap a `raw_ac4_frame()` payload in Annex G sync framing. When
+/// `with_crc` the 0xAC41 form is used and the Annex G.4.2 `crc_word`
+/// (over `frame_size` + payload) is appended.
+pub fn wrap_sync_frame(payload: &[u8], with_crc: bool) -> Vec<u8> {
+    let sync = if with_crc {
+        SYNC_WORD_CRC
+    } else {
+        SYNC_WORD_PLAIN
+    };
+    let mut out = Vec::with_capacity(payload.len() + 9);
+    out.extend_from_slice(&sync.to_be_bytes());
+    let protected_start = out.len();
+    if payload.len() >= 0xFFFF {
+        out.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        let fs = payload.len() as u32;
+        out.push(((fs >> 16) & 0xFF) as u8);
+        out.push(((fs >> 8) & 0xFF) as u8);
+        out.push((fs & 0xFF) as u8);
+    } else {
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+    if with_crc {
+        let word = crc16(&out[protected_start..]);
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    out
 }
 
 /// Compute the AC-4 frame CRC-16 (generator x^16 + x^15 + x^2 + 1,
@@ -140,5 +188,42 @@ mod tests {
     fn crc16_zero_empty() {
         // Empty input with zero initial register → 0.
         assert_eq!(crc16(&[]), 0x0000);
+    }
+
+    #[test]
+    fn crc_frame_verifies_and_flags_corruption() {
+        let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let wrapped = wrap_sync_frame(&payload, true);
+        let f = find_sync_frame(&wrapped).expect("should sync");
+        assert!(f.crc_protected);
+        assert_eq!(f.payload, &payload);
+        assert_eq!(f.crc_valid, Some(true));
+        // G.4.2 self-check: protected payload followed by crc_word
+        // yields 0x0000.
+        let end = wrapped.len();
+        assert_eq!(crc16(&wrapped[2..end]), 0x0000);
+        // Corrupt one payload byte: the same crc_word no longer
+        // matches.
+        let mut bad = wrapped.clone();
+        bad[5] ^= 0x01;
+        let f = find_sync_frame(&bad).expect("framing still parses");
+        assert_eq!(f.crc_valid, Some(false));
+        // Corrupt the crc_word itself.
+        let mut bad = wrapped;
+        let last = bad.len() - 1;
+        bad[last] ^= 0x80;
+        let f = find_sync_frame(&bad).expect("framing still parses");
+        assert_eq!(f.crc_valid, Some(false));
+    }
+
+    #[test]
+    fn plain_frame_has_no_crc_fields() {
+        let payload = [0xAAu8, 0xBB];
+        let wrapped = wrap_sync_frame(&payload, false);
+        let f = find_sync_frame(&wrapped).expect("should sync");
+        assert!(!f.crc_protected);
+        assert_eq!(f.crc_word, None);
+        assert_eq!(f.crc_valid, None);
+        assert_eq!(f.payload, &payload);
     }
 }
