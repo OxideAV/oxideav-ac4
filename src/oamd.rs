@@ -1601,7 +1601,7 @@ pub enum ToolTwoWay {
     Other(u8),
 }
 
-fn parse_tool_three_way(br: &mut BitReader<'_>) -> Result<ToolThreeWay> {
+pub(crate) fn parse_tool_three_way(br: &mut BitReader<'_>) -> Result<ToolThreeWay> {
     if br.read_bit()? {
         Ok(ToolThreeWay::Front(br.read_u32(3)? as u8))
     } else if br.read_bit()? {
@@ -1611,7 +1611,7 @@ fn parse_tool_three_way(br: &mut BitReader<'_>) -> Result<ToolThreeWay> {
     }
 }
 
-fn write_tool_three_way(bw: &mut BitWriter, t: ToolThreeWay) {
+pub(crate) fn write_tool_three_way(bw: &mut BitWriter, t: ToolThreeWay) {
     match t {
         ToolThreeWay::Front(g) => {
             bw.write_bit(true);
@@ -1630,7 +1630,7 @@ fn write_tool_three_way(bw: &mut BitWriter, t: ToolThreeWay) {
     }
 }
 
-fn parse_tool_two_way(br: &mut BitReader<'_>) -> Result<ToolTwoWay> {
+pub(crate) fn parse_tool_two_way(br: &mut BitReader<'_>) -> Result<ToolTwoWay> {
     if br.read_bit()? {
         Ok(ToolTwoWay::Front(br.read_u32(3)? as u8))
     } else {
@@ -1638,7 +1638,7 @@ fn parse_tool_two_way(br: &mut BitReader<'_>) -> Result<ToolTwoWay> {
     }
 }
 
-fn write_tool_two_way(bw: &mut BitWriter, t: ToolTwoWay) {
+pub(crate) fn write_tool_two_way(bw: &mut BitWriter, t: ToolTwoWay) {
     match t {
         ToolTwoWay::Front(g) => {
             bw.write_bit(true);
