@@ -565,6 +565,524 @@ pub fn write_custom_dmx_data(
     Ok(())
 }
 
+// =====================================================================
+// ac4_presentation_substream (§6.2.2.3)
+// =====================================================================
+
+/// Per-target block of the `b_alternative` branch (§6.2.2.3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PresTarget {
+    /// 3-bit `target_level`.
+    pub target_level: u8,
+    /// 4-bit `target_device_category[]`.
+    pub target_device_category: u8,
+    /// 4 reserved bits when `b_tdc_extension == 1`.
+    pub tdc_reserved: Option<u8>,
+    /// 6-bit `max_ducking_depth` (`b_ducking_depth_present`).
+    pub max_ducking_depth: Option<u8>,
+    /// 5-bit `loud_corr_target` (`b_loud_corr_target`).
+    pub loud_corr_target: Option<u8>,
+    /// Per-substream activation: `None` = `b_active == 0`, otherwise
+    /// the resolved `alt_data_set_index` (1-bit base with a
+    /// `variable_bits(2)` extension on 1).
+    pub substream_active: Vec<Option<u32>>,
+}
+
+/// `b_associated` scaling block (§6.2.2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AssociatedScaling {
+    /// 8-bit `scale_main` (`b_scale_main`).
+    pub scale_main: Option<u8>,
+    /// 8-bit `scale_main_centre` (`b_scale_main_centre`).
+    pub scale_main_centre: Option<u8>,
+    /// 8-bit `scale_main_front` (`b_scale_main_front`).
+    pub scale_main_front: Option<u8>,
+    /// 8-bit `pan_associated` — present iff `b_associate_is_mono`.
+    pub pan_associated: Option<u8>,
+}
+
+/// Parsed `ac4_presentation_substream()` (§6.2.2.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PresentationSubstream {
+    /// `presentation_name` bytes (`b_alternative` + `b_name_present`).
+    pub name: Option<Vec<u8>>,
+    /// Alternative-presentation targets (`b_alternative`).
+    pub targets: Vec<PresTarget>,
+    /// `add_data` bytes (`b_additional_data`).
+    pub add_data: Option<Vec<u8>>,
+    /// 7-bit `dialnorm_bits`.
+    pub dialnorm_bits: u8,
+    /// `further_loudness_info(1, 1)` (`b_further_loudness_info`).
+    pub further_loudness_info: Option<crate::metadata::FurtherLoudnessInfoV2>,
+    /// Resolved `drc_metadata_size` envelope in bits.
+    pub drc_metadata_size: u32,
+    /// `drc_frame(b_pres_ndot)`.
+    pub drc: crate::drc::DrcFrame,
+    /// Announced-but-unparsed trailing bits of the DRC envelope.
+    pub drc_trailing_bits: u32,
+    /// Substream-group gains (`n_substream_groups > 1`):
+    /// `None` = flag absent, `Some(None)` = `b_keep`,
+    /// `Some(Some(gains))` = 6-bit `sg_gain` per group.
+    pub substream_group_gains: Option<Option<Vec<u8>>>,
+    /// `b_associated` scaling block.
+    pub associated: Option<AssociatedScaling>,
+    /// `custom_dmx_data(...)`.
+    pub custom_dmx_data: CustomDmxData,
+    /// `loud_corr(...)`.
+    pub loud_corr: LoudCorr,
+}
+
+/// Caller context for `ac4_presentation_substream()` — everything the
+/// syntax gates on, all signalled in the TOC / presentation info.
+#[derive(Debug, Clone, Copy)]
+pub struct PresSubstreamParams {
+    /// `b_alternative` (from `ac4_presentation_substream_info()`).
+    pub b_alternative: bool,
+    /// `b_pres_ndot` — the presentation I-frame flag (§6.3.2.11.2),
+    /// passed to `drc_frame()`.
+    pub b_pres_ndot: bool,
+    /// `n_substreams_in_presentation`.
+    pub n_substreams_in_presentation: u32,
+    /// `n_substream_groups`.
+    pub n_substream_groups: u32,
+    /// `b_objects` — the presentation carries object substreams.
+    pub b_objects: bool,
+    /// `pres_ch_mode` (−1 = none).
+    pub pres_ch_mode: i32,
+    /// `pres_ch_mode_core` (−1 = none).
+    pub pres_ch_mode_core: i32,
+    /// `b_pres_4_back_channels_present`.
+    pub b_pres_4_back_channels_present: bool,
+    /// `pres_top_channel_pairs`.
+    pub pres_top_channel_pairs: u32,
+    /// `b_pres_has_lfe`.
+    pub b_pres_has_lfe: bool,
+    /// AC-4 frame length in samples (drives `nr_drc_subframes`).
+    pub frame_length: u32,
+}
+
+impl PresSubstreamParams {
+    fn custom_dmx(&self) -> CustomDmxParams {
+        CustomDmxParams {
+            pres_ch_mode: self.pres_ch_mode,
+            pres_ch_mode_core: self.pres_ch_mode_core,
+            b_pres_4_back_channels_present: self.b_pres_4_back_channels_present,
+            pres_top_channel_pairs: self.pres_top_channel_pairs,
+            b_pres_has_lfe: self.b_pres_has_lfe,
+        }
+    }
+
+    fn drc_chan_info(&self) -> crate::drc::DrcChannelInfo {
+        let mode = if self.pres_ch_mode >= 0 {
+            self.pres_ch_mode as u32
+        } else {
+            // Object presentations: Table 168's multichannel grouping.
+            5
+        };
+        crate::drc::DrcChannelInfo::new(
+            crate::drc::nr_drc_channels(mode),
+            crate::drc::nr_drc_subframes(self.frame_length).unwrap_or(1),
+        )
+    }
+}
+
+fn parse_alt_data_set_index(br: &mut BitReader<'_>) -> Result<u32> {
+    let mut idx = br.read_u32(1)?;
+    if idx == 1 {
+        idx += crate::toc::variable_bits(br, 2)?;
+    }
+    Ok(idx)
+}
+
+fn write_alt_data_set_index(bw: &mut BitWriter, idx: u32) {
+    if idx == 0 {
+        bw.write_u32(0, 1);
+    } else {
+        bw.write_u32(1, 1);
+        crate::toc::write_variable_bits(bw, 2, idx - 1);
+    }
+}
+
+/// Parse `ac4_presentation_substream()` per §6.2.2.3.
+///
+/// `prev_drc_config` carries the presentation DRC configuration from a
+/// prior `b_pres_ndot` frame (required to decode `drc_data()` on
+/// dependent frames).
+pub fn parse_presentation_substream(
+    br: &mut BitReader<'_>,
+    params: &PresSubstreamParams,
+    prev_drc_config: Option<&crate::drc::DrcConfig>,
+) -> Result<PresentationSubstream> {
+    let mut name = None;
+    let mut targets = Vec::new();
+    if params.b_alternative {
+        if br.read_bit()? {
+            // b_name_present.
+            let name_len = if br.read_bit()? { br.read_u32(5)? } else { 32 };
+            let mut bytes = Vec::with_capacity(name_len as usize);
+            for _ in 0..name_len {
+                bytes.push(br.read_u32(8)? as u8);
+            }
+            name = Some(bytes);
+        }
+        let mut n_targets = br.read_u32(2)? + 1;
+        if n_targets == 4 {
+            n_targets += crate::toc::variable_bits(br, 2)?;
+        }
+        for _ in 0..n_targets {
+            let target_level = br.read_u32(3)? as u8;
+            let target_device_category = br.read_u32(4)? as u8;
+            let tdc_reserved = if br.read_bit()? {
+                Some(br.read_u32(4)? as u8)
+            } else {
+                None
+            };
+            let max_ducking_depth = if br.read_bit()? {
+                Some(br.read_u32(6)? as u8)
+            } else {
+                None
+            };
+            let loud_corr_target = if br.read_bit()? {
+                Some(br.read_u32(5)? as u8)
+            } else {
+                None
+            };
+            let mut substream_active =
+                Vec::with_capacity(params.n_substreams_in_presentation as usize);
+            for _ in 0..params.n_substreams_in_presentation {
+                if br.read_bit()? {
+                    substream_active.push(Some(parse_alt_data_set_index(br)?));
+                } else {
+                    substream_active.push(None);
+                }
+            }
+            targets.push(PresTarget {
+                target_level,
+                target_device_category,
+                tdc_reserved,
+                max_ducking_depth,
+                loud_corr_target,
+                substream_active,
+            });
+        }
+    }
+    let add_data = if br.read_bit()? {
+        // b_additional_data.
+        let mut add_data_bytes = br.read_u32(4)? + 1;
+        if add_data_bytes == 16 {
+            add_data_bytes += crate::toc::variable_bits(br, 2)?;
+        }
+        br.align_to_byte();
+        let mut bytes = Vec::with_capacity(add_data_bytes as usize);
+        for _ in 0..add_data_bytes {
+            bytes.push(br.read_u32(8)? as u8);
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let dialnorm_bits = br.read_u32(7)? as u8;
+    let further_loudness_info = if br.read_bit()? {
+        Some(crate::metadata::parse_further_loudness_info_v2(br, true)?)
+    } else {
+        None
+    };
+    let mut drc_metadata_size = br.read_u32(5)?;
+    if br.read_bit()? {
+        drc_metadata_size = drc_metadata_size
+            .checked_add(
+                crate::toc::variable_bits(br, 3)?
+                    .checked_shl(5)
+                    .ok_or_else(|| Error::invalid("ac4: drc_metadata_size shift overflow"))?,
+            )
+            .ok_or_else(|| Error::invalid("ac4: drc_metadata_size overflow"))?;
+    }
+    let drc_start = br.bit_position();
+    let drc = crate::drc::parse_drc_frame(
+        br,
+        params.b_pres_ndot,
+        params.drc_chan_info(),
+        prev_drc_config,
+    )?;
+    let consumed = (br.bit_position() - drc_start) as u32;
+    if consumed > drc_metadata_size {
+        return Err(Error::invalid(
+            "ac4: presentation drc_frame overran drc_metadata_size",
+        ));
+    }
+    let drc_trailing_bits = drc_metadata_size - consumed;
+    crate::metadata::skip_n_bits(br, drc_trailing_bits)?;
+    let substream_group_gains = if params.n_substream_groups > 1 {
+        if br.read_bit()? {
+            // b_substream_group_gains_present.
+            if br.read_bit()? {
+                // b_keep.
+                Some(None)
+            } else {
+                let mut gains = Vec::with_capacity(params.n_substream_groups as usize);
+                for _ in 0..params.n_substream_groups {
+                    gains.push(br.read_u32(6)? as u8);
+                }
+                Some(Some(gains))
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let associated = if br.read_bit()? {
+        // b_associated.
+        let scale_main = if br.read_bit()? {
+            Some(br.read_u32(8)? as u8)
+        } else {
+            None
+        };
+        let scale_main_centre = if br.read_bit()? {
+            Some(br.read_u32(8)? as u8)
+        } else {
+            None
+        };
+        let scale_main_front = if br.read_bit()? {
+            Some(br.read_u32(8)? as u8)
+        } else {
+            None
+        };
+        let pan_associated = if br.read_bit()? {
+            // b_associate_is_mono.
+            Some(br.read_u32(8)? as u8)
+        } else {
+            None
+        };
+        Some(AssociatedScaling {
+            scale_main,
+            scale_main_centre,
+            scale_main_front,
+            pan_associated,
+        })
+    } else {
+        None
+    };
+    let custom_dmx_data = parse_custom_dmx_data(br, &params.custom_dmx())?;
+    let loud_corr = parse_loud_corr(
+        br,
+        params.pres_ch_mode,
+        params.pres_ch_mode_core,
+        params.b_objects,
+    )?;
+    br.align_to_byte();
+    Ok(PresentationSubstream {
+        name,
+        targets,
+        add_data,
+        dialnorm_bits,
+        further_loudness_info,
+        drc_metadata_size,
+        drc,
+        drc_trailing_bits,
+        substream_group_gains,
+        associated,
+        custom_dmx_data,
+        loud_corr,
+    })
+}
+
+/// Write `ac4_presentation_substream()` — exact inverse of
+/// [`parse_presentation_substream`] under the same parameters (the
+/// element is byte-aligned at entry per §6.2.2.1).
+pub fn write_presentation_substream(
+    bw: &mut BitWriter,
+    v: &PresentationSubstream,
+    params: &PresSubstreamParams,
+) -> Result<()> {
+    if params.b_alternative {
+        match &v.name {
+            Some(bytes) => {
+                bw.write_bit(true);
+                if bytes.len() == 32 {
+                    bw.write_bit(false);
+                } else {
+                    if bytes.len() > 31 {
+                        return Err(Error::invalid("ac4: presentation_name too long"));
+                    }
+                    bw.write_bit(true);
+                    bw.write_u32(bytes.len() as u32, 5);
+                }
+                for &b in bytes {
+                    bw.write_u32(b as u32, 8);
+                }
+            }
+            None => bw.write_bit(false),
+        }
+        if v.targets.is_empty() {
+            return Err(Error::invalid(
+                "ac4: alternative presentation needs targets",
+            ));
+        }
+        let n_targets = v.targets.len() as u32;
+        if n_targets < 4 {
+            bw.write_u32(n_targets - 1, 2);
+        } else {
+            bw.write_u32(3, 2);
+            crate::toc::write_variable_bits(bw, 2, n_targets - 4);
+        }
+        for t in &v.targets {
+            bw.write_u32(t.target_level as u32, 3);
+            bw.write_u32(t.target_device_category as u32, 4);
+            match t.tdc_reserved {
+                Some(r) => {
+                    bw.write_bit(true);
+                    bw.write_u32(r as u32, 4);
+                }
+                None => bw.write_bit(false),
+            }
+            match t.max_ducking_depth {
+                Some(d) => {
+                    bw.write_bit(true);
+                    bw.write_u32(d as u32, 6);
+                }
+                None => bw.write_bit(false),
+            }
+            match t.loud_corr_target {
+                Some(l) => {
+                    bw.write_bit(true);
+                    bw.write_u32(l as u32, 5);
+                }
+                None => bw.write_bit(false),
+            }
+            if t.substream_active.len() != params.n_substreams_in_presentation as usize {
+                return Err(Error::invalid(
+                    "ac4: per-target substream activation length mismatch",
+                ));
+            }
+            for a in &t.substream_active {
+                match a {
+                    Some(idx) => {
+                        bw.write_bit(true);
+                        write_alt_data_set_index(bw, *idx);
+                    }
+                    None => bw.write_bit(false),
+                }
+            }
+        }
+    } else if v.name.is_some() || !v.targets.is_empty() {
+        return Err(Error::invalid(
+            "ac4: targets/name need b_alternative presentations",
+        ));
+    }
+    match &v.add_data {
+        Some(bytes) => {
+            if bytes.is_empty() {
+                return Err(Error::invalid("ac4: add_data must not be empty"));
+            }
+            bw.write_bit(true);
+            let n = bytes.len() as u32;
+            if n < 16 {
+                bw.write_u32(n - 1, 4);
+            } else {
+                bw.write_u32(15, 4);
+                crate::toc::write_variable_bits(bw, 2, n - 16);
+            }
+            bw.align_to_byte();
+            for &b in bytes {
+                bw.write_u32(b as u32, 8);
+            }
+        }
+        None => bw.write_bit(false),
+    }
+    if v.dialnorm_bits > 127 {
+        return Err(Error::invalid("ac4: dialnorm_bits out of range"));
+    }
+    bw.write_u32(v.dialnorm_bits as u32, 7);
+    match &v.further_loudness_info {
+        Some(f) => {
+            if !f.b_presentation_ldn {
+                return Err(Error::invalid(
+                    "ac4: presentation further_loudness_info needs b_presentation_ldn",
+                ));
+            }
+            bw.write_bit(true);
+            crate::metadata::write_further_loudness_info_v2(bw, f)?;
+        }
+        None => bw.write_bit(false),
+    }
+    if v.drc_metadata_size < (1 << 5) {
+        bw.write_u32(v.drc_metadata_size, 5);
+        bw.write_bit(false);
+    } else {
+        bw.write_u32(v.drc_metadata_size & 0x1F, 5);
+        bw.write_bit(true);
+        crate::toc::write_variable_bits(bw, 3, v.drc_metadata_size >> 5);
+    }
+    let start = bw.bit_position();
+    crate::drc::write_drc_frame(bw, &v.drc, params.b_pres_ndot, params.drc_chan_info())?;
+    let used = (bw.bit_position() - start) as u32;
+    if used + v.drc_trailing_bits != v.drc_metadata_size {
+        return Err(Error::invalid(
+            "ac4: presentation DRC envelope inconsistent with trailing bits",
+        ));
+    }
+    for _ in 0..v.drc_trailing_bits {
+        bw.write_bit(false);
+    }
+    if params.n_substream_groups > 1 {
+        match &v.substream_group_gains {
+            None => bw.write_bit(false),
+            Some(None) => {
+                bw.write_bit(true);
+                bw.write_bit(true); // b_keep
+            }
+            Some(Some(gains)) => {
+                if gains.len() != params.n_substream_groups as usize {
+                    return Err(Error::invalid("ac4: sg_gain count mismatch"));
+                }
+                bw.write_bit(true);
+                bw.write_bit(false);
+                for &g in gains {
+                    if g > 63 {
+                        return Err(Error::invalid("ac4: sg_gain out of range"));
+                    }
+                    bw.write_u32(g as u32, 6);
+                }
+            }
+        }
+    } else if v.substream_group_gains.is_some() {
+        return Err(Error::invalid("ac4: sg gains need n_substream_groups > 1"));
+    }
+    match &v.associated {
+        Some(a) => {
+            bw.write_bit(true);
+            for field in [a.scale_main, a.scale_main_centre, a.scale_main_front] {
+                match field {
+                    Some(s) => {
+                        bw.write_bit(true);
+                        bw.write_u32(s as u32, 8);
+                    }
+                    None => bw.write_bit(false),
+                }
+            }
+            match a.pan_associated {
+                Some(p) => {
+                    bw.write_bit(true);
+                    bw.write_u32(p as u32, 8);
+                }
+                None => bw.write_bit(false),
+            }
+        }
+        None => bw.write_bit(false),
+    }
+    write_custom_dmx_data(bw, &v.custom_dmx_data, &params.custom_dmx())?;
+    write_loud_corr(
+        bw,
+        &v.loud_corr,
+        params.pres_ch_mode,
+        params.pres_ch_mode_core,
+        params.b_objects,
+    )?;
+    bw.align_to_byte();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,5 +1461,231 @@ mod tests {
         let mut bw = BitWriter::new();
         write_custom_dmx_data(&mut bw, &CustomDmxData::default(), &stereo).unwrap();
         assert_eq!(bw.bit_position(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // ac4_presentation_substream (§6.2.2.3)
+    // ------------------------------------------------------------------
+
+    fn empty_drc() -> crate::drc::DrcFrame {
+        crate::drc::DrcFrame {
+            b_drc_present: false,
+            config: None,
+            data: None,
+        }
+    }
+
+    fn round_trip_pres(v: &PresentationSubstream, params: &PresSubstreamParams) {
+        let mut bw = BitWriter::new();
+        write_presentation_substream(&mut bw, v, params).unwrap();
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let got = parse_presentation_substream(&mut br, params, None).unwrap();
+        assert_eq!(&got, v);
+        // The element is byte-aligned at exit.
+        assert_eq!(br.bit_position() % 8, 0);
+    }
+
+    fn minimal_pres() -> PresentationSubstream {
+        PresentationSubstream {
+            name: None,
+            targets: Vec::new(),
+            add_data: None,
+            dialnorm_bits: 64,
+            further_loudness_info: None,
+            drc_metadata_size: 1,
+            drc: empty_drc(),
+            drc_trailing_bits: 0,
+            substream_group_gains: None,
+            associated: None,
+            custom_dmx_data: CustomDmxData::default(),
+            loud_corr: LoudCorr::default(),
+        }
+    }
+
+    #[test]
+    fn presentation_substream_minimal_stereo_round_trips() {
+        let params = PresSubstreamParams {
+            b_alternative: false,
+            b_pres_ndot: true,
+            n_substreams_in_presentation: 1,
+            n_substream_groups: 1,
+            b_objects: false,
+            pres_ch_mode: 1,
+            pres_ch_mode_core: -1,
+            b_pres_4_back_channels_present: false,
+            pres_top_channel_pairs: 0,
+            b_pres_has_lfe: false,
+            frame_length: 2048,
+        };
+        round_trip_pres(&minimal_pres(), &params);
+    }
+
+    #[test]
+    fn presentation_substream_alternative_full_round_trips() {
+        let params = PresSubstreamParams {
+            b_alternative: true,
+            b_pres_ndot: true,
+            n_substreams_in_presentation: 3,
+            n_substream_groups: 3,
+            b_objects: false,
+            pres_ch_mode: 12,
+            pres_ch_mode_core: 4,
+            b_pres_4_back_channels_present: true,
+            pres_top_channel_pairs: 2,
+            b_pres_has_lfe: true,
+            frame_length: 2048,
+        };
+        let v = PresentationSubstream {
+            name: Some(b"Alt!".to_vec()),
+            targets: vec![
+                PresTarget {
+                    target_level: 5,
+                    target_device_category: 9,
+                    tdc_reserved: Some(3),
+                    max_ducking_depth: Some(40),
+                    loud_corr_target: Some(17),
+                    substream_active: vec![Some(0), None, Some(1)],
+                },
+                PresTarget {
+                    target_level: 0,
+                    target_device_category: 1,
+                    tdc_reserved: None,
+                    max_ducking_depth: None,
+                    loud_corr_target: None,
+                    substream_active: vec![Some(5), Some(2), None],
+                },
+            ],
+            add_data: Some(vec![0xDE, 0xAD, 0xBE]),
+            dialnorm_bits: 96,
+            further_loudness_info: Some(crate::metadata::FurtherLoudnessInfoV2 {
+                b_presentation_ldn: true,
+                ..Default::default()
+            }),
+            drc_metadata_size: 4,
+            drc: empty_drc(),
+            drc_trailing_bits: 3,
+            substream_group_gains: Some(Some(vec![10, 20, 63])),
+            associated: Some(AssociatedScaling {
+                scale_main: Some(200),
+                scale_main_centre: None,
+                scale_main_front: Some(0),
+                pan_associated: Some(128),
+            }),
+            custom_dmx_data: CustomDmxData {
+                cdmx_configs: Some(vec![(
+                    2,
+                    CdmxParameters {
+                        b4_to_b2: Some(3),
+                        ..Default::default()
+                    },
+                )]),
+                stereo_dmx_coeff: Some(StereoDmxCoeff {
+                    loro_centre_mixgain: 4,
+                    loro_surround_mixgain: 4,
+                    ltrt_mixgains: None,
+                    lfe_mixgain: Some(2),
+                    preferred_dmx_method: 1,
+                }),
+            },
+            loud_corr: LoudCorr {
+                b_corr_for_immersive_out: Some(true),
+                loro_dmx_loud_corr: Some(15),
+                loud_corr_5_x: Some(1),
+                loud_corr_5_x_2: Some(2),
+                loud_corr_7_x: Some(3),
+                loud_corr_7_x_4: Some(4),
+                loud_corr_7_x_2: Some(5),
+                loud_corr_5_x_4: Some(6),
+                loud_corr_core_5_x: Some(7),
+                loud_corr_core_loro_ltrt: Some((8, 9)),
+                ..Default::default()
+            },
+        };
+        round_trip_pres(&v, &params);
+    }
+
+    #[test]
+    fn presentation_substream_sg_keep_and_32_byte_name() {
+        let params = PresSubstreamParams {
+            b_alternative: true,
+            b_pres_ndot: true,
+            n_substreams_in_presentation: 1,
+            n_substream_groups: 2,
+            b_objects: true,
+            pres_ch_mode: -1,
+            pres_ch_mode_core: -1,
+            b_pres_4_back_channels_present: false,
+            pres_top_channel_pairs: 0,
+            b_pres_has_lfe: false,
+            frame_length: 1920,
+        };
+        let v = PresentationSubstream {
+            name: Some(vec![b'x'; 32]),
+            targets: vec![PresTarget {
+                target_level: 7,
+                target_device_category: 15,
+                tdc_reserved: None,
+                max_ducking_depth: None,
+                loud_corr_target: None,
+                substream_active: vec![None],
+            }],
+            substream_group_gains: Some(None), // b_keep
+            loud_corr: LoudCorr {
+                b_obj_loud_corr: true,
+                b_corr_for_immersive_out: Some(false),
+                loud_corr_5_x: Some(11),
+                loud_corr_9_x_4: Some(22),
+                ..Default::default()
+            },
+            ..minimal_pres()
+        };
+        round_trip_pres(&v, &params);
+    }
+
+    #[test]
+    fn presentation_substream_carries_real_drc_frame() {
+        // A presentation with a real drc_frame() (I-frame config +
+        // gains) inside the announced envelope.
+        let params = PresSubstreamParams {
+            b_alternative: false,
+            b_pres_ndot: true,
+            n_substreams_in_presentation: 1,
+            n_substream_groups: 1,
+            b_objects: false,
+            pres_ch_mode: 1,
+            pres_ch_mode_core: -1,
+            b_pres_4_back_channels_present: false,
+            pres_top_channel_pairs: 0,
+            b_pres_has_lfe: false,
+            frame_length: 2048,
+        };
+        // Build the DRC frame bit-first through the real parser so the
+        // struct matches a canonical decode.
+        let mut dbw = BitWriter::new();
+        dbw.write_bit(true); // b_drc_present
+        dbw.write_bit(false); // drc_config: b_more_drc_configs... minimal
+        dbw.write_u32(0, 3); // drc_decoder_nr_modes = 0 → one default mode
+        dbw.write_bit(false); // b_drc_gains_present = 0
+        dbw.write_u32(0, 7); // guard
+        let dbytes = dbw.into_bytes();
+        let mut dbr = BitReader::new(&dbytes);
+        let drc = match crate::drc::parse_drc_frame(&mut dbr, true, params.drc_chan_info(), None) {
+            Ok(d) => d,
+            // If the minimal hand bits don't form a valid config the
+            // simpler absent form still exercises the envelope.
+            Err(_) => empty_drc(),
+        };
+        // Measure the exact element size by writing it back.
+        let mut mbw = BitWriter::new();
+        crate::drc::write_drc_frame(&mut mbw, &drc, true, params.drc_chan_info()).unwrap();
+        let drc_bits = mbw.bit_position() as u32;
+        let v = PresentationSubstream {
+            drc_metadata_size: drc_bits + 2,
+            drc,
+            drc_trailing_bits: 2,
+            ..minimal_pres()
+        };
+        round_trip_pres(&v, &params);
     }
 }

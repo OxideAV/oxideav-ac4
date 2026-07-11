@@ -1077,7 +1077,7 @@ pub fn write_metadata(
 
 /// Skip `n` bits from the reader — the BitReader API tops out at u32
 /// chunks, so split into 16-bit slices for safety.
-fn skip_n_bits(br: &mut BitReader<'_>, mut n: u32) -> Result<()> {
+pub(crate) fn skip_n_bits(br: &mut BitReader<'_>, mut n: u32) -> Result<()> {
     while n >= 16 {
         br.skip(16)?;
         n -= 16;
