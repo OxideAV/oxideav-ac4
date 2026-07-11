@@ -272,6 +272,20 @@ pub struct Ac4FrameInfo {
     /// (`ac4_substream_info_obj()`, TS 103 190-2 §6.2.1.11), in
     /// substream-group walk order.
     pub obj_substreams: Vec<ObjSubstreamInfo>,
+    /// OAMD substream descriptors (`oamd_substream_info()`,
+    /// TS 103 190-2 §6.2.1.13), in substream-group walk order.
+    pub oamd_substreams: Vec<OamdSubstreamInfoDesc>,
+}
+
+/// Parsed `oamd_substream_info(b_substreams_present)`
+/// (TS 103 190-2 §6.2.1.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OamdSubstreamInfoDesc {
+    /// `b_oamd_ndot` — true when the OAMD substream decodes
+    /// independently from preceding frames (§6.3.2.12.1).
+    pub b_oamd_ndot: bool,
+    /// `substream_index` when `b_substreams_present`.
+    pub substream_index: Option<u32>,
 }
 
 /// Per-presentation information we extract from `ac4_presentation_info()`.
@@ -362,6 +376,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     let mut presentations = Vec::with_capacity(n_presentations as usize);
     let mut ajoc_substreams = Vec::new();
     let mut obj_substreams = Vec::new();
+    let mut oamd_substreams = Vec::new();
     if bitstream_version <= 1 {
         for _ in 0..n_presentations {
             let pi = parse_presentation_info(&mut br, fs_index, frame_rate_index)?;
@@ -402,6 +417,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
             }
             ajoc_substreams.extend(g.ajoc);
             obj_substreams.extend(g.objs);
+            oamd_substreams.extend(g.oamd);
         }
         if let Some(p) = presentations.first_mut() {
             if p.channels == 0 {
@@ -452,6 +468,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         toc_size,
         ajoc_substreams,
         obj_substreams,
+        oamd_substreams,
     })
 }
 
@@ -967,14 +984,21 @@ fn parse_substream_group_info(
     } else {
         let b_oamd_substream = br.read_bit()?;
         if b_oamd_substream {
-            // oamd_substream_info(b_substreams_present)
-            let _b_oamd_ndot = br.read_bit()?;
-            if b_substreams_present {
-                let si = br.read_u32(2)?;
+            // oamd_substream_info(b_substreams_present), §6.2.1.13.
+            let b_oamd_ndot = br.read_bit()?;
+            let substream_index = if b_substreams_present {
+                let mut si = br.read_u32(2)?;
                 if si == 3 {
-                    let _ = variable_bits(br, 2)?;
+                    si += variable_bits(br, 2)?;
                 }
-            }
+                Some(si)
+            } else {
+                None
+            };
+            summary.oamd.push(OamdSubstreamInfoDesc {
+                b_oamd_ndot,
+                substream_index,
+            });
         }
         // §6.2.1.6 non-channel-coded substream loop: each substream is
         // either A-JOC coded (`ac4_substream_info_ajoc()`, §6.2.1.9) or
@@ -1069,6 +1093,7 @@ struct SubstreamGroupSummary {
     first_sf_multiplier: u32,
     ajoc: Vec<AjocSubstreamInfo>,
     objs: Vec<ObjSubstreamInfo>,
+    oamd: Vec<OamdSubstreamInfoDesc>,
 }
 
 // =====================================================================

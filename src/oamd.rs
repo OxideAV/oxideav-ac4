@@ -1415,6 +1415,135 @@ pub fn write_oamd_dyndata_multi(
 }
 
 // =====================================================================
+// oamd_substream (§6.2.2.4)
+// =====================================================================
+
+/// Parsed standalone `oamd_substream()` (§6.2.2.4) — the OAMD-only
+/// substream referenced by `oamd_substream_info()` (§6.2.1.13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OamdSubstream {
+    /// `oamd_common_data()` (`b_oamd_common_data_present`).
+    pub common_data: Option<OamdCommonData>,
+    /// `oamd_timing_data()` (`b_oamd_timing_present`).
+    pub timing: Option<OamdTimingData>,
+    /// `oamd_dyndata_multi(...)` — present iff `b_alternative == 0`.
+    pub dyndata: Option<OamdDynDataMulti>,
+}
+
+/// Caller context for [`parse_oamd_substream`] — the presentation- and
+/// object-descriptor-level quantities the syntax gates on.
+#[derive(Debug, Clone, Copy)]
+pub struct OamdSubstreamContext<'a> {
+    /// `b_alternative` from `ac4_presentation_substream_info()`.
+    pub b_alternative: bool,
+    /// `b_oamd_ndot` from `oamd_substream_info()` — true when this
+    /// frame's OAMD decodes independently (§6.3.2.12.1), i.e. the
+    /// I-frame flag for `oamd_dyndata_multi`.
+    pub b_oamd_ndot: bool,
+    /// The bed context's LFE presence (gates the
+    /// `stereo_dmx_coeff()` LFE sub-block inside `oamd_common_data`).
+    pub bed_has_lfe: bool,
+    /// `num_obj_info_blocks` carried from a prior frame's
+    /// `oamd_timing_data()`; used when `b_oamd_timing_present == 0`.
+    pub prev_num_obj_info_blocks: usize,
+    /// Per-object types (all `n_objs` objects).
+    pub obj_type: &'a [ObjType],
+    /// Per-object LFE flags.
+    pub b_lfe: &'a [bool],
+    /// Per-object `b_ajoc_coded` flags (A-JOC-carried objects are
+    /// skipped by `oamd_dyndata_multi`).
+    pub b_ajoc_coded: &'a [bool],
+}
+
+/// Parse `oamd_substream()` per §6.2.2.4. The element is byte-aligned
+/// at entry and exit (§6.2.2.1).
+pub fn parse_oamd_substream(
+    br: &mut BitReader<'_>,
+    ctx: &OamdSubstreamContext<'_>,
+) -> Result<OamdSubstream> {
+    let common_data = if br.read_bit()? {
+        Some(parse_oamd_common_data(br, ctx.bed_has_lfe)?)
+    } else {
+        None
+    };
+    let timing = if br.read_bit()? {
+        Some(parse_oamd_timing_data(br)?)
+    } else {
+        None
+    };
+    let dyndata = if !ctx.b_alternative {
+        let n_blocks = timing
+            .as_ref()
+            .map(|t| t.num_obj_info_blocks())
+            .unwrap_or(ctx.prev_num_obj_info_blocks);
+        Some(parse_oamd_dyndata_multi(
+            br,
+            n_blocks,
+            ctx.b_oamd_ndot,
+            ctx.obj_type,
+            ctx.b_lfe,
+            ctx.b_ajoc_coded,
+        )?)
+    } else {
+        None
+    };
+    br.align_to_byte();
+    Ok(OamdSubstream {
+        common_data,
+        timing,
+        dyndata,
+    })
+}
+
+/// Write `oamd_substream()` — exact inverse of
+/// [`parse_oamd_substream`] under the same context.
+pub fn write_oamd_substream(
+    bw: &mut BitWriter,
+    s: &OamdSubstream,
+    ctx: &OamdSubstreamContext<'_>,
+) -> Result<()> {
+    match &s.common_data {
+        Some(c) => {
+            bw.write_bit(true);
+            write_oamd_common_data(bw, c, ctx.bed_has_lfe)?;
+        }
+        None => bw.write_bit(false),
+    }
+    match &s.timing {
+        Some(t) => {
+            bw.write_bit(true);
+            write_oamd_timing_data(bw, t)?;
+        }
+        None => bw.write_bit(false),
+    }
+    match (&s.dyndata, ctx.b_alternative) {
+        (Some(d), false) => {
+            write_oamd_dyndata_multi(
+                bw,
+                d,
+                ctx.b_oamd_ndot,
+                ctx.obj_type,
+                ctx.b_lfe,
+                ctx.b_ajoc_coded,
+            )?;
+        }
+        (None, true) => {}
+        (Some(_), true) => {
+            return Err(Error::invalid(
+                "ac4: oamd_substream dyndata needs b_alternative == 0",
+            ));
+        }
+        (None, false) => {
+            return Err(Error::invalid(
+                "ac4: oamd_substream requires dyndata when b_alternative == 0",
+            ));
+        }
+    }
+    bw.align_to_byte();
+    Ok(())
+}
+
+// =====================================================================
 // trim (§6.2.8.9) + bed_render_info (§6.2.8.8) + tool elements
 // =====================================================================
 
@@ -2702,6 +2831,96 @@ mod tests {
             let mut br = BitReader::new(&bytes);
             assert_eq!(parse_oamd_common_data(&mut br, false).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn oamd_substream_round_trips_all_shapes() {
+        // Two dynamic objects, one A-JOC-coded (skipped by the multi
+        // walk), one plain.
+        let obj_type = [ObjType::Dyn, ObjType::Dyn];
+        let b_lfe = [false, false];
+        let b_ajoc_coded = [true, false];
+        let timing = OamdTimingData {
+            sample_offset: OaSampleOffset::Zero,
+            blocks: vec![OamdTimingBlock {
+                block_offset_factor: 5,
+                ramp_duration: RampDuration::D512,
+            }],
+        };
+        for (b_alternative, with_common, with_timing) in [
+            (false, false, true),
+            (false, true, true),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let ctx = OamdSubstreamContext {
+                b_alternative,
+                b_oamd_ndot: true,
+                bed_has_lfe: false,
+                prev_num_obj_info_blocks: 1,
+                obj_type: &obj_type,
+                b_lfe: &b_lfe,
+                b_ajoc_coded: &b_ajoc_coded,
+            };
+            let n_blocks = 1;
+            let dyndata = (!b_alternative).then(|| {
+                // Build a canonical dyndata by writing the flag bits
+                // through the real writer: one non-A-JOC object with
+                // one no-delta block (b_object_not_active form).
+                let mut dbw = BitWriter::new();
+                // object_info_block(b_no_delta = 1): b_object_not_active
+                // = 1 → object_basic_info implied defaults... use the
+                // parser to produce the canonical struct instead.
+                dbw.write_bit(true); // b_object_not_active
+                dbw.write_u32(0, 7);
+                let dbytes = dbw.into_bytes();
+                let mut dbr = BitReader::new(&dbytes);
+                parse_oamd_dyndata_multi(&mut dbr, n_blocks, true, &obj_type, &b_lfe, &b_ajoc_coded)
+                    .unwrap()
+            });
+            let s = OamdSubstream {
+                common_data: with_common.then(OamdCommonData::default),
+                timing: with_timing.then(|| timing.clone()),
+                dyndata,
+            };
+            let mut bw = BitWriter::new();
+            write_oamd_substream(&mut bw, &s, &ctx).unwrap();
+            let bytes = bw.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let got = parse_oamd_substream(&mut br, &ctx).unwrap();
+            assert_eq!(got, s, "alt={b_alternative} common={with_common}");
+            assert_eq!(br.bit_position() % 8, 0);
+        }
+    }
+
+    #[test]
+    fn oamd_substream_uses_prev_block_count_without_timing() {
+        // b_alternative = 0 and no timing → num_obj_info_blocks falls
+        // back to the carried prev count (here 0 → empty block rows).
+        let obj_type = [ObjType::Dyn];
+        let b_lfe = [false];
+        let b_ajoc_coded = [false];
+        let ctx = OamdSubstreamContext {
+            b_alternative: false,
+            b_oamd_ndot: true,
+            bed_has_lfe: false,
+            prev_num_obj_info_blocks: 0,
+            obj_type: &obj_type,
+            b_lfe: &b_lfe,
+            b_ajoc_coded: &b_ajoc_coded,
+        };
+        let s = OamdSubstream {
+            common_data: None,
+            timing: None,
+            dyndata: Some(OamdDynDataMulti {
+                object_blocks: vec![Vec::new()],
+            }),
+        };
+        let mut bw = BitWriter::new();
+        write_oamd_substream(&mut bw, &s, &ctx).unwrap();
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(parse_oamd_substream(&mut br, &ctx).unwrap(), s);
     }
 
     #[test]
