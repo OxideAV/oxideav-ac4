@@ -870,7 +870,10 @@ fn parse_presentation_v1_info(
         // b_pres_ndot, substream_index (2 + optional variable_bits(2)).
         let _b_alternative = br.read_bit()?;
         let b_pres_ndot = br.read_bit()?;
-        info.b_iframe = !b_pres_ndot; // ndot = "not intra-coded" → invert.
+        // §6.3.2.11.2: ndot = "no dependency over time" — true means
+        // the presentation substream decodes independently from
+        // preceding frames, i.e. it IS the I-frame flag (no inversion).
+        info.b_iframe = b_pres_ndot;
         let si = br.read_u32(2)?;
         if si == 3 {
             let _ = variable_bits(br, 2)?;
@@ -1235,10 +1238,11 @@ pub struct AjocSubstreamInfo {
 }
 
 impl AjocSubstreamInfo {
-    /// `b_iframe` for the (first) audio frame — the inverse of
-    /// `b_audio_ndot`.
+    /// `b_iframe` for the (first) audio frame. §6.3.2.x: `b_audio_ndot`
+    /// = "no dependency over time" — true means the frame decodes
+    /// independently, i.e. it IS the I-frame flag.
     pub fn b_iframe(&self) -> bool {
-        !self.b_audio_ndot.first().copied().unwrap_or(false)
+        self.b_audio_ndot.first().copied().unwrap_or(true)
     }
 
     /// Total downmix signal count including the optional LFE.
@@ -1817,8 +1821,9 @@ mod tests {
         bw.write_bit(false);
         // b_bitrate_info = 0.
         bw.write_bit(false);
-        // frame_rate_factor = 1 → one b_audio_ndot = 0 (I-frame).
-        bw.write_bit(false);
+        // frame_rate_factor = 1 → one b_audio_ndot = 1 ("no dependency
+        // over time" = I-frame, §6.3.2.x).
+        bw.write_bit(true);
         // b_substreams_present = 1 → substream_index = 1.
         bw.write_u32(1, 2);
     }
@@ -1878,8 +1883,8 @@ mod tests {
         bw.write_bit(true);
         // fs_index = 0 → no sf_multiplier bit. b_bitrate_info = 0.
         bw.write_bit(false);
-        // b_audio_ndot = 1 (P-frame).
-        bw.write_bit(true);
+        // b_audio_ndot = 0 (dependency over time = P-frame).
+        bw.write_bit(false);
         bw.write_u32(0, 7);
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);
@@ -1968,7 +1973,7 @@ mod tests {
         bw.write_bit(true); // DynObjectsOnly
         bw.write_bit(false); // b_sf_multiplier = 0 (fs_index = 1)
         bw.write_bit(false); // b_bitrate_info = 0
-        bw.write_bit(false); // b_audio_ndot = 0
+        bw.write_bit(true); // b_audio_ndot = 1 (independent = I-frame)
         bw.write_bit(false); // b_content_type = 0
         bw.write_u32(0, 7);
         let bytes = bw.into_bytes();

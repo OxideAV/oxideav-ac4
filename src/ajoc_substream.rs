@@ -979,9 +979,10 @@ pub fn encode_ajoc_raw_frame(
     bw.write_bit(false); // b_pre_virtualized
     bw.write_bit(false); // b_add_emdf_substreams
                          // ac4_presentation_substream_info(): b_alternative = 0,
-                         // b_pres_ndot = !b_iframe, substream_index = 0.
+                         // b_pres_ndot = b_iframe (§6.3.2.11.2 — "no
+                         // dependency over time"), substream_index = 0.
     bw.write_bit(false);
-    bw.write_bit(!b_iframe);
+    bw.write_bit(b_iframe);
     bw.write_u32(0, 2);
     // ---- ac4_substream_group_info() (§6.2.1.6) ----
     bw.write_bit(true); // b_substreams_present
@@ -1000,7 +1001,7 @@ pub fn encode_ajoc_raw_frame(
     bw.write_bit(true); // umx bed_dyn_obj_assignment: b_dyn_objects_only
     bw.write_bit(false); // b_sf_multiplier (fs_index == 1)
     bw.write_bit(false); // b_bitrate_info
-    bw.write_bit(!b_iframe); // b_audio_ndot (frame_rate_factor = 1)
+    bw.write_bit(b_iframe); // b_audio_ndot = b_iframe (frame_rate_factor = 1)
     bw.write_u32(0, 2); // substream_index
     bw.write_bit(false); // b_content_type
                          // ---- substream_index_table() ----

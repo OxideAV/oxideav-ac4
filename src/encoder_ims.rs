@@ -62,8 +62,9 @@
 //!   absent in the produced frame.
 //! * No `ac4_substream_group_info()` body beyond the
 //!   `b_substreams_present == 1` + `n_lf_substreams == 2` skeleton.
-//!   The `sus_ver` bit + the per-substream `b_audio_ndot` /
-//!   `b_pres_ndot` / `b_oamd_ndot` flags are all zero.
+//!   The `sus_ver` bit is zero; the per-substream `b_audio_ndot` /
+//!   `b_pres_ndot` flags carry the I-frame flag directly
+//!   (§6.3.2.11.2 — ndot means "no dependency over time").
 //! * No bit-rate signalling beyond `br_code = 0`.
 
 use oxideav_core::bits::BitWriter;
@@ -343,7 +344,7 @@ impl Ac4ImsEncoder {
     /// `b_presentation_filter = 0`, `ac4_sgi_specifier()` referencing
     /// `group_index = 0`, `b_pre_virtualized = 0`,
     /// `b_add_emdf_substreams = 0`, and `ac4_presentation_substream_info()`
-    /// (b_alternative = 0, b_pres_ndot = !iframe, substream_index = 0).
+    /// (b_alternative = 0, b_pres_ndot = iframe, substream_index = 0).
     fn write_presentation_v1_info(&self, bw: &mut BitWriter) {
         // b_single_substream_group = 1.
         bw.write_u32(1, 1);
@@ -374,9 +375,10 @@ impl Ac4ImsEncoder {
         bw.write_u32(0, 1);
         bw.write_u32(0, 1);
         // ac4_presentation_substream_info(): b_alternative = 0,
-        // b_pres_ndot = !b_iframe_global, substream_index = 0 (2 b).
+        // b_pres_ndot = b_iframe_global (§6.3.2.11.2 — ndot means "no
+        // dependency over time"), substream_index = 0 (2 b).
         bw.write_u32(0, 1);
-        bw.write_u32(if self.b_iframe_global { 0 } else { 1 }, 1);
+        bw.write_u32(if self.b_iframe_global { 1 } else { 0 }, 1);
         bw.write_u32(0, 2);
     }
 
@@ -408,8 +410,8 @@ impl Ac4ImsEncoder {
         bw.write_u32(0, 1); // b_bitrate_info
                             // frame_rate_factor for {0,1,7,8,9} with
                             // b_multiplier=0 is 1; for {2,3,4} also 1; otherwise 1.
-                            // → 1 b_audio_ndot bit.
-        bw.write_u32(if self.b_iframe_global { 0 } else { 1 }, 1);
+                            // → 1 b_audio_ndot bit = b_iframe (§6.3.2.x).
+        bw.write_u32(if self.b_iframe_global { 1 } else { 0 }, 1);
         bw.write_u32(0, 2); // substream_index
                             // b_content_type = 0.
         bw.write_u32(0, 1);
