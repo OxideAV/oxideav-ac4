@@ -1767,7 +1767,7 @@ impl Ac4Decoder {
             ));
         }
         let dec = &mut self.ajoc_dec.as_mut().expect("ajoc decoder ensured").2;
-        let (objects, lfe, _body) = dec.decode_substream_pcm(
+        let (objects, lfe, _body, _metadata) = dec.decode_substream_pcm(
             substream,
             &params,
             desc.b_iframe(),

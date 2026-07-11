@@ -447,8 +447,14 @@ pub fn parse_audio_data_ajoc(
 /// carries one.
 pub type AjocObjectPcm = (Vec<Vec<f32>>, Option<Vec<f32>>);
 
-/// [`AjocObjectPcm`] plus the parsed `audio_data_ajoc()` body.
-pub type AjocSubstreamDecode = (Vec<Vec<f32>>, Option<Vec<f32>>, AudioDataAjoc);
+/// [`AjocObjectPcm`] plus the parsed `audio_data_ajoc()` body and the
+/// post-audio `metadata(…, sus_ver = 1)` element (§6.2.2.2).
+pub type AjocSubstreamDecode = (
+    Vec<Vec<f32>>,
+    Option<Vec<f32>>,
+    AudioDataAjoc,
+    Option<crate::metadata::MetadataV2>,
+);
 
 /// Persistent A-JOC object-substream decoder state: the §5.7.3.2
 /// differential reference, the §5.7.3.4-6 reconstruction state
@@ -463,6 +469,10 @@ pub struct AjocSubstreamDecoder {
     synthesis: Vec<crate::qmf::QmfSynthesisBank>,
     num_dmx: usize,
     num_umx: usize,
+    /// `de_config()` carried from a prior I-frame's post-audio
+    /// `metadata()` — needed to parse `dialog_enhancement()` on
+    /// dependent frames.
+    prev_de: Option<crate::de::DeConfig>,
 }
 
 impl AjocSubstreamDecoder {
@@ -484,6 +494,7 @@ impl AjocSubstreamDecoder {
                 .collect(),
             num_dmx,
             num_umx,
+            prev_de: None,
         }
     }
 
@@ -618,9 +629,20 @@ impl AjocSubstreamDecoder {
     }
 
     /// Parse + decode one complete part-2 `ac4_substream()` body
-    /// (§6.2.2.2: `audio_size` + byte-aligned `audio_data_ajoc()`) to
-    /// object PCM. Returns the PCM grid, the decoded LFE PCM (when
-    /// the substream carries an LFE), and the parsed body.
+    /// (§6.2.2.2: `audio_size` + byte-aligned `audio_data_ajoc()` +
+    /// `metadata(…, sus_ver = 1)`) to object PCM. Returns the PCM
+    /// grid, the decoded LFE PCM (when the substream carries an LFE),
+    /// the parsed body, and the post-audio metadata element.
+    ///
+    /// Metadata channel-mode binding: per TS 103 190-2 §6.2.7.2 the
+    /// `sus_ver = 1` `basic_metadata()` gates its downmix-history /
+    /// phase90 fields on `channel_mode`; an A-JOC object substream
+    /// signals no channel mode, so neither the `== stereo` nor the
+    /// `> stereo` gate applies — the walk uses `channel_mode = MONO`
+    /// (which opens no channel-gated field) and the `sus_ver = 1`
+    /// stereo-dmx block is absent by definition (the bed/custom
+    /// downmix data is authoritative for objects). Substreams whose
+    /// payload ends exactly at the audio envelope surface `None`.
     pub fn decode_substream_pcm(
         &mut self,
         substream_bytes: &[u8],
@@ -653,8 +675,27 @@ impl AjocSubstreamDecoder {
                 "ac4: audio_data_ajoc overran the announced audio_size",
             ));
         }
+        // §6.2.2.2: fill_bits + byte_align pad out to audio_size, then
+        // metadata(b_alternative, b_ajoc = 1, b_audio_ndot, sus_ver = 1).
+        let meta_off = audio_start + audio_size as usize;
+        let metadata = if meta_off < substream_bytes.len() {
+            let mut mbr = BitReader::new(&substream_bytes[meta_off..]);
+            let meta = crate::metadata::parse_metadata_v2(
+                &mut mbr,
+                crate::metadata::channel_mode::MONO,
+                b_iframe,
+                false,
+                self.prev_de,
+            )?;
+            if let Some(cfg) = meta.dialog_enhancement.config {
+                self.prev_de = Some(cfg);
+            }
+            Some(meta)
+        } else {
+            None
+        };
         let (pcm, lfe) = self.decode_frame_pcm(&ajoc, frame_len_base)?;
-        Ok((pcm, lfe, ajoc))
+        Ok((pcm, lfe, ajoc, metadata))
     }
 }
 
@@ -1020,6 +1061,21 @@ pub fn write_ajoc_substream_simple(
     bw.align_to_byte();
     let mut out = bw.into_bytes();
     out.extend_from_slice(&body_bytes);
+    // §6.2.2.2 tail: metadata(b_alternative = 0, b_ajoc = 1,
+    // b_audio_ndot, sus_ver = 1) + byte_align — the minimal form
+    // (object substreams carry no channel-gated basic_metadata fields
+    // and no drc_frame per §6.2.7.1/2).
+    let mut mw = BitWriter::new();
+    mw.write_bit(false); // basic_metadata(…, 1): b_more_basic_metadata
+    mw.write_bit(false); // extended_metadata(…, 1): b_dialog
+    mw.write_bit(false); // b_channels_classifier
+    mw.write_bit(false); // b_event_probability
+    mw.write_u32(1, 7); // tools_metadata_size = 1 (DE only — no DRC)
+    mw.write_bit(false); // b_more_bits
+    mw.write_bit(false); // dialog_enhancement(): b_de_data_present
+    mw.write_bit(false); // b_emdf_payloads_substream
+    mw.align_to_byte();
+    out.extend_from_slice(&mw.into_bytes());
     Ok(out)
 }
 
@@ -1409,9 +1465,17 @@ mod tests {
                 &mut enc_state,
             )
             .unwrap();
-            let (objects, _lfe, parsed) = dec
+            let (objects, _lfe, parsed, metadata) = dec
                 .decode_substream_pcm(&bytes, &params, true, false, TL)
                 .unwrap();
+            // The §6.2.2.2 post-audio metadata(…, sus_ver = 1) tail
+            // parses to the minimal element the writer emits.
+            let meta = metadata.expect("post-audio metadata present");
+            assert!(!meta.basic.more_basic_metadata);
+            assert!(!meta.b_dialog);
+            assert_eq!(meta.tools_metadata_size, 1);
+            assert!(!meta.dialog_enhancement.data_present);
+            assert!(meta.emdf_payloads_substream.is_none());
             assert_eq!(objects.len(), num_umx);
 
             // Reference: the DECODED downmix spectra (post ASF
