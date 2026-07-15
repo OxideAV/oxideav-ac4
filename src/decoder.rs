@@ -291,7 +291,7 @@ impl Ac4Decoder {
     /// uniformly before each channel runs its own synthesis via
     /// [`Self::qmf_synthesise_pcm`].
     #[allow(clippy::too_many_arguments)]
-    fn aspx_extend_to_qmf(
+    pub(crate) fn aspx_extend_to_qmf(
         pcm_in: &[f32],
         tables: &aspx::AspxFrequencyTables,
         cfg: &aspx::AspxConfig,

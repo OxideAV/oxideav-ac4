@@ -30,7 +30,9 @@ use crate::ajoc::{
 };
 use crate::ajoc_data::{decode_ajoc, AjocFrame};
 use crate::asf::SubstreamTools;
-use crate::aspx::{parse_aspx_config, parse_companding_control, AspxConfig, CompandingControl};
+use crate::aspx::{
+    parse_aspx_config, parse_companding_control, AspxConfig, CompandingControl, FiveXAspxTrailer,
+};
 use crate::mch::{
     parse_mono_data, parse_three_channel_data, parse_two_channel_data, MonoLfeData,
     ThreeChannelData, TwoChannelData,
@@ -81,10 +83,11 @@ pub struct VarChannelElement {
     /// Odd-count tail.
     pub odd_tail: Option<Box<VarOddTail>>,
     /// Per-pair A-SPX payloads (`aspx_data_2ch()`, A-SPX mode only) —
-    /// one [`SubstreamTools`] scratch per pair.
-    pub aspx_pair_tools: Vec<Box<SubstreamTools>>,
+    /// captured as decode-ready trailers; `None` when the capture
+    /// guards tripped (the bits were still consumed).
+    pub aspx_pair_trailers: Vec<Option<Box<FiveXAspxTrailer>>>,
     /// Odd-channel `aspx_data_1ch()` payload (A-SPX mode only).
-    pub aspx_odd_tools: Option<Box<SubstreamTools>>,
+    pub aspx_odd_trailer: Option<Box<FiveXAspxTrailer>>,
 }
 
 impl VarChannelElement {
@@ -193,29 +196,50 @@ pub fn parse_var_channel_element(
     }
     if out.aspx_mode {
         let (cfg, sticky_xover) = match (&out.aspx_config, sticky_aspx) {
-            (Some(c), _) => (c, None),
-            (None, Some((c, x))) => (c, Some(x)),
+            (Some(c), _) => (*c, None),
+            (None, Some((c, x))) => (*c, Some(x)),
             (None, None) => {
                 return Err(Error::invalid(
                     "ac4: non-iframe var_channel_element A-SPX without sticky config",
                 ))
             }
         };
+        // Scratch tools shared across the captures — carries the
+        // sticky xover for P-frames (the capture helpers snapshot /
+        // restore around each parse).
+        let mut scratch = SubstreamTools {
+            aspx_xover_subband_offset: sticky_xover,
+            ..Default::default()
+        };
         for _ in 0..n_pairs {
-            let mut tools = Box::<SubstreamTools>::default();
-            if let Some(x) = sticky_xover {
-                tools.aspx_xover_subband_offset = Some(x);
+            let t = crate::asf::capture_aspx_data_2ch_trailer(
+                br,
+                &mut scratch,
+                &cfg,
+                b_iframe,
+                frame_len_base,
+            );
+            if t.is_none() {
+                return Err(Error::invalid(
+                    "ac4: var_channel_element aspx_data_2ch parse failed",
+                ));
             }
-            crate::asf::parse_aspx_data_2ch_body(br, &mut tools, cfg, b_iframe, frame_len_base)?;
-            out.aspx_pair_tools.push(tools);
+            out.aspx_pair_trailers.push(t.map(Box::new));
         }
         if b_isodd {
-            let mut tools = Box::<SubstreamTools>::default();
-            if let Some(x) = sticky_xover {
-                tools.aspx_xover_subband_offset = Some(x);
+            let t = crate::asf::capture_aspx_data_1ch_trailer(
+                br,
+                &mut scratch,
+                &cfg,
+                b_iframe,
+                frame_len_base,
+            );
+            if t.is_none() {
+                return Err(Error::invalid(
+                    "ac4: var_channel_element aspx_data_1ch parse failed",
+                ));
             }
-            crate::asf::parse_aspx_data_1ch_body(br, &mut tools, cfg, b_iframe, frame_len_base)?;
-            out.aspx_odd_tools = Some(tools);
+            out.aspx_odd_trailer = t.map(Box::new);
         }
     }
     Ok(out)
@@ -303,6 +327,9 @@ impl AjocBodyParams {
 /// `b_alternative` comes from the presentation substream
 /// (`ac4_presentation_substream_info()`, §6.2.1.12); `ajoc_state`
 /// carries the §5.7.3.2 differential-decode reference across frames.
+/// `sticky_aspx` supplies the previous I-frame's `aspx_config` +
+/// `aspx_xover_subband_offset` for `b_iframe == 0` A-SPX downmixes
+/// (Tables 51/52 omit both on non-I-frames).
 pub fn parse_audio_data_ajoc(
     br: &mut BitReader<'_>,
     params: &AjocBodyParams,
@@ -310,6 +337,7 @@ pub fn parse_audio_data_ajoc(
     b_alternative: bool,
     frame_len_base: u32,
     ajoc_state: &mut AjocDiffState,
+    sticky_aspx: Option<(&AspxConfig, u8)>,
 ) -> Result<AudioDataAjoc> {
     let mut static_chan_tools = None;
     let mut dmx_active_signals_mask = None;
@@ -342,7 +370,7 @@ pub fn parse_audio_data_ajoc(
             params.n_fullband_dmx_signals,
             params.b_lfe,
             frame_len_base,
-            None,
+            sticky_aspx,
         )?);
         if br.read_bit()? {
             // b_dmx_timing.
@@ -456,6 +484,98 @@ pub type AjocSubstreamDecode = (
     Option<crate::metadata::MetadataV2>,
 );
 
+/// Extract the static-downmix 5.X core's fullband spectra in the
+/// canonical `[L, R, C, Ls, Rs]` order from the parsed
+/// `audio_data_chan(b_lfe ? 5.1 : 5.0)` tools (part-1 Table 180
+/// channel mappings, SIMPLE codec mode). The A-SPX / A-CPL 5.X codec
+/// modes are parsed upstream but their carrier synthesis is not wired
+/// into the object path.
+fn static_dmx_spectra(tools: &SubstreamTools) -> Result<[Option<&[f32]>; 5]> {
+    use crate::mch::{FiveXCodecMode, FiveXCodingConfig};
+    if !matches!(tools.five_x_mode, Some(FiveXCodecMode::Simple)) {
+        return Err(Error::unsupported(
+            "ac4: static-dmx A-JOC core beyond the SIMPLE codec mode not wired yet",
+        ));
+    }
+    fn pair_ch(p: &TwoChannelData, ch: usize) -> Option<&[f32]> {
+        p.scaled_spec_per_channel.get(ch).and_then(|s| s.as_deref())
+    }
+    let mut out: [Option<&[f32]>; 5] = [None; 5];
+    match tools.five_x_coding_config {
+        Some(FiveXCodingConfig::Cfg3Five) => {
+            if let Some(five) = tools.five_channel_data.as_ref() {
+                // Table 180 cfg3: five_channel_data → [L, R, C, Ls, Rs].
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = five
+                        .scaled_spec_per_channel
+                        .get(i)
+                        .and_then(|s| s.as_deref());
+                }
+            }
+        }
+        Some(FiveXCodingConfig::Cfg0Stereo2plusMono) => {
+            // Table 180 cfg0: pair order depends on b_2ch_mode
+            // (L/R + Ls/Rs, or L/Ls + R/Rs); trailing mono is C.
+            if tools.two_channel_data.len() >= 2 {
+                let (p0, p1) = (&tools.two_channel_data[0], &tools.two_channel_data[1]);
+                if tools.b_2ch_mode == Some(true) {
+                    out[0] = pair_ch(p0, 0);
+                    out[3] = pair_ch(p0, 1);
+                    out[1] = pair_ch(p1, 0);
+                    out[4] = pair_ch(p1, 1);
+                } else {
+                    out[0] = pair_ch(p0, 0);
+                    out[1] = pair_ch(p0, 1);
+                    out[3] = pair_ch(p1, 0);
+                    out[4] = pair_ch(p1, 1);
+                }
+            }
+            out[2] = tools
+                .cfg0_centre_mono
+                .as_ref()
+                .and_then(|m| m.scaled_spec.as_deref());
+        }
+        Some(FiveXCodingConfig::Cfg1ThreeStereo) => {
+            // Table 180 cfg1: three_channel_data → [L, R, C],
+            // two_channel_data → [Ls, Rs].
+            if let Some(three) = tools.three_channel_data.as_ref() {
+                for (i, slot) in out.iter_mut().take(3).enumerate() {
+                    *slot = three
+                        .scaled_spec_per_channel
+                        .get(i)
+                        .and_then(|s| s.as_deref());
+                }
+            }
+            if let Some(p) = tools.two_channel_data.first() {
+                out[3] = pair_ch(p, 0);
+                out[4] = pair_ch(p, 1);
+            }
+        }
+        Some(FiveXCodingConfig::Cfg2FourMono) => {
+            // Table 180 cfg2: four_channel_data → [L, R, Ls, Rs],
+            // trailing mono → C.
+            if let Some(four) = tools.four_channel_data.as_ref() {
+                for (i, slot) in [0usize, 1, 3, 4].into_iter().enumerate() {
+                    out[slot] = four
+                        .scaled_spec_per_channel
+                        .get(i)
+                        .and_then(|s| s.as_deref());
+                }
+            }
+            out[2] = tools
+                .cfg2_back_mono
+                .as_ref()
+                .and_then(|m| m.scaled_spec.as_deref());
+        }
+        _ => {
+            return Err(Error::invalid(
+                "ac4: static-dmx core without a coding_config",
+            ))
+        }
+    }
+    Ok(out)
+}
+
 /// Persistent A-JOC object-substream decoder state: the §5.7.3.2
 /// differential reference, the §5.7.3.4-6 reconstruction state
 /// (interpolators + decorrelator histories), the per-downmix-channel
@@ -473,6 +593,13 @@ pub struct AjocSubstreamDecoder {
     /// `metadata()` — needed to parse `dialog_enhancement()` on
     /// dependent frames.
     prev_de: Option<crate::de::DeConfig>,
+    /// I-frame-sticky `(aspx_config, aspx_xover_subband_offset)` for
+    /// the A-SPX downmix form (Tables 51/52 omit both on non-I-frames;
+    /// single-xover-per-substream convention).
+    sticky_aspx: Option<(AspxConfig, u8)>,
+    /// Per-downmix-channel A-SPX extension state (envelope / noise /
+    /// tone / TNS carry-over).
+    aspx_ext_state: Vec<crate::aspx::AspxChannelExtState>,
 }
 
 impl AjocSubstreamDecoder {
@@ -495,6 +622,8 @@ impl AjocSubstreamDecoder {
             num_dmx,
             num_umx,
             prev_de: None,
+            sticky_aspx: None,
+            aspx_ext_state: Vec::new(),
         }
     }
 
@@ -526,55 +655,136 @@ impl AjocSubstreamDecoder {
     /// Decode one parsed `audio_data_ajoc()` frame to reconstructed
     /// object PCM (`[o][samples]`, `num_umx` fullband objects) plus
     /// the decoded LFE PCM when the substream carries one (the LFE is
-    /// coded directly in the downmix `mono_data(1)` and bypasses the
-    /// A-JOC spatial reconstruction).
+    /// coded directly in the downmix `mono_data(1)` / the 5.1 core and
+    /// bypasses the A-JOC spatial reconstruction).
     ///
-    /// Covers the dynamic SIMPLE downmix form: per-channel IMDCT →
-    /// QMF analysis → §5.7.3.6 Table 49 spatial reconstruction →
-    /// per-object QMF synthesis. The A-SPX downmix layer and the
-    /// `b_static_dmx` 5.X core are parsed upstream but not yet driven
-    /// through this PCM path.
+    /// Covers all three downmix forms: the dynamic SIMPLE form, the
+    /// dynamic **A-SPX** form (per-channel QMF-domain bandwidth
+    /// extension from the captured `aspx_data_*` payloads before the
+    /// spatial reconstruction; companding gains are not applied), and
+    /// the **`b_static_dmx`** 5.X core (SIMPLE coding configs — the
+    /// `audio_data_chan(5.0/5.1)` spectra feed the reconstruction in
+    /// `[L, R, C, Ls, Rs]` order). Per-channel IMDCT → QMF →
+    /// §5.7.3.6 Table 49 spatial reconstruction → per-object QMF
+    /// synthesis.
     pub fn decode_frame_pcm(
         &mut self,
         ajoc: &AudioDataAjoc,
         frame_len_base: u32,
     ) -> Result<AjocObjectPcm> {
-        let elem = ajoc.var_element.as_ref().ok_or_else(|| {
-            Error::unsupported("ac4: static-downmix A-JOC PCM decode not wired yet")
-        })?;
-        let spectra = elem.fullband_spectra();
+        let n = frame_len_base as usize;
+        // Downmix spectra in channel order + the LFE body, from either
+        // the static 5.X core or the dynamic var_channel_element.
+        let (spectra, lfe_data): (Vec<Option<&[f32]>>, Option<&MonoLfeData>) =
+            if let Some(tools) = ajoc.static_chan_tools.as_deref() {
+                (
+                    static_dmx_spectra(tools)?.to_vec(),
+                    tools.lfe_mono_data.as_ref(),
+                )
+            } else {
+                let elem = ajoc.var_element.as_ref().ok_or_else(|| {
+                    Error::invalid("ac4: audio_data_ajoc without a downmix element")
+                })?;
+                (elem.fullband_spectra(), elem.lfe.as_ref())
+            };
         if spectra.len() != self.num_dmx {
             return Err(Error::invalid("ac4: downmix channel count mismatch"));
         }
-        let n = frame_len_base as usize;
         // 0. The LFE channel (when present) is carried directly as a
         // long-frame ASF mono body: IMDCT it on its dedicated overlap
         // slot (index num_dmx). An undecodable LFE body degrades to
         // silence (`None`) like the channel-based paths.
-        let lfe_pcm = match (&elem.lfe, elem.lfe_spectrum()) {
-            (Some(lfe), Some(spec))
+        let lfe_pcm = match lfe_data.and_then(|l| l.scaled_spec.as_deref().map(|s| (l, s))) {
+            Some((lfe, spec))
                 if lfe
                     .transform_info
                     .as_ref()
                     .is_some_and(|ti| ti.transform_length_0 as usize == n) =>
             {
+                let spec = spec.to_vec();
                 let slot = self.num_dmx;
-                Some(self.imdct_channel_f32(slot, spec, n))
+                Some(self.imdct_channel_f32(slot, &spec, n))
             }
             _ => None,
         };
         // 1. IMDCT each downmix channel.
+        let spectra: Vec<Vec<f32>> = spectra
+            .iter()
+            .map(|spec| {
+                spec.map(<[f32]>::to_vec)
+                    .ok_or_else(|| Error::unsupported("ac4: undecodable downmix channel body"))
+            })
+            .collect::<Result<_>>()?;
         let mut pcm_dmx: Vec<Vec<f32>> = Vec::with_capacity(self.num_dmx);
         for (ch, spec) in spectra.iter().enumerate() {
-            let spec =
-                spec.ok_or_else(|| Error::unsupported("ac4: undecodable downmix channel body"))?;
             pcm_dmx.push(self.imdct_channel_f32(ch, spec, n));
         }
-        // 2. QMF-analyse each channel into x[ts][sb][ch].
+        // 2. QMF-analyse each channel into x[ts][sb][ch]. For the
+        // A-SPX downmix form each channel is bandwidth-extended in the
+        // QMF domain from its captured payload (Tables 51/52; the
+        // §5.7.5 companding gain is not applied on this route — the
+        // in-crate writer signals compand-off).
         let num_sb = crate::qmf::NUM_QMF_SUBBANDS;
         let num_ts = n / num_sb;
         let mut x = vec![vec![vec![(0.0f64, 0.0f64); self.num_dmx]; num_sb]; num_ts];
+        let aspx_elem = ajoc
+            .var_element
+            .as_ref()
+            .filter(|e| e.aspx_mode)
+            .map(|e| {
+                let cfg = e
+                    .aspx_config
+                    .or(self.sticky_aspx.map(|(c, _)| c))
+                    .ok_or_else(|| Error::invalid("ac4: A-SPX downmix without a config"))?;
+                Ok::<_, Error>((e, cfg))
+            })
+            .transpose()?;
         for ch in 0..self.num_dmx {
+            // A-SPX extension path: payload mapping pair p → channels
+            // (2p, 2p+1), trailing aspx_data_1ch → the odd channel.
+            if let Some((elem, cfg)) = &aspx_elem {
+                let n_paired = 2 * elem.aspx_pair_trailers.len();
+                let trailer = if ch < n_paired {
+                    elem.aspx_pair_trailers[ch / 2]
+                        .as_deref()
+                        .map(|t| (t, ch % 2 == 1))
+                } else {
+                    elem.aspx_odd_trailer.as_deref().map(|t| (t, false))
+                };
+                if let Some((trailer, is_secondary)) = trailer {
+                    while self.aspx_ext_state.len() <= ch {
+                        self.aspx_ext_state
+                            .push(crate::aspx::AspxChannelExtState::new());
+                    }
+                    let chd = if is_secondary {
+                        trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                    } else {
+                        &trailer.primary
+                    };
+                    if let Some((q, _sb0, _sb1)) = crate::decoder::Ac4Decoder::aspx_extend_to_qmf(
+                        &pcm_dmx[ch],
+                        &trailer.frequency_tables,
+                        cfg,
+                        Some(&chd.framing),
+                        Some(&chd.data_sig),
+                        Some(&chd.data_noise),
+                        Some(chd.qmode_env),
+                        Some(&chd.delta_dir),
+                        chd.add_harmonic.as_deref(),
+                        chd.tna_mode.as_deref(),
+                        &mut self.aspx_ext_state[ch],
+                        crate::aspx::num_ts_in_ats(frame_len_base.max(1)),
+                    ) {
+                        for (ts, x_ts) in x.iter_mut().enumerate().take(num_ts) {
+                            for (sb, row) in q.iter().enumerate().take(num_sb) {
+                                let (re, im) = row.get(ts).copied().unwrap_or((0.0, 0.0));
+                                x_ts[sb][ch] = (re as f64, im as f64);
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             let slots = self.analysis[ch].process_block(&pcm_dmx[ch]);
             for (ts, slot) in slots.iter().take(num_ts).enumerate() {
                 for (sb, &(re, im)) in slot.iter().enumerate() {
@@ -659,6 +869,7 @@ impl AjocSubstreamDecoder {
         }
         br.align_to_byte();
         let audio_start = br.byte_position();
+        let sticky = self.sticky_aspx;
         let ajoc = parse_audio_data_ajoc(
             &mut br,
             params,
@@ -666,7 +877,23 @@ impl AjocSubstreamDecoder {
             b_alternative,
             frame_len_base,
             &mut self.diff_state,
+            sticky.as_ref().map(|(c, x)| (c, *x)),
         )?;
+        // Harvest the I-frame-sticky A-SPX config + xover for the
+        // P-frames that follow (single-xover convention — the first
+        // payload's offset stands for the element).
+        if b_iframe {
+            if let Some(elem) = ajoc.var_element.as_ref().filter(|e| e.aspx_mode) {
+                let first = elem
+                    .aspx_pair_trailers
+                    .first()
+                    .and_then(|t| t.as_deref())
+                    .or(elem.aspx_odd_trailer.as_deref());
+                if let (Some(cfg), Some(t)) = (elem.aspx_config, first) {
+                    self.sticky_aspx = Some((cfg, t.xover));
+                }
+            }
+        }
         // The walk must stay inside the announced audio_size envelope
         // (the remainder up to it is fill_bits + byte_align).
         let consumed = br.bit_position().div_ceil(8) - audio_start as u64;
@@ -988,6 +1215,18 @@ pub fn write_audio_data_ajoc_simple(
     // b_some_signals_inactive = 0.
     bw.write_bit(false);
     write_var_channel_element_simple_lfe(bw, lfe, dmx_spectra, transform_length, max_sfb)?;
+    write_ajoc_dyn_oamd_mid(bw, params, b_iframe)?;
+    write_ajoc_tail(bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state)
+}
+
+/// Dynamic-form middle section of `audio_data_ajoc()`: `b_dmx_timing`
+/// plus minimal core OAMD (one inactive info block per downmix
+/// object) plus `b_oamd_extension_present = 0`.
+fn write_ajoc_dyn_oamd_mid(
+    bw: &mut BitWriter,
+    params: &AjocBodyParams,
+    b_iframe: bool,
+) -> Result<()> {
     // b_dmx_timing = 1 + minimal timing (1 block).
     bw.write_bit(true);
     let timing = minimal_oamd_timing();
@@ -1003,6 +1242,20 @@ pub fn write_audio_data_ajoc_simple(
     )?;
     // b_oamd_extension_present = 0.
     bw.write_bit(false);
+    Ok(())
+}
+
+/// Shared tail of `audio_data_ajoc()`: the `ajoc()` element,
+/// `ajoc_dmx_de_data()`, and the full-decode OAMD timing + dyndata.
+fn write_ajoc_tail(
+    bw: &mut BitWriter,
+    params: &AjocBodyParams,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+) -> Result<()> {
     // ajoc().
     crate::encoder_ajoc::encode_ajoc(bw, num_decorr, ctrl, qmats, b_iframe, enc_state)?;
     // ajoc_dmx_de_data(): b_dmx_de_cfg = 0, b_keep_dmx_de_coeffs = 1.
@@ -1021,6 +1274,155 @@ pub fn write_audio_data_ajoc_simple(
         &is_lfe_umx,
     )?;
     Ok(())
+}
+
+/// Write a complete **static-downmix** `audio_data_ajoc()`
+/// (`b_static_dmx == 1`): the part-1 `audio_data_chan(b_lfe ? 5.1 :
+/// 5.0)` core in the SIMPLE / Cfg3Five form (Table 25 + Table 29,
+/// spectra in `[L, R, C, Ls, Rs]` order, optional LFE `mono_data(1)`)
+/// followed by the `ajoc()` tail. Per §6.2.3.4 the static form
+/// carries no signals-inactive mask, no var element, and no core OAMD
+/// block.
+#[allow(clippy::too_many_arguments)]
+pub fn write_audio_data_ajoc_static(
+    bw: &mut BitWriter,
+    params: &AjocBodyParams,
+    chan_spectra: &[&[f32]; 5],
+    lfe: Option<(&[f32], u32)>,
+    transform_length: u32,
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+) -> Result<()> {
+    if !params.b_static_dmx || params.n_fullband_dmx_signals != 5 {
+        return Err(Error::invalid(
+            "ac4: static audio_data_ajoc writer needs b_static_dmx with 5 core signals",
+        ));
+    }
+    if params.b_lfe != lfe.is_some() {
+        return Err(Error::invalid(
+            "ac4: LFE spectrum presence must match the descriptor's b_lfe",
+        ));
+    }
+    // audio_data_chan(5.X): 5_X_codec_mode = SIMPLE (3 bits), no
+    // I-frame config block, optional LFE, coding_config = 3.
+    bw.write_u32(0, 3);
+    if let Some((coeffs, max_sfb_lfe)) = lfe {
+        write_mono_data_lfe_simple(bw, coeffs, transform_length, max_sfb_lfe)?;
+    }
+    bw.write_u32(3, 2);
+    crate::ice::write_five_channel_data_simple(bw, chan_spectra, transform_length, max_sfb)?;
+    write_ajoc_tail(bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state)
+}
+
+/// Write a complete dynamic-form `audio_data_ajoc()` whose downmix is
+/// the **A-SPX** `var_channel_element()` form (`var_codec_mode = 1`):
+/// I-frame `aspx_config()`, compand-off `companding_control()`
+/// (`n_fb_dmx_signals <= 5`), the paired channel data, and one
+/// floored-noise single-envelope `aspx_data_2ch()` per pair (see
+/// [`crate::ice::write_ice_body_ajcc`] on the noise floor). Even
+/// fullband signal counts only.
+#[allow(clippy::too_many_arguments)]
+pub fn write_audio_data_ajoc_aspx(
+    bw: &mut BitWriter,
+    params: &AjocBodyParams,
+    dmx_spectra: &[&[f32]],
+    aspx_cfg: &AspxConfig,
+    lfe: Option<(&[f32], u32)>,
+    transform_length: u32,
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+) -> Result<()> {
+    if params.b_static_dmx {
+        return Err(Error::invalid(
+            "ac4: A-SPX audio_data_ajoc writer covers the dynamic form",
+        ));
+    }
+    if params.b_lfe != lfe.is_some() {
+        return Err(Error::invalid(
+            "ac4: LFE spectrum presence must match the descriptor's b_lfe",
+        ));
+    }
+    let n = params.n_fullband_dmx_signals as usize;
+    if dmx_spectra.len() != n || n == 0 || n % 2 != 0 {
+        return Err(Error::invalid(
+            "ac4: A-SPX downmix writer covers even fullband signal counts",
+        ));
+    }
+    // b_some_signals_inactive = 0.
+    bw.write_bit(false);
+    // var_channel_element(): var_codec_mode = A-SPX.
+    bw.write_bit(true);
+    if b_iframe {
+        crate::encoder_acpl3::write_aspx_config(bw, aspx_cfg);
+    }
+    if n <= 5 {
+        // companding_control(n): sync_flag = 1, b_compand_on[0] = 0,
+        // b_compand_avg = 0.
+        bw.write_bit(true);
+        bw.write_bit(false);
+        bw.write_bit(false);
+    }
+    if let Some((coeffs, max_sfb_lfe)) = lfe {
+        write_mono_data_lfe_simple(bw, coeffs, transform_length, max_sfb_lfe)?;
+    }
+    for p in 0..n / 2 {
+        write_two_channel_data_simple(
+            bw,
+            dmx_spectra[2 * p],
+            dmx_spectra[2 * p + 1],
+            transform_length,
+            max_sfb,
+        )?;
+    }
+    // Per-pair aspx_data_2ch(): single-envelope FIXFIX with a floored
+    // noise envelope (qnoise = 30) so the regenerated band carries no
+    // decoder-side noise-floor energy.
+    let tables = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0)
+        .map_err(|_| Error::invalid("ac4: aspx frequency-table derivation failed"))?;
+    let counts = tables.counts;
+    let num_sbg_sig = if aspx_cfg.signals_freq_res() {
+        counts.num_sbg_sig_lowres
+    } else {
+        counts.num_sbg_sig_highres
+    } as usize;
+    let num_sbg_noise = counts.num_sbg_noise as usize;
+    let sig_row = vec![0i32; num_sbg_sig.max(1)];
+    let mut noise_row = vec![0i32; num_sbg_noise.max(1)];
+    noise_row[0] = 30;
+    let bal_sig = vec![0i32; num_sbg_sig.max(1)];
+    let bal_noise = vec![0i32; num_sbg_noise.max(1)];
+    let tna = vec![0u8; num_sbg_noise];
+    let ch_level = crate::encoder_acpl3::AspxRealEnvelopeChannel {
+        sig: &sig_row,
+        noise: &noise_row,
+    };
+    let ch_bal = crate::encoder_acpl3::AspxRealEnvelopeChannel {
+        sig: &bal_sig,
+        noise: &bal_noise,
+    };
+    for _ in 0..n / 2 {
+        crate::encoder_acpl3::write_aspx_data_2ch_real_envelope_tna_ah_framed(
+            bw,
+            aspx_cfg,
+            ch_level,
+            ch_bal,
+            &tna,
+            &[],
+            &[],
+            b_iframe,
+        )
+        .map_err(Error::invalid)?;
+    }
+    write_ajoc_dyn_oamd_mid(bw, params, b_iframe)?;
+    write_ajoc_tail(bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state)
 }
 
 /// Assemble a complete part-2 `ac4_substream()` (§6.2.2.2) around a
@@ -1054,6 +1456,14 @@ pub fn write_ajoc_substream_simple(
         b_iframe,
         enc_state,
     )?;
+    wrap_ajoc_substream(body)
+}
+
+/// Wrap an `audio_data_ajoc()` body into a complete part-2
+/// `ac4_substream()`: `audio_size` header, byte-aligned audio data,
+/// and the minimal `metadata(…, sus_ver = 1)` tail.
+pub fn wrap_ajoc_substream(body: BitWriter) -> Result<Vec<u8>> {
+    let mut body = body;
     body.align_to_byte();
     let body_bytes = body.into_bytes();
     let audio_size = body_bytes.len() as u32;
@@ -1115,6 +1525,33 @@ pub fn encode_ajoc_raw_frame(
             "ac4: LFE spectrum presence must match the descriptor's b_lfe",
         ));
     }
+    let mut frame = write_ajoc_toc(sequence_counter, params, b_iframe)?;
+    let substream = write_ajoc_substream_simple(
+        params,
+        dmx_spectra,
+        lfe,
+        1920,
+        max_sfb,
+        num_decorr,
+        ctrl,
+        qmats,
+        b_iframe,
+        enc_state,
+    )?;
+    frame.extend_from_slice(&substream);
+    Ok(frame)
+}
+
+/// Emit the byte-aligned v2 `ac4_toc()` for a single A-JOC object
+/// substream (single presentation / single substream group,
+/// `b_channel_coded = 0`, `b_ajoc = 1`, `fs_index = 1`,
+/// `frame_rate_index = 1`). Handles both the dynamic and the
+/// `b_static_dmx` descriptor forms of `ac4_substream_info_ajoc()`.
+pub fn write_ajoc_toc(
+    sequence_counter: u32,
+    params: &AjocBodyParams,
+    b_iframe: bool,
+) -> Result<Vec<u8>> {
     if params.n_fullband_upmix_signals >= 16 || params.n_fullband_dmx_signals > 16 {
         return Err(Error::invalid("ac4: frame writer signal-count limits"));
     }
@@ -1159,9 +1596,11 @@ pub fn encode_ajoc_raw_frame(
     bw.write_bit(true); // b_ajoc
                         // ac4_substream_info_ajoc() (§6.2.1.9):
     bw.write_bit(params.b_lfe); // b_lfe
-    bw.write_bit(false); // b_static_dmx
-    bw.write_u32(params.n_fullband_dmx_signals - 1, 4);
-    bw.write_bit(true); // dmx bed_dyn_obj_assignment: b_dyn_objects_only
+    bw.write_bit(params.b_static_dmx); // b_static_dmx
+    if !params.b_static_dmx {
+        bw.write_u32(params.n_fullband_dmx_signals - 1, 4);
+        bw.write_bit(true); // dmx bed_dyn_obj_assignment: b_dyn_objects_only
+    }
     bw.write_bit(false); // b_oamd_common_data_present
     bw.write_u32(params.n_fullband_upmix_signals - 1, 4);
     bw.write_bit(true); // umx bed_dyn_obj_assignment: b_dyn_objects_only
@@ -1174,10 +1613,31 @@ pub fn encode_ajoc_raw_frame(
     bw.write_u32(1, 2); // n_substreams = 1
     bw.write_bit(false); // b_size_present = 0 (spans to frame end)
     bw.align_to_byte();
-    let mut frame = bw.into_bytes();
-    let substream = write_ajoc_substream_simple(
+    Ok(bw.into_bytes())
+}
+
+/// Emit a complete v2 `raw_ac4_frame()` carrying one **static-downmix**
+/// A-JOC object substream (`b_static_dmx = 1` — the 5-signal 5.X core;
+/// see [`write_audio_data_ajoc_static`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ajoc_raw_frame_static(
+    sequence_counter: u32,
+    params: &AjocBodyParams,
+    chan_spectra: &[&[f32]; 5],
+    lfe: Option<(&[f32], u32)>,
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+) -> Result<Vec<u8>> {
+    let mut frame = write_ajoc_toc(sequence_counter, params, b_iframe)?;
+    let mut body = BitWriter::new();
+    write_audio_data_ajoc_static(
+        &mut body,
         params,
-        dmx_spectra,
+        chan_spectra,
         lfe,
         1920,
         max_sfb,
@@ -1187,7 +1647,44 @@ pub fn encode_ajoc_raw_frame(
         b_iframe,
         enc_state,
     )?;
-    frame.extend_from_slice(&substream);
+    frame.extend_from_slice(&wrap_ajoc_substream(body)?);
+    Ok(frame)
+}
+
+/// Emit a complete v2 `raw_ac4_frame()` carrying one A-JOC object
+/// substream whose downmix uses the **A-SPX** `var_channel_element()`
+/// form (see [`write_audio_data_ajoc_aspx`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ajoc_raw_frame_aspx(
+    sequence_counter: u32,
+    params: &AjocBodyParams,
+    dmx_spectra: &[&[f32]],
+    aspx_cfg: &AspxConfig,
+    lfe: Option<(&[f32], u32)>,
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+) -> Result<Vec<u8>> {
+    let mut frame = write_ajoc_toc(sequence_counter, params, b_iframe)?;
+    let mut body = BitWriter::new();
+    write_audio_data_ajoc_aspx(
+        &mut body,
+        params,
+        dmx_spectra,
+        aspx_cfg,
+        lfe,
+        1920,
+        max_sfb,
+        num_decorr,
+        ctrl,
+        qmats,
+        b_iframe,
+        enc_state,
+    )?;
+    frame.extend_from_slice(&wrap_ajoc_substream(body)?);
     Ok(frame)
 }
 
@@ -1355,7 +1852,7 @@ mod tests {
         let mut dec_state = new_ajoc_diff_state(num_umx, num_dmx, num_decorr);
         let mut br = BitReader::new(&bytes);
         let ajoc =
-            parse_audio_data_ajoc(&mut br, &params, true, false, TL, &mut dec_state).unwrap();
+            parse_audio_data_ajoc(&mut br, &params, true, false, TL, &mut dec_state, None).unwrap();
 
         // Downmix spectra survive.
         let elem = ajoc.var_element.as_ref().unwrap();
