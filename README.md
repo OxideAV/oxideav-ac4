@@ -144,6 +144,37 @@ an S16 `AudioFrame`:
   `de_config()` carried across frames; per §6.2.7.2 an object
   substream opens no channel-gated `basic_metadata` field and carries
   no stereo-dmx block — the bed/custom downmix data is authoritative).
+  All three §6.2.3.4 downmix forms reach object PCM: the dynamic
+  SIMPLE form, the dynamic **A-SPX** form (each downmix channel is
+  bandwidth-extended in the QMF domain from its captured
+  `aspx_data_2ch()` / `aspx_data_1ch()` payload before the spatial
+  reconstruction, with the I-frame `aspx_config` + xover sticky
+  across P-frames), and the **`b_static_dmx`** 5.X core (the
+  `audio_data_chan(5.0/5.1)` SIMPLE coding configs feed the
+  reconstruction in the Table 180 `[L, R, C, Ls, Rs]` order; the 5.1
+  core's LFE lands on the leading output slot). The write side gains
+  the matching `write_audio_data_ajoc_static` /
+  `write_audio_data_ajoc_aspx` bodies and
+  `encode_ajoc_raw_frame_static` / `encode_ajoc_raw_frame_aspx`
+  full-frame writers.
+- **Immersive channel element** (TS 103 190-2 §6.2.4.1-2 — channel
+  modes 7.0.4 / 7.1.4 / 9.0.4 / 9.1.4, Table 78) — the `ice` module
+  parses the full `immersive_channel_element()` family: the Table 95
+  `immersive_codec_mode` prefix code, `immers_cfg()` on the shared
+  I-frame-sticky config slots, all four Table 97 core groupings
+  (1+2+2 incl. both `2ch_mode` forms / 3+2 / 1+4 / 5) with the
+  §5.2.3.2 Table 19 track assignment, the 7CH_STATIC
+  `b_use_sap_add_ch` chparam pair + additional pair, the
+  mode-dependent A-SPX payload roster (captured per element),
+  `ajcc_data(b_5fronts)`, the S-CPL pair/chparam section, and the
+  4/6-element `acpl_data_1ch()` section — with P-frame sticky-config
+  support. `Ac4Decoder` routes the immersive channel modes and
+  synthesises **SCPL full decoding** (§5.3.3.1 Table 23 time-domain
+  matrix, identity SAP) and **ASPX_AJCC full decoding** (§5.6.3.5.2:
+  core IMDCT → per-channel QMF A-SPX extension → A-JCC full decode →
+  11/13 outputs; LFE first). Writers emit complete v2 frames
+  (`write_ice_body_scpl` / `write_ice_body_ajcc` /
+  `encode_ice_raw_frame`) for all four channel modes.
 - **OAMD** (object audio metadata, TS 103 190-2 §6.2.8 + §6.3.9) —
   the `oamd` module parses and re-emits (exact writer inverses)
   `oamd_timing_data()`, `object_info_block()` with basic / render info
@@ -241,12 +272,16 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **A-JOC decode-path remainders** — the frame-decoder route covers the
-  dynamic SIMPLE downmix form (incl. LFE); the `b_static_dmx` 5.X core
-  and the A-SPX `var_channel_element` mode are parsed but not yet
-  driven through the object PCM path.
-- **`immersive_channel_element()`** (§6.2.4.1) — the core that feeds
-  the complete A-JCC parameter + reconstruction chain.
+- **Immersive-channel-element synthesis remainders** — ASPX_SCPL /
+  ASPX_ACPL_1 / ASPX_ACPL_2 parse fully but emit silence (their
+  per-channel S-CPL gain ladders and §5.5.2 Table 27 A-CPL modules
+  aren't wired yet); the §5.2.3.2 step-4/step-6 SAP mixing runs at
+  identity (`sap_mode != 0` chparam payloads are parsed, not applied);
+  companding gains are not applied on the ICE ASPX_AJCC or A-JOC
+  A-SPX-downmix routes; the A-SPX / A-CPL codec modes of the A-JOC
+  `b_static_dmx` core parse but their carrier synthesis into the
+  object path is pending; core decoding mode (7-channel outputs) and
+  the `22_2_channel_element` are unimplemented.
 - Remaining TS 103 190-2 multi-stream / immersive / object-based (IFM)
   extensions beyond the parsed presentation / OAMD / object substream
   surfaces.

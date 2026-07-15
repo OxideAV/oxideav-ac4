@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 414 — **immersive_channel_element family + the two A-JOC
+  downmix remainders to object PCM** (ETSI TS 103 190-2). Four
+  landings:
+  1. **Table 78 channel_mode codes** (`toc`): the prefix decoder
+     conflated the part-1 and part-2 trees and invented 7-bit codes
+     for the immersive layouts. `decode_channel_mode_v0` (Table 88:
+     `1111110` / `≥ 1111111` are Reserved) and
+     `decode_channel_mode_v2` (Table 78: 8-bit `1111110x` = 7.0.4 /
+     7.1.4, 9-bit `111111100..110` = 9.0.4 / 9.1.4 / 22.2) replace
+     it; both `ac4_substream_info` walkers now read the previously
+     skipped `add_ch_base` bit (ch_mode 7..=10), and
+     `ac4_substream_info_chan` reads the §6.3.2.7.3-5 immersive
+     presence fields — the full `ChannelModeDesc` + presence surface
+     on `Ac4FrameInfo`.
+  2. **`immersive_channel_element()`** (§6.2.4.1-2, new `ice`
+     module): full parser for all five Table 95 codec modes —
+     `immers_cfg()` on the sticky config slots, LFE,
+     `companding_control(5)`, all four Table 97 core groupings with
+     the §5.2.3.2 Table 19 track assignment (incl. both `2ch_mode`
+     forms), the 7CH_STATIC `b_use_sap_add_ch` chparam pair +
+     additional pair, the mode-dependent A-SPX roster (per-element
+     trailer captures; ASPX_SCPL interleaves the 1ch payload),
+     `ajcc_data(b_5fronts)`, the S-CPL section, and the 4/6
+     `acpl_data_1ch()` sets — P-frames reuse the sticky configs.
+     Writers: `write_five_channel_data_simple`, SCPL / ASPX_AJCC
+     bodies, and `encode_ice_raw_frame` (complete v2 frames for all
+     four immersive channel modes). Fix: the ASPX trailer captures
+     detached the sticky xover before non-I-frame walks (latent on
+     the 5_X/7_X trailer paths too).
+  3. **ICE decode routing** (`Ac4Decoder`): SCPL full decoding
+     (§5.3.3.1 Table 23 — c_gain 2 / m_gain √2, b_5fronts front rows,
+     identity SAP) and ASPX_AJCC full decoding (§5.6.3.5.2 — core
+     IMDCT → per-channel QMF A-SPX extension → `decode_ajcc_parsed`
+     (new split; differential state on the decoder) → A-JCC full
+     decode → 11/13 outputs), LFE-first output, ASPX_SCPL/ACPL modes
+     emit silence pending their synthesis. Decoder-level pins: Table
+     23 sum/difference cancellation, 9.1.4 front rows + LFE, and an
+     ASPX_AJCC I+P+P GOP with left-module tone reconstruction.
+  4. **A-JOC downmix remainders** (§6.2.3.4 / §6.2.4.4): the
+     `b_static_dmx` 5.X core (SIMPLE coding configs → Table 180
+     `[L, R, C, Ls, Rs]`, 5.1-core LFE on the leading slot) and the
+     A-SPX `var_channel_element` form (per-channel QMF extension from
+     captured payload trailers, sticky `aspx_config`/xover across
+     P-frames) now reach object PCM; matching static / A-SPX body +
+     full-frame writers and I+P+P decoder-level energy pins.
+  Suite grows 1284 → 1300 tests, all green.
 - ac4 round 411 — **presentation/OAMD substream surfaces + stereo-dmx
   coefficients + A-JOC LFE/metadata decode + CRC + ndot polarity fix**
   (ETSI TS 103 190-1/-2). Eight landings:
