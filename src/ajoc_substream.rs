@@ -707,7 +707,12 @@ impl AjocSubstreamDecoder {
 /// (sections + spectra + scalefactors + SNF) for `coeffs` at
 /// `max_sfb` bands, mirroring the decode path of
 /// `decode_mch_sf_data_channels`.
-fn write_asf_body_from_spectrum(bw: &mut BitWriter, coeffs: &[f32], sfbo: &[u16], max_sfb: u32) {
+pub(crate) fn write_asf_body_from_spectrum(
+    bw: &mut BitWriter,
+    coeffs: &[f32],
+    sfbo: &[u16],
+    max_sfb: u32,
+) {
     use crate::encoder_asf::{
         build_band_codebook_cost_table, build_sections_from_dp,
         compute_snf_dpcm_for_zero_quant_bands, dp_optimise_sections, pick_best_codebook_for_band,

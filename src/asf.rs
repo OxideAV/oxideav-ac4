@@ -1634,6 +1634,10 @@ pub struct SubstreamTools {
     /// a stereo split-MDCT path. `None` for mono substreams or for
     /// stereo substreams whose right channel is on ASF.
     pub ssf_data_secondary: Option<crate::ssf::SsfData>,
+    /// Parsed `immersive_channel_element()` (TS 103 190-2 §6.2.4.1)
+    /// for the immersive channel modes (7.0.4 / 7.1.4 / 9.0.4 /
+    /// 9.1.4). Populated by [`crate::ice::parse_ice_audio_data_outer`].
+    pub ice: Option<Box<crate::ice::IceElement>>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -2193,6 +2197,12 @@ pub(crate) fn capture_aspx_data_2ch_trailer(
     frame_len_base: u32,
 ) -> Option<aspx::FiveXAspxTrailer> {
     let snap = AspxTrailerSnapshot::capture(tools);
+    // Tables 51 / 52: non-I-frames carry no xover offset on the wire —
+    // the parse below needs the I-frame-sticky value the snapshot just
+    // detached, so re-seed it for the walk (restored either way).
+    if !b_iframe {
+        tools.aspx_xover_subband_offset = snap.xover;
+    }
     let parse_ok = parse_aspx_data_2ch_body(br, tools, cfg, b_iframe, frame_len_base).is_ok();
     let trailer = if parse_ok {
         let xover = tools.aspx_xover_subband_offset?;
@@ -2274,6 +2284,11 @@ pub(crate) fn capture_aspx_data_1ch_trailer(
     frame_len_base: u32,
 ) -> Option<aspx::FiveXAspxTrailer> {
     let snap = AspxTrailerSnapshot::capture(tools);
+    // See capture_aspx_data_2ch_trailer — re-seed the sticky xover the
+    // snapshot detached so the Table 51 non-I-frame walk can run.
+    if !b_iframe {
+        tools.aspx_xover_subband_offset = snap.xover;
+    }
     let parse_ok = parse_aspx_data_1ch_body(br, tools, cfg, b_iframe, frame_len_base).is_ok();
     let trailer = if parse_ok {
         let xover = tools.aspx_xover_subband_offset?;
@@ -3586,6 +3601,24 @@ pub fn walk_ac4_substream_sticky(
                 &mut br,
                 &mut tools,
                 true,
+                b_iframe,
+                frame_len_base,
+            );
+        }
+        // Immersive channel modes (TS 103 190-2 Table 78, ch_mode
+        // 11..=14): `audio_data_chan()` routes to
+        // `immersive_channel_element(b_lfe, b_5fronts, b_iframe)` per
+        // §6.2.3.1. The channel counts are unique per mode (11 =
+        // 7.0.4, 12 = 7.1.4, 13 = 9.0.4, 14 = 9.1.4). Try-and-bail
+        // like the 5.X / 7.X walkers.
+        11..=14 => {
+            let b_lfe = channels == 12 || channels == 14;
+            let b_5fronts = channels == 13 || channels == 14;
+            let _ = crate::ice::parse_ice_audio_data_outer(
+                &mut br,
+                &mut tools,
+                b_lfe,
+                b_5fronts,
                 b_iframe,
                 frame_len_base,
             );

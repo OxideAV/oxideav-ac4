@@ -731,7 +731,7 @@ fn write_aspx_data_2ch_minimal(
 
 /// [`write_aspx_data_2ch_minimal`] with an explicit `b_iframe` — Tables 51/52 gate the
 /// leading 3-bit xover offset on I-frames.
-fn write_aspx_data_2ch_minimal_framed(
+pub(crate) fn write_aspx_data_2ch_minimal_framed(
     bw: &mut BitWriter,
     cfg: &aspx::AspxConfig,
     b_iframe: bool,
@@ -3514,7 +3514,7 @@ fn write_aspx_data_1ch_minimal(
 
 /// [`write_aspx_data_1ch_minimal`] with an explicit `b_iframe` — Tables 51/52 gate the
 /// leading 3-bit xover offset on I-frames.
-fn write_aspx_data_1ch_minimal_framed(
+pub(crate) fn write_aspx_data_1ch_minimal_framed(
     bw: &mut BitWriter,
     cfg: &aspx::AspxConfig,
     b_iframe: bool,

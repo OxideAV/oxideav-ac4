@@ -514,6 +514,7 @@ pub mod encoder_asf;
 pub mod encoder_ims;
 pub mod encoder_mdct;
 pub mod huffman;
+pub mod ice;
 pub mod mch;
 pub mod mdct;
 pub mod metadata;
