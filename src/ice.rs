@@ -694,8 +694,11 @@ pub fn write_ice_body_scpl(
 
 /// Write an ASPX_AJCC-mode `immersive_channel_element()` body:
 /// grouping 3 core, `companding_control(5)` with `sync_flag = 1` /
-/// `b_compand_on = 1`, minimal A-SPX payloads (FIXFIX, one envelope,
-/// zero rows), and the given `ajcc_data()` element.
+/// `b_compand_on = 0` (no decoder-side gain), single-envelope FIXFIX
+/// A-SPX payloads with a **floored noise envelope** (`qnoise = 30` →
+/// `2^(6−30)` per Pseudocode 83 — the all-zero minimal scaffold's
+/// `qnoise = 0` decodes to a full-scale HF noise floor on every
+/// channel), and the given `ajcc_data()` element.
 #[allow(clippy::too_many_arguments)]
 pub fn write_ice_body_ajcc(
     bw: &mut BitWriter,
@@ -719,19 +722,62 @@ pub fn write_ice_body_ajcc(
             max_sfb_lfe,
         )?;
     }
-    // companding_control(5): sync_flag = 1, b_compand_on[0] = 1.
+    // companding_control(5): sync_flag = 1, b_compand_on[0] = 0,
+    // b_compand_avg = 0 (companding off).
     bw.write_bit(true);
-    bw.write_bit(true);
+    bw.write_bit(false);
+    bw.write_bit(false);
     // core_5ch_grouping = 3.
     bw.write_u32(3, 2);
     write_five_channel_data_simple(bw, core, transform_length, max_sfb)?;
     // A-SPX: 2× aspx_data_2ch + 1× aspx_data_1ch (5CH_DYNAMIC).
-    crate::encoder_acpl3::write_aspx_data_2ch_minimal_framed(bw, aspx_cfg, b_iframe)
+    // Level rows: sig F0 = 0 (codebook minimum), noise F0 = 30
+    // (floored); balance rows all-zero (channel 1 mirrors channel 0).
+    let tables = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0)
+        .map_err(|_| Error::invalid("ac4: aspx frequency-table derivation failed"))?;
+    let counts = tables.counts;
+    let num_sbg_sig = if aspx_cfg.signals_freq_res() {
+        counts.num_sbg_sig_lowres
+    } else {
+        counts.num_sbg_sig_highres
+    } as usize;
+    let num_sbg_noise = counts.num_sbg_noise as usize;
+    let sig_row = vec![0i32; num_sbg_sig.max(1)];
+    let mut noise_row = vec![0i32; num_sbg_noise.max(1)];
+    noise_row[0] = 30;
+    let bal_sig = vec![0i32; num_sbg_sig.max(1)];
+    let bal_noise = vec![0i32; num_sbg_noise.max(1)];
+    let tna = vec![0u8; num_sbg_noise];
+    let ch_level = crate::encoder_acpl3::AspxRealEnvelopeChannel {
+        sig: &sig_row,
+        noise: &noise_row,
+    };
+    let ch_bal = crate::encoder_acpl3::AspxRealEnvelopeChannel {
+        sig: &bal_sig,
+        noise: &bal_noise,
+    };
+    for _ in 0..2 {
+        crate::encoder_acpl3::write_aspx_data_2ch_real_envelope_tna_ah_framed(
+            bw,
+            aspx_cfg,
+            ch_level,
+            ch_bal,
+            &tna,
+            &[],
+            &[],
+            b_iframe,
+        )
         .map_err(Error::invalid)?;
-    crate::encoder_acpl3::write_aspx_data_2ch_minimal_framed(bw, aspx_cfg, b_iframe)
-        .map_err(Error::invalid)?;
-    crate::encoder_acpl3::write_aspx_data_1ch_minimal_framed(bw, aspx_cfg, b_iframe)
-        .map_err(Error::invalid)?;
+    }
+    crate::encoder_acpl3::write_aspx_data_1ch_real_envelope_tna_ah_framed(
+        bw,
+        aspx_cfg,
+        ch_level,
+        &tna,
+        &[],
+        b_iframe,
+    )
+    .map_err(Error::invalid)?;
     write_ajcc_data(bw, ajcc)?;
     Ok(())
 }
@@ -810,7 +856,8 @@ pub fn encode_ice_raw_frame(
     bw.write_bit(false); // b_bitrate_info
     bw.write_bit(b_iframe); // b_audio_ndot = b_iframe (frame_rate_factor = 1)
     bw.write_u32(0, 2); // substream_index
-                        // ---- substream_index_table() ----
+    bw.write_bit(false); // b_content_type (group level, §6.2.1.6)
+                         // ---- substream_index_table() ----
     bw.write_u32(1, 2); // n_substreams = 1
     bw.write_bit(false); // b_size_present = 0 (spans to frame end)
     bw.align_to_byte();

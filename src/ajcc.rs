@@ -766,6 +766,15 @@ pub fn decode_ajcc(
     state: &mut AjccState,
 ) -> Result<AjccDecoded> {
     let data = parse_ajcc_data(br, b_5fronts)?;
+    decode_ajcc_parsed(data, state)
+}
+
+/// Run the §5.6.3.2 differential decode + dequantization over an
+/// already-parsed `ajcc_data()` element (e.g. one stored on a parsed
+/// `immersive_channel_element`). `state` carries the per-SET
+/// `ajcc_<SET>_q_prev` rows across frames.
+pub fn decode_ajcc_parsed(data: AjccData, state: &mut AjccState) -> Result<AjccDecoded> {
+    let b_5fronts = data.b_5fronts;
     let nb = data.num_bands as usize;
 
     let alpha_q = decode_family(
