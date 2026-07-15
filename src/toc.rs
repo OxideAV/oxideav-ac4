@@ -132,89 +132,182 @@ pub fn write_variable_bits(bw: &mut oxideav_core::bits::BitWriter, n_bits: u32, 
     }
 }
 
-/// Channel mode lookup — maps the encoded bit pattern to channel count.
-///
-/// The channel_mode field uses a variable-length code: 1, 2, 4 or 7 bits
-/// per the table hint in Syntax of `ac4_substream_info()`. We implement
-/// the prefix decoder spelled out in the spec (clause 4.3.3.4.1 Table
-/// 85 — "channel_mode encoding"). Returns `(channel_count, total_bits)`.
-///
-/// The shortest codes give the common mono / stereo / 5.1 layouts; the
-/// 7-bit codes reach the high-count and immersive modes. `0b1111111`
-/// with a `variable_bits(2)` extension is reserved for future use and
-/// is returned as "0 channels" so the caller can treat it as unknown.
-pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
-    // Table 85 channel_mode prefix codes per TS 103 190-1 clause 4.3.3.4.1.
-    //
-    // Prefix   Length  channel_mode  channels  layout
-    // 0              1  0             1         mono
-    // 10             2  1             2         stereo
-    // 1100           4  2             3         3.0
-    // 1101           4  3             5         5.0
-    // 1110           4  4             6         5.1
-    // 11110000       7  5             7         7.0 (3/4/0)
-    // 11110001       7  6             8         7.1 (3/4/0.1)
-    // 11110010       7  7             7         7.0 (5/2/0)
-    // 11110011       7  8             8         7.1 (5/2/0.1)
-    // 11110100       7  9             7         7.0 (3/2/2)
-    // 11110101       7 10             8         7.1 (3/2/2.1)
-    // 11110110       7 11             7         7.0.4
-    // 11110111       7 12             9         7.1.4 (9.1)
-    // 11111000       7 13            11         9.0.4
-    // 11111001       7 14            12         9.1.4
-    // 11111010       7 15             3         mono + 2 (reserved-ish)
-    // 11111011       7 16             2         stereo (add channel form)
-    // 11111100       7 17             4         quad (add channel form)
-    // 11111101       7 18             4         quad (add channel form)
-    // 11111110       7 19-…           0         immersive/object escape
-    // 1111111        7 escape         —         variable_bits(2) follow-on
-    //
-    // Exact channel counts above index 11 are used by TS 103 190-2 IFM
-    // streams; for this foundation we treat them as opaque — the field is
-    // still consumed correctly so downstream bit-alignment is preserved.
-    //
-    // We read up to 7 bits; on the 0b1111111 escape the caller is expected
-    // to run `variable_bits(2)` to extend the encoded index.
+/// Decoded `channel_mode` descriptor — the `ch_mode` index (TS 103
+/// 190-1 Table 88 / TS 103 190-2 Table 78), the channel count of the
+/// layout, and the number of bits the prefix code consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelModeDesc {
+    /// `ch_mode` variable per the table (0 = mono … 15 = 22.2;
+    /// reserved codes land on 11+/16+ depending on the table).
+    pub ch_mode: u32,
+    /// Channel count of the layout (0 for reserved codes).
+    pub channels: u32,
+    /// Bits consumed by the prefix code (excluding any
+    /// `variable_bits(2)` reserved-escape extension).
+    pub bits: u32,
+}
+
+impl ChannelModeDesc {
+    /// Whether this is one of the TS 103 190-2 Table 78 immersive
+    /// channel modes that route `audio_data_chan()` to
+    /// `immersive_channel_element()` (7.0.4 / 7.1.4 / 9.0.4 / 9.1.4).
+    pub fn is_immersive(&self) -> bool {
+        (11..=14).contains(&self.ch_mode)
+    }
+
+    /// `b_lfe` argument `immersive_channel_element(b_lfe, …)` receives
+    /// for this channel mode (§6.2.3.1: 7.1.4 / 9.1.4 carry an LFE).
+    pub fn immersive_b_lfe(&self) -> bool {
+        self.ch_mode == 12 || self.ch_mode == 14
+    }
+
+    /// `b_5fronts` argument `immersive_channel_element(…, b_5fronts, …)`
+    /// receives for this channel mode (§6.2.3.1: 9.0.4 / 9.1.4).
+    pub fn immersive_b_5fronts(&self) -> bool {
+        self.ch_mode == 13 || self.ch_mode == 14
+    }
+}
+
+/// Shared 1/2/4-bit head of both channel_mode prefix tables. Returns
+/// `Some(desc)` when the code resolved within 4 bits, otherwise `None`
+/// (the caller handles the `1111…` group per its table).
+fn decode_channel_mode_head(br: &mut BitReader<'_>) -> Result<Option<ChannelModeDesc>> {
     let b0 = br.read_u32(1)?;
     if b0 == 0 {
-        return Ok((1, 1));
+        return Ok(Some(ChannelModeDesc {
+            ch_mode: 0,
+            channels: 1,
+            bits: 1,
+        }));
     }
     let b1 = br.read_u32(1)?;
     if b1 == 0 {
-        return Ok((2, 2));
+        return Ok(Some(ChannelModeDesc {
+            ch_mode: 1,
+            channels: 2,
+            bits: 2,
+        }));
     }
     let nx = br.read_u32(2)?;
-    if nx != 0b11 {
+    Ok(match nx {
         // 4-bit prefix group: 1100 / 1101 / 1110.
-        return Ok((
-            match nx {
-                0b00 => 3,
-                0b01 => 5,
-                0b10 => 6,
-                _ => 0,
-            },
-            4,
-        ));
+        0b00 => Some(ChannelModeDesc {
+            ch_mode: 2,
+            channels: 3,
+            bits: 4,
+        }),
+        0b01 => Some(ChannelModeDesc {
+            ch_mode: 3,
+            channels: 5,
+            bits: 4,
+        }),
+        0b10 => Some(ChannelModeDesc {
+            ch_mode: 4,
+            channels: 6,
+            bits: 4,
+        }),
+        _ => None,
+    })
+}
+
+/// Decode the TS 103 190-1 `channel_mode` prefix code (§4.3.3.7.1
+/// Table 88) as used by the `bitstream_version <= 1`
+/// `ac4_substream_info()` walker.
+///
+/// The part-1 table is a 1/2/4/7-bit tree: codes `1111000`..`1111101`
+/// are the 7.0 / 7.1 layout family (ch_mode 5..10), `1111110` is
+/// Reserved (ch_mode 11), and `≥ 1111111` is Reserved with a
+/// `variable_bits(2)` extension (ch_mode 12+). Reserved codes return
+/// 0 channels so the caller treats the layout as unknown.
+pub fn decode_channel_mode_v0(br: &mut BitReader<'_>) -> Result<ChannelModeDesc> {
+    if let Some(d) = decode_channel_mode_head(br)? {
+        return Ok(d);
     }
     // 7-bit prefix group: 1111xxx.
     let tail = br.read_u32(3)?;
-    let channels = match tail {
-        0b000 => 7, // channel_mode 5 — 7.0 (3/4/0)
-        0b001 => 8, // channel_mode 6 — 7.1 (3/4/0.1)
-        0b010 => 7, // channel_mode 7 — 7.0 (5/2/0)
-        0b011 => 8, // channel_mode 8 — 7.1 (5/2/0.1)
-        0b100 => 7, // channel_mode 9 — 7.0 (3/2/2)
-        0b101 => 8, // channel_mode 10 — 7.1 (3/2/2.1)
-        0b110 => 7, // channel_mode 11 — 7.0.4
+    let (ch_mode, channels) = match tail {
+        0b000 => (5, 7),  // 7.0: 3/4/0
+        0b001 => (6, 8),  // 7.1: 3/4/0.1
+        0b010 => (7, 7),  // 7.0: 5/2/0
+        0b011 => (8, 8),  // 7.1: 5/2/0.1
+        0b100 => (9, 7),  // 7.0: 3/2/2
+        0b101 => (10, 8), // 7.1: 3/2/2.1
+        0b110 => (11, 0), // Reserved.
         0b111 => {
-            // 1111111 — escape. Caller reads variable_bits(2); we leave
-            // channel count unknown.
-            let _ext = variable_bits(br, 2)?;
-            return Ok((0, 7 + 3));
+            // ≥ 1111111 — Reserved, extended by variable_bits(2).
+            let ext = variable_bits(br, 2)?;
+            (12 + ext, 0)
         }
         _ => unreachable!("3-bit tail is 0..=7"),
     };
-    Ok((channels, 7))
+    Ok(ChannelModeDesc {
+        ch_mode,
+        channels,
+        bits: 7,
+    })
+}
+
+/// Decode the TS 103 190-2 `channel_mode` prefix code (§6.3.2.7.2
+/// Table 78) as used by the `bitstream_version >= 2`
+/// `ac4_substream_info_chan()` walker.
+///
+/// Table 78 extends part-1 Table 88 with the immersive layouts: the
+/// 8-bit codes `11111100` / `11111101` are 7.0.4 / 7.1.4 (ch_mode
+/// 11 / 12) and the 9-bit codes `111111100` / `111111101` /
+/// `111111110` are 9.0.4 / 9.1.4 / 22.2 (ch_mode 13 / 14 / 15);
+/// `0b111111111` is Reserved with a `variable_bits(2)` extension
+/// (ch_mode 16+, returned as 0 channels).
+pub fn decode_channel_mode_v2(br: &mut BitReader<'_>) -> Result<ChannelModeDesc> {
+    if let Some(d) = decode_channel_mode_head(br)? {
+        return Ok(d);
+    }
+    // 7-bit prefix group: 1111xxx.
+    let tail = br.read_u32(3)?;
+    let (ch_mode, channels, bits) = match tail {
+        0b000 => (5, 7, 7),  // 7.0: 3/4/0
+        0b001 => (6, 8, 7),  // 7.1: 3/4/0.1
+        0b010 => (7, 7, 7),  // 7.0: 5/2/0
+        0b011 => (8, 8, 7),  // 7.1: 5/2/0.1
+        0b100 => (9, 7, 7),  // 7.0: 3/2/2
+        0b101 => (10, 8, 7), // 7.1: 3/2/2.1
+        0b110 => {
+            // 8-bit group: 11111100 (7.0.4) / 11111101 (7.1.4).
+            if br.read_bit()? {
+                (12, 12, 8) // 7.1.4
+            } else {
+                (11, 11, 8) // 7.0.4
+            }
+        }
+        0b111 => {
+            // 9-bit group: 111111100 (9.0.4) / 111111101 (9.1.4) /
+            // 111111110 (22.2) / 111111111 (Reserved + variable_bits).
+            match br.read_u32(2)? {
+                0b00 => (13, 13, 9), // 9.0.4
+                0b01 => (14, 14, 9), // 9.1.4
+                0b10 => (15, 24, 9), // 22.2
+                _ => {
+                    let ext = variable_bits(br, 2)?;
+                    (16 + ext, 0, 9)
+                }
+            }
+        }
+        _ => unreachable!("3-bit tail is 0..=7"),
+    };
+    Ok(ChannelModeDesc {
+        ch_mode,
+        channels,
+        bits,
+    })
+}
+
+/// Channel mode lookup — maps the encoded bit pattern to channel count.
+///
+/// Compatibility wrapper over [`decode_channel_mode_v0`] (TS 103 190-1
+/// Table 88 — the `bitstream_version <= 1` tree). Returns
+/// `(channel_count, total_bits)`; reserved codes return 0 channels.
+pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
+    let d = decode_channel_mode_v0(br)?;
+    Ok((d.channels, d.bits))
 }
 
 /// Parsed AC-4 frame information — the result of running
@@ -275,6 +368,15 @@ pub struct Ac4FrameInfo {
     /// OAMD substream descriptors (`oamd_substream_info()`,
     /// TS 103 190-2 §6.2.1.13), in substream-group walk order.
     pub oamd_substreams: Vec<OamdSubstreamInfoDesc>,
+    /// Channel-mode descriptor of the first channel-coded substream of
+    /// the first v2 substream group (`ac4_substream_info_chan()`,
+    /// TS 103 190-2 Table 78). `None` for v0/v1 TOCs and for
+    /// non-channel-coded groups.
+    pub first_chan_mode: Option<ChannelModeDesc>,
+    /// §6.3.2.7.3-5 immersive content-presence fields, present when
+    /// `first_chan_mode` is one of the 7.0.4 / 7.1.4 / 9.0.4 / 9.1.4
+    /// modes.
+    pub immersive_presence: Option<ImmersivePresence>,
 }
 
 /// Parsed `oamd_substream_info(b_substreams_present)`
@@ -377,6 +479,8 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     let mut ajoc_substreams = Vec::new();
     let mut obj_substreams = Vec::new();
     let mut oamd_substreams = Vec::new();
+    let mut first_chan_mode = None;
+    let mut immersive_presence = None;
     if bitstream_version <= 1 {
         for _ in 0..n_presentations {
             let pi = parse_presentation_info(&mut br, fs_index, frame_rate_index)?;
@@ -414,6 +518,8 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
             if j == 0 {
                 first_group_channels = g.first_channels;
                 first_group_sf_mul = g.first_sf_multiplier;
+                first_chan_mode = g.first_chan_mode;
+                immersive_presence = g.first_immersive_presence;
             }
             ajoc_substreams.extend(g.ajoc);
             obj_substreams.extend(g.objs);
@@ -469,6 +575,8 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         ajoc_substreams,
         obj_substreams,
         oamd_substreams,
+        first_chan_mode,
+        immersive_presence,
     })
 }
 
@@ -564,7 +672,8 @@ fn parse_substream_info(
     frame_rate_index: u32,
 ) -> Result<SubstreamInfo> {
     // §4.2.3.6 ac4_substream_info().
-    let (channels, _mode_bits) = decode_channel_mode(br)?;
+    let mode = decode_channel_mode_v0(br)?;
+    let channels = mode.channels;
     let mut sf_multiplier = 0;
     if fs_index == 1 {
         let b_sf_multiplier = br.read_bit()?;
@@ -583,22 +692,12 @@ fn parse_substream_info(
             let _ = br.read_u32(2)?;
         }
     }
-    // add_ch_base bit for certain channel_mode values (0b1111010..0b1111101).
-    // Since we decoded via the prefix tree we don't have that exact code
-    // value; the spec gates it on channel_mode numeric identity, and our
-    // 7-bit prefix decoder returns the channel count, not the code.
-    // For the frame-shape foundation we don't need add_ch_base, so we
-    // skip this bit conservatively when the channel count suggests an
-    // extended layout (7/8 channels from the 7-bit prefix group).
-    if channels == 7 || channels == 8 {
-        // The spec specifies add_ch_base for exactly codes 122..125; those
-        // map to our (channels, mode_bits=7) results for tail in 0b010..=
-        // 0b101. We cannot distinguish them after the fact from
-        // decode_channel_mode alone, so we approximate by always reading
-        // the bit when mode_bits == 7 — safe because it's the next bit
-        // either way; in the non-add-ch-base subset the bit is a
-        // b_content_type that we consume just below. Approximate path is
-        // kept minimal; see note in README.
+    // Table 9: `add_ch_base` for channel_mode codes 0b1111010 ..
+    // 0b1111101 (ch_mode 7..=10 — the 5/2/0 and 3/2/2 layout family;
+    // §4.3.3.7.6). With the ch_mode index now surfaced from the prefix
+    // decoder the gate is exact.
+    if (7..=10).contains(&mode.ch_mode) {
+        let _add_ch_base = br.read_bit()?;
     }
     let b_content_type = br.read_bit()?;
     if b_content_type {
@@ -973,6 +1072,8 @@ fn parse_substream_group_info(
             if sus == 0 {
                 summary.first_channels = chan.channels;
                 summary.first_sf_multiplier = chan.sf_multiplier;
+                summary.first_chan_mode = Some(chan.mode);
+                summary.first_immersive_presence = chan.immersive_presence;
             }
             if b_hsf_ext && b_substreams_present {
                 let si = br.read_u32(2)?;
@@ -1048,7 +1149,19 @@ fn parse_substream_info_chan(
     frame_rate_index: u32,
     b_substreams_present: bool,
 ) -> Result<SubstreamInfoChan> {
-    let (channels, _mode_bits) = decode_channel_mode(br)?;
+    let mode = decode_channel_mode_v2(br)?;
+    // §6.2.1.8: the immersive channel modes (7.0.4 / 7.1.4 / 9.0.4 /
+    // 9.1.4 — codes 0b11111100 / 0b11111101 / 0b111111100 /
+    // 0b111111101) carry three content-presence fields right after the
+    // channel_mode (Tables 79-81).
+    let mut immersive_presence = None;
+    if mode.is_immersive() {
+        immersive_presence = Some(ImmersivePresence {
+            b_4_back_channels_present: br.read_bit()?,
+            b_centre_present: br.read_bit()?,
+            top_channels_present: br.read_u32(2)? as u8,
+        });
+    }
     let mut sf_multiplier = 0;
     if fs_index == 1 {
         let b_sf_multiplier = br.read_bit()?;
@@ -1063,11 +1176,18 @@ fn parse_substream_info_chan(
             let _ = br.read_u32(2)?;
         }
     }
-    // §6.2.1.8 add_ch_base bit gate — skipped for the v2 walker for the
-    // same reason as the v0 walker (we don't surface raw channel_mode).
+    // §6.2.1.8: `add_ch_base` for channel_mode codes 0b1111010 ..
+    // 0b1111101 (ch_mode 7..=10), same gate as part-1 Table 9.
+    if (7..=10).contains(&mode.ch_mode) {
+        let _add_ch_base = br.read_bit()?;
+    }
     let factor = frame_rate_factor(frame_rate_index, false, 0);
+    let mut b_audio_ndot = false;
     for _ in 0..factor.max(1) {
-        let _b_audio_ndot = br.read_bit()?;
+        let f = br.read_bit()?;
+        if !b_audio_ndot {
+            b_audio_ndot = f;
+        }
     }
     if b_substreams_present {
         let si = br.read_u32(2)?;
@@ -1076,21 +1196,59 @@ fn parse_substream_info_chan(
         }
     }
     Ok(SubstreamInfoChan {
-        channels: channels as u16,
+        mode,
+        channels: mode.channels as u16,
         sf_multiplier,
+        immersive_presence,
+        b_audio_ndot,
     })
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// §6.3.2.7.3-5 immersive content-presence fields
+/// (`ac4_substream_info_chan()` channel modes 11..=14 only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImmersivePresence {
+    /// Table 79 — whether Lb / Rb carry original content (false =
+    /// encoded silence).
+    pub b_4_back_channels_present: bool,
+    /// Table 80 — whether C carries original content.
+    pub b_centre_present: bool,
+    /// Table 81 — how the top channels (Tfl / Tbl / Tfr / Tbr) map to
+    /// the original content (2-bit code).
+    pub top_channels_present: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct SubstreamInfoChan {
+    mode: ChannelModeDesc,
     channels: u16,
     sf_multiplier: u32,
+    immersive_presence: Option<ImmersivePresence>,
+    b_audio_ndot: bool,
+}
+
+impl Default for SubstreamInfoChan {
+    fn default() -> Self {
+        SubstreamInfoChan {
+            mode: ChannelModeDesc {
+                ch_mode: 0,
+                channels: 0,
+                bits: 0,
+            },
+            channels: 0,
+            sf_multiplier: 0,
+            immersive_presence: None,
+            b_audio_ndot: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct SubstreamGroupSummary {
     first_channels: u16,
     first_sf_multiplier: u32,
+    first_chan_mode: Option<ChannelModeDesc>,
+    first_immersive_presence: Option<ImmersivePresence>,
     ajoc: Vec<AjocSubstreamInfo>,
     objs: Vec<ObjSubstreamInfo>,
     oamd: Vec<OamdSubstreamInfoDesc>,
@@ -1723,6 +1881,109 @@ mod tests {
         let bytes = [0b1110_0000];
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_channel_mode(&mut br).unwrap(), (6, 4));
+    }
+
+    /// Part-1 Table 88: the full 7-bit group incl. the Reserved codes.
+    #[test]
+    fn channel_mode_v0_seven_bit_group() {
+        // (leading bits, ch_mode, channels)
+        // Each entry is the 7-bit prefix code left-aligned in a byte
+        // (one trailing pad bit).
+        let cases: [(u8, u32, u32); 8] = [
+            (0b1111_0000, 5, 7),
+            (0b1111_0010, 6, 8),
+            (0b1111_0100, 7, 7),
+            (0b1111_0110, 8, 8),
+            (0b1111_1000, 9, 7),
+            (0b1111_1010, 10, 8),
+            (0b1111_1100, 11, 0), // Reserved
+            // 1111111 + variable_bits(2) = chunk 0b01, stop bit 0 → +1.
+            (0b1111_1110, 13, 0),
+        ];
+        for (byte, ch_mode, channels) in cases {
+            let bytes = [byte, 0b1000_0000];
+            let mut br = BitReader::new(&bytes);
+            let d = decode_channel_mode_v0(&mut br).unwrap();
+            assert_eq!((d.ch_mode, d.channels), (ch_mode, channels), "{byte:08b}");
+        }
+    }
+
+    /// Part-2 Table 78: the 8- and 9-bit immersive codes.
+    #[test]
+    fn channel_mode_v2_immersive_codes() {
+        // (code, code_bits, ch_mode, channels)
+        let cases: [(u32, u32, u32, u32); 6] = [
+            (0b1111101, 7, 10, 8),    // 7.1 (3/2/2.1) — unchanged
+            (0b11111100, 8, 11, 11),  // 7.0.4
+            (0b11111101, 8, 12, 12),  // 7.1.4
+            (0b111111100, 9, 13, 13), // 9.0.4
+            (0b111111101, 9, 14, 14), // 9.1.4
+            (0b111111110, 9, 15, 24), // 22.2
+        ];
+        for (code, code_bits, ch_mode, channels) in cases {
+            let mut bw = oxideav_core::bits::BitWriter::new();
+            bw.write_u32(code, code_bits);
+            bw.write_u32(0, 9); // padding
+            let bytes = bw.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let d = decode_channel_mode_v2(&mut br).unwrap();
+            assert_eq!(
+                (d.ch_mode, d.channels, d.bits),
+                (ch_mode, channels, code_bits),
+                "{code:b}"
+            );
+            assert_eq!(d.is_immersive(), (11..=14).contains(&ch_mode));
+        }
+        // Reserved escape: 111111111 + variable_bits(2) chunk 0b10,
+        // stop bit 0 → ch_mode 16 + 2 = 18.
+        let mut bw = oxideav_core::bits::BitWriter::new();
+        bw.write_u32(0b111111111, 9);
+        bw.write_u32(0b10, 2);
+        bw.write_bit(false);
+        bw.write_u32(0, 8);
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let d = decode_channel_mode_v2(&mut br).unwrap();
+        assert_eq!((d.ch_mode, d.channels), (18, 0));
+    }
+
+    /// The immersive modes' `(b_lfe, b_5fronts)` routing arguments per
+    /// §6.2.3.1 `audio_data_chan()`.
+    #[test]
+    fn channel_mode_immersive_routing_flags() {
+        let mk = |ch_mode, channels| ChannelModeDesc {
+            ch_mode,
+            channels,
+            bits: 8,
+        };
+        assert_eq!(
+            (
+                mk(11, 11).immersive_b_lfe(),
+                mk(11, 11).immersive_b_5fronts()
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            (
+                mk(12, 12).immersive_b_lfe(),
+                mk(12, 12).immersive_b_5fronts()
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            (
+                mk(13, 13).immersive_b_lfe(),
+                mk(13, 13).immersive_b_5fronts()
+            ),
+            (false, true)
+        );
+        assert_eq!(
+            (
+                mk(14, 14).immersive_b_lfe(),
+                mk(14, 14).immersive_b_5fronts()
+            ),
+            (true, true)
+        );
     }
 
     use oxideav_core::bits::BitWriter;
