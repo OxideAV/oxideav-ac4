@@ -113,17 +113,20 @@ pub struct Ac4ImsEncoder {
     /// Forward-MDCT analysis state for `encode_frame_pcm()`. Carries
     /// the previous frame's `N` PCM samples so the 50% TDAC overlap
     /// runs correctly across frames. Lazy-initialised on first use.
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub mdct_state: Option<EncoderMdctState>,
     /// Forward-MDCT analysis state for the secondary (right) channel of
     /// `encode_frame_pcm_stereo()`. Identical role to `mdct_state` but
     /// for the second channel — separate so 50% TDAC overlap is
     /// per-channel.
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub mdct_state_r: Option<EncoderMdctState>,
     /// Forward-MDCT analysis state for the multichannel encoder paths
     /// (`encode_frame_pcm_5_0()` and any future N>2 variants). One
     /// [`EncoderMdctState`] per output channel — separate so 50% TDAC
     /// overlap continuity is preserved per channel across frames. Lazy-
     /// initialised on first use; grown to the required channel count.
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub mdct_states_multi: Vec<EncoderMdctState>,
     /// Previous frame's absolute A-SPX envelope rows on the live 5_X
     /// ACPL_3 single-envelope path — drives the P-frame TIME-direction
@@ -131,12 +134,14 @@ pub struct Ac4ImsEncoder {
     /// `None` until an ACPL_3 single-envelope frame has been emitted;
     /// cleared when a multi-envelope body is emitted (its last-envelope
     /// rows are not tracked, so the next frame safely stays FREQ).
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub acpl3_env_prev: Option<crate::encoder_acpl3::Acpl3EnvPrevRows>,
     /// Previous frame's absolute A-CPL quantized parameter rows on the
     /// live 5_X ACPL_3 single-envelope path — drives the P-frame
     /// DIFF_TIME decision (Table 65 / Pseudocode 121). Unprimed until
     /// an ACPL_3 single-envelope frame has been emitted; reset when a
     /// multi-envelope body is emitted.
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub acpl3_param_prev: crate::encoder_acpl3::Acpl3ParamPrevRows,
 }
 

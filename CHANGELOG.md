@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- API surface: marked the 44 internal bitstream-walker / synthesis /
+  table modules (plus the encoder's cross-frame state fields)
+  `#[doc(hidden)]` — the stable public API is the registry entry points
+  (`register` / `register_codecs` / `CODEC_ID_STR`) plus the `decoder`,
+  `encoder_ims`, `toc`, and `sync` modules; attributes/comments only,
+  no semantic changes.
 - ac4 round 414 — **immersive_channel_element family + the two A-JOC
   downmix remainders to object PCM** (ETSI TS 103 190-2). Four
   landings:

@@ -481,53 +481,106 @@
 
 #![allow(dead_code)]
 
+// Stable public surface: the registry entry points below (`register` /
+// `register_codecs`), the [`decoder`] module (`Ac4Decoder` +
+// `make_decoder`), the [`encoder_ims`] module (`Ac4ImsEncoder`), the
+// [`toc`] module (`parse_ac4_toc` + `Ac4FrameInfo`), and the [`sync`]
+// module (sync framing helpers). All other modules are decoder/encoder
+// plumbing that is `pub` only so the integration-test and fuzz crates
+// can reach it; they are `#[doc(hidden)]` and NOT part of the stable
+// API surface for semver purposes.
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod acpl;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod acpl_huffman;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod acpl_synth;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ajcc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ajcc_synth;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ajoc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ajoc_data;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ajoc_huffman;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ajoc_substream;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod asf;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod asf_data;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_ah_select;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_huffman;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_limiter;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_noise;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_preflat_select;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_tna_select;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_tns;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_tone;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de_huffman;
 pub mod decoder;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod dmx_coeff;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod drc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod drc_huffman;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod emdf;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_acpl3;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_ajoc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_asf;
 pub mod encoder_ims;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_mdct;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod huffman;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ice;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mch;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod mdct;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod metadata;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod oamd;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod pres_data;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod qmf;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod sfb_offset;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ssf;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ssf_ac;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ssf_pred_coeff;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ssf_synth;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod ssf_tables;
 pub mod sync;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod tables;
 pub mod toc;
 
