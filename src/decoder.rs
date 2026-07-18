@@ -1134,7 +1134,9 @@ impl Ac4Decoder {
     /// should run (mode is `SyncPerSlot` or `SyncAveraged`); `None`
     /// when the per-channel pipeline should run (sync_flag missing /
     /// false, or sync_flag=true resolves to `Off`).
-    fn five_x_synced_mode(cc: Option<&aspx::CompandingControl>) -> Option<aspx::CompandingMode> {
+    pub(crate) fn five_x_synced_mode(
+        cc: Option<&aspx::CompandingControl>,
+    ) -> Option<aspx::CompandingMode> {
         let cc = cc?;
         if !matches!(cc.sync_flag, Some(true)) {
             return None;

@@ -207,6 +207,7 @@ fn decoder_ajoc_aspx_downmix_to_object_pcm() {
             &qmats,
             iframe,
             &mut enc_state,
+            None,
         )
         .unwrap();
         let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame);

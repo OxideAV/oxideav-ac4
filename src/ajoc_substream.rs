@@ -660,8 +660,9 @@ impl AjocSubstreamDecoder {
     ///
     /// Covers all three downmix forms: the dynamic SIMPLE form, the
     /// dynamic **A-SPX** form (per-channel QMF-domain bandwidth
-    /// extension from the captured `aspx_data_*` payloads before the
-    /// spatial reconstruction; companding gains are not applied), and
+    /// extension from the captured `aspx_data_*` payloads, then the
+    /// §4.8.3.10.4 companding gains from the element's
+    /// `companding_control()`, before the spatial reconstruction), and
     /// the **`b_static_dmx`** 5.X core (SIMPLE coding configs — the
     /// `audio_data_chan(5.0/5.1)` spectra feed the reconstruction in
     /// `[L, R, C, Ls, Rs]` order). Per-channel IMDCT → QMF →
@@ -721,9 +722,9 @@ impl AjocSubstreamDecoder {
         }
         // 2. QMF-analyse each channel into x[ts][sb][ch]. For the
         // A-SPX downmix form each channel is bandwidth-extended in the
-        // QMF domain from its captured payload (Tables 51/52; the
-        // §5.7.5 companding gain is not applied on this route — the
-        // in-crate writer signals compand-off).
+        // QMF domain from its captured payload (Tables 51/52) and the
+        // §4.8.3.10.4 / §5.7.5 companding gains apply from the
+        // element's companding_control(n_dmx_signals).
         let num_sb = crate::qmf::NUM_QMF_SUBBANDS;
         let num_ts = n / num_sb;
         let mut x = vec![vec![vec![(0.0f64, 0.0f64); self.num_dmx]; num_sb]; num_ts];
@@ -739,10 +740,14 @@ impl AjocSubstreamDecoder {
                 Ok::<_, Error>((e, cfg))
             })
             .transpose()?;
-        for ch in 0..self.num_dmx {
-            // A-SPX extension path: payload mapping pair p → channels
-            // (2p, 2p+1), trailing aspx_data_1ch → the odd channel.
-            if let Some((elem, cfg)) = &aspx_elem {
+        // Phase A: A-SPX-extend each covered channel (payload mapping
+        // pair p → channels (2p, 2p+1), trailing aspx_data_1ch → the
+        // odd channel), keeping each post-extension matrix together
+        // with its (sb0, sbz) companding band.
+        let mut ext: Vec<Option<(crate::aspx::QmfMatrix, u32, u32)>> =
+            (0..self.num_dmx).map(|_| None).collect();
+        if let Some((elem, cfg)) = &aspx_elem {
+            for (ch, slot) in ext.iter_mut().enumerate() {
                 let n_paired = 2 * elem.aspx_pair_trailers.len();
                 let trailer = if ch < n_paired {
                     elem.aspx_pair_trailers[ch / 2]
@@ -751,39 +756,70 @@ impl AjocSubstreamDecoder {
                 } else {
                     elem.aspx_odd_trailer.as_deref().map(|t| (t, false))
                 };
-                if let Some((trailer, is_secondary)) = trailer {
-                    while self.aspx_ext_state.len() <= ch {
-                        self.aspx_ext_state
-                            .push(crate::aspx::AspxChannelExtState::new());
-                    }
-                    let chd = if is_secondary {
-                        trailer.secondary.as_ref().unwrap_or(&trailer.primary)
-                    } else {
-                        &trailer.primary
-                    };
-                    if let Some((q, _sb0, _sb1)) = crate::decoder::Ac4Decoder::aspx_extend_to_qmf(
-                        &pcm_dmx[ch],
-                        &trailer.frequency_tables,
-                        cfg,
-                        Some(&chd.framing),
-                        Some(&chd.data_sig),
-                        Some(&chd.data_noise),
-                        Some(chd.qmode_env),
-                        Some(&chd.delta_dir),
-                        chd.add_harmonic.as_deref(),
-                        chd.tna_mode.as_deref(),
-                        &mut self.aspx_ext_state[ch],
-                        crate::aspx::num_ts_in_ats(frame_len_base.max(1)),
-                    ) {
-                        for (ts, x_ts) in x.iter_mut().enumerate().take(num_ts) {
-                            for (sb, row) in q.iter().enumerate().take(num_sb) {
-                                let (re, im) = row.get(ts).copied().unwrap_or((0.0, 0.0));
-                                x_ts[sb][ch] = (re as f64, im as f64);
-                            }
-                        }
-                        continue;
+                let Some((trailer, is_secondary)) = trailer else {
+                    continue;
+                };
+                while self.aspx_ext_state.len() <= ch {
+                    self.aspx_ext_state
+                        .push(crate::aspx::AspxChannelExtState::new());
+                }
+                let chd = if is_secondary {
+                    trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                } else {
+                    &trailer.primary
+                };
+                *slot = crate::decoder::Ac4Decoder::aspx_extend_to_qmf(
+                    &pcm_dmx[ch],
+                    &trailer.frequency_tables,
+                    cfg,
+                    Some(&chd.framing),
+                    Some(&chd.data_sig),
+                    Some(&chd.data_noise),
+                    Some(chd.qmode_env),
+                    Some(&chd.delta_dir),
+                    chd.add_harmonic.as_deref(),
+                    chd.tna_mode.as_deref(),
+                    &mut self.aspx_ext_state[ch],
+                    crate::aspx::num_ts_in_ats(frame_len_base.max(1)),
+                );
+            }
+            // Phase B: §4.8.3.10.4 companding — objects coded in the
+            // (≤ 5-channel) downmix element run the part-1 §6.2.9 /
+            // §5.7.5 companding tool from the element's
+            // companding_control(n_dmx_signals). sync_flag = 1
+            // broadcasts the cross-channel geometric-mean gain;
+            // sync_flag = 0 resolves the per-channel Pseudocode 121
+            // sub-branch.
+            let cc = elem.companding.as_ref();
+            if let Some(mode) = crate::decoder::Ac4Decoder::five_x_synced_mode(cc) {
+                let mut sync_view: Vec<crate::aspx::SyncCompandingEntry<'_>> = Vec::new();
+                for slot in ext.iter_mut() {
+                    if let Some((q, sb0, sbz)) = slot.as_mut() {
+                        sync_view.push((q, *sb0, *sbz));
                     }
                 }
+                crate::aspx::apply_synchronised_companding_across_channels(&mut sync_view, mode);
+            } else if let Some(cc) = cc {
+                for (ch, slot) in ext.iter_mut().enumerate() {
+                    let Some((q, sb0, sbz)) = slot.as_mut() else {
+                        continue;
+                    };
+                    let mode = crate::aspx::CompandingMode::from_control(cc, ch);
+                    crate::aspx::apply_companding_on_qmf_with_mode(q, *sb0, *sbz, mode);
+                }
+            }
+        }
+        // Phase C: scatter into x[ts][sb][ch] (plain QMF analysis for
+        // channels without a usable extension).
+        for (ch, slot) in ext.into_iter().enumerate() {
+            if let Some((q, _, _)) = slot {
+                for (ts, x_ts) in x.iter_mut().enumerate().take(num_ts) {
+                    for (sb, row) in q.iter().enumerate().take(num_sb) {
+                        let (re, im) = row.get(ts).copied().unwrap_or((0.0, 0.0));
+                        x_ts[sb][ch] = (re as f64, im as f64);
+                    }
+                }
+                continue;
             }
             let slots = self.analysis[ch].process_block(&pcm_dmx[ch]);
             for (ts, slot) in slots.iter().take(num_ts).enumerate() {
@@ -1320,7 +1356,8 @@ pub fn write_audio_data_ajoc_static(
 
 /// Write a complete dynamic-form `audio_data_ajoc()` whose downmix is
 /// the **A-SPX** `var_channel_element()` form (`var_codec_mode = 1`):
-/// I-frame `aspx_config()`, compand-off `companding_control()`
+/// I-frame `aspx_config()`, `companding_control()` (off triple when
+/// `companding` is `None`)
 /// (`n_fb_dmx_signals <= 5`), the paired channel data, and one
 /// floored-noise single-envelope `aspx_data_2ch()` per pair (see
 /// [`crate::ice::write_ice_body_ajcc`] on the noise floor). Even
@@ -1339,6 +1376,7 @@ pub fn write_audio_data_ajoc_aspx(
     qmats: &crate::encoder_ajoc::AjocQuantMatrices,
     b_iframe: bool,
     enc_state: &mut AjocDiffState,
+    companding: Option<&CompandingControl>,
 ) -> Result<()> {
     if params.b_static_dmx {
         return Err(Error::invalid(
@@ -1364,11 +1402,42 @@ pub fn write_audio_data_ajoc_aspx(
         crate::encoder_acpl3::write_aspx_config(bw, aspx_cfg);
     }
     if n <= 5 {
-        // companding_control(n): sync_flag = 1, b_compand_on[0] = 0,
-        // b_compand_avg = 0.
-        bw.write_bit(true);
-        bw.write_bit(false);
-        bw.write_bit(false);
+        // companding_control(n) — exact inverse of
+        // `parse_companding_control(_, n)`; `None` emits the off
+        // triple (sync_flag = 1, b_compand_on[0] = 0,
+        // b_compand_avg = 0).
+        match companding {
+            None => {
+                bw.write_bit(true);
+                bw.write_bit(false);
+                bw.write_bit(false);
+            }
+            Some(cc) => {
+                let sync = match cc.sync_flag {
+                    Some(sync) => sync,
+                    None => {
+                        return Err(Error::invalid(
+                            "ac4: companding_control(n > 1) needs sync_flag",
+                        ));
+                    }
+                };
+                bw.write_bit(sync);
+                let nc = if sync { 1 } else { n };
+                if cc.compand_on.len() != nc {
+                    return Err(Error::invalid("ac4: companding_control compand_on length"));
+                }
+                let mut need_avg = false;
+                for &b in &cc.compand_on {
+                    bw.write_bit(b);
+                    if !b {
+                        need_avg = true;
+                    }
+                }
+                if need_avg {
+                    bw.write_bit(cc.compand_avg.unwrap_or(false));
+                }
+            }
+        }
     }
     if let Some((coeffs, max_sfb_lfe)) = lfe {
         write_mono_data_lfe_simple(bw, coeffs, transform_length, max_sfb_lfe)?;
@@ -1667,6 +1736,7 @@ pub fn encode_ajoc_raw_frame_aspx(
     qmats: &crate::encoder_ajoc::AjocQuantMatrices,
     b_iframe: bool,
     enc_state: &mut AjocDiffState,
+    companding: Option<&CompandingControl>,
 ) -> Result<Vec<u8>> {
     let mut frame = write_ajoc_toc(sequence_counter, params, b_iframe)?;
     let mut body = BitWriter::new();
@@ -1683,6 +1753,7 @@ pub fn encode_ajoc_raw_frame_aspx(
         qmats,
         b_iframe,
         enc_state,
+        companding,
     )?;
     frame.extend_from_slice(&wrap_ajoc_substream(body)?);
     Ok(frame)

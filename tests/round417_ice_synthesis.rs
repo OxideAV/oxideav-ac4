@@ -753,3 +753,120 @@ fn ice_ajcc_companding_applies_per_input_channel() {
         "companded L stays at a sane level ({e_ratio})"
     );
 }
+
+/// §4.8.3.10.4 companding on the A-JOC A-SPX-downmix route: the
+/// var_channel_element's companding_control(n_dmx_signals) drives the
+/// §5.7.5 gains on the extended downmix channels ahead of the spatial
+/// reconstruction. An explicit all-off control decodes identically to
+/// the writer's off triple; enabling the second channel reshapes only
+/// the object reconstructed from it.
+#[test]
+fn ajoc_aspx_downmix_companding_applies_per_channel() {
+    use oxideav_ac4::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
+    use oxideav_ac4::ajoc_data::new_ajoc_diff_state;
+    use oxideav_ac4::ajoc_substream::{encode_ajoc_raw_frame_aspx, AjocBodyParams};
+    use oxideav_ac4::aspx::CompandingControl;
+    use oxideav_ac4::encoder_ajoc::AjocQuantMatrices;
+    use oxideav_ac4::oamd::ObjType;
+    let num_dmx = 2usize;
+    let num_umx = 2usize;
+    let num_decorr = 1usize;
+    let params = AjocBodyParams {
+        b_lfe: false,
+        b_static_dmx: false,
+        n_fullband_dmx_signals: num_dmx as u32,
+        n_fullband_upmix_signals: num_umx as u32,
+        obj_type_dmx: vec![ObjType::Dyn; num_dmx],
+        obj_type_umx: vec![ObjType::Dyn; num_umx],
+    };
+    // Selector control info: object o reconstructs from downmix
+    // channel o with unit dry gain and zero wet gain.
+    let ctrl = AjocCtrlInfo {
+        decorr_enable: vec![true; num_decorr],
+        object_present: vec![true; num_umx],
+        data_point_info: AjocDataPointInfo {
+            num_dpoints: 1,
+            start_pos: vec![0],
+            ramp_len: vec![16],
+        },
+        num_bands_code: vec![7; num_umx],
+        num_bands: vec![1; num_umx],
+        quant_select: vec![AjocQuantMode::Fine; num_umx],
+        sparse_select: vec![false; num_umx],
+        mix_mtx_dry_present: vec![vec![true; num_dmx]; num_umx],
+        mix_mtx_wet_present: vec![vec![true; num_decorr]; num_umx],
+    };
+    let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+        .map(|o| {
+            vec![(0..num_dmx)
+                .map(|ch| vec![if ch == o { 1.0 } else { 0.0 }])
+                .collect()]
+        })
+        .collect();
+    let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+        .map(|_| vec![vec![vec![0.0]; num_decorr]])
+        .collect();
+    let qmats = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
+    let s0 = tone_spectrum(24, 40.0);
+    let s1 = tone_spectrum(60, 40.0);
+    let spectra: Vec<&[f32]> = vec![&s0, &s1];
+    let cfg = test_aspx_config();
+    let dec_params = CodecParameters::audio(CodecId::new("ac4"));
+    let run = |cc: Option<CompandingControl>| {
+        let mut enc_state = new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let mut dec = Ac4Decoder::new(&dec_params);
+        let mut out: Vec<Vec<i16>> = Vec::new();
+        for (seq, iframe) in [(0u32, true), (1, false)] {
+            let frame = encode_ajoc_raw_frame_aspx(
+                seq,
+                &params,
+                &spectra,
+                &cfg,
+                None,
+                MAX_SFB,
+                num_decorr as u32,
+                &ctrl,
+                &qmats,
+                iframe,
+                &mut enc_state,
+                cc.as_ref(),
+            )
+            .unwrap();
+            out = decode_frame(&mut dec, frame, num_umx);
+        }
+        out
+    };
+    let off_implicit = run(None);
+    let off_explicit = run(Some(CompandingControl {
+        sync_flag: Some(false),
+        compand_on: vec![false, false],
+        compand_avg: Some(false),
+    }));
+    let on_ch1 = run(Some(CompandingControl {
+        sync_flag: Some(false),
+        compand_on: vec![false, true],
+        compand_avg: Some(false),
+    }));
+    let d = |x: &[i16], y: &[i16]| -> f64 {
+        x.iter()
+            .zip(y.iter())
+            .map(|(&p, &q)| {
+                let e = p as f64 - q as f64;
+                e * e
+            })
+            .sum()
+    };
+    // Off is off, regardless of the wire form.
+    assert_eq!(off_implicit, off_explicit, "off triple == explicit all-off");
+    // Companding channel 1 reshapes object 1 only.
+    let d0 = d(&off_implicit[0], &on_ch1[0]);
+    let d1 = d(&off_implicit[1], &on_ch1[1]);
+    assert!(d0 < 1.0, "object 0 (uncompanded ch0) identical ({d0})");
+    assert!(d1 > 1e5, "object 1 (companded ch1) reshaped ({d1})");
+    // Sanity: the reshaped object stays at a sane level.
+    let e_ratio = energy(&on_ch1[1]) / energy(&off_implicit[1]).max(1.0);
+    assert!(
+        (0.1..=10.0).contains(&e_ratio),
+        "companded object level sane ({e_ratio})"
+    );
+}
