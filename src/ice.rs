@@ -36,6 +36,26 @@
 //!   envelopes for guaranteed silence while E'' (the fifth A-JCC core
 //!   input) stayed band-limited. This implementation pairs the two
 //!   fullband surround tracks `(D'', E'')` instead.
+//! * Table 8's ASPX_ACPL_1 rows additionally list `(H'', J'')` /
+//!   `(I'', K'')` A-SPX groups (and, with b_5fronts, front groups
+//!   `(A'', L'')` / `(B'', M'')`), but the §6.2.4.1 syntax carries the
+//!   same four payloads (3× `aspx_data_2ch()` + 1× `aspx_data_1ch()`)
+//!   for the whole ACPL / AJCC family — there is no payload to apply
+//!   to the extra groups. This implementation associates the
+//!   transmitted payloads with `(A'', B'')` / `(D'', F'')` /
+//!   `(E'', G'')` / `C''` and passes the S-CPL-section tracks through
+//!   unextended.
+//! * §5.5.2 Table 27's ASPX_ACPL_2 branch reads exactly the carrier
+//!   positions x5 / x6 / x9 / x10 (plus x0..x2), while §5.2.3.3
+//!   silences tracks H' onward — so the coded F / G tracks must occupy
+//!   the Tfl / Tfr carrier positions (x9 / x10) in that mode (in
+//!   ASPX_ACPL_1 they are the Lb / Rb residuals at x7 / x8 instead).
+//! * §5.2.3.2 step 5 extracts a single prediction gain `a'_j` per
+//!   element "as specified in [part-1] clause 5.3.2", whose
+//!   Pseudocode 59 produces the quartet `(a, b, c, d)`; the additive
+//!   Table 20 row `(a'_j, 1)` carries the prediction gain only, read
+//!   here as `a' = a − 1` (`= sap_gain`) on full-SAP coded bands and 0
+//!   elsewhere (see [`crate::asf::extract_sap_a_prime`]).
 
 use crate::acpl::{
     parse_acpl_config_1ch, parse_acpl_data_1ch, sb_to_pb, Acpl1chMode, AcplConfig1ch, AcplData1ch,

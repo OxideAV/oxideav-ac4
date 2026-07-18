@@ -169,12 +169,35 @@ an S16 `AudioFrame`:
   `ajcc_data(b_5fronts)`, the S-CPL pair/chparam section, and the
   4/6-element `acpl_data_1ch()` section — with P-frame sticky-config
   support. `Ac4Decoder` routes the immersive channel modes and
-  synthesises **SCPL full decoding** (§5.3.3.1 Table 23 time-domain
-  matrix, identity SAP) and **ASPX_AJCC full decoding** (§5.6.3.5.2:
-  core IMDCT → per-channel QMF A-SPX extension → A-JCC full decode →
-  11/13 outputs; LFE first). Writers emit complete v2 frames
-  (`write_ice_body_scpl` / `write_ice_body_ajcc` /
-  `encode_ice_raw_frame`) for all four channel modes.
+  synthesises **all five Table 95 codec modes** to PCM in full
+  decoding: **SCPL** (§5.3.3.1 Table 23 time-domain matrix),
+  **ASPX_SCPL** (Table 23 with `c_gain = m_gain = 1`, per-channel
+  A-SPX over the Table 8 channel grouping, §4.8.3.11.3 Table 10/11
+  output gains), **ASPX_ACPL_1 / ASPX_ACPL_2** (§5.5.2 Table 27 —
+  four/six parallel ACplModules with D0/D0/D1/D1/D2/D2 decorrelators
+  over the Table 26 mapping; ACPL_1 runs the PARTIAL config's
+  `acpl_qmf_band` M/S split on the S-CPL-section residual tracks,
+  ACPL_2 runs fully parametric with the coded F/G tracks on the
+  Tfl/Tfr carrier positions; per-module cross-frame differential
+  state), and **ASPX_AJCC** (§5.6.3.5.2: core IMDCT → per-channel QMF
+  A-SPX extension → §4.8.3.10.3 companding on L/R/C/Ls/Rs → A-JCC
+  full decode → 11/13 outputs; LFE first). The §5.2.3.2 SAP mixing
+  (steps 3-6) runs on the track spectra for the SCPL / ASPX_SCPL /
+  ASPX_ACPL_1 modes — the `b_use_sap_add_ch` quartets mix (D, F) /
+  (E, G) and the S-CPL-section full-SAP `a'_j` gains drive the
+  Table 20 additive rows. Writers emit complete v2 frames for all
+  five codec modes (`write_ice_body_scpl[_with_sap]` /
+  `write_ice_body_aspx_scpl` / `write_ice_body_acpl` /
+  `write_ice_body_ajcc[_with_companding]` / `encode_ice_raw_frame`).
+- **22.2 channel element** (TS 103 190-2 §6.2.4.3 + §5.2.4 — Table 78
+  channel mode 15, 24 channels) — `22_2_channel_element()` parses and
+  decodes in both Table 98 codec modes: the two LFE `mono_data(1)`
+  bodies route directly through the IMDCT, the eleven
+  `two_channel_data()` pairs map to channels per Table 21, and the
+  A-SPX mode bandwidth-extends every pair from its `aspx_data_2ch()`
+  payload (I-frame-sticky config). Output is 24-channel PCM (both
+  LFEs first, then the Table 21 order); `write_22_2_body` +
+  `encode_22_2_raw_frame` emit complete frames for both modes.
 - **OAMD** (object audio metadata, TS 103 190-2 §6.2.8 + §6.3.9) —
   the `oamd` module parses and re-emits (exact writer inverses)
   `oamd_timing_data()`, `object_info_block()` with basic / render info
@@ -272,16 +295,17 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **Immersive-channel-element synthesis remainders** — ASPX_SCPL /
-  ASPX_ACPL_1 / ASPX_ACPL_2 parse fully but emit silence (their
-  per-channel S-CPL gain ladders and §5.5.2 Table 27 A-CPL modules
-  aren't wired yet); the §5.2.3.2 step-4/step-6 SAP mixing runs at
-  identity (`sap_mode != 0` chparam payloads are parsed, not applied);
-  companding gains are not applied on the ICE ASPX_AJCC or A-JOC
-  A-SPX-downmix routes; the A-SPX / A-CPL codec modes of the A-JOC
-  `b_static_dmx` core parse but their carrier synthesis into the
-  object path is pending; core decoding mode (7-channel outputs) and
-  the `22_2_channel_element` are unimplemented.
+- **Immersive remainders** — core decoding mode (the reduced
+  7-channel operating point of §5.3.3.2 / §5.6.3.5.3 / §4.8.3.11.2;
+  the A-JCC core-decode reconstruction itself is implemented, but no
+  decoder API selects the mode yet); the A-SPX / A-CPL codec modes of
+  the A-JOC `b_static_dmx` core parse but their carrier synthesis
+  into the object path is pending (needs the 5_X carrier pipeline
+  shared into the object decoder). Table 8's ASPX_ACPL_1 rows list
+  more A-SPX groups than the §6.2.4.1 syntax carries payloads for —
+  the extension covers the four transmitted payloads and the
+  S-CPL-section tracks pass through unextended (see the `ice` module
+  notes).
 - Remaining TS 103 190-2 multi-stream / immersive / object-based (IFM)
   extensions beyond the parsed presentation / OAMD / object substream
   surfaces.

@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 417 — **immersive synthesis remainders to PCM** (ETSI
+  TS 103 190-1/-2). Seven landings:
+  1. **`sap_mode == 2` fix** (part-1 Table 114): the chparam_info
+     code 2 row is "M/S processing in all scale factor bands"; the
+     extraction treated it as reserved-identity, silently dropping
+     the M/S inverse on every band. `SapMode::Reserved` →
+     `SapMode::MsAll`; wire format unchanged (header-only).
+  2. **SMP SAP mixing** (§5.2.3.2 steps 3-6): the `b_use_sap_add_ch`
+     Pseudocode-59 quartets now mix (D, F) / (E, G) on the track
+     spectra, and the S-CPL-section full-SAP prediction gains
+     (`extract_sap_a_prime` — `a' = sap_gain` on coded bands, 0
+     elsewhere) drive the Table 20 additive rows (H..K + b_5fronts
+     L/M), for the SCPL / ASPX_SCPL / ASPX_ACPL_1 modes.
+  3. **ASPX_SCPL full decoding** (§5.3.3.1 + §4.8.3.11.3): SAP →
+     IMDCT → Table 23 with `c_gain = m_gain = 1` → per-channel A-SPX
+     over the Table 8 grouping → Table 10/11 output gains. The shared
+     minimal-payload writer now floors the secondary (BALANCE-coded)
+     noise row too — r414's all-zero ch1 row decoded to a full-scale
+     HF noise floor on every secondary-extended channel.
+  4. **ASPX_ACPL_1 / ASPX_ACPL_2 full decoding** (§5.5.2 Table 27):
+     four/six parallel ACplModules (D0/D0/D1/D1/D2/D2) over the
+     Table 26 mapping with per-module cross-frame differential state;
+     ACPL_1 runs the PARTIAL `acpl_qmf_band` M/S split on the
+     S-CPL-section residuals, ACPL_2 fully parametric with F/G on the
+     Tfl/Tfr carrier positions. Conformance fix uncovered by the
+     alpha-mutation pin: `acpl_module()` interpolated from all-zero
+     prev rows every frame; the §5.7.7.3 interpolation now starts
+     from the carried Pseudocode-110 previous-frame rows (also
+     settles the part-1 5_X ASPX_ACPL_1/_2 paths).
+  5. **Companding on the ICE ASPX_AJCC route** (§4.8.3.10.3): the
+     §5.7.5 tool now runs on the five input channels L/R/C/Ls/Rs from
+     the parsed `companding_control(5)` (synced geometric-mean or
+     per-slot Pseudocode-121 sub-branches, like the 5_X dispatchers).
+  6. **Companding on the A-JOC A-SPX-downmix route** (§4.8.3.10.4):
+     the var_channel_element's `companding_control(n_dmx_signals)`
+     applies to the extended downmix channels ahead of the spatial
+     reconstruction.
+  7. **`22_2_channel_element`** (§6.2.4.3 + §5.2.4): full parse +
+     decode in both Table 98 codec modes — two direct-IMDCT LFEs,
+     eleven pairs on the Table 21 mapping, per-pair A-SPX extension —
+     to 24-channel PCM, with body/raw-frame writers.
+  Suite grows 1300 → 1316 tests, all green.
 - API surface: marked the 44 internal bitstream-walker / synthesis /
   table modules (plus the encoder's cross-frame state fields)
   `#[doc(hidden)]` — the stable public API is the registry entry points
