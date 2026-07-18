@@ -5,8 +5,11 @@
 //! `raw_ac4_frame()` packets.
 
 use oxideav_ac4::asf::ChparamInfo;
+use oxideav_ac4::aspx::{AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep};
 use oxideav_ac4::decoder::Ac4Decoder;
-use oxideav_ac4::ice::{encode_ice_raw_frame, write_ice_body_scpl_with_sap, IceScplSpectra};
+use oxideav_ac4::ice::{
+    encode_ice_raw_frame, write_ice_body_aspx_scpl, write_ice_body_scpl_with_sap, IceScplSpectra,
+};
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 
@@ -205,4 +208,174 @@ fn ice_scpl_sap_step6_full_sap_predicts_top_from_surround() {
     );
     // The a'_1 element is identity → the right top row stays silent.
     assert!(s_tfr < s_tfl / 1e3, "Tfr stays silent ({s_tfr})");
+}
+
+fn test_aspx_config() -> AspxConfig {
+    AspxConfig {
+        quant_mode_env: AspxQuantStep::Fine,
+        // A high crossover keeps the minimal payload's regenerated
+        // band well above the test tones.
+        start_freq: 7,
+        stop_freq: 0,
+        master_freq_scale: AspxMasterFreqScale::LowRes,
+        interpolation: false,
+        preflat: false,
+        limiter: false,
+        noise_sbg: 0,
+        num_env_bits_fixfix: 0,
+        freq_res_mode: AspxFreqResMode::Low,
+    }
+}
+
+/// Power of the projection onto the test tone's frequency (MDCT bin
+/// `k` ↔ `(k + 0,5) · fs / (2N)` Hz) — isolates the coherent tone
+/// from the A-SPX-regenerated high band.
+fn tone_power(pcm: &[i16], bin: usize) -> f64 {
+    let omega = std::f64::consts::PI * (bin as f64 + 0.5) / N as f64;
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for (i, &s) in pcm.iter().enumerate() {
+        let ph = omega * i as f64;
+        re += s as f64 * ph.cos();
+        im -= s as f64 * ph.sin();
+    }
+    re * re + im * im
+}
+
+/// ASPX_SCPL 7.0.4 full decoding: the c_gain = m_gain = 1 S-CPL matrix
+/// followed by the per-channel A-SPX extension and the Table 10 output
+/// gains must reproduce the SCPL decode of the same track spectra in
+/// the coded band (the two gain ladders compose to the same totals),
+/// while the extension regenerates a high band SCPL does not have.
+#[test]
+fn ice_aspx_scpl_7_0_4_matches_scpl_low_band_and_extends() {
+    // Distinct low-band tones per track group.
+    let a = tone_spectrum(6, 200.0);
+    let b = tone_spectrum(10, 200.0);
+    let c = tone_spectrum(14, 200.0);
+    let d = tone_spectrum(18, 200.0);
+    let e = tone_spectrum(22, 200.0);
+    let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
+    let fg = [tone_spectrum(26, 150.0), tone_spectrum(30, 150.0)];
+    let hi = [tone_spectrum(34, 150.0), tone_spectrum(38, 150.0)];
+    let jk = [tone_spectrum(42, 150.0), tone_spectrum(46, 150.0)];
+    let scpl_pairs: [[&[f32]; 2]; 2] = [[&hi[0], &hi[1]], [&jk[0], &jk[1]]];
+    let spectra = IceScplSpectra {
+        core: &core,
+        add_pair: [&fg[0], &fg[1]],
+        scpl_pairs: &scpl_pairs,
+    };
+    let cfg = test_aspx_config();
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    // SCPL reference decode.
+    let mut dec_ref = Ac4Decoder::new(&params);
+    let build_scpl = |seq: u32| {
+        let mut body = BitWriter::new();
+        write_ice_body_scpl_with_sap(&mut body, &spectra, None, false, TL, MAX_SFB, None, &[])
+            .unwrap();
+        encode_ice_raw_frame(seq, false, false, true, body).unwrap()
+    };
+    let _ = decode_frame(&mut dec_ref, build_scpl(0), 11);
+    let scpl = decode_frame(&mut dec_ref, build_scpl(1), 11);
+    // ASPX_SCPL decode of the same spectra.
+    let mut dec = Ac4Decoder::new(&params);
+    let build_aspx = |seq: u32| {
+        let mut body = BitWriter::new();
+        write_ice_body_aspx_scpl(&mut body, &spectra, None, false, &cfg, true, TL, MAX_SFB)
+            .unwrap();
+        encode_ice_raw_frame(seq, false, false, true, body).unwrap()
+    };
+    let _ = decode_frame(&mut dec, build_aspx(0), 11);
+    let aspx = decode_frame(&mut dec, build_aspx(1), 11);
+    // Per-channel tone bins in the output slot order
+    // [L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]: L/R/C carry the
+    // A/B/C tones; the mixing rows carry both source tones.
+    let checks: [(usize, usize); 7] = [
+        (0, 6),  // L   <- A
+        (1, 10), // R   <- B
+        (2, 14), // C   <- C
+        (3, 18), // Ls  <- D (+F)
+        (4, 22), // Rs  <- E (+G)
+        (7, 34), // Tfl <- H (+J)
+        (9, 34), // Tbl <- H (−J)
+    ];
+    for (slot, bin) in checks {
+        let p_ref = tone_power(&scpl[slot], bin);
+        let p_aspx = tone_power(&aspx[slot], bin);
+        assert!(p_ref > 1e12, "SCPL slot {slot} tone live ({p_ref})");
+        let ratio = p_aspx / p_ref;
+        assert!(
+            (0.5..=2.0).contains(&ratio),
+            "slot {slot}: ASPX_SCPL low band matches SCPL within 3 dB (ratio {ratio})"
+        );
+    }
+    // The composed gain ladders (S-CPL c/m = 1 + Table 10 output
+    // gains vs SCPL c = 2 / m = √2) keep the overall level: total
+    // energy across all channels matches within 3 dB (the scaffold
+    // payloads keep the regenerated band at the floored noise level).
+    let tot_ref: f64 = scpl.iter().map(|ch| energy(ch)).sum();
+    let tot_aspx: f64 = aspx.iter().map(|ch| energy(ch)).sum();
+    let tot_ratio = tot_aspx / tot_ref;
+    assert!(
+        (0.5..=2.0).contains(&tot_ratio),
+        "ASPX_SCPL total level matches SCPL within 3 dB (ratio {tot_ratio})"
+    );
+}
+
+/// ASPX_SCPL 9.1.4: 13 named channels + LFE decode with the b_5fronts
+/// payload roster (7 elements) and Table 11 gains.
+#[test]
+fn ice_aspx_scpl_9_1_4_full_decode() {
+    let a = tone_spectrum(6, 200.0);
+    let b = tone_spectrum(10, 200.0);
+    let c = tone_spectrum(14, 200.0);
+    let d = tone_spectrum(18, 200.0);
+    let e = tone_spectrum(22, 200.0);
+    let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
+    let fg = [tone_spectrum(26, 150.0), tone_spectrum(30, 150.0)];
+    let hi = [tone_spectrum(34, 150.0), tone_spectrum(38, 150.0)];
+    let jk = [tone_spectrum(42, 150.0), tone_spectrum(46, 150.0)];
+    // L'' == A -> Lscr = A − L'' cancels at the A tone; Lw reinforces.
+    let lm = [a.clone(), tone_spectrum(50, 150.0)];
+    let scpl_pairs: [[&[f32]; 2]; 3] = [[&hi[0], &hi[1]], [&jk[0], &jk[1]], [&lm[0], &lm[1]]];
+    let spectra = IceScplSpectra {
+        core: &core,
+        add_pair: [&fg[0], &fg[1]],
+        scpl_pairs: &scpl_pairs,
+    };
+    let lfe = tone_spectrum(2, 100.0);
+    let cfg = test_aspx_config();
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let build = |seq: u32| {
+        let mut body = BitWriter::new();
+        write_ice_body_aspx_scpl(
+            &mut body,
+            &spectra,
+            Some((&lfe, 4)),
+            true,
+            &cfg,
+            true,
+            TL,
+            MAX_SFB,
+        )
+        .unwrap();
+        encode_ice_raw_frame(seq, true, true, true, body).unwrap()
+    };
+    let _ = decode_frame(&mut dec, build(0), 14);
+    let chans = decode_frame(&mut dec, build(1), 14);
+    // Output order: [LFE, Lw, Rw, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl,
+    // Tfr, Tbl, Tbr].
+    let e_lfe = tone_power(&chans[0], 2);
+    let p_lw = tone_power(&chans[1], 6);
+    let p_lscr = tone_power(&chans[4], 6);
+    let p_c = tone_power(&chans[3], 14);
+    let p_ls = tone_power(&chans[6], 18);
+    assert!(e_lfe > 1e10, "LFE decoded ({e_lfe})");
+    assert!(p_lw > 1e12, "Lw carries the A tone ({p_lw})");
+    assert!(
+        p_lscr < p_lw / 1e3,
+        "Lscr = A − L'' cancels ({p_lscr} vs {p_lw})"
+    );
+    assert!(p_c > 1e12, "C carries its tone ({p_c})");
+    assert!(p_ls > 1e12, "Ls carries the D tone ({p_ls})");
 }

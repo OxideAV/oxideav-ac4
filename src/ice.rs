@@ -905,54 +905,169 @@ pub fn write_ice_body_ajcc(
     bw.write_u32(3, 2);
     write_five_channel_data_simple(bw, core, transform_length, max_sfb)?;
     // A-SPX: 2× aspx_data_2ch + 1× aspx_data_1ch (5CH_DYNAMIC).
-    // Level rows: sig F0 = 0 (codebook minimum), noise F0 = 30
-    // (floored); balance rows all-zero (channel 1 mirrors channel 0).
-    let tables = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0)
-        .map_err(|_| Error::invalid("ac4: aspx frequency-table derivation failed"))?;
-    let counts = tables.counts;
-    let num_sbg_sig = if aspx_cfg.signals_freq_res() {
-        counts.num_sbg_sig_lowres
-    } else {
-        counts.num_sbg_sig_highres
-    } as usize;
-    let num_sbg_noise = counts.num_sbg_noise as usize;
-    let sig_row = vec![0i32; num_sbg_sig.max(1)];
-    let mut noise_row = vec![0i32; num_sbg_noise.max(1)];
-    noise_row[0] = 30;
-    let bal_sig = vec![0i32; num_sbg_sig.max(1)];
-    let bal_noise = vec![0i32; num_sbg_noise.max(1)];
-    let tna = vec![0u8; num_sbg_noise];
-    let ch_level = crate::encoder_acpl3::AspxRealEnvelopeChannel {
-        sig: &sig_row,
-        noise: &noise_row,
-    };
-    let ch_bal = crate::encoder_acpl3::AspxRealEnvelopeChannel {
-        sig: &bal_sig,
-        noise: &bal_noise,
-    };
+    let rows = MinimalAspxRows::derive(aspx_cfg)?;
     for _ in 0..2 {
+        rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    }
+    rows.write_1ch(bw, aspx_cfg, b_iframe)?;
+    write_ajcc_data(bw, ajcc)?;
+    Ok(())
+}
+
+/// Minimal (floored-noise) A-SPX payload rows shared by the immersive
+/// body writers: sig F0 = 0 (codebook minimum), noise F0 = 30
+/// (`2^(6−30)` per Pseudocode 83 — an all-zero `qnoise = 0` row
+/// decodes to a full-scale HF noise floor). The channel-1 rows go out
+/// through the BALANCE codebooks but decode to the same absolute
+/// q-values in the in-tree chain, so the secondary noise row is
+/// floored as well — the balance noise F0 codebook tops out at 12, and
+/// the writer clamps 30 down to it (r414's all-zero ch1 noise row left
+/// a full-scale noise floor on every secondary-extended channel).
+struct MinimalAspxRows {
+    sig_row: Vec<i32>,
+    noise_row: Vec<i32>,
+    tna: Vec<u8>,
+}
+
+impl MinimalAspxRows {
+    fn derive(aspx_cfg: &AspxConfig) -> Result<Self> {
+        let tables = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0)
+            .map_err(|_| Error::invalid("ac4: aspx frequency-table derivation failed"))?;
+        let counts = tables.counts;
+        let num_sbg_sig = if aspx_cfg.signals_freq_res() {
+            counts.num_sbg_sig_lowres
+        } else {
+            counts.num_sbg_sig_highres
+        } as usize;
+        let num_sbg_noise = counts.num_sbg_noise as usize;
+        let sig_row = vec![0i32; num_sbg_sig.max(1)];
+        let mut noise_row = vec![0i32; num_sbg_noise.max(1)];
+        noise_row[0] = 30;
+        Ok(Self {
+            sig_row,
+            noise_row,
+            tna: vec![0u8; num_sbg_noise],
+        })
+    }
+
+    fn level(&self) -> crate::encoder_acpl3::AspxRealEnvelopeChannel<'_> {
+        crate::encoder_acpl3::AspxRealEnvelopeChannel {
+            sig: &self.sig_row,
+            noise: &self.noise_row,
+        }
+    }
+
+    fn write_2ch(&self, bw: &mut BitWriter, aspx_cfg: &AspxConfig, b_iframe: bool) -> Result<()> {
         crate::encoder_acpl3::write_aspx_data_2ch_real_envelope_tna_ah_framed(
             bw,
             aspx_cfg,
-            ch_level,
-            ch_bal,
-            &tna,
+            self.level(),
+            self.level(),
+            &self.tna,
             &[],
             &[],
             b_iframe,
         )
-        .map_err(Error::invalid)?;
+        .map_err(Error::invalid)
     }
-    crate::encoder_acpl3::write_aspx_data_1ch_real_envelope_tna_ah_framed(
+
+    fn write_1ch(&self, bw: &mut BitWriter, aspx_cfg: &AspxConfig, b_iframe: bool) -> Result<()> {
+        crate::encoder_acpl3::write_aspx_data_1ch_real_envelope_tna_ah_framed(
+            bw,
+            aspx_cfg,
+            self.level(),
+            &self.tna,
+            &[],
+            b_iframe,
+        )
+        .map_err(Error::invalid)
+    }
+}
+
+/// Write an ASPX_SCPL-mode `immersive_channel_element()` body:
+/// grouping-3 core, `b_use_sap_add_ch = 0`, the §6.2.4.1 ASPX_SCPL
+/// payload roster (minimal floored-noise single-envelope FIXFIX
+/// payloads — see [`MinimalAspxRows`]), and the identity
+/// (`sap_mode = 0`) S-CPL section. `aspx_config()` is emitted on
+/// I-frames only (P-frames reuse the sticky config).
+#[allow(clippy::too_many_arguments)]
+pub fn write_ice_body_aspx_scpl(
+    bw: &mut BitWriter,
+    spectra: &IceScplSpectra<'_>,
+    lfe: Option<(&[f32], u32)>,
+    b_5fronts: bool,
+    aspx_cfg: &AspxConfig,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+) -> Result<()> {
+    let want_pairs = if b_5fronts { 3 } else { 2 };
+    if spectra.scpl_pairs.len() != want_pairs {
+        return Err(Error::invalid("ac4: ice scpl pair count mismatch"));
+    }
+    IceCodecMode::AspxScpl.write(bw);
+    // immers_cfg(ASPX_SCPL): aspx_config() on I-frames.
+    if b_iframe {
+        crate::encoder_acpl3::write_aspx_config(bw, aspx_cfg);
+    }
+    if let Some((coeffs, max_sfb_lfe)) = lfe {
+        crate::ajoc_substream::write_mono_data_lfe_simple(
+            bw,
+            coeffs,
+            transform_length,
+            max_sfb_lfe,
+        )?;
+    }
+    // core_5ch_grouping = 3 (five_channel_data).
+    bw.write_u32(3, 2);
+    write_five_channel_data_simple(bw, spectra.core, transform_length, max_sfb)?;
+    // 7CH_STATIC: b_use_sap_add_ch = 0 + additional pair (F, G).
+    bw.write_bit(false);
+    crate::ajoc_substream::write_two_channel_data_simple(
         bw,
-        aspx_cfg,
-        ch_level,
-        &tna,
-        &[],
-        b_iframe,
-    )
-    .map_err(Error::invalid)?;
-    write_ajcc_data(bw, ajcc)?;
+        spectra.add_pair[0],
+        spectra.add_pair[1],
+        transform_length,
+        max_sfb,
+    )?;
+    // ASPX_SCPL roster: 2ch, 2ch, 1ch, (b_5fronts ? 2ch 2ch : 2ch),
+    // 2ch, 2ch.
+    let rows = MinimalAspxRows::derive(aspx_cfg)?;
+    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    rows.write_1ch(bw, aspx_cfg, b_iframe)?;
+    let mid = if b_5fronts { 2 } else { 1 };
+    for _ in 0..mid {
+        rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    }
+    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    // S-CPL section: pairs then identity chparam elements.
+    for p in &spectra.scpl_pairs[..2] {
+        crate::ajoc_substream::write_two_channel_data_simple(
+            bw,
+            p[0],
+            p[1],
+            transform_length,
+            max_sfb,
+        )?;
+    }
+    for _ in 0..4 {
+        bw.write_u32(0, 2);
+    }
+    if b_5fronts {
+        let p = &spectra.scpl_pairs[2];
+        crate::ajoc_substream::write_two_channel_data_simple(
+            bw,
+            p[0],
+            p[1],
+            transform_length,
+            max_sfb,
+        )?;
+        for _ in 0..2 {
+            bw.write_u32(0, 2);
+        }
+    }
     Ok(())
 }
 
@@ -1568,6 +1683,54 @@ mod tests {
         assert_eq!(specs[8].get(26).copied().unwrap_or(0.0), 0.0);
         // D itself is unmodified by step 6.
         assert!((specs[3][22] - d_tone).abs() < 1.0);
+    }
+
+    /// ASPX_SCPL body round-trip: aspx_config on the sticky slot, the
+    /// full 6- / 7-element payload roster, and the S-CPL section.
+    #[test]
+    fn ice_aspx_scpl_body_round_trips() {
+        for b_5fronts in [false, true] {
+            let core: Vec<Vec<f32>> = (0..5).map(|i| tone_spectrum(10 + 4 * i, 30.0)).collect();
+            let core_refs: [&[f32]; 5] = [&core[0], &core[1], &core[2], &core[3], &core[4]];
+            let fg = [tone_spectrum(40, 25.0), tone_spectrum(44, 25.0)];
+            let p0 = [tone_spectrum(50, 20.0), tone_spectrum(54, 20.0)];
+            let p1 = [tone_spectrum(60, 20.0), tone_spectrum(64, 20.0)];
+            let p2 = [tone_spectrum(70, 20.0), tone_spectrum(74, 20.0)];
+            let pairs_5f: [[&[f32]; 2]; 3] = [[&p0[0], &p0[1]], [&p1[0], &p1[1]], [&p2[0], &p2[1]]];
+            let pairs_4f: [[&[f32]; 2]; 2] = [[&p0[0], &p0[1]], [&p1[0], &p1[1]]];
+            let spectra = IceScplSpectra {
+                core: &core_refs,
+                add_pair: [&fg[0], &fg[1]],
+                scpl_pairs: if b_5fronts { &pairs_5f } else { &pairs_4f },
+            };
+            let cfg = test_aspx_config();
+            let mut bw = BitWriter::new();
+            write_ice_body_aspx_scpl(&mut bw, &spectra, None, b_5fronts, &cfg, true, TL, MAX_SFB)
+                .unwrap();
+            bw.write_u32(0, 16);
+            let bytes = bw.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let mut tools = SubstreamTools::default();
+            parse_ice_audio_data_outer(&mut br, &mut tools, false, b_5fronts, true, TL).unwrap();
+            let ice = tools.ice.as_deref().expect("ice element parsed");
+            assert_eq!(ice.mode, IceCodecMode::AspxScpl);
+            assert!(tools.aspx_config.is_some(), "sticky aspx_config landed");
+            let want = if b_5fronts { 7 } else { 6 };
+            assert_eq!(ice.aspx_elements.len(), want);
+            // Roster shape: 2ch, 2ch, 1ch, then 2ch to the end.
+            for (i, el) in ice.aspx_elements.iter().enumerate() {
+                match (i, el) {
+                    (2, IceAspxElement::OneCh(Some(_))) => {}
+                    (2, _) => panic!("payload 2 must be the 1ch element"),
+                    (_, IceAspxElement::TwoCh(Some(_))) => {}
+                    _ => panic!("payload {i} must be a captured 2ch element"),
+                }
+            }
+            assert_eq!(ice.scpl_pairs.len(), if b_5fronts { 3 } else { 2 });
+            assert_eq!(ice.scpl_chparam.len(), if b_5fronts { 6 } else { 4 });
+            assert!(ice.ajcc.is_none());
+            assert!(ice.acpl_data.is_empty());
+        }
     }
 
     /// The full-frame writer emits a TOC the parser identifies as an

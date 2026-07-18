@@ -1836,6 +1836,58 @@ impl Ac4Decoder {
             .collect()
     }
 
+    /// §5.3.3.1 Table 23 S-CPL full-decoding matrix over the 13 IMDCT
+    /// track signals `t[0..13]` (A''..M''). `c_gain` / `m_gain` follow
+    /// the mode: 2 / √2 for SCPL, 1 / 1 for ASPX_SCPL (whose output
+    /// levels are restored by the §4.8.3.11.3 post-A-SPX gains). The
+    /// b_5fronts front rows carry the fixed x2 matrix (independent of
+    /// both gains); the x2 · ½ entries of every mixing row cancel.
+    ///
+    /// Returns the 11 / 13 output channels in the route's slot order
+    /// `[L, R, C, (Lscr, Rscr,) Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`
+    /// (for b_5fronts the Table 23 `Lw` / `Rw` outputs occupy the L /
+    /// R slots).
+    fn ice_scpl_full_matrix(
+        t: &[Vec<f32>],
+        b_5fronts: bool,
+        c_gain: f32,
+        m_gain: f32,
+        n: usize,
+    ) -> Vec<Vec<f32>> {
+        let n_named = if b_5fronts { 13 } else { 11 };
+        let mut chans: Vec<Vec<f32>> = vec![Vec::new(); n_named];
+        if b_5fronts {
+            // [Lw, Lscr] from (A, L''), [Rw, Rscr] from (B, M'') —
+            // Lw / Rw occupy the L / R slots.
+            chans[0] = Self::ice_mix2(&t[0], &t[11], 1.0, 1.0, n);
+            chans[3] = Self::ice_mix2(&t[0], &t[11], 1.0, -1.0, n);
+            chans[1] = Self::ice_mix2(&t[1], &t[12], 1.0, 1.0, n);
+            chans[4] = Self::ice_mix2(&t[1], &t[12], 1.0, -1.0, n);
+            chans[2] = Self::ice_scale(&t[2], c_gain, n);
+        } else {
+            chans[0] = Self::ice_scale(&t[0], c_gain, n);
+            chans[1] = Self::ice_scale(&t[1], c_gain, n);
+            chans[2] = Self::ice_scale(&t[2], c_gain, n);
+        }
+        // Surround / top rows are position-independent of b_5fronts;
+        // the output slots shift by the two screen channels.
+        let base = if b_5fronts { 5 } else { 3 };
+        let rows: [(usize, usize, f32); 8] = [
+            (3, 5, 1.0),   // Ls  = m(D + F)
+            (4, 6, 1.0),   // Rs  = m(E + G)
+            (3, 5, -1.0),  // Lb  = m(D − F)
+            (4, 6, -1.0),  // Rb  = m(E − G)
+            (7, 9, 1.0),   // Tfl = m(H + J)
+            (8, 10, 1.0),  // Tfr = m(I + K)
+            (7, 9, -1.0),  // Tbl = m(H − J)
+            (8, 10, -1.0), // Tbr = m(I − K)
+        ];
+        for (i, (a, b, sign)) in rows.into_iter().enumerate() {
+            chans[base + i] = Self::ice_mix2(&t[a], &t[b], m_gain, sign, n);
+        }
+        chans
+    }
+
     /// Plain (extension-free) QMF analysis of one channel's PCM into a
     /// `q[sb][ts]` matrix — the fallback when a core channel has no
     /// usable A-SPX payload.
@@ -1992,38 +2044,119 @@ impl Ac4Decoder {
                     for (slot, spec) in specs.iter().enumerate() {
                         t.push(self.imdct_channel_f32(slot, spec, n));
                     }
-                    let c_gain = 2.0f32;
-                    let m_gain = std::f32::consts::SQRT_2;
-                    if b_5fronts {
-                        // [Lw, Lscr] from (A, L''), [Rw, Rscr] from
-                        // (B, M'') — Lw / Rw occupy the L / R slots.
-                        chans[0] = Self::ice_mix2(&t[0], &t[11], 1.0, 1.0, n);
-                        chans[3] = Self::ice_mix2(&t[0], &t[11], 1.0, -1.0, n);
-                        chans[1] = Self::ice_mix2(&t[1], &t[12], 1.0, 1.0, n);
-                        chans[4] = Self::ice_mix2(&t[1], &t[12], 1.0, -1.0, n);
-                        chans[2] = Self::ice_scale(&t[2], c_gain, n);
-                    } else {
-                        chans[0] = Self::ice_scale(&t[0], c_gain, n);
-                        chans[1] = Self::ice_scale(&t[1], c_gain, n);
-                        chans[2] = Self::ice_scale(&t[2], c_gain, n);
+                    chans =
+                        Self::ice_scpl_full_matrix(&t, b_5fronts, 2.0, std::f32::consts::SQRT_2, n);
+                }
+                ice::IceCodecMode::AspxScpl if tl_ok => {
+                    // §5.2.3.2 steps 3-6 (SAP), IMDCT, §5.3.3.1
+                    // Table 23 with c_gain = m_gain = 1, then the
+                    // per-channel A-SPX extension (Table 8 grouping)
+                    // and the §4.8.3.11.3 Table 10 / 11 output gains.
+                    let mut specs = ice_el.track_spectra_owned();
+                    ice::apply_sap_steps(&mut specs, ice_el, samples);
+                    let mut t: Vec<Vec<f32>> = Vec::with_capacity(13);
+                    for (slot, spec) in specs.iter().enumerate() {
+                        t.push(self.imdct_channel_f32(slot, spec, n));
                     }
-                    // Surround / top rows are position-independent of
-                    // b_5fronts; the output slots shift by the two
-                    // screen channels.
-                    let base = if b_5fronts { 5 } else { 3 };
-                    let rows: [(usize, usize, f32); 8] = [
-                        (3, 5, 1.0),   // Ls  = m(D + F)
-                        (4, 6, 1.0),   // Rs  = m(E + G)
-                        (3, 5, -1.0),  // Lb  = m(D − F)
-                        (4, 6, -1.0),  // Rb  = m(E − G)
-                        (7, 9, 1.0),   // Tfl = m(H + J)
-                        (8, 10, 1.0),  // Tfr = m(I + K)
-                        (7, 9, -1.0),  // Tbl = m(H − J)
-                        (8, 10, -1.0), // Tbr = m(I − K)
-                    ];
-                    for (i, (a, b, sign)) in rows.into_iter().enumerate() {
-                        chans[base + i] = Self::ice_mix2(&t[a], &t[b], m_gain, sign, n);
+                    let mut ch_pcm = Self::ice_scpl_full_matrix(&t, b_5fronts, 1.0, 1.0, n);
+                    // A-SPX per decoupled channel. Table 8 groups the
+                    // channels as (L, R), C, (Ls, Lb), (Rs, Rb),
+                    // (Tfl, Tbl), (Tfr, Tbr) — with b_5fronts the
+                    // front groups become (L, Lscr) and (R, Rscr) —
+                    // associated with the §6.2.4.1 payload roster in
+                    // transmission order (2ch payloads to the pair
+                    // groups, the 1ch payload to C).
+                    let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+                    if let Some(cfg) = sub_aspx_cfg {
+                        // (payload index, output slot, is_secondary)
+                        let mapping: &[(usize, usize, bool)] = if b_5fronts {
+                            &[
+                                (0, 0, false), // (L, Lscr)
+                                (0, 3, true),
+                                (1, 1, false), // (R, Rscr)
+                                (1, 4, true),
+                                (2, 2, false), // C
+                                (3, 5, false), // (Ls, Lb)
+                                (3, 7, true),
+                                (4, 6, false), // (Rs, Rb)
+                                (4, 8, true),
+                                (5, 9, false), // (Tfl, Tbl)
+                                (5, 11, true),
+                                (6, 10, false), // (Tfr, Tbr)
+                                (6, 12, true),
+                            ]
+                        } else {
+                            &[
+                                (0, 0, false), // (L, R)
+                                (0, 1, true),
+                                (1, 3, false), // (Ls, Lb)
+                                (1, 5, true),
+                                (2, 2, false), // C
+                                (3, 4, false), // (Rs, Rb)
+                                (3, 6, true),
+                                (4, 7, false), // (Tfl, Tbl)
+                                (4, 9, true),
+                                (5, 8, false), // (Tfr, Tbr)
+                                (5, 10, true),
+                            ]
+                        };
+                        for &(elem_idx, slot, is_secondary) in mapping {
+                            let trailer = match ice_el.aspx_elements.get(elem_idx) {
+                                Some(
+                                    ice::IceAspxElement::TwoCh(Some(t))
+                                    | ice::IceAspxElement::OneCh(Some(t)),
+                                ) => (**t).clone(),
+                                _ => continue,
+                            };
+                            let ch = if is_secondary {
+                                trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                            } else {
+                                &trailer.primary
+                            };
+                            while self.aspx_ext_state.len() <= slot {
+                                self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
+                            }
+                            ch_pcm[slot] = Self::aspx_extend_pcm(
+                                &ch_pcm[slot],
+                                &trailer.frequency_tables,
+                                &cfg,
+                                Some(&ch.framing),
+                                Some(&ch.data_sig),
+                                Some(&ch.data_noise),
+                                Some(ch.qmode_env),
+                                Some(&ch.delta_dir),
+                                ch.add_harmonic.as_deref(),
+                                ch.tna_mode.as_deref(),
+                                &mut self.aspx_ext_state[slot],
+                                num_ts_in_ats,
+                                aspx::CompandingMode::Off,
+                                None,
+                            );
+                        }
                     }
+                    // §4.8.3.11.3 Tables 10 / 11 channel-dependent
+                    // output gains (applied full-band, so equivalently
+                    // on the synthesised PCM).
+                    let sq2 = std::f32::consts::SQRT_2;
+                    for (slot, pcm) in ch_pcm.iter_mut().enumerate() {
+                        let g = if b_5fronts {
+                            match slot {
+                                2 => 2.0,             // C
+                                0 | 1 | 3 | 4 => 1.0, // L, R, Lscr, Rscr
+                                _ => sq2,
+                            }
+                        } else if slot < 3 {
+                            2.0 // L, R, C
+                        } else {
+                            sq2
+                        };
+                        if (g - 1.0).abs() > f32::EPSILON {
+                            for v in pcm.iter_mut() {
+                                *v *= g;
+                            }
+                        }
+                    }
+                    chans = ch_pcm;
                 }
                 ice::IceCodecMode::AspxAjcc if tl_ok => {
                     let specs: Vec<Option<Vec<f32>>> = ice_el
