@@ -650,3 +650,106 @@ fn ice_acpl2_9_0_4_front_modules() {
     assert!(p_ls > 1e11, "Ls carries the D carrier ({p_ls})");
     assert!(p_tfl > 1e11, "Tfl carries the F carrier ({p_tfl})");
 }
+
+fn minimal_ajcc_data(iframe: bool) -> oxideav_ac4::ajcc::AjccData {
+    use oxideav_ac4::acpl::AcplQuantMode;
+    use oxideav_ac4::ajcc::{encode_ajcc_deltas_freq, AjccData, AjccFramingData};
+    use oxideav_ac4::ajoc::AjocDiffType;
+    let nb = 9usize;
+    let fine = AcplQuantMode::Fine;
+    let freq_row = |q: i32| vec![(AjocDiffType::Freq, encode_ajcc_deltas_freq(&vec![q; nb]))];
+    let time_row = || vec![(AjocDiffType::Time, vec![0i32; nb])];
+    let row = |q: i32| if iframe { freq_row(q) } else { time_row() };
+    AjccData {
+        b_5fronts: false,
+        b_no_dt: iframe,
+        num_param_bands_id: 2,
+        num_bands: nb as u32,
+        core_mode: false,
+        qm_f: fine,
+        qm_b: fine,
+        qm_ab: fine,
+        qm_dw: fine,
+        framing: vec![
+            AjccFramingData {
+                steep: false,
+                num_param_sets: 1,
+                param_timeslot: vec![],
+            };
+            2
+        ],
+        alpha: vec![row(16), row(16)],
+        beta: vec![row(0), row(0)],
+        dry: vec![row(8); 4],
+        wet: vec![row(20); 6],
+    }
+}
+
+/// §4.8.3.10.3 companding on the ASPX_AJCC route: with per-channel
+/// (sync = 0) companding enabled on input channel L only, the §5.7.5
+/// per-slot gains reshape the regenerated band of the left A-JCC
+/// module's outputs while channels fed by the other carriers decode
+/// bit-identically to the companding-off frame.
+#[test]
+fn ice_ajcc_companding_applies_per_input_channel() {
+    use oxideav_ac4::aspx::CompandingControl;
+    use oxideav_ac4::ice::write_ice_body_ajcc_with_companding;
+    let a = tone_spectrum(6, 200.0);
+    let b = tone_spectrum(10, 200.0);
+    let silent = vec![0.0f32; a.len()];
+    let core: [&[f32]; 5] = [&a, &b, &silent, &silent, &silent];
+    let cfg = test_aspx_config();
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let run = |compand_on_l: bool| {
+        let mut dec = Ac4Decoder::new(&params);
+        let cc = CompandingControl {
+            sync_flag: Some(false),
+            compand_on: vec![compand_on_l, false, false, false, false],
+            compand_avg: Some(false),
+        };
+        let mut out = Vec::new();
+        for (seq, iframe) in [(0u32, true), (1, false)] {
+            let ajcc = minimal_ajcc_data(iframe);
+            let mut body = BitWriter::new();
+            write_ice_body_ajcc_with_companding(
+                &mut body, &core, &ajcc, &cfg, None, iframe, TL, MAX_SFB, &cc, true,
+            )
+            .unwrap();
+            let frame = encode_ice_raw_frame(seq, false, false, iframe, body).unwrap();
+            out = decode_frame(&mut dec, frame, 11);
+        }
+        out
+    };
+    let plain = run(false);
+    let companded = run(true);
+    // Output order: [L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr].
+    // The left module (x0 = A) feeds L and Tfl; the right module
+    // (x1 = B) feeds R and Tfr.
+    let d = |x: &[i16], y: &[i16]| -> f64 {
+        x.iter()
+            .zip(y.iter())
+            .map(|(&p, &q)| {
+                let e = p as f64 - q as f64;
+                e * e
+            })
+            .sum()
+    };
+    let d_l = d(&plain[0], &companded[0]);
+    let d_r = d(&plain[1], &companded[1]);
+    assert!(
+        d_l > 1e6,
+        "companding on the L input reshapes the L output ({d_l})"
+    );
+    assert!(
+        d_r < 1.0,
+        "the R input stays uncompanded — R decodes identically ({d_r})"
+    );
+    // Sanity: companding reshapes the slot gains — it neither
+    // silences nor blows up the channel (the full-scale test HF plus
+    // i16 clipping makes finer tone-level pins unreliable here).
+    let e_ratio = energy(&companded[0]) / energy(&plain[0]).max(1.0);
+    assert!(
+        (0.1..=10.0).contains(&e_ratio),
+        "companded L stays at a sane level ({e_ratio})"
+    );
+}

@@ -1953,6 +1953,10 @@ impl Ac4Decoder {
     /// using a captured payload trailer; falls back to the plain
     /// low-band analysis when the extension guards trip.
     #[allow(clippy::too_many_arguments)]
+    /// Returns the post-extension matrix plus the `(sbx, sbz)` band
+    /// the §5.7.5 companding tool needs; the band is `None` when the
+    /// extension guards tripped and the plain low-band analysis was
+    /// used instead.
     fn ice_extend_channel_qmf(
         &mut self,
         pcm: &[f32],
@@ -1961,7 +1965,7 @@ impl Ac4Decoder {
         cfg: &aspx::AspxConfig,
         slot: usize,
         num_ts_in_ats: u32,
-    ) -> aspx::QmfMatrix {
+    ) -> (aspx::QmfMatrix, Option<(u32, u32)>) {
         while self.aspx_ext_state.len() <= slot {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
         }
@@ -1984,8 +1988,8 @@ impl Ac4Decoder {
             &mut self.aspx_ext_state[slot],
             num_ts_in_ats,
         ) {
-            Some((q, _sb0, _sb1)) => q,
-            None => Self::ice_plain_qmf(pcm),
+            Some((q, sb0, sb1)) => (q, Some((sb0, sb1))),
+            None => (Self::ice_plain_qmf(pcm), None),
         }
     }
 
@@ -2241,7 +2245,7 @@ impl Ac4Decoder {
                                 ) => (**t).clone(),
                                 _ => continue,
                             };
-                            q_tr[tr] = self.ice_extend_channel_qmf(
+                            (q_tr[tr], _) = self.ice_extend_channel_qmf(
                                 &t[tr],
                                 &trailer,
                                 is_secondary,
@@ -2440,6 +2444,7 @@ impl Ac4Decoder {
                     // Table 8's (D'', F'') row).
                     let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
                     let mut q_ch: Vec<aspx::QmfMatrix> = Vec::with_capacity(5);
+                    let mut bands: Vec<Option<(u32, u32)>> = vec![None; 5];
                     for pcm in pcm_core.iter().take(5) {
                         q_ch.push(Self::ice_plain_qmf(pcm));
                     }
@@ -2459,7 +2464,7 @@ impl Ac4Decoder {
                                 ) => (**t).clone(),
                                 _ => continue,
                             };
-                            q_ch[ch] = self.ice_extend_channel_qmf(
+                            (q_ch[ch], bands[ch]) = self.ice_extend_channel_qmf(
                                 &pcm_core[ch],
                                 &trailer,
                                 is_secondary,
@@ -2467,6 +2472,27 @@ impl Ac4Decoder {
                                 ch,
                                 num_ts_in_ats,
                             );
+                        }
+                    }
+                    // §4.8.3.10.3: companding on the five input
+                    // channels L, R, C, Ls, Rs — the same order as
+                    // companding_control(5) — via the §5.7.5 tool.
+                    // Channel slot order here is the Table 19 track
+                    // order A..E = L, R, C, Ls, Rs.
+                    let cc = ice_el.companding.as_ref();
+                    if let Some(mode) = Self::five_x_synced_mode(cc) {
+                        let mut sync_view: Vec<aspx::SyncCompandingEntry<'_>> = Vec::new();
+                        for (q, band) in q_ch.iter_mut().zip(bands.iter()) {
+                            if let Some((sb0, sbz)) = band {
+                                sync_view.push((q, *sb0, *sbz));
+                            }
+                        }
+                        aspx::apply_synchronised_companding_across_channels(&mut sync_view, mode);
+                    } else {
+                        for (slot, (q, band)) in q_ch.iter_mut().zip(bands.iter()).enumerate() {
+                            let Some((sb0, sbz)) = band else { continue };
+                            let mode = Self::five_x_compand_mode_for_slot(cc, slot);
+                            aspx::apply_companding_on_qmf_with_mode(q, *sb0, *sbz, mode);
                         }
                     }
                     // §5.6.3.2-5: differential decode + full-decode

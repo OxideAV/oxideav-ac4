@@ -884,6 +884,43 @@ pub fn write_ice_body_ajcc(
     transform_length: u32,
     max_sfb: u32,
 ) -> Result<()> {
+    let off = CompandingControl {
+        sync_flag: Some(true),
+        compand_on: vec![false],
+        compand_avg: Some(false),
+    };
+    write_ice_body_ajcc_with_companding(
+        bw,
+        core,
+        ajcc,
+        aspx_cfg,
+        lfe,
+        b_iframe,
+        transform_length,
+        max_sfb,
+        &off,
+        false,
+    )
+}
+
+/// [`write_ice_body_ajcc`] with an explicit `companding_control(5)`
+/// payload (§4.8.3.10.3 — channel order L, R, C, Ls, Rs) and a
+/// `loud_hf` switch: when set, the A-SPX payload noise rows stay at
+/// the all-zero full-scale floor (`qnoise = 0`) so the §5.7.5
+/// companding gains act on a measurable regenerated band.
+#[allow(clippy::too_many_arguments)]
+pub fn write_ice_body_ajcc_with_companding(
+    bw: &mut BitWriter,
+    core: &[&[f32]; 5],
+    ajcc: &AjccData,
+    aspx_cfg: &AspxConfig,
+    lfe: Option<(&[f32], u32)>,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+    companding: &CompandingControl,
+    loud_hf: bool,
+) -> Result<()> {
     IceCodecMode::AspxAjcc.write(bw);
     if b_iframe {
         crate::encoder_acpl3::write_aspx_config(bw, aspx_cfg);
@@ -896,16 +933,41 @@ pub fn write_ice_body_ajcc(
             max_sfb_lfe,
         )?;
     }
-    // companding_control(5): sync_flag = 1, b_compand_on[0] = 0,
-    // b_compand_avg = 0 (companding off).
-    bw.write_bit(true);
-    bw.write_bit(false);
-    bw.write_bit(false);
+    // companding_control(5) — exact inverse of
+    // `parse_companding_control(_, 5)`.
+    match companding.sync_flag {
+        Some(sync) => bw.write_bit(sync),
+        None => {
+            return Err(Error::invalid("ac4: companding_control(5) needs sync_flag"));
+        }
+    }
+    let nc = if companding.sync_flag == Some(true) {
+        1
+    } else {
+        5
+    };
+    if companding.compand_on.len() != nc {
+        return Err(Error::invalid("ac4: companding_control compand_on length"));
+    }
+    let mut need_avg = false;
+    for &b in &companding.compand_on {
+        bw.write_bit(b);
+        if !b {
+            need_avg = true;
+        }
+    }
+    if need_avg {
+        bw.write_bit(companding.compand_avg.unwrap_or(false));
+    }
     // core_5ch_grouping = 3.
     bw.write_u32(3, 2);
     write_five_channel_data_simple(bw, core, transform_length, max_sfb)?;
     // A-SPX: 2× aspx_data_2ch + 1× aspx_data_1ch (5CH_DYNAMIC).
-    let rows = MinimalAspxRows::derive(aspx_cfg)?;
+    let rows = if loud_hf {
+        MinimalAspxRows::derive_with_noise_floor(aspx_cfg, 0)?
+    } else {
+        MinimalAspxRows::derive(aspx_cfg)?
+    };
     for _ in 0..2 {
         rows.write_2ch(bw, aspx_cfg, b_iframe)?;
     }
@@ -931,6 +993,10 @@ struct MinimalAspxRows {
 
 impl MinimalAspxRows {
     fn derive(aspx_cfg: &AspxConfig) -> Result<Self> {
+        Self::derive_with_noise_floor(aspx_cfg, 30)
+    }
+
+    fn derive_with_noise_floor(aspx_cfg: &AspxConfig, noise_f0: i32) -> Result<Self> {
         let tables = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0)
             .map_err(|_| Error::invalid("ac4: aspx frequency-table derivation failed"))?;
         let counts = tables.counts;
@@ -942,7 +1008,7 @@ impl MinimalAspxRows {
         let num_sbg_noise = counts.num_sbg_noise as usize;
         let sig_row = vec![0i32; num_sbg_sig.max(1)];
         let mut noise_row = vec![0i32; num_sbg_noise.max(1)];
-        noise_row[0] = 30;
+        noise_row[0] = noise_f0;
         Ok(Self {
             sig_row,
             noise_row,
