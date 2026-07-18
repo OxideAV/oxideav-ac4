@@ -1983,16 +1983,14 @@ impl Ac4Decoder {
             }
             match ice_el.mode {
                 ice::IceCodecMode::Scpl if tl_ok => {
-                    // §5.3.3.1 Table 23, c_gain = 2 / m_gain = √2.
-                    let specs: Vec<Option<Vec<f32>>> = ice_el
-                        .track_spectra()
-                        .into_iter()
-                        .map(|s| s.map(<[f32]>::to_vec))
-                        .collect();
+                    // §5.2.3.2 steps 3-6 (SAP mixing on the track
+                    // spectra), then §5.3.3.1 Table 23 with c_gain = 2
+                    // / m_gain = √2.
+                    let mut specs = ice_el.track_spectra_owned();
+                    ice::apply_sap_steps(&mut specs, ice_el, samples);
                     let mut t: Vec<Vec<f32>> = Vec::with_capacity(13);
                     for (slot, spec) in specs.iter().enumerate() {
-                        let coeffs: &[f32] = spec.as_deref().unwrap_or(&[]);
-                        t.push(self.imdct_channel_f32(slot, coeffs, n));
+                        t.push(self.imdct_channel_f32(slot, spec, n));
                     }
                     let c_gain = 2.0f32;
                     let m_gain = std::f32::consts::SQRT_2;

@@ -335,6 +335,133 @@ impl IceElement {
     pub fn lfe_spectrum(&self) -> Option<&[f32]> {
         self.lfe.as_ref().and_then(|m| m.scaled_spec.as_deref())
     }
+
+    /// Owned copy of [`IceElement::track_spectra`] — always 13 dense
+    /// rows (uncoded tracks come back as empty vectors, which the SAP
+    /// / IMDCT stages treat as silence).
+    pub fn track_spectra_owned(&self) -> Vec<Vec<f32>> {
+        self.track_spectra()
+            .into_iter()
+            .map(|s| s.map(<[f32]>::to_vec).unwrap_or_default())
+            .collect()
+    }
+}
+
+/// Apply the TS 103 190-2 §5.2.3.2 SAP mixing (steps 3-6) in place on
+/// the 13 dense track spectra (index 0 = A … 12 = M; empty rows are
+/// silence).
+///
+/// * **Steps 3-4** — when `b_use_sap_add_ch == 1`, the two contained
+///   `chparam_info()` elements drive the 2x2 quartets `(a_i, b_i, c_i,
+///   d_i)` (part-1 Pseudocode 59) mixing `(D, F)` and `(E, G)`:
+///   `D' = a_0 D + b_0 F`, `F' = c_0 D + d_0 F` (and likewise `E`/`G`
+///   with the second element). Per Table 19 NOTE 2 only D, E, F, G are
+///   modified; bins past the SAP-coded extent pass through.
+/// * **Steps 5-6** — the S-CPL-section `chparam_info()` elements
+///   resolve the additive prediction gains `a'_j`
+///   ([`crate::asf::extract_sap_a_prime`] — non-zero only for
+///   `sap_mode == 3`) and Table 20 adds the scaled carriers into the
+///   S-CPL mid/residual tracks: `H'' = H' + a'_0 D'`,
+///   `I'' = I' + a'_1 E'`, `J'' = J' + a'_2 F'`, `K'' = K' + a'_3 G'`,
+///   and with `b_5fronts` also `L'' = L' + a'_4 A'`,
+///   `M'' = M' + a'_5 B'`.
+///
+/// The steps only apply to the §5.2.3.2 modes (SCPL / ASPX_SCPL /
+/// ASPX_ACPL_1 — [`IceCodecMode::has_scpl_section`]); the ASPX_ACPL_2
+/// and ASPX_AJCC processing clauses (§5.2.3.3-4) carry no SAP stage,
+/// so the call is a no-op for them. Both stages run on the parse-side
+/// single-window-group grid: each `chparam_info()` is keyed against
+/// the same `max_sfb` bound it was parsed with, over the
+/// `transform_length` sfb offsets.
+pub fn apply_sap_steps(specs: &mut [Vec<f32>], ice: &IceElement, transform_length: u32) {
+    if !ice.mode.has_scpl_section() || specs.len() < 13 {
+        return;
+    }
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+        return;
+    };
+    let n = transform_length as usize;
+    // Materialise a lazily-zero row to length `len` so in-place mixing
+    // has both operands.
+    fn ensure_len(v: &mut Vec<f32>, len: usize) {
+        if v.len() < len {
+            v.resize(len, 0.0);
+        }
+    }
+    // Steps 3-4: b_use_sap_add_ch quartets on (D, F) and (E, G).
+    if ice.b_use_sap_add_ch == Some(true) {
+        if let (Some(cp), Ok(ctx)) = (ice.sap_add_chparam.as_deref(), core_de_max_sfb(&ice.core)) {
+            for (i, info) in cp.iter().enumerate() {
+                let coeffs = crate::asf::extract_sap_abcd(info, &[ctx]);
+                let abcd: &[(f32, f32, f32, f32)] =
+                    coeffs.abcd.first().map(|v| v.as_slice()).unwrap_or(&[]);
+                let usable = abcd.len().min(ctx as usize);
+                let hi_bin = sfbo
+                    .get(usable)
+                    .copied()
+                    .map(|v| (v as usize).min(n))
+                    .unwrap_or(0);
+                let (lo_idx, hi_idx) = (3 + i, 5 + i); // (D, F) / (E, G)
+                let (head, tail) = specs.split_at_mut(hi_idx);
+                let x_row = &mut head[lo_idx];
+                let y_row = &mut tail[0];
+                ensure_len(x_row, hi_bin);
+                ensure_len(y_row, hi_bin);
+                for (sfb, &(a, b, c, d)) in abcd.iter().enumerate().take(usable) {
+                    let lo = sfbo[sfb] as usize;
+                    let hi = (sfbo[sfb + 1] as usize).min(n);
+                    for (x, y) in x_row[lo..hi].iter_mut().zip(y_row[lo..hi].iter_mut()) {
+                        let (xv, yv) = (*x, *y);
+                        *x = a * xv + b * yv;
+                        *y = c * xv + d * yv;
+                    }
+                }
+            }
+        }
+    }
+    // Steps 5-6: additive a'_j prediction into the S-CPL tracks.
+    // (target, source) pairs in Table 20 row order.
+    const TARGETS: [(usize, usize); 6] = [(7, 3), (8, 4), (9, 5), (10, 6), (11, 0), (12, 1)];
+    for (j, info) in ice.scpl_chparam.iter().enumerate() {
+        if j >= TARGETS.len() {
+            break;
+        }
+        // Mirror the parse-side context: pair j/2 for the first four
+        // elements, the third pair for the b_5fronts extras.
+        let pair_idx = if j < 4 { j / 2 } else { 2 };
+        let Some(ctx) = ice
+            .scpl_pairs
+            .get(pair_idx)
+            .and_then(|p| p.psy_info.as_ref())
+            .map(|p| p.max_sfb_0)
+        else {
+            continue;
+        };
+        let a_prime = crate::asf::extract_sap_a_prime(info, &[ctx]);
+        let row: &[f32] = a_prime.first().map(|v| v.as_slice()).unwrap_or(&[]);
+        if row.iter().all(|&g| g == 0.0) {
+            continue;
+        }
+        let (tgt, src) = TARGETS[j];
+        let usable = row.len().min(ctx as usize);
+        let hi_bin = sfbo
+            .get(usable)
+            .copied()
+            .map(|v| (v as usize).min(n))
+            .unwrap_or(0);
+        ensure_len(&mut specs[tgt], hi_bin);
+        for (sfb, &g) in row.iter().enumerate().take(usable) {
+            if g == 0.0 {
+                continue;
+            }
+            let lo = sfbo[sfb] as usize;
+            let hi = (sfbo[sfb + 1] as usize).min(n);
+            for k in lo..hi {
+                let s = specs[src].get(k).copied().unwrap_or(0.0);
+                specs[tgt][k] += g * s;
+            }
+        }
+    }
 }
 
 /// The `max_sfb` context (single window group) of the channel-data
@@ -637,9 +764,44 @@ pub fn write_ice_body_scpl(
     transform_length: u32,
     max_sfb: u32,
 ) -> Result<()> {
+    write_ice_body_scpl_with_sap(
+        bw,
+        spectra,
+        lfe,
+        b_5fronts,
+        transform_length,
+        max_sfb,
+        None,
+        &[],
+    )
+}
+
+/// [`write_ice_body_scpl`] with explicit SAP payloads: `sap_add_pair`
+/// emits `b_use_sap_add_ch = 1` plus the two step-3 `chparam_info()`
+/// elements, and `scpl_chparam` replaces the identity (`sap_mode = 0`)
+/// S-CPL-section elements — pass the 4 (or 6 with `b_5fronts`)
+/// elements whose `a'_j` gains drive the Table 20 step-6 rows; an
+/// empty slice keeps the identity elements. All `chparam_info()`
+/// bodies are emitted against the shared single-window-group
+/// `max_sfb` bound (the same context the parser hands them).
+#[allow(clippy::too_many_arguments)]
+pub fn write_ice_body_scpl_with_sap(
+    bw: &mut BitWriter,
+    spectra: &IceScplSpectra<'_>,
+    lfe: Option<(&[f32], u32)>,
+    b_5fronts: bool,
+    transform_length: u32,
+    max_sfb: u32,
+    sap_add_pair: Option<&[ChparamInfo; 2]>,
+    scpl_chparam: &[ChparamInfo],
+) -> Result<()> {
     let want_pairs = if b_5fronts { 3 } else { 2 };
     if spectra.scpl_pairs.len() != want_pairs {
         return Err(Error::invalid("ac4: ice scpl pair count mismatch"));
+    }
+    let n_chparam = 2 * want_pairs;
+    if !scpl_chparam.is_empty() && scpl_chparam.len() != n_chparam {
+        return Err(Error::invalid("ac4: ice scpl chparam count mismatch"));
     }
     IceCodecMode::Scpl.write(bw);
     // immers_cfg(SCPL) is empty (no aspx_config, no acpl_config).
@@ -654,8 +816,16 @@ pub fn write_ice_body_scpl(
     // core_5ch_grouping = 3 (five_channel_data).
     bw.write_u32(3, 2);
     write_five_channel_data_simple(bw, spectra.core, transform_length, max_sfb)?;
-    // 7CH_STATIC: b_use_sap_add_ch = 0 + additional pair (F, G).
-    bw.write_bit(false);
+    // 7CH_STATIC: b_use_sap_add_ch + additional pair (F, G).
+    match sap_add_pair {
+        Some(pair) => {
+            bw.write_bit(true);
+            for info in pair.iter() {
+                crate::encoder_asf::write_chparam_info(bw, info, &[max_sfb]);
+            }
+        }
+        None => bw.write_bit(false),
+    }
     crate::ajoc_substream::write_two_channel_data_simple(
         bw,
         spectra.add_pair[0],
@@ -663,7 +833,11 @@ pub fn write_ice_body_scpl(
         transform_length,
         max_sfb,
     )?;
-    // S-CPL section: pairs then chparam elements (sap_mode = 0).
+    // S-CPL section: pairs then chparam elements.
+    let write_chparam = |bw: &mut BitWriter, j: usize| match scpl_chparam.get(j) {
+        Some(info) => crate::encoder_asf::write_chparam_info(bw, info, &[max_sfb]),
+        None => bw.write_u32(0, 2),
+    };
     for p in &spectra.scpl_pairs[..2] {
         crate::ajoc_substream::write_two_channel_data_simple(
             bw,
@@ -673,8 +847,8 @@ pub fn write_ice_body_scpl(
             max_sfb,
         )?;
     }
-    for _ in 0..4 {
-        bw.write_u32(0, 2);
+    for j in 0..4 {
+        write_chparam(bw, j);
     }
     if b_5fronts {
         let p = &spectra.scpl_pairs[2];
@@ -685,8 +859,8 @@ pub fn write_ice_body_scpl(
             transform_length,
             max_sfb,
         )?;
-        for _ in 0..2 {
-            bw.write_u32(0, 2);
+        for j in 4..6 {
+            write_chparam(bw, j);
         }
     }
     Ok(())
@@ -1269,6 +1443,131 @@ mod tests {
         assert_eq!(peak(tracks[3]), 18, "D");
         assert_eq!(peak(tracks[4]), 22, "E");
         assert_eq!(peak(tracks[2]), 30, "C");
+    }
+
+    /// §5.2.3.2 step 4: a `b_use_sap_add_ch` chparam pair with
+    /// `sap_mode == 2` (M/S in all bands) mixes (D, F) / (E, G) into
+    /// sum/difference tracks; step-6 identity elements leave the S-CPL
+    /// tracks alone.
+    #[test]
+    fn ice_sap_step4_msall_mixes_d_f_and_e_g() {
+        let core: Vec<Vec<f32>> = (0..5).map(|i| tone_spectrum(10 + 4 * i, 30.0)).collect();
+        let core_refs: [&[f32]; 5] = [&core[0], &core[1], &core[2], &core[3], &core[4]];
+        // F carries a distinct tone; G is silent.
+        let f = tone_spectrum(40, 24.0);
+        let g = vec![0.0f32; f.len()];
+        let hi = [tone_spectrum(50, 20.0), tone_spectrum(54, 20.0)];
+        let jk = [tone_spectrum(60, 20.0), tone_spectrum(64, 20.0)];
+        let scpl_pairs: [[&[f32]; 2]; 2] = [[&hi[0], &hi[1]], [&jk[0], &jk[1]]];
+        let spectra = IceScplSpectra {
+            core: &core_refs,
+            add_pair: [&f, &g],
+            scpl_pairs: &scpl_pairs,
+        };
+        let msall = ChparamInfo {
+            sap_mode: 2,
+            ..ChparamInfo::default()
+        };
+        let pair = [msall.clone(), msall];
+        let mut bw = BitWriter::new();
+        write_ice_body_scpl_with_sap(
+            &mut bw,
+            &spectra,
+            None,
+            false,
+            TL,
+            MAX_SFB,
+            Some(&pair),
+            &[],
+        )
+        .unwrap();
+        bw.write_u32(0, 16);
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_ice_audio_data_outer(&mut br, &mut tools, false, false, true, TL).unwrap();
+        let ice = tools.ice.as_deref().unwrap();
+        assert_eq!(ice.b_use_sap_add_ch, Some(true));
+        assert!(ice.sap_add_chparam.is_some());
+        let mut specs = ice.track_spectra_owned();
+        let d_before = specs[3].clone();
+        let f_before = specs[5].clone();
+        apply_sap_steps(&mut specs, ice, TL);
+        // D' = D + F: both the bin-22 core-D tone and the bin-40 F
+        // tone appear on track D; F' = D − F: the F tone flips sign.
+        let d_tone = d_before[22];
+        let f_tone = f_before[40];
+        assert!(d_tone > 20.0 && f_tone > 20.0, "fixture tones decoded");
+        assert!((specs[3][22] - d_tone).abs() < 1.0, "D' keeps the D tone");
+        assert!((specs[3][40] - f_tone).abs() < 1.0, "D' gains the F tone");
+        assert!((specs[5][22] - d_tone).abs() < 1.0, "F' keeps the D tone");
+        assert!((specs[5][40] + f_tone).abs() < 1.0, "F' negates the F tone");
+        // Second quartet mixes (E, G): G silent → E' == E, G' == E.
+        assert!((specs[4][26] - 30.0).abs() < 3.0, "E' keeps the E tone");
+        assert!((specs[6][26] - specs[4][26]).abs() < 1.0, "G' = E - G = E");
+        // A, B, C and the S-CPL tracks are untouched by step 4.
+        assert!(specs[7][50] > 15.0 && specs[7].get(22).copied().unwrap_or(0.0) == 0.0);
+    }
+
+    /// §5.2.3.2 steps 5-6: a full-SAP (`sap_mode == 3`) S-CPL-section
+    /// chparam element resolves per-band `a'_0` gains and Table 20
+    /// adds `a'_0 · D'` into track H.
+    #[test]
+    fn ice_sap_step6_full_sap_adds_carrier_into_scpl_mid() {
+        let core: Vec<Vec<f32>> = (0..5).map(|i| tone_spectrum(10 + 4 * i, 30.0)).collect();
+        let core_refs: [&[f32]; 5] = [&core[0], &core[1], &core[2], &core[3], &core[4]];
+        let fg = [tone_spectrum(40, 25.0), tone_spectrum(44, 25.0)];
+        let hi = [tone_spectrum(50, 20.0), tone_spectrum(54, 20.0)];
+        let jk = [tone_spectrum(60, 20.0), tone_spectrum(64, 20.0)];
+        let scpl_pairs: [[&[f32]; 2]; 2] = [[&hi[0], &hi[1]], [&jk[0], &jk[1]]];
+        let spectra = IceScplSpectra {
+            core: &core_refs,
+            add_pair: [&fg[0], &fg[1]],
+            scpl_pairs: &scpl_pairs,
+        };
+        // alpha_q = 10 on every band -> sap_gain = 1,0 -> a'_0 = 1,0.
+        let m = MAX_SFB as usize;
+        let mut dpcm = vec![0i32; m];
+        dpcm[0] = 10;
+        let full_sap = ChparamInfo {
+            sap_mode: 3,
+            sap_data: Some(crate::asf::SapData {
+                sap_coeff_all: true,
+                sap_coeff_used: vec![vec![true; m]],
+                delta_code_time: false,
+                dpcm_alpha_q: vec![dpcm],
+            }),
+            ..ChparamInfo::default()
+        };
+        let identity = ChparamInfo::default();
+        let chparams = [
+            full_sap,
+            identity.clone(),
+            identity.clone(),
+            identity.clone(),
+        ];
+        let mut bw = BitWriter::new();
+        write_ice_body_scpl_with_sap(&mut bw, &spectra, None, false, TL, MAX_SFB, None, &chparams)
+            .unwrap();
+        bw.write_u32(0, 16);
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let mut tools = SubstreamTools::default();
+        parse_ice_audio_data_outer(&mut br, &mut tools, false, false, true, TL).unwrap();
+        let ice = tools.ice.as_deref().unwrap();
+        assert_eq!(ice.scpl_chparam.len(), 4);
+        let mut specs = ice.track_spectra_owned();
+        let d_tone = specs[3][22];
+        let h_tone = specs[7][50];
+        assert!(d_tone > 20.0 && h_tone > 15.0, "fixture tones decoded");
+        apply_sap_steps(&mut specs, ice, TL);
+        // H'' = H' + 1,0 · D' — the D tone lands on H, the H tone stays.
+        assert!((specs[7][22] - d_tone).abs() < 1.0, "H'' gains a'0 * D'");
+        assert!((specs[7][50] - h_tone).abs() < 1.0, "H'' keeps its tone");
+        // I (a'_1 element is identity-mode) is untouched.
+        assert_eq!(specs[8].get(26).copied().unwrap_or(0.0), 0.0);
+        // D itself is unmodified by step 6.
+        assert!((specs[3][22] - d_tone).abs() < 1.0);
     }
 
     /// The full-frame writer emits a TOC the parser identifies as an

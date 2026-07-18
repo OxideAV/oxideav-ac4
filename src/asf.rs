@@ -650,6 +650,41 @@ pub fn extract_sap_abcd(info: &ChparamInfo, max_sfb_per_group: &[u32]) -> SapCoe
     SapCoeffs { abcd }
 }
 
+/// Extract the per-(g, sfb) SAP prediction coefficients `a'` used by
+/// the TS 103 190-2 §5.2.3.2 step-5/step-6 immersive matrixing
+/// (Table 20: `H'' = a'_0 · D' + H'` and friends).
+///
+/// Step 5 reads: "If the sap_mode = full SAP, the parameters a'_j
+/// shall be extracted from n_elem chparam_info elements [per part-1
+/// §5.3.2]. Otherwise, the parameters a'_j shall be set to 0."
+///
+/// Full SAP is `sap_mode == 3` (Table 114). Pseudocode 59 resolves a
+/// SAP-coded band to the quartet `(1 + g, 1, 1 - g, -1)` with
+/// `g = alpha_q · 0,1` and a skipped band to identity `(1, 0, 0, 1)`;
+/// the additive Table 20 row `(a'_j, 1)` carries the prediction gain
+/// only, so `a' = a - 1 = g` on SAP-coded bands and `a' = 0` on
+/// skipped bands (the `b` coefficient — 1 on coded bands, 0 on skipped
+/// ones — is the discriminator). Every non-full-SAP mode yields the
+/// all-zero row per the step-5 "otherwise" arm.
+pub fn extract_sap_a_prime(info: &ChparamInfo, max_sfb_per_group: &[u32]) -> Vec<Vec<f32>> {
+    if !matches!(info.mode(), SapMode::SapData) {
+        return max_sfb_per_group
+            .iter()
+            .map(|&m| vec![0.0f32; m as usize])
+            .collect();
+    }
+    let coeffs = extract_sap_abcd(info, max_sfb_per_group);
+    coeffs
+        .abcd
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|&(a, b, _, _)| if b != 0.0 { a - 1.0 } else { 0.0 })
+                .collect()
+        })
+        .collect()
+}
+
 /// `(L_spec, R_spec, Ls_spec, Rs_spec)` — the four preliminary
 /// spectra produced by [`apply_sap_table_181`].
 pub type SapTable181Output = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
