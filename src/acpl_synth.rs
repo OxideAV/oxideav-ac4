@@ -825,25 +825,30 @@ pub struct AcplCpeOutput {
 /// `y[ts][sb]` is the post-ducker decorrelated output of `x0` (provided
 /// by [`run_pseudocode_115_pair`] below); `x1` may be all-zero for the
 /// `ASPX_ACPL_2` mode (single-channel input).
+///
+/// `prev_alpha` / `prev_beta` are the previous frame's last-set
+/// expanded `[sb]` parameter rows (the Pseudocode 110 carry —
+/// [`AcplCpeState::alpha_prev_sb`] / [`AcplCpeState::beta_prev_sb`]);
+/// the §5.7.7.3 interpolation walks from them to this frame's first
+/// parameter set. Pass all-zero rows on the first frame.
 pub fn acpl_module(
     frame: &AcplCpeFrame<'_>,
     y: &[[(f32, f32); NUM_QMF_SUBBANDS]],
+    prev_alpha: &[f32],
+    prev_beta: &[f32],
 ) -> AcplCpeOutput {
     let num_ts = frame.x0.len();
     debug_assert_eq!(y.len(), num_ts);
     let num_pset = frame.alpha_dq.len() as u32;
     let alpha_sb = expand_pb_to_sb(frame.alpha_dq, frame.num_param_bands);
     let beta_sb = expand_pb_to_sb(frame.beta_dq, frame.num_param_bands);
-    // Default prev to zeros for the first frame.
-    let prev_alpha = vec![0.0f32; NUM_QMF_SUBBANDS];
-    let prev_beta = vec![0.0f32; NUM_QMF_SUBBANDS];
     let alpha_inp = InterpInputs {
         by_pset: &alpha_sb,
-        prev: &prev_alpha,
+        prev: prev_alpha,
     };
     let beta_inp = InterpInputs {
         by_pset: &beta_sb,
-        prev: &prev_beta,
+        prev: prev_beta,
     };
 
     let zero_col = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
@@ -972,7 +977,9 @@ pub fn run_pseudocode_115_pair(state: &mut AcplCpeState, frame: AcplCpeFrame<'_>
         steep: frame.steep,
         param_timeslots: frame.param_timeslots,
     };
-    let out = acpl_module(&inner_frame, &y0);
+    // §5.7.7.3: interpolate from the previous frame's last-set rows
+    // (the Pseudocode 110 carry) to this frame's parameter sets.
+    let out = acpl_module(&inner_frame, &y0, &state.alpha_prev_sb, &state.beta_prev_sb);
     // Update prev arrays per Pseudocode 110 (last param set's expanded
     // sb values).
     if !frame.alpha_dq.is_empty() {
@@ -2822,7 +2829,12 @@ mod tests {
             steep: false,
             param_timeslots: &[],
         };
-        let out = acpl_module(&frame, &y);
+        let out = acpl_module(
+            &frame,
+            &y,
+            &[0.0; NUM_QMF_SUBBANDS],
+            &[0.0; NUM_QMF_SUBBANDS],
+        );
         assert_eq!(out.z0.len(), num_ts);
         assert_eq!(out.z1.len(), num_ts);
         // Above acpl_qmf_band, with x1=0 and y=x0, the formula is
@@ -2898,7 +2910,12 @@ mod tests {
             steep: false,
             param_timeslots: &[],
         };
-        let out = acpl_module(&frame, &y);
+        let out = acpl_module(
+            &frame,
+            &y,
+            &[0.0; NUM_QMF_SUBBANDS],
+            &[0.0; NUM_QMF_SUBBANDS],
+        );
         for ts in 0..num_ts {
             let z0 = out.z0[ts][2];
             let z1 = out.z1[ts][2];
@@ -2991,7 +3008,12 @@ mod tests {
             steep: false,
             param_timeslots: &[],
         };
-        let out = acpl_module(&frame, &y);
+        let out = acpl_module(
+            &frame,
+            &y,
+            &[0.0; NUM_QMF_SUBBANDS],
+            &[0.0; NUM_QMF_SUBBANDS],
+        );
         // Above qmf_band (sb=20), a=b=0, y=0 → z0 = 0.5*x0*(1+0) = 0.5*x0in
         // = (1.0, 0.5)
         for ts in 0..num_ts {

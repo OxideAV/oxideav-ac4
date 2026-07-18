@@ -379,3 +379,274 @@ fn ice_aspx_scpl_9_1_4_full_decode() {
     assert!(p_c > 1e12, "C carries its tone ({p_c})");
     assert!(p_ls > 1e12, "Ls carries the D tone ({p_ls})");
 }
+
+/// Build one ASPX_ACPL_1 / ASPX_ACPL_2 frame with per-module constant
+/// alpha_q rows (beta_q = 0).
+#[allow(clippy::too_many_arguments)]
+fn build_acpl_frame(
+    seq: u32,
+    mode: oxideav_ac4::ice::IceCodecMode,
+    core: &[&[f32]; 5],
+    add_pair: [&[f32]; 2],
+    scpl_pairs: &[[&[f32]; 2]],
+    alpha_q_per_module: &[i32],
+    qmf_band: u8,
+    b_5fronts: bool,
+    b_iframe: bool,
+) -> Vec<u8> {
+    let num_bands = oxideav_ac4::acpl::num_param_bands_from_id(2) as usize;
+    let rows: Vec<(Vec<i32>, Vec<i32>)> = alpha_q_per_module
+        .iter()
+        .map(|&a| (vec![a; num_bands], vec![0i32; num_bands]))
+        .collect();
+    let modules: Vec<(&[i32], &[i32])> = rows
+        .iter()
+        .map(|(a, b)| (a.as_slice(), b.as_slice()))
+        .collect();
+    let acpl = oxideav_ac4::ice::IceAcplParams {
+        num_param_bands_id: 2,
+        quant_mode: oxideav_ac4::acpl::AcplQuantMode::Fine,
+        qmf_band,
+        modules: &modules,
+    };
+    let cfg = test_aspx_config();
+    let mut body = BitWriter::new();
+    oxideav_ac4::ice::write_ice_body_acpl(
+        &mut body, mode, core, add_pair, scpl_pairs, &acpl, &cfg, None, b_5fronts, b_iframe, TL,
+        MAX_SFB,
+    )
+    .unwrap();
+    encode_ice_raw_frame(seq, false, b_5fronts, b_iframe, body).unwrap()
+}
+
+/// ASPX_ACPL_2 7.0.4 full decoding (§5.5.2 Table 27): with alpha =
+/// beta = 0 every module splits its carrier evenly onto both outputs,
+/// the coded F / G tracks drive the top rows (the Table 27 ACPL_2
+/// branch reads x9 / x10), and the L / R / C passthroughs carry the
+/// A / B / C tones.
+#[test]
+fn ice_acpl2_7_0_4_full_decode_routes_carriers() {
+    use oxideav_ac4::ice::IceCodecMode;
+    let a = tone_spectrum(6, 200.0);
+    let b = tone_spectrum(10, 200.0);
+    let c = tone_spectrum(14, 200.0);
+    let d = tone_spectrum(18, 200.0);
+    let e = tone_spectrum(22, 200.0);
+    let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
+    let f = tone_spectrum(26, 150.0);
+    let g = tone_spectrum(30, 150.0);
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let build = |seq: u32| {
+        build_acpl_frame(
+            seq,
+            IceCodecMode::AspxAcpl2,
+            &core,
+            [&f, &g],
+            &[],
+            &[0, 0, 0, 0],
+            0,
+            false,
+            true,
+        )
+    };
+    let _ = decode_frame(&mut dec, build(0), 11);
+    let chans = decode_frame(&mut dec, build(1), 11);
+    // Output order: [L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr].
+    let p_l = tone_power(&chans[0], 6);
+    let p_r = tone_power(&chans[1], 10);
+    let p_c = tone_power(&chans[2], 14);
+    let p_ls = tone_power(&chans[3], 18);
+    let p_lb = tone_power(&chans[5], 18);
+    let p_tfl = tone_power(&chans[7], 26);
+    let p_tbl = tone_power(&chans[9], 26);
+    let p_tfr = tone_power(&chans[8], 30);
+    assert!(p_l > 1e12, "L carries the A tone ({p_l})");
+    assert!(p_r > 1e12, "R carries the B tone ({p_r})");
+    assert!(p_c > 1e12, "C carries the C tone ({p_c})");
+    assert!(p_ls > 1e11, "Ls carries the D carrier ({p_ls})");
+    let ls_lb = p_ls / p_lb.max(1.0);
+    assert!(
+        (0.7..=1.4).contains(&ls_lb),
+        "alpha = 0 splits D evenly across Ls / Lb ({ls_lb})"
+    );
+    assert!(p_tfl > 1e11, "Tfl carries the F carrier ({p_tfl})");
+    let tf = p_tfl / p_tbl.max(1.0);
+    assert!(
+        (0.7..=1.4).contains(&tf),
+        "alpha = 0 splits F evenly across Tfl / Tbl ({tf})"
+    );
+    assert!(p_tfr > 1e11, "Tfr carries the G carrier ({p_tfr})");
+    // Cross-talk: the D carrier stays out of the top row.
+    let leak = tone_power(&chans[7], 18) / p_ls.max(1.0);
+    assert!(leak < 0.02, "D carrier leaks into Tfl ({leak})");
+}
+
+/// ASPX_ACPL_2 alpha mutation: alpha_q = 8 dequantises to 1,0, so the
+/// first module's sub output (Lb) collapses to the (zero-beta)
+/// decorrelator term while Ls doubles — the parameters demonstrably
+/// steer the decoded PCM.
+#[test]
+fn ice_acpl2_alpha_steers_surround_pair() {
+    use oxideav_ac4::ice::IceCodecMode;
+    let a = tone_spectrum(6, 200.0);
+    let b = tone_spectrum(10, 200.0);
+    let c = tone_spectrum(14, 200.0);
+    let d = tone_spectrum(18, 200.0);
+    let e = tone_spectrum(22, 200.0);
+    let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
+    let f = tone_spectrum(26, 150.0);
+    let g = tone_spectrum(30, 150.0);
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let run = |alpha0: i32| {
+        let mut dec = Ac4Decoder::new(&params);
+        let build = |seq: u32| {
+            build_acpl_frame(
+                seq,
+                IceCodecMode::AspxAcpl2,
+                &core,
+                [&f, &g],
+                &[],
+                &[alpha0, 0, 0, 0],
+                0,
+                false,
+                true,
+            )
+        };
+        let _ = decode_frame(&mut dec, build(0), 11);
+        decode_frame(&mut dec, build(1), 11)
+    };
+    let flat = run(0);
+    let steered = run(8);
+    let flat_ls = tone_power(&flat[3], 18);
+    let flat_lb = tone_power(&flat[5], 18);
+    let st_ls = tone_power(&steered[3], 18);
+    let st_lb = tone_power(&steered[5], 18);
+    assert!(
+        st_lb < flat_lb / 1e3,
+        "alpha = 1 cancels the Lb dry path ({st_lb} vs {flat_lb})"
+    );
+    let gain = st_ls / flat_ls.max(1.0);
+    assert!(
+        (3.0..=5.0).contains(&gain),
+        "alpha = 1 doubles the Ls amplitude (energy x4, got x{gain})"
+    );
+    // The other modules are untouched.
+    let rs_ratio = tone_power(&steered[4], 22) / tone_power(&flat[4], 22).max(1.0);
+    assert!(
+        (0.8..=1.25).contains(&rs_ratio),
+        "Rs unaffected by the module-0 mutation ({rs_ratio})"
+    );
+}
+
+/// ASPX_ACPL_1 7.0.4 full decoding across an I + P GOP: with
+/// acpl_qmf_band = 8 every test tone sits in the M/S-coded band, so
+/// each module reconstructs (main + residual) / (main − residual) —
+/// identical D / F tracks cancel in Lb, and a silent J residual splits
+/// H evenly across Tfl / Tbl. The P-frame reuses the sticky
+/// aspx_config + acpl_config.
+#[test]
+fn ice_acpl1_7_0_4_ms_band_and_p_frame() {
+    use oxideav_ac4::ice::IceCodecMode;
+    let a = tone_spectrum(6, 200.0);
+    let b = tone_spectrum(10, 200.0);
+    let c = tone_spectrum(14, 200.0);
+    let d = tone_spectrum(18, 200.0);
+    let e = tone_spectrum(22, 200.0);
+    let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
+    let f = d.clone(); // F == D → Lb = (D − F) cancels
+    let g = tone_spectrum(30, 150.0);
+    let h = tone_spectrum(34, 150.0);
+    let silent = vec![0.0f32; a.len()];
+    let jk = [tone_spectrum(42, 150.0), tone_spectrum(46, 150.0)];
+    let scpl_pairs: [[&[f32]; 2]; 2] = [[&h, &silent], [&silent, &jk[1]]];
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let build = |seq: u32, iframe: bool| {
+        build_acpl_frame(
+            seq,
+            IceCodecMode::AspxAcpl1,
+            &core,
+            [&f, &g],
+            &scpl_pairs,
+            &[0, 0, 0, 0],
+            8,
+            false,
+            iframe,
+        )
+    };
+    let _ = decode_frame(&mut dec, build(0, true), 11);
+    let ifr = decode_frame(&mut dec, build(1, false), 11);
+    let pfr = decode_frame(&mut dec, build(2, false), 11);
+    // Output order: [L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr].
+    for (tag, chans) in [("settled", &ifr), ("p-frame", &pfr)] {
+        let p_l = tone_power(&chans[0], 6);
+        let p_ls = tone_power(&chans[3], 18);
+        let p_lb = tone_power(&chans[5], 18);
+        let p_tfl = tone_power(&chans[7], 34);
+        let p_tbl = tone_power(&chans[9], 34);
+        assert!(p_l > 1e12, "{tag}: L carries the A tone ({p_l})");
+        assert!(p_ls > 1e11, "{tag}: Ls = D + F reinforces ({p_ls})");
+        assert!(
+            p_lb < p_ls / 1e3,
+            "{tag}: Lb = D − F cancels ({p_lb} vs {p_ls})"
+        );
+        assert!(p_tfl > 1e11, "{tag}: Tfl = H + J carries H ({p_tfl})");
+        let t = p_tfl / p_tbl.max(1.0);
+        assert!(
+            (0.7..=1.4).contains(&t),
+            "{tag}: silent J splits H evenly across Tfl / Tbl ({t})"
+        );
+    }
+}
+
+/// ASPX_ACPL_2 9.1.4: the b_5fronts modules 5 / 6 reconstruct
+/// (L, Lscr) / (R, Rscr) from the A / B tracks (decorrelator-only
+/// second input); 13 named channels decode.
+#[test]
+fn ice_acpl2_9_0_4_front_modules() {
+    use oxideav_ac4::ice::IceCodecMode;
+    let a = tone_spectrum(6, 200.0);
+    let b = tone_spectrum(10, 200.0);
+    let c = tone_spectrum(14, 200.0);
+    let d = tone_spectrum(18, 200.0);
+    let e = tone_spectrum(22, 200.0);
+    let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
+    let f = tone_spectrum(26, 150.0);
+    let g = tone_spectrum(30, 150.0);
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut dec = Ac4Decoder::new(&params);
+    let build = |seq: u32| {
+        build_acpl_frame(
+            seq,
+            IceCodecMode::AspxAcpl2,
+            &core,
+            [&f, &g],
+            &[],
+            &[0, 0, 0, 0, 0, 0],
+            0,
+            true,
+            true,
+        )
+    };
+    let _ = decode_frame(&mut dec, build(0), 13);
+    let chans = decode_frame(&mut dec, build(1), 13);
+    // Output order: [L, R, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl, Tfr,
+    // Tbl, Tbr].
+    let p_l = tone_power(&chans[0], 6);
+    let p_lscr = tone_power(&chans[3], 6);
+    let p_r = tone_power(&chans[1], 10);
+    let p_c = tone_power(&chans[2], 14);
+    let p_ls = tone_power(&chans[5], 18);
+    let p_tfl = tone_power(&chans[9], 26);
+    assert!(p_l > 1e11, "L carries the A tone ({p_l})");
+    let scr = p_l / p_lscr.max(1.0);
+    assert!(
+        (0.7..=1.4).contains(&scr),
+        "alpha = 0 splits A evenly across L / Lscr ({scr})"
+    );
+    assert!(p_r > 1e11, "R carries the B tone ({p_r})");
+    assert!(p_c > 1e12, "C carries its tone ({p_c})");
+    assert!(p_ls > 1e11, "Ls carries the D carrier ({p_ls})");
+    assert!(p_tfl > 1e11, "Tfl carries the F carrier ({p_tfl})");
+}

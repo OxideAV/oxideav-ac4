@@ -99,6 +99,47 @@ pub struct Ac4Decoder {
     /// interpolator / decorrelator / ducker state, keyed by
     /// `b_5fronts`. Allocated on the first ASPX_AJCC immersive frame.
     ice_ajcc: Option<(bool, crate::ajcc::AjccState, ajcc_synth::AjccSynthState)>,
+    /// Immersive-channel-element A-CPL decode state (TS 103 190-2
+    /// §5.5.2): the up-to-six parallel ACplModule states (decorrelator,
+    /// ducker and prev arrays) plus the per-module alpha / beta
+    /// differential-decode rolling references, keyed by `b_5fronts`.
+    /// Allocated on the first ASPX_ACPL_1 / ASPX_ACPL_2 immersive
+    /// frame.
+    ice_acpl: Option<IceAcplState>,
+}
+
+/// Per-decoder immersive A-CPL state — see [`Ac4Decoder::ice_acpl`].
+///
+/// Module order follows the §5.5.2 Table 27 pseudocode: modules 0-3
+/// drive (Ls, Lb) / (Rs, Rb) / (Tfl, Tbl) / (Tfr, Tbr) with
+/// decorrelators D0 / D0 / D1 / D1; modules 4-5 (b_5fronts only)
+/// drive (L, Lscr) / (R, Rscr) with D2.
+struct IceAcplState {
+    b_5fronts: bool,
+    modules: Vec<acpl_synth::AcplCpeState>,
+    diffs: Vec<(acpl_synth::AcplDiffState, acpl_synth::AcplDiffState)>,
+}
+
+impl IceAcplState {
+    fn new(b_5fronts: bool) -> Self {
+        use acpl_synth::DecorrelatorId as D;
+        let ids = [D::D0, D::D0, D::D1, D::D1, D::D2, D::D2];
+        Self {
+            b_5fronts,
+            modules: ids
+                .iter()
+                .map(|&d| acpl_synth::AcplCpeState::new(d))
+                .collect(),
+            diffs: (0..6)
+                .map(|_| {
+                    (
+                        acpl_synth::AcplDiffState::new(),
+                        acpl_synth::AcplDiffState::new(),
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Phase-1 result of [`Ac4Decoder::aspx_extend_to_qmf`]:
@@ -176,6 +217,7 @@ impl Ac4Decoder {
             sticky: asf::StickyConfig::default(),
             ajoc_dec: None,
             ice_ajcc: None,
+            ice_acpl: None,
         }
     }
 
@@ -1962,21 +2004,25 @@ impl Ac4Decoder {
     /// Decode one immersive-channel-element frame (TS 103 190-2
     /// §6.2.4.1, channel modes 7.0.4 / 7.1.4 / 9.0.4 / 9.1.4) to PCM.
     ///
-    /// Wired synthesis paths:
+    /// Wired synthesis paths (all five Table 95 codec modes):
     ///
-    /// * **SCPL** (full decoding, §5.3.3.1 Table 23) — pure time
-    ///   domain: IMDCT the SMP tracks and apply the S-CPL matrix
-    ///   (`c_gain = 2`, `m_gain = √2`). The §5.2.3.2 step-4 / step-6
-    ///   SAP mixing stages run at identity — `sap_mode != 0` chparam
-    ///   payloads are parsed but not yet applied to the spectra.
+    /// * **SCPL** (full decoding, §5.3.3.1 Table 23) — §5.2.3.2 SAP
+    ///   steps 3-6 on the track spectra, IMDCT, then the pure
+    ///   time-domain S-CPL matrix (`c_gain = 2`, `m_gain = √2`).
+    /// * **ASPX_SCPL** (full decoding) — SAP + IMDCT + Table 23 with
+    ///   `c_gain = m_gain = 1`, per-channel A-SPX extension over the
+    ///   Table 8 channel grouping, and the §4.8.3.11.3 Table 10 / 11
+    ///   output gains.
+    /// * **ASPX_ACPL_1 / ASPX_ACPL_2** (full decoding, §5.5.2
+    ///   Table 27) — SAP (ACPL_1 only) + IMDCT + per-track QMF with
+    ///   the Table 8 A-SPX extension, then the four / six parallel
+    ///   ACplModules (D0/D0/D1/D1/D2/D2 decorrelators, per-module
+    ///   cross-frame differential state) over the Table 26 mapping.
     /// * **ASPX_AJCC** (full decoding, §5.6.3.5.2) — IMDCT the
     ///   5-channel core, A-SPX-extend each core channel in the QMF
     ///   domain (payload mapping `(A, B)` / `(D, E)` / `C` — see the
     ///   ice module notes), run the A-JCC full decode and
-    ///   QMF-synthesise the 11 / 13 outputs. Companding gains are not
-    ///   yet applied on this route.
-    /// * ASPX_SCPL / ASPX_ACPL_1 / ASPX_ACPL_2 parse fully and emit
-    ///   silence with the correct shape.
+    ///   QMF-synthesise the 11 / 13 outputs.
     ///
     /// Output channel order follows the §5.6.3.5.2 output addressing:
     /// `[L, R, C, (Lscr, Rscr,) Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`
@@ -2024,6 +2070,8 @@ impl Ac4Decoder {
         let mut chans: Vec<Vec<f32>> = vec![Vec::new(); n_named];
         let mut lfe_pcm: Option<Vec<f32>> = None;
         let sub_aspx_cfg = sub.tools.aspx_config;
+        let sub_acpl_partial = sub.tools.acpl_config_1ch_partial;
+        let sub_acpl_full = sub.tools.acpl_config_1ch_full;
         if let Some(ice_el) = sub.tools.ice.as_deref() {
             let tl_ok = ice_el.transform_length() == Some(samples);
             // LFE (Table 21 mono_data(1)) — IMDCT on a dedicated
@@ -2158,6 +2206,221 @@ impl Ac4Decoder {
                     }
                     chans = ch_pcm;
                 }
+                ice::IceCodecMode::AspxAcpl1 | ice::IceCodecMode::AspxAcpl2 if tl_ok => {
+                    let is_acpl1 = matches!(ice_el.mode, ice::IceCodecMode::AspxAcpl1);
+                    // §5.2.3.2 steps 3-6 (SAP — the ASPX_ACPL_2
+                    // processing clause §5.2.3.3 carries no SAP stage;
+                    // apply_sap_steps gates on the mode).
+                    let mut specs = ice_el.track_spectra_owned();
+                    ice::apply_sap_steps(&mut specs, ice_el, samples);
+                    let mut t: Vec<Vec<f32>> = Vec::with_capacity(13);
+                    for (slot, spec) in specs.iter().enumerate() {
+                        t.push(self.imdct_channel_f32(slot, spec, n));
+                    }
+                    // QMF analysis per track, with the A-SPX extension
+                    // on the §6.2.4.1 payload roster tracks (Table 8:
+                    // (A'', B''), (D'', F''), (E'', G'') pairs + C'').
+                    let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+                    let mut q_tr: Vec<aspx::QmfMatrix> =
+                        t.iter().map(|p| Self::ice_plain_qmf(p)).collect();
+                    if let Some(cfg) = sub_aspx_cfg {
+                        let mapping: [(usize, usize, bool); 7] = [
+                            (0, 0, false), // payload 0 → (A, B)
+                            (0, 1, true),
+                            (1, 3, false), // payload 1 → (D, F)
+                            (1, 5, true),
+                            (2, 4, false), // payload 2 → (E, G)
+                            (2, 6, true),
+                            (3, 2, false), // payload 3 (1ch) → C
+                        ];
+                        for (elem_idx, tr, is_secondary) in mapping {
+                            let trailer = match ice_el.aspx_elements.get(elem_idx) {
+                                Some(
+                                    ice::IceAspxElement::TwoCh(Some(t))
+                                    | ice::IceAspxElement::OneCh(Some(t)),
+                                ) => (**t).clone(),
+                                _ => continue,
+                            };
+                            q_tr[tr] = self.ice_extend_channel_qmf(
+                                &t[tr],
+                                &trailer,
+                                is_secondary,
+                                &cfg,
+                                tr,
+                                num_ts_in_ats,
+                            );
+                        }
+                    }
+                    // §5.5.2 Table 27 — four / six parallel A-CPL
+                    // modules over the Table 26 channel/x mapping.
+                    let acfg = if is_acpl1 {
+                        sub_acpl_partial
+                    } else {
+                        sub_acpl_full
+                    };
+                    let n_modules = if b_5fronts { 6 } else { 4 };
+                    if let Some(acfg) = acfg {
+                        if ice_el.acpl_data.len() >= n_modules {
+                            let num_ts = n / qmf::NUM_QMF_SUBBANDS;
+                            let cols: Vec<Vec<ajcc_synth::QmfCol>> =
+                                q_tr.iter().map(|q| Self::ice_qmf_cols(q, num_ts)).collect();
+                            let state_ok =
+                                matches!(&self.ice_acpl, Some(s) if s.b_5fronts == b_5fronts);
+                            if !state_ok {
+                                self.ice_acpl = Some(IceAcplState::new(b_5fronts));
+                            }
+                            let st = self.ice_acpl.as_mut().expect("ice acpl state ensured");
+                            // Module routing: (main track, ASPX_ACPL_1
+                            // residual track, (z_main, z_sub)). For
+                            // ASPX_ACPL_2 the coded F / G tracks
+                            // occupy the Tfl / Tfr carrier positions
+                            // (x9 / x10 — the Table 27 ACPL_2 branch
+                            // reads exactly x5, x6, x9, x10) and each
+                            // module runs decorrelator-only.
+                            let mut routing: Vec<(usize, Option<usize>, usize, usize, bool)> =
+                                if is_acpl1 {
+                                    vec![
+                                        (3, Some(5), 5, 6, true),    // (Ls, Lb)
+                                        (4, Some(6), 7, 8, true),    // (Rs, Rb)
+                                        (7, Some(9), 9, 10, true),   // (Tfl, Tbl)
+                                        (8, Some(10), 11, 12, true), // (Tfr, Tbr)
+                                    ]
+                                } else {
+                                    vec![
+                                        (3, None, 5, 6, true),
+                                        (4, None, 7, 8, true),
+                                        (5, None, 9, 10, true),
+                                        (6, None, 11, 12, true),
+                                    ]
+                                };
+                            if b_5fronts {
+                                let res_l = if is_acpl1 { Some(11) } else { None };
+                                let res_m = if is_acpl1 { Some(12) } else { None };
+                                routing.push((0, res_l, 0, 1, false)); // (L, Lscr)
+                                routing.push((1, res_m, 2, 3, false)); // (R, Rscr)
+                            }
+                            let sq2 = std::f32::consts::SQRT_2;
+                            let mut z: Vec<Option<Vec<ajcc_synth::QmfCol>>> = vec![None; 13];
+                            for (m, &(main, res, z_main, z_sub, scale)) in
+                                routing.iter().enumerate()
+                            {
+                                let data = &ice_el.acpl_data[m];
+                                let (ad, bd) = &mut st.diffs[m];
+                                let alpha_q = acpl_synth::differential_decode(
+                                    &data.alpha1,
+                                    acfg.num_param_bands,
+                                    ad,
+                                );
+                                let beta_q = acpl_synth::differential_decode(
+                                    &data.beta1,
+                                    acfg.num_param_bands,
+                                    bd,
+                                );
+                                let (alpha_dq, beta_dq) = acpl_synth::dequantize_alpha_beta(
+                                    &alpha_q,
+                                    &beta_q,
+                                    acfg.quant_mode,
+                                );
+                                if alpha_dq.is_empty() {
+                                    continue;
+                                }
+                                let frame = acpl_synth::AcplCpeFrame {
+                                    x0: &cols[main],
+                                    x1: res.map(|r| cols[r].as_slice()),
+                                    alpha_dq: &alpha_dq,
+                                    beta_dq: &beta_dq,
+                                    num_param_bands: acfg.num_param_bands,
+                                    // ASPX_ACPL_1 keeps the M/S-coded
+                                    // residual band below acpl_qmf_band
+                                    // (PARTIAL config); FULL runs fully
+                                    // parametric from band 0.
+                                    acpl_qmf_band: if is_acpl1 { acfg.qmf_band as u32 } else { 0 },
+                                    steep: matches!(
+                                        data.framing.interpolation_type,
+                                        crate::acpl::AcplInterpolationType::Steep
+                                    ),
+                                    param_timeslots: &data.framing.param_timeslots,
+                                };
+                                let out =
+                                    acpl_synth::run_pseudocode_115_pair(&mut st.modules[m], frame);
+                                let (mut z0, mut z1) = (out.z0, out.z1);
+                                if scale {
+                                    for col in z0.iter_mut().chain(z1.iter_mut()) {
+                                        for v in col.iter_mut() {
+                                            v.0 *= sq2;
+                                            v.1 *= sq2;
+                                        }
+                                    }
+                                }
+                                z[z_main] = Some(z0);
+                                z[z_sub] = Some(z1);
+                            }
+                            // Passthrough rows: z4 = 2·x2 (C), and the
+                            // non-b_5fronts z0 = 2·x0 / z2 = 2·x1.
+                            let double = |cols: &[ajcc_synth::QmfCol]| {
+                                cols.iter()
+                                    .map(|col| {
+                                        let mut c = *col;
+                                        for v in c.iter_mut() {
+                                            v.0 *= 2.0;
+                                            v.1 *= 2.0;
+                                        }
+                                        c
+                                    })
+                                    .collect::<Vec<_>>()
+                            };
+                            z[4] = Some(double(&cols[2]));
+                            if !b_5fronts {
+                                z[0] = Some(double(&cols[0]));
+                                z[2] = Some(double(&cols[1]));
+                            }
+                            // Table 26 z → output-slot mapping (slot
+                            // order [L, R, C, (Lscr, Rscr,) Ls, Rs,
+                            // Lb, Rb, Tfl, Tfr, Tbl, Tbr]).
+                            let z_to_slot: &[(usize, usize)] = if b_5fronts {
+                                &[
+                                    (0, 0),
+                                    (2, 1),
+                                    (4, 2),
+                                    (1, 3),
+                                    (3, 4),
+                                    (5, 5),
+                                    (7, 6),
+                                    (6, 7),
+                                    (8, 8),
+                                    (9, 9),
+                                    (11, 10),
+                                    (10, 11),
+                                    (12, 12),
+                                ]
+                            } else {
+                                &[
+                                    (0, 0),
+                                    (2, 1),
+                                    (4, 2),
+                                    (5, 3),
+                                    (7, 4),
+                                    (6, 5),
+                                    (8, 6),
+                                    (9, 7),
+                                    (11, 8),
+                                    (10, 9),
+                                    (12, 10),
+                                ]
+                            };
+                            for &(zi, slot) in z_to_slot {
+                                let Some(zm) = &z[zi] else { continue };
+                                let mut syn = qmf::QmfSynthesisBank::new();
+                                let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
+                                for col in zm.iter().take(num_ts) {
+                                    let row = syn.process_slot(col);
+                                    pcm.extend_from_slice(&row);
+                                }
+                                chans[slot] = pcm;
+                            }
+                        }
+                    }
+                }
                 ice::IceCodecMode::AspxAjcc if tl_ok => {
                     let specs: Vec<Option<Vec<f32>>> = ice_el
                         .track_spectra()
@@ -2247,9 +2510,8 @@ impl Ac4Decoder {
                         }
                     }
                 }
-                // ASPX_SCPL / ASPX_ACPL_1 / ASPX_ACPL_2 synthesis (and
-                // transform-length mismatches) fall through to
-                // silence with the correct shape.
+                // Transform-length mismatches fall through to silence
+                // with the correct shape.
                 _ => {}
             }
         }

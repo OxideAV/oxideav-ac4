@@ -8462,7 +8462,7 @@ fn write_acpl_data_1ch_real_alpha(
 /// chain a forward `delta_q = beta_q[pb] − beta_q[pb-1]` which the
 /// decoder reverses via `acpl_synth::differential_decode`'s DIFF_FREQ
 /// branch.
-fn write_acpl_data_1ch_real_alpha_beta(
+pub(crate) fn write_acpl_data_1ch_real_alpha_beta(
     bw: &mut BitWriter,
     num_bands: u32,
     start_band: u32,

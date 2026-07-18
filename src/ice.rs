@@ -1071,6 +1071,157 @@ pub fn write_ice_body_aspx_scpl(
     Ok(())
 }
 
+/// Per-module quantised A-CPL parameters for the ASPX_ACPL_1 /
+/// ASPX_ACPL_2 body writer: one `(alpha_q, beta_q)` row pair per
+/// parameter band, one entry per `acpl_data_1ch()` element (4, or 6
+/// with `b_5fronts`), in the §6.2.4.1 transmission order (= the §5.5.2
+/// module order: (Ls, Lb), (Rs, Rb), (Tfl, Tbl), (Tfr, Tbr)
+/// [, (L, Lscr), (R, Rscr)]).
+pub struct IceAcplParams<'a> {
+    /// `acpl_num_param_bands_id` (2 bits, Table 59).
+    pub num_param_bands_id: u8,
+    /// ALPHA / BETA quantiser mode.
+    pub quant_mode: crate::acpl::AcplQuantMode,
+    /// `acpl_qmf_band` for the PARTIAL (ASPX_ACPL_1) config — the
+    /// M/S-coded low-band split. Ignored for ASPX_ACPL_2 (FULL).
+    pub qmf_band: u8,
+    /// Per-module `(alpha_q, beta_q)` per parameter band.
+    pub modules: &'a [(&'a [i32], &'a [i32])],
+}
+
+/// Write an ASPX_ACPL_1- / ASPX_ACPL_2-mode
+/// `immersive_channel_element()` body: grouping-3 core,
+/// `b_use_sap_add_ch = 0`, the shared minimal A-SPX roster
+/// (3× `aspx_data_2ch` + 1× `aspx_data_1ch` — 7CH_STATIC), for
+/// ASPX_ACPL_1 the S-CPL section (`scpl_pairs` carries the residual
+/// tracks H..K / H..M with identity `sap_mode = 0` chparam elements),
+/// and the trailing `acpl_data_1ch()` parameter section. On I-frames
+/// `immers_cfg()` emits `aspx_config()` plus the matching
+/// `acpl_config_1ch(PARTIAL / FULL)`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_ice_body_acpl(
+    bw: &mut BitWriter,
+    mode: IceCodecMode,
+    core: &[&[f32]; 5],
+    add_pair: [&[f32]; 2],
+    scpl_pairs: &[[&[f32]; 2]],
+    acpl: &IceAcplParams<'_>,
+    aspx_cfg: &AspxConfig,
+    lfe: Option<(&[f32], u32)>,
+    b_5fronts: bool,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+) -> Result<()> {
+    let is_acpl1 = match mode {
+        IceCodecMode::AspxAcpl1 => true,
+        IceCodecMode::AspxAcpl2 => false,
+        _ => return Err(Error::invalid("ac4: write_ice_body_acpl mode")),
+    };
+    let want_pairs = if is_acpl1 {
+        if b_5fronts {
+            3
+        } else {
+            2
+        }
+    } else {
+        0
+    };
+    if scpl_pairs.len() != want_pairs {
+        return Err(Error::invalid("ac4: ice acpl scpl pair count mismatch"));
+    }
+    let n_modules = if b_5fronts { 6 } else { 4 };
+    if acpl.modules.len() != n_modules {
+        return Err(Error::invalid("ac4: ice acpl module count mismatch"));
+    }
+    mode.write(bw);
+    if b_iframe {
+        crate::encoder_acpl3::write_aspx_config(bw, aspx_cfg);
+        // acpl_config_1ch(PARTIAL / FULL) per Table 59.
+        bw.write_u32(acpl.num_param_bands_id as u32 & 0b11, 2);
+        bw.write_bit(matches!(
+            acpl.quant_mode,
+            crate::acpl::AcplQuantMode::Coarse
+        ));
+        if is_acpl1 {
+            let m1 = acpl.qmf_band.saturating_sub(1).min(7);
+            bw.write_u32(m1 as u32, 3);
+        }
+    }
+    if let Some((coeffs, max_sfb_lfe)) = lfe {
+        crate::ajoc_substream::write_mono_data_lfe_simple(
+            bw,
+            coeffs,
+            transform_length,
+            max_sfb_lfe,
+        )?;
+    }
+    // core_5ch_grouping = 3 (five_channel_data).
+    bw.write_u32(3, 2);
+    write_five_channel_data_simple(bw, core, transform_length, max_sfb)?;
+    // 7CH_STATIC: b_use_sap_add_ch = 0 + additional pair (F, G).
+    bw.write_bit(false);
+    crate::ajoc_substream::write_two_channel_data_simple(
+        bw,
+        add_pair[0],
+        add_pair[1],
+        transform_length,
+        max_sfb,
+    )?;
+    // A-SPX roster: 3× 2ch (7CH_STATIC) + 1ch.
+    let rows = MinimalAspxRows::derive(aspx_cfg)?;
+    for _ in 0..3 {
+        rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    }
+    rows.write_1ch(bw, aspx_cfg, b_iframe)?;
+    // S-CPL section (ASPX_ACPL_1 only).
+    if is_acpl1 {
+        for p in &scpl_pairs[..2] {
+            crate::ajoc_substream::write_two_channel_data_simple(
+                bw,
+                p[0],
+                p[1],
+                transform_length,
+                max_sfb,
+            )?;
+        }
+        for _ in 0..4 {
+            bw.write_u32(0, 2);
+        }
+        if b_5fronts {
+            let p = &scpl_pairs[2];
+            crate::ajoc_substream::write_two_channel_data_simple(
+                bw,
+                p[0],
+                p[1],
+                transform_length,
+                max_sfb,
+            )?;
+            for _ in 0..2 {
+                bw.write_u32(0, 2);
+            }
+        }
+    }
+    // acpl_data_1ch() section.
+    let num_bands = crate::acpl::num_param_bands_from_id(acpl.num_param_bands_id as u32);
+    let start_band = if is_acpl1 && acpl.qmf_band > 0 {
+        sb_to_pb(acpl.qmf_band as u32, num_bands)
+    } else {
+        0
+    };
+    for (alpha_q, beta_q) in acpl.modules.iter() {
+        crate::encoder_acpl3::write_acpl_data_1ch_real_alpha_beta(
+            bw,
+            num_bands,
+            start_band,
+            acpl.quant_mode,
+            alpha_q,
+            Some(beta_q),
+        );
+    }
+    Ok(())
+}
+
 /// The Table 78 channel-mode prefix code for an immersive layout.
 fn ice_channel_mode_code(b_lfe: bool, b_5fronts: bool) -> (u32, u32) {
     match (b_5fronts, b_lfe) {
@@ -1730,6 +1881,88 @@ mod tests {
             assert_eq!(ice.scpl_chparam.len(), if b_5fronts { 6 } else { 4 });
             assert!(ice.ajcc.is_none());
             assert!(ice.acpl_data.is_empty());
+        }
+    }
+
+    /// ASPX_ACPL_1 / ASPX_ACPL_2 body round-trips: configs land on the
+    /// sticky slots, the 4-payload roster parses, the S-CPL section is
+    /// present exactly for ACPL_1, and the acpl_data section carries
+    /// one element per module.
+    #[test]
+    fn ice_acpl_bodies_round_trip() {
+        for (mode, b_5fronts) in [
+            (IceCodecMode::AspxAcpl1, false),
+            (IceCodecMode::AspxAcpl1, true),
+            (IceCodecMode::AspxAcpl2, false),
+            (IceCodecMode::AspxAcpl2, true),
+        ] {
+            let is_acpl1 = matches!(mode, IceCodecMode::AspxAcpl1);
+            let core: Vec<Vec<f32>> = (0..5).map(|i| tone_spectrum(10 + 4 * i, 30.0)).collect();
+            let core_refs: [&[f32]; 5] = [&core[0], &core[1], &core[2], &core[3], &core[4]];
+            let fg = [tone_spectrum(40, 25.0), tone_spectrum(44, 25.0)];
+            let p0 = [tone_spectrum(50, 20.0), tone_spectrum(54, 20.0)];
+            let p1 = [tone_spectrum(60, 20.0), tone_spectrum(64, 20.0)];
+            let p2 = [tone_spectrum(70, 20.0), tone_spectrum(74, 20.0)];
+            let pairs_5f: [[&[f32]; 2]; 3] = [[&p0[0], &p0[1]], [&p1[0], &p1[1]], [&p2[0], &p2[1]]];
+            let pairs_4f: [[&[f32]; 2]; 2] = [[&p0[0], &p0[1]], [&p1[0], &p1[1]]];
+            let scpl_pairs: &[[&[f32]; 2]] = if !is_acpl1 {
+                &[]
+            } else if b_5fronts {
+                &pairs_5f
+            } else {
+                &pairs_4f
+            };
+            let n_modules = if b_5fronts { 6 } else { 4 };
+            let num_bands = crate::acpl::num_param_bands_from_id(2) as usize;
+            let alpha = vec![4i32; num_bands];
+            let beta = vec![0i32; num_bands];
+            let modules: Vec<(&[i32], &[i32])> =
+                vec![(alpha.as_slice(), beta.as_slice()); n_modules];
+            let acpl = IceAcplParams {
+                num_param_bands_id: 2,
+                quant_mode: AcplQuantMode::Fine,
+                qmf_band: 8,
+                modules: &modules,
+            };
+            let cfg = test_aspx_config();
+            let mut bw = BitWriter::new();
+            write_ice_body_acpl(
+                &mut bw,
+                mode,
+                &core_refs,
+                [&fg[0], &fg[1]],
+                scpl_pairs,
+                &acpl,
+                &cfg,
+                None,
+                b_5fronts,
+                true,
+                TL,
+                MAX_SFB,
+            )
+            .unwrap();
+            bw.write_u32(0, 16);
+            let bytes = bw.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let mut tools = SubstreamTools::default();
+            parse_ice_audio_data_outer(&mut br, &mut tools, false, b_5fronts, true, TL).unwrap();
+            let ice = tools.ice.as_deref().expect("ice element parsed");
+            assert_eq!(ice.mode, mode);
+            assert!(tools.aspx_config.is_some());
+            if is_acpl1 {
+                assert!(tools.acpl_config_1ch_partial.is_some());
+                assert_eq!(tools.acpl_config_1ch_partial.unwrap().qmf_band, 8);
+                assert_eq!(ice.scpl_pairs.len(), if b_5fronts { 3 } else { 2 });
+            } else {
+                assert!(tools.acpl_config_1ch_full.is_some());
+                assert!(ice.scpl_pairs.is_empty());
+            }
+            assert_eq!(ice.aspx_elements.len(), 4);
+            assert!(matches!(
+                &ice.aspx_elements[3],
+                IceAspxElement::OneCh(Some(_))
+            ));
+            assert_eq!(ice.acpl_data.len(), n_modules);
         }
     }
 
