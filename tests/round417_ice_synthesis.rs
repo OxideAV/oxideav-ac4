@@ -870,3 +870,87 @@ fn ajoc_aspx_downmix_companding_applies_per_channel() {
         "companded object level sane ({e_ratio})"
     );
 }
+
+/// 22_2_channel_element (§6.2.4.3 / §5.2.4 Table 21): a Simple-mode
+/// frame decodes to 24 channels — two LFEs first, then the eleven
+/// pairs in Table 21 order — and an A-SPX-mode I + P GOP preserves
+/// the low band per channel while the sticky config carries the
+/// P-frame.
+#[test]
+fn el_22_2_decodes_24_channels() {
+    use oxideav_ac4::ice::{encode_22_2_raw_frame, write_22_2_body};
+    // Per-channel tone bins 4 apart (bin = 6 + 4·ch) so the DFT
+    // projections stay leakage-isolated between pair partners.
+    let pairs_spec: Vec<[Vec<f32>; 2]> = (0..11)
+        .map(|p| {
+            [
+                tone_spectrum(6 + 8 * p, 150.0),
+                tone_spectrum(10 + 8 * p, 150.0),
+            ]
+        })
+        .collect();
+    let pairs: [[&[f32]; 2]; 11] =
+        std::array::from_fn(|p| [pairs_spec[p][0].as_slice(), pairs_spec[p][1].as_slice()]);
+    let lfe0 = tone_spectrum(2, 100.0);
+    let lfe1 = tone_spectrum(3, 100.0);
+    let cfg = test_aspx_config();
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let run = |aspx: bool| {
+        let mut dec = Ac4Decoder::new(&params);
+        let mut out = Vec::new();
+        let frames: &[(u32, bool)] = if aspx {
+            &[(0, true), (1, false)]
+        } else {
+            &[(0, true), (1, true)]
+        };
+        for &(seq, iframe) in frames {
+            let mut body = BitWriter::new();
+            write_22_2_body(
+                &mut body,
+                [(&lfe0, 4), (&lfe1, 4)],
+                &pairs,
+                aspx.then_some(&cfg),
+                iframe,
+                TL,
+                MAX_SFB,
+            )
+            .unwrap();
+            let frame = encode_22_2_raw_frame(seq, iframe, body).unwrap();
+            if seq == 0 {
+                let info = oxideav_ac4::toc::parse_ac4_toc(&frame).unwrap();
+                let mode = info.first_chan_mode.expect("chan mode surfaced");
+                assert_eq!(mode.ch_mode, 15);
+                assert_eq!(mode.channels, 24);
+                assert!(!mode.is_immersive());
+                assert_eq!(info.channels, 24);
+            }
+            out = decode_frame(&mut dec, frame, 24);
+        }
+        out
+    };
+    for aspx in [false, true] {
+        let chans = run(aspx);
+        let tag = if aspx { "aspx" } else { "simple" };
+        // LFE slots.
+        assert!(
+            tone_power(&chans[0], 2) > 1e9,
+            "{tag}: LFE decoded ({})",
+            tone_power(&chans[0], 2)
+        );
+        assert!(tone_power(&chans[1], 3) > 1e9, "{tag}: LFE2 decoded");
+        // Every fullband channel carries its own tone at unity gain
+        // (no S-CPL / A-CPL / output-gain stage for 22.2).
+        for ch in 0..22 {
+            let bin = 6 + 4 * ch;
+            let p = tone_power(&chans[2 + ch], bin);
+            assert!(p > 1e11, "{tag}: channel {ch} tone missing ({p})");
+            // Neighbour-channel isolation: the partner's tone stays
+            // out of this channel (the A-SPX QMF round trip smears the
+            // projection floor a little, hence the looser bound).
+            let other = 6 + 4 * (ch ^ 1);
+            let leak = tone_power(&chans[2 + ch], other) / p;
+            let bound = if aspx { 0.1 } else { 0.02 };
+            assert!(leak < bound, "{tag}: channel {ch} pair leak ({leak})");
+        }
+    }
+}

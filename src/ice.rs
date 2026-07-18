@@ -706,6 +706,103 @@ pub fn parse_ice_audio_data_outer(
 }
 
 // =====================================================================
+// §6.2.4.3 22_2_channel_element
+// =====================================================================
+
+/// Parsed `22_2_channel_element(b_iframe)` (TS 103 190-2 §6.2.4.3):
+/// two LFE `mono_data(1)` bodies, eleven `two_channel_data()` pairs,
+/// and (for `22_2_codec_mode == ASPX`, Table 98) one
+/// `aspx_data_2ch()` payload per pair. The §5.2.4 Table 21 mapping
+/// assigns the pairs to `[L, R]`, `[C, Tc]`, `[Ls, Rs]`, `[Lb, Rb]`,
+/// `[Tfl, Tfr]`, `[Tbl, Tbr]`, `[Tsl, Tsr]`, `[Tfc, Tbc]`,
+/// `[Bfl, Bfr]`, `[Bfc, Cb]`, `[Lw, Rw]` in transmission order.
+#[derive(Debug, Clone)]
+pub struct El222 {
+    /// `22_2_codec_mode` — false = Simple, true = A-SPX (Table 98).
+    pub aspx_mode: bool,
+    /// The two LFE `mono_data(1)` bodies (LFE, LFE2).
+    pub lfe: [MonoLfeData; 2],
+    /// The eleven `two_channel_data()` pairs in transmission order.
+    pub pairs: Vec<TwoChannelData>,
+    /// One captured `aspx_data_2ch()` trailer per pair (A-SPX mode;
+    /// empty for Simple). `None` entries mean the capture bailed.
+    pub aspx_elements: Vec<Option<Box<FiveXAspxTrailer>>>,
+}
+
+impl El222 {
+    /// The 22 fullband spectra in the Table 21 channel order
+    /// (`[L, R, C, Tc, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr, Tsl, Tsr,
+    /// Tfc, Tbc, Bfl, Bfr, Bfc, Cb, Lw, Rw]`); uncoded tracks are
+    /// `None`.
+    pub fn fullband_spectra(&self) -> Vec<Option<&[f32]>> {
+        let mut out: Vec<Option<&[f32]>> = Vec::with_capacity(22);
+        for p in &self.pairs {
+            for ch in 0..2 {
+                out.push(p.scaled_spec_per_channel.get(ch).and_then(|s| s.as_deref()));
+            }
+        }
+        out.resize(22, None);
+        out
+    }
+
+    /// The core transform length (from the first pair).
+    pub fn transform_length(&self) -> Option<u32> {
+        self.pairs
+            .first()
+            .and_then(|p| p.transform_info.as_ref())
+            .map(|t| t.transform_length_0)
+    }
+}
+
+/// Parse `22_2_channel_element(b_iframe)` into `tools` (the A-SPX
+/// config lands on the shared I-frame-sticky slot; the element body
+/// lands on `tools.el_22_2`). For `b_iframe == 0` the caller must have
+/// pre-seeded `tools` with the sticky `aspx_config` /
+/// `aspx_xover_subband_offset` from the last I-frame.
+pub fn parse_22_2_audio_data_outer(
+    br: &mut BitReader<'_>,
+    tools: &mut SubstreamTools,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Result<()> {
+    let aspx_mode = br.read_bit()?;
+    if b_iframe && aspx_mode {
+        tools.aspx_config = Some(parse_aspx_config(br)?);
+    }
+    let lfe0 = parse_mono_data(br, true, frame_len_base)?;
+    let lfe1 = parse_mono_data(br, true, frame_len_base)?;
+    let mut pairs = Vec::with_capacity(11);
+    for _ in 0..11 {
+        pairs.push(parse_two_channel_data(br, frame_len_base)?);
+    }
+    let mut aspx_elements = Vec::new();
+    if aspx_mode {
+        let cfg = tools.aspx_config.ok_or_else(|| {
+            Error::invalid("ac4: non-iframe 22_2_channel_element without sticky aspx_config")
+        })?;
+        for _ in 0..11 {
+            let t = capture_aspx_data_2ch_trailer(br, tools, &cfg, b_iframe, frame_len_base)
+                .ok_or_else(|| Error::invalid("ac4: 22_2 aspx_data_2ch parse failed"))?;
+            aspx_elements.push(Some(Box::new(t)));
+        }
+        // Same one-xover-per-substream sticky convention as the ICE /
+        // 5_X / 7_X trailer paths.
+        if b_iframe {
+            if let Some(Some(t)) = aspx_elements.first() {
+                tools.aspx_xover_subband_offset = Some(t.xover);
+            }
+        }
+    }
+    tools.el_22_2 = Some(Box::new(El222 {
+        aspx_mode,
+        lfe: [lfe0, lfe1],
+        pairs,
+        aspx_elements,
+    }));
+    Ok(())
+}
+
+// =====================================================================
 // Write side
 // =====================================================================
 
@@ -1288,6 +1385,51 @@ pub fn write_ice_body_acpl(
     Ok(())
 }
 
+/// Write a `22_2_channel_element()` body (§6.2.4.3): Simple mode when
+/// `aspx_cfg` is `None` (pure channel data), A-SPX mode otherwise
+/// (I-frame `aspx_config()` + one minimal floored-noise
+/// `aspx_data_2ch()` per pair). `lfe` carries the two LFE spectra
+/// (`(coeffs, max_sfb_lfe)` each); `pairs` the eleven Table 21 channel
+/// pairs in transmission order.
+pub fn write_22_2_body(
+    bw: &mut BitWriter,
+    lfe: [(&[f32], u32); 2],
+    pairs: &[[&[f32]; 2]; 11],
+    aspx_cfg: Option<&AspxConfig>,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+) -> Result<()> {
+    bw.write_bit(aspx_cfg.is_some()); // 22_2_codec_mode (Table 98)
+    if let (true, Some(cfg)) = (b_iframe, aspx_cfg) {
+        crate::encoder_acpl3::write_aspx_config(bw, cfg);
+    }
+    for (coeffs, max_sfb_lfe) in lfe {
+        crate::ajoc_substream::write_mono_data_lfe_simple(
+            bw,
+            coeffs,
+            transform_length,
+            max_sfb_lfe,
+        )?;
+    }
+    for p in pairs {
+        crate::ajoc_substream::write_two_channel_data_simple(
+            bw,
+            p[0],
+            p[1],
+            transform_length,
+            max_sfb,
+        )?;
+    }
+    if let Some(cfg) = aspx_cfg {
+        let rows = MinimalAspxRows::derive(cfg)?;
+        for _ in 0..11 {
+            rows.write_2ch(bw, cfg, b_iframe)?;
+        }
+    }
+    Ok(())
+}
+
 /// The Table 78 channel-mode prefix code for an immersive layout.
 fn ice_channel_mode_code(b_lfe: bool, b_5fronts: bool) -> (u32, u32) {
     match (b_5fronts, b_lfe) {
@@ -1311,6 +1453,28 @@ pub fn encode_ice_raw_frame(
     sequence_counter: u32,
     b_lfe: bool,
     b_5fronts: bool,
+    b_iframe: bool,
+    body: BitWriter,
+) -> Result<Vec<u8>> {
+    let (code, code_bits) = ice_channel_mode_code(b_lfe, b_5fronts);
+    encode_chan_raw_frame(sequence_counter, code, code_bits, true, b_iframe, body)
+}
+
+/// [`encode_ice_raw_frame`] for the 22.2 channel mode (Table 78 code
+/// `111111110`, no §6.3.2.7.3-5 presence fields).
+pub fn encode_22_2_raw_frame(
+    sequence_counter: u32,
+    b_iframe: bool,
+    body: BitWriter,
+) -> Result<Vec<u8>> {
+    encode_chan_raw_frame(sequence_counter, 0b111111110, 9, false, b_iframe, body)
+}
+
+fn encode_chan_raw_frame(
+    sequence_counter: u32,
+    mode_code: u32,
+    mode_code_bits: u32,
+    presence_fields: bool,
     b_iframe: bool,
     body: BitWriter,
 ) -> Result<Vec<u8>> {
@@ -1351,13 +1515,14 @@ pub fn encode_ice_raw_frame(
     bw.write_bit(true); // b_single_substream
     bw.write_bit(true); // b_channel_coded
                         // ac4_substream_info_chan() (§6.2.1.8):
-    let (code, code_bits) = ice_channel_mode_code(b_lfe, b_5fronts);
-    bw.write_u32(code, code_bits);
-    // §6.3.2.7.3-5 presence fields: back channels + centre carry
-    // content, top_channels_present = 0.
-    bw.write_bit(true);
-    bw.write_bit(true);
-    bw.write_u32(0, 2);
+    bw.write_u32(mode_code, mode_code_bits);
+    if presence_fields {
+        // §6.3.2.7.3-5 presence fields (immersive modes only): back
+        // channels + centre carry content, top_channels_present = 0.
+        bw.write_bit(true);
+        bw.write_bit(true);
+        bw.write_u32(0, 2);
+    }
     bw.write_bit(false); // b_sf_multiplier (fs_index == 1)
     bw.write_bit(false); // b_bitrate_info
     bw.write_bit(b_iframe); // b_audio_ndot = b_iframe (frame_rate_factor = 1)
@@ -2029,6 +2194,63 @@ mod tests {
                 IceAspxElement::OneCh(Some(_))
             ));
             assert_eq!(ice.acpl_data.len(), n_modules);
+        }
+    }
+
+    /// 22_2_channel_element bodies round-trip in both Table 98 codec
+    /// modes: two LFE bodies, eleven pairs, and (A-SPX) one captured
+    /// payload per pair with the config on the sticky slot.
+    #[test]
+    fn el_22_2_bodies_round_trip() {
+        for aspx in [false, true] {
+            let pairs_spec: Vec<[Vec<f32>; 2]> = (0..11)
+                .map(|p| {
+                    [
+                        tone_spectrum(10 + 6 * p, 30.0),
+                        tone_spectrum(12 + 6 * p, 30.0),
+                    ]
+                })
+                .collect();
+            let pairs: [[&[f32]; 2]; 11] =
+                std::array::from_fn(|p| [pairs_spec[p][0].as_slice(), pairs_spec[p][1].as_slice()]);
+            let lfe0 = tone_spectrum(2, 15.0);
+            let lfe1 = tone_spectrum(3, 15.0);
+            let cfg = test_aspx_config();
+            let mut bw = BitWriter::new();
+            write_22_2_body(
+                &mut bw,
+                [(&lfe0, 4), (&lfe1, 4)],
+                &pairs,
+                aspx.then_some(&cfg),
+                true,
+                TL,
+                MAX_SFB,
+            )
+            .unwrap();
+            bw.write_u32(0, 16);
+            let bytes = bw.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let mut tools = SubstreamTools::default();
+            parse_22_2_audio_data_outer(&mut br, &mut tools, true, TL).unwrap();
+            let el = tools.el_22_2.as_deref().expect("22.2 element parsed");
+            assert_eq!(el.aspx_mode, aspx);
+            assert_eq!(el.pairs.len(), 11);
+            assert_eq!(el.transform_length(), Some(TL));
+            assert!(el.lfe[0].scaled_spec.is_some() && el.lfe[1].scaled_spec.is_some());
+            let full = el.fullband_spectra();
+            assert_eq!(full.len(), 22);
+            for (ch, s) in full.iter().enumerate() {
+                let s = s.unwrap_or_else(|| panic!("channel {ch} missing"));
+                assert!(s.iter().any(|&v| v.abs() > 1.0), "channel {ch} silent");
+            }
+            if aspx {
+                assert_eq!(el.aspx_elements.len(), 11);
+                assert!(el.aspx_elements.iter().all(|t| t.is_some()));
+                assert!(tools.aspx_config.is_some());
+                assert_eq!(tools.aspx_xover_subband_offset, Some(0));
+            } else {
+                assert!(el.aspx_elements.is_empty());
+            }
         }
     }
 

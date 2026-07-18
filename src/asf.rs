@@ -1686,6 +1686,10 @@ pub struct SubstreamTools {
     /// for the immersive channel modes (7.0.4 / 7.1.4 / 9.0.4 /
     /// 9.1.4). Populated by [`crate::ice::parse_ice_audio_data_outer`].
     pub ice: Option<Box<crate::ice::IceElement>>,
+    /// Parsed `22_2_channel_element()` (TS 103 190-2 §6.2.4.3) for
+    /// channel mode 22.2. Populated by
+    /// [`crate::ice::parse_22_2_audio_data_outer`].
+    pub el_22_2: Option<Box<crate::ice::El222>>,
 }
 
 /// Result of walking a single `ac4_substream()` payload.
@@ -3667,6 +3671,17 @@ pub fn walk_ac4_substream_sticky(
                 &mut tools,
                 b_lfe,
                 b_5fronts,
+                b_iframe,
+                frame_len_base,
+            );
+        }
+        // 22.2 (TS 103 190-2 Table 78 ch_mode 15 — 24 channels incl.
+        // two LFEs): `audio_data_chan()` routes to
+        // `22_2_channel_element(b_iframe)` per §6.2.3.1.
+        24 => {
+            let _ = crate::ice::parse_22_2_audio_data_outer(
+                &mut br,
+                &mut tools,
                 b_iframe,
                 frame_len_base,
             );

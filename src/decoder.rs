@@ -2569,6 +2569,137 @@ impl Ac4Decoder {
             data: vec![buf],
         }))
     }
+
+    /// Decode one `22_2_channel_element()` frame (TS 103 190-2
+    /// §6.2.4.3 / §5.2.4) to 24-channel PCM.
+    ///
+    /// The §5.2.4 Table 21 mapping assigns the eleven pairs to the 22
+    /// fullband channels; the two LFE `mono_data(1)` bodies route
+    /// directly through the IMDCT (§4.8.3.6). For
+    /// `22_2_codec_mode == ASPX` every pair is bandwidth-extended per
+    /// its `aspx_data_2ch()` payload (§4.8.3.11 Table 8 — full
+    /// decoding only, no output gain stage). Output channel order: the
+    /// two LFEs first, then the 22 fullband channels in Table 21 order
+    /// (`L, R, C, Tc, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr, Tsl, Tsr,
+    /// Tfc, Tbc, Bfl, Bfr, Bfc, Cb, Lw, Rw`).
+    fn receive_frame_22_2(
+        &mut self,
+        raw: &[u8],
+        info: toc::Ac4FrameInfo,
+        pts: Option<i64>,
+    ) -> Result<Frame> {
+        let start = (info.toc_size + info.payload_base) as usize;
+        if start >= raw.len() {
+            return Err(Error::invalid("ac4: 22.2 frame without substream"));
+        }
+        let end = info
+            .substream_sizes
+            .first()
+            .map(|&sz| start.saturating_add(sz as usize).min(raw.len()))
+            .unwrap_or(raw.len());
+        let substream = &raw[start..end];
+        let b_iframe = info
+            .presentations
+            .first()
+            .map(|p| p.b_iframe)
+            .unwrap_or(info.b_iframe_global);
+        let sub = asf::walk_ac4_substream_sticky(
+            substream,
+            24,
+            b_iframe,
+            info.frame_length,
+            None,
+            Some(&mut self.sticky),
+        )?;
+        let samples = info.frame_length;
+        let n = samples as usize;
+        let channels_out = 24usize;
+        let mut lfe_pcm: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+        let mut chans: Vec<Vec<f32>> = vec![Vec::new(); 22];
+        let sub_aspx_cfg = sub.tools.aspx_config;
+        if let Some(el) = sub.tools.el_22_2.as_deref() {
+            if el.transform_length() == Some(samples) {
+                // LFEs — dedicated overlap slots past the 22 fullband
+                // slots.
+                for (i, lfe_body) in el.lfe.iter().enumerate() {
+                    if let Some(pcm) = self.imdct_mono_lfe_data_f32(lfe_body, 22 + i, n) {
+                        lfe_pcm[i] = pcm;
+                    }
+                }
+                let specs: Vec<Vec<f32>> = el
+                    .fullband_spectra()
+                    .into_iter()
+                    .map(|s| s.map(<[f32]>::to_vec).unwrap_or_default())
+                    .collect();
+                for (ch, spec) in specs.iter().enumerate() {
+                    chans[ch] = self.imdct_channel_f32(ch, spec, n);
+                }
+                // A-SPX extension per pair (payload p → channels
+                // (2p, 2p + 1)); no output gain stage for 22.2.
+                if el.aspx_mode {
+                    if let Some(cfg) = sub_aspx_cfg {
+                        let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+                        for (ch, chan) in chans.iter_mut().enumerate().take(22) {
+                            let Some(trailer) =
+                                el.aspx_elements.get(ch / 2).and_then(|t| t.as_deref())
+                            else {
+                                continue;
+                            };
+                            let trailer = trailer.clone();
+                            let chd = if ch % 2 == 1 {
+                                trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                            } else {
+                                &trailer.primary
+                            };
+                            while self.aspx_ext_state.len() <= ch {
+                                self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
+                            }
+                            *chan = Self::aspx_extend_pcm(
+                                chan,
+                                &trailer.frequency_tables,
+                                &cfg,
+                                Some(&chd.framing),
+                                Some(&chd.data_sig),
+                                Some(&chd.data_noise),
+                                Some(chd.qmode_env),
+                                Some(&chd.delta_dir),
+                                chd.add_harmonic.as_deref(),
+                                chd.tna_mode.as_deref(),
+                                &mut self.aspx_ext_state[ch],
+                                num_ts_in_ats,
+                                aspx::CompandingMode::Off,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Interleave to S16: LFE, LFE2, then the 22 fullband channels.
+        let mut buf = vec![0u8; n * channels_out * 2];
+        let write_channel = |buf: &mut [u8], c: usize, pcm: &[f32]| {
+            for (i, &v) in pcm.iter().take(n).enumerate() {
+                let s = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                let le = s.to_le_bytes();
+                let off = (i * channels_out + c) * 2;
+                buf[off] = le[0];
+                buf[off + 1] = le[1];
+            }
+        };
+        for (i, pcm) in lfe_pcm.iter().enumerate() {
+            write_channel(&mut buf, i, pcm);
+        }
+        for (c, pcm) in chans.iter().enumerate() {
+            write_channel(&mut buf, c + 2, pcm);
+        }
+        self.last_substream = Some(sub);
+        self.last_info = Some(info);
+        Ok(Frame::Audio(AudioFrame {
+            samples,
+            pts,
+            data: vec![buf],
+        }))
+    }
 }
 
 impl Decoder for Ac4Decoder {
@@ -2625,6 +2756,17 @@ impl Decoder for Ac4Decoder {
             let raw_owned = raw.to_vec();
             let pts = pkt.pts;
             return self.receive_frame_ice(&raw_owned, info, pts);
+        }
+        // 22.2 (Table 78 ch_mode 15): route `audio_data_chan()` to the
+        // `22_2_channel_element()` decode chain (§6.2.4.3).
+        if info
+            .first_chan_mode
+            .map(|m| m.ch_mode == 15)
+            .unwrap_or(false)
+        {
+            let raw_owned = raw.to_vec();
+            let pts = pkt.pts;
+            return self.receive_frame_22_2(&raw_owned, info, pts);
         }
         // Resolve shape with fallbacks to the container hint when the
         // TOC carried a reserved / escape value.
