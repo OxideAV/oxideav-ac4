@@ -4,7 +4,7 @@
 //! `oxideav_ac4::encoder_asf::write_chparam_info` is the dual of
 //! `oxideav_ac4::asf::parse_chparam_info` per ETSI TS 103 190-1
 //! §4.2.10.1 Table 47. The tests below pin the round-trip across all
-//! four `sap_mode` codes (None / MsUsed / Reserved / SapData) plus
+//! four `sap_mode` codes (None / MsUsed / MsAll / SapData) plus
 //! representative edge cases (multi-group, sap_coeff_all, asymmetric
 //! pair entry, sub-`max_sfb` rows in the input).
 
@@ -37,7 +37,7 @@ fn sap_mode_zero_header_only_two_bits() {
 }
 
 #[test]
-fn sap_mode_two_reserved_header_only_two_bits() {
+fn sap_mode_two_ms_all_header_only_two_bits() {
     let info = ChparamInfo {
         sap_mode: 2,
         ..ChparamInfo::default()
@@ -47,7 +47,16 @@ fn sap_mode_two_reserved_header_only_two_bits() {
     assert_eq!(bw.bit_position(), 2);
     let out = roundtrip(&info, &[6]);
     assert_eq!(out.sap_mode, 2);
-    assert_eq!(out.mode(), SapMode::Reserved);
+    assert_eq!(out.mode(), SapMode::MsAll);
+    // Table 114 mode 2 = M/S in ALL scale-factor bands: the SAP
+    // coefficient extraction resolves every band to the M/S inverse
+    // quartet (1, 1, 1, -1) with no per-band payload on the wire.
+    let coeffs = oxideav_ac4::asf::extract_sap_abcd(&out, &[6]);
+    assert_eq!(coeffs.abcd.len(), 1);
+    assert_eq!(coeffs.abcd[0].len(), 6);
+    for &q in &coeffs.abcd[0] {
+        assert_eq!(q, (1.0, 1.0, 1.0, -1.0));
+    }
 }
 
 #[test]

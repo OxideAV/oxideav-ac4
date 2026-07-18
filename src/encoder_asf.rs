@@ -831,8 +831,9 @@ pub fn write_section_data(bw: &mut BitWriter, sections: &AsfSections) {
 ///   `max_sfb_per_group[g]` (e.g. empty rows on a half-built
 ///   `ChparamInfo`), the writer pads the tail with `false` bits so
 ///   it stays total across the full per-group bound.
-/// * `2` — *reserved* (`SapMode::Reserved`): header-only emission,
-///   matching the parser's accept-and-skip handling for this code.
+/// * `2` — `SapMode::MsAll` (Table 114: M/S processing in all
+///   scale-factor bands): header-only emission — the mode carries no
+///   per-band payload on the wire.
 /// * `3` — `SapMode::SapData`: header followed by a full
 ///   `sap_data()` body (Table 48) via [`write_sap_data`].
 ///
@@ -843,7 +844,7 @@ pub fn write_section_data(bw: &mut BitWriter, sections: &AsfSections) {
 /// output into [`crate::asf::parse_chparam_info`] with the same
 /// `max_sfb_per_group` recovers the original [`crate::asf::ChparamInfo`]
 /// for `SapMode::None`, `SapMode::MsUsed` and `SapMode::SapData`. The
-/// `SapMode::Reserved` header is also round-trip stable (sap_mode = 2
+/// `SapMode::MsAll` header is also round-trip stable (sap_mode = 2
 /// in, sap_mode = 2 out, both header-only).
 pub fn write_chparam_info(
     bw: &mut BitWriter,
@@ -853,7 +854,7 @@ pub fn write_chparam_info(
     let sap_mode = info.sap_mode & 0b11;
     bw.write_u32(sap_mode, 2);
     match crate::asf::SapMode::from_u32(sap_mode) {
-        crate::asf::SapMode::None | crate::asf::SapMode::Reserved => {}
+        crate::asf::SapMode::None | crate::asf::SapMode::MsAll => {}
         crate::asf::SapMode::MsUsed => {
             for (g, &m) in max_sfb_per_group.iter().enumerate() {
                 let row = info.ms_used.get(g);

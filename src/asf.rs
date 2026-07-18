@@ -328,17 +328,19 @@ pub fn parse_asf_psy_info_lfe(
 }
 
 /// `sap_mode` enum for `chparam_info()` (ETSI TS 103 190-1 §4.2.10.1
-/// Table 47 / §4.3.8.1).
+/// Table 47 / §4.3.8.1 Table 114).
 ///
-/// * `0` — no MDCT-stereo data follows; both channels are independent.
-/// * `1` — per-sfb `ms_used[g][sfb]` flag array follows.
-/// * `2` — *reserved*.
-/// * `3` — full `sap_data()` body follows (Table 48).
+/// * `0` — no SAP; both channels are independent.
+/// * `1` — M/S processing in the scale-factor bands flagged by the
+///   `ms_used[g][sfb]` array that follows.
+/// * `2` — M/S processing in **all** scale-factor bands (header-only
+///   on the wire — no per-band payload follows).
+/// * `3` — full SAP: a `sap_data()` body follows (Table 48).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SapMode {
     None,
     MsUsed,
-    Reserved,
+    MsAll,
     SapData,
 }
 
@@ -347,7 +349,7 @@ impl SapMode {
         match v & 0b11 {
             0 => Self::None,
             1 => Self::MsUsed,
-            2 => Self::Reserved,
+            2 => Self::MsAll,
             _ => Self::SapData,
         }
     }
@@ -412,7 +414,7 @@ pub fn parse_chparam_info(
         ..ChparamInfo::default()
     };
     match SapMode::from_u32(sap_mode) {
-        SapMode::None | SapMode::Reserved => {}
+        SapMode::None | SapMode::MsAll => {}
         SapMode::MsUsed => {
             let mut groups = Vec::with_capacity(max_sfb_per_group.len());
             for &m in max_sfb_per_group {
@@ -504,7 +506,8 @@ pub fn parse_sap_data(br: &mut BitReader<'_>, max_sfb_per_group: &[u32]) -> Resu
 /// * `sap_mode == 0` — identity: `a = d = 1, b = c = 0`.
 /// * `sap_mode == 1, ms_used == 0` — identity (same as mode 0).
 /// * `sap_mode == 1, ms_used == 1` — M/S inverse: `a = b = c = 1, d = -1`.
-/// * `sap_mode == 2` — *reserved* (treated as identity here for safety).
+/// * `sap_mode == 2` — M/S inverse in **all** scale-factor bands
+///   (Table 114 row 2; same coefficients as the flagged mode-1 bands).
 /// * `sap_mode == 3, sap_used` — alpha-driven SAP: with
 ///   `sap_gain = alpha_q * 0.1`,
 ///   `a = 1 + sap_gain, b = 1, c = 1 - sap_gain, d = -1`.
@@ -551,8 +554,18 @@ pub fn extract_sap_abcd(info: &ChparamInfo, max_sfb_per_group: &[u32]) -> SapCoe
         .map(|&m| vec![(1.0, 0.0, 0.0, 1.0); m as usize])
         .collect();
     match mode {
-        SapMode::None | SapMode::Reserved => {
+        SapMode::None => {
             // Identity already populated above.
+        }
+        SapMode::MsAll => {
+            // Table 114 mode 2: M/S processing in ALL scale-factor
+            // bands — every row takes the Pseudocode 59 M/S column
+            // `a = b = c = 1, d = -1` (no per-band payload on the wire).
+            for row in abcd.iter_mut() {
+                for slot in row.iter_mut() {
+                    *slot = (1.0, 1.0, 1.0, -1.0);
+                }
+            }
         }
         SapMode::MsUsed => {
             // Per-sfb selector — when ms_used == 1, swap the row to the
@@ -862,7 +875,7 @@ pub fn invert_sap_table_181(
 // (with per-band `alpha_q` indices in [-60, +60]), build a `ChparamInfo`
 // that round-trips through `extract_sap_abcd` to recover the same
 // matrix the encoder picked. The two builders below are the two
-// non-trivial `SapMode` arms (`SapMode::None` / `SapMode::Reserved`
+// non-trivial `SapMode` arms (`SapMode::None` / `SapMode::MsAll`
 // are header-only and need no builder).
 
 /// Build a `ChparamInfo` with `sap_mode == 1` (`SapMode::MsUsed`) from
