@@ -1165,6 +1165,133 @@ impl MinimalAspxRows {
         )
         .map_err(Error::invalid)
     }
+
+    fn rows_2ch(&self) -> IceAspx2chRows {
+        IceAspx2chRows {
+            ch0: IceAspxChannelRows {
+                sig: self.sig_row.clone(),
+                noise: self.noise_row.clone(),
+                ah: Vec::new(),
+            },
+            ch1: IceAspxChannelRows {
+                sig: self.sig_row.clone(),
+                noise: self.noise_row.clone(),
+                ah: Vec::new(),
+            },
+            tna: self.tna.clone(),
+        }
+    }
+
+    fn rows_1ch(&self) -> IceAspx1chRows {
+        IceAspx1chRows {
+            ch: IceAspxChannelRows {
+                sig: self.sig_row.clone(),
+                noise: self.noise_row.clone(),
+                ah: Vec::new(),
+            },
+            tna: self.tna.clone(),
+        }
+    }
+}
+
+// =====================================================================
+// Real (synthesis-driven) A-SPX payload rows for the ICE body writers
+// =====================================================================
+
+/// Real A-SPX quant-index rows for one extended channel of an ICE
+/// payload — the encoder-side counterpart of the decoder's
+/// Pseudocode 82 / 83 dequantised envelopes. `sig` / `noise` carry the
+/// FREQ-DPCM `[F0, DF₁, …]` vectors (see
+/// [`crate::encoder_acpl3::build_aspx_real_envelope_channel_from_qmf`]);
+/// `ah` the per-high-res-signal-SBG `aspx_add_harmonic` decisions
+/// (§4.2.12.6). Empty vectors zero-pad in the underlying writers —
+/// note an all-zero NOISE row decodes to a full-scale HF noise floor
+/// (Pseudocode 83's `2^(6−0)`), so callers should always supply a real
+/// (or floored) noise row.
+#[derive(Debug, Clone, Default)]
+pub struct IceAspxChannelRows {
+    /// SIGNAL envelope FREQ-DPCM quant indices `[F0, DF₁, …]`.
+    pub sig: Vec<i32>,
+    /// NOISE envelope FREQ-DPCM quant indices `[F0, DF₁, …]`.
+    pub noise: Vec<i32>,
+    /// Per-high-res-signal-SBG `aspx_add_harmonic` decisions.
+    pub ah: Vec<bool>,
+}
+
+/// Real A-SPX rows for one `aspx_data_2ch()` ICE payload. The `tna`
+/// vector is the primary-derived per-noise-SBG `aspx_tna_mode`
+/// (§4.3.10.6.1), mirrored to the secondary channel under the balance
+/// coding — matching the 5_X / 7_X live-path writers.
+#[derive(Debug, Clone, Default)]
+pub struct IceAspx2chRows {
+    /// Primary-channel rows.
+    pub ch0: IceAspxChannelRows,
+    /// Secondary-channel rows.
+    pub ch1: IceAspxChannelRows,
+    /// Shared per-noise-SBG `aspx_tna_mode` vector.
+    pub tna: Vec<u8>,
+}
+
+impl IceAspx2chRows {
+    fn write(&self, bw: &mut BitWriter, aspx_cfg: &AspxConfig, b_iframe: bool) -> Result<()> {
+        crate::encoder_acpl3::write_aspx_data_2ch_real_envelope_tna_ah_framed(
+            bw,
+            aspx_cfg,
+            crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                sig: &self.ch0.sig,
+                noise: &self.ch0.noise,
+            },
+            crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                sig: &self.ch1.sig,
+                noise: &self.ch1.noise,
+            },
+            &self.tna,
+            &self.ch0.ah,
+            &self.ch1.ah,
+            b_iframe,
+        )
+        .map_err(Error::invalid)
+    }
+}
+
+/// Real A-SPX rows for one `aspx_data_1ch()` ICE payload.
+#[derive(Debug, Clone, Default)]
+pub struct IceAspx1chRows {
+    /// The single channel's rows.
+    pub ch: IceAspxChannelRows,
+    /// Per-noise-SBG `aspx_tna_mode` vector.
+    pub tna: Vec<u8>,
+}
+
+impl IceAspx1chRows {
+    fn write(&self, bw: &mut BitWriter, aspx_cfg: &AspxConfig, b_iframe: bool) -> Result<()> {
+        crate::encoder_acpl3::write_aspx_data_1ch_real_envelope_tna_ah_framed(
+            bw,
+            aspx_cfg,
+            crate::encoder_acpl3::AspxRealEnvelopeChannel {
+                sig: &self.ch.sig,
+                noise: &self.ch.noise,
+            },
+            &self.tna,
+            &self.ch.ah,
+            b_iframe,
+        )
+        .map_err(Error::invalid)
+    }
+}
+
+/// The full real-A-SPX payload roster for one ICE element body: the
+/// `two_ch` payloads in transmission order with the single
+/// `aspx_data_1ch()` payload factored out (the writers splice it at
+/// the mode's roster position — third for ASPX_SCPL, last for the
+/// ACPL / AJCC family).
+#[derive(Debug, Clone)]
+pub struct IceAspxRows<'a> {
+    /// `aspx_data_2ch()` rows in transmission order (5 / 6 for
+    /// ASPX_SCPL without / with `b_5fronts`; 3 for the ACPL family).
+    pub two_ch: &'a [IceAspx2chRows],
+    /// The `aspx_data_1ch()` rows (the centre-carrier payload).
+    pub one_ch: &'a IceAspx1chRows,
 }
 
 /// Write an ASPX_SCPL-mode `immersive_channel_element()` body:
@@ -1184,9 +1311,55 @@ pub fn write_ice_body_aspx_scpl(
     transform_length: u32,
     max_sfb: u32,
 ) -> Result<()> {
+    let rows = MinimalAspxRows::derive(aspx_cfg)?;
+    let two_ch = vec![rows.rows_2ch(); if b_5fronts { 6 } else { 5 }];
+    let one_ch = rows.rows_1ch();
+    write_ice_body_aspx_scpl_real(
+        bw,
+        spectra,
+        lfe,
+        b_5fronts,
+        aspx_cfg,
+        b_iframe,
+        transform_length,
+        max_sfb,
+        &IceAspxRows {
+            two_ch: &two_ch,
+            one_ch: &one_ch,
+        },
+    )
+}
+
+/// [`write_ice_body_aspx_scpl`] with **real** (synthesis-driven) A-SPX
+/// payload rows: `rows.two_ch` carries the 5 (or 6 with `b_5fronts`)
+/// `aspx_data_2ch()` payloads in transmission order and `rows.one_ch`
+/// the centre `aspx_data_1ch()` payload spliced in at the ASPX_SCPL
+/// roster's third position. Per the decoder's Table 8 channel-grouping
+/// association the payloads extend the **decoupled** output channels
+/// (post-Table 23, pre-§4.8.3.11.3 gain): without `b_5fronts` the
+/// `two_ch` order is `(L, R)`, `(Ls, Lb)`, `(Rs, Rb)`, `(Tfl, Tbl)`,
+/// `(Tfr, Tbr)` (centre payload = `C`); with `b_5fronts` it is
+/// `(L, Lscr)`, `(R, Rscr)`, `(Ls, Lb)`, `(Rs, Rb)`, `(Tfl, Tbl)`,
+/// `(Tfr, Tbr)`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_ice_body_aspx_scpl_real(
+    bw: &mut BitWriter,
+    spectra: &IceScplSpectra<'_>,
+    lfe: Option<(&[f32], u32)>,
+    b_5fronts: bool,
+    aspx_cfg: &AspxConfig,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+    rows: &IceAspxRows<'_>,
+) -> Result<()> {
     let want_pairs = if b_5fronts { 3 } else { 2 };
     if spectra.scpl_pairs.len() != want_pairs {
         return Err(Error::invalid("ac4: ice scpl pair count mismatch"));
+    }
+    let want_2ch = if b_5fronts { 6 } else { 5 };
+    if rows.two_ch.len() != want_2ch {
+        return Err(Error::invalid("ac4: ice aspx_scpl 2ch payload count"));
     }
     IceCodecMode::AspxScpl.write(bw);
     // immers_cfg(ASPX_SCPL): aspx_config() on I-frames.
@@ -1215,16 +1388,12 @@ pub fn write_ice_body_aspx_scpl(
     )?;
     // ASPX_SCPL roster: 2ch, 2ch, 1ch, (b_5fronts ? 2ch 2ch : 2ch),
     // 2ch, 2ch.
-    let rows = MinimalAspxRows::derive(aspx_cfg)?;
-    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
-    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
-    rows.write_1ch(bw, aspx_cfg, b_iframe)?;
-    let mid = if b_5fronts { 2 } else { 1 };
-    for _ in 0..mid {
-        rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    rows.two_ch[0].write(bw, aspx_cfg, b_iframe)?;
+    rows.two_ch[1].write(bw, aspx_cfg, b_iframe)?;
+    rows.one_ch.write(bw, aspx_cfg, b_iframe)?;
+    for r in &rows.two_ch[2..] {
+        r.write(bw, aspx_cfg, b_iframe)?;
     }
-    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
-    rows.write_2ch(bw, aspx_cfg, b_iframe)?;
     // S-CPL section: pairs then identity chparam elements.
     for p in &spectra.scpl_pairs[..2] {
         crate::ajoc_substream::write_two_channel_data_simple(
@@ -1296,11 +1465,60 @@ pub fn write_ice_body_acpl(
     transform_length: u32,
     max_sfb: u32,
 ) -> Result<()> {
+    let rows = MinimalAspxRows::derive(aspx_cfg)?;
+    let two_ch = vec![rows.rows_2ch(); 3];
+    let one_ch = rows.rows_1ch();
+    write_ice_body_acpl_real(
+        bw,
+        mode,
+        core,
+        add_pair,
+        scpl_pairs,
+        acpl,
+        aspx_cfg,
+        lfe,
+        b_5fronts,
+        b_iframe,
+        transform_length,
+        max_sfb,
+        &IceAspxRows {
+            two_ch: &two_ch,
+            one_ch: &one_ch,
+        },
+    )
+}
+
+/// [`write_ice_body_acpl`] with **real** (synthesis-driven) A-SPX
+/// payload rows. The ACPL / AJCC-family roster carries exactly
+/// 3× `aspx_data_2ch()` + 1× `aspx_data_1ch()`; per the decoder's
+/// Table 8 association the payloads extend the **tracks** `(A, B)`,
+/// `(D, F)`, `(E, G)` and `C`, so `rows.two_ch` (length 3) carries the
+/// per-track-pair rows in that order and `rows.one_ch` the C-track
+/// rows.
+#[allow(clippy::too_many_arguments)]
+pub fn write_ice_body_acpl_real(
+    bw: &mut BitWriter,
+    mode: IceCodecMode,
+    core: &[&[f32]; 5],
+    add_pair: [&[f32]; 2],
+    scpl_pairs: &[[&[f32]; 2]],
+    acpl: &IceAcplParams<'_>,
+    aspx_cfg: &AspxConfig,
+    lfe: Option<(&[f32], u32)>,
+    b_5fronts: bool,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+    rows: &IceAspxRows<'_>,
+) -> Result<()> {
     let is_acpl1 = match mode {
         IceCodecMode::AspxAcpl1 => true,
         IceCodecMode::AspxAcpl2 => false,
         _ => return Err(Error::invalid("ac4: write_ice_body_acpl mode")),
     };
+    if rows.two_ch.len() != 3 {
+        return Err(Error::invalid("ac4: ice acpl 2ch payload count"));
+    }
     let want_pairs = if is_acpl1 {
         if b_5fronts {
             3
@@ -1352,11 +1570,10 @@ pub fn write_ice_body_acpl(
         max_sfb,
     )?;
     // A-SPX roster: 3× 2ch (7CH_STATIC) + 1ch.
-    let rows = MinimalAspxRows::derive(aspx_cfg)?;
-    for _ in 0..3 {
-        rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    for r in rows.two_ch {
+        r.write(bw, aspx_cfg, b_iframe)?;
     }
-    rows.write_1ch(bw, aspx_cfg, b_iframe)?;
+    rows.one_ch.write(bw, aspx_cfg, b_iframe)?;
     // S-CPL section (ASPX_ACPL_1 only).
     if is_acpl1 {
         for p in &scpl_pairs[..2] {
@@ -1420,6 +1637,40 @@ pub fn write_22_2_body(
     transform_length: u32,
     max_sfb: u32,
 ) -> Result<()> {
+    let two_ch = match aspx_cfg {
+        Some(cfg) => vec![MinimalAspxRows::derive(cfg)?.rows_2ch(); 11],
+        None => Vec::new(),
+    };
+    write_22_2_body_real(
+        bw,
+        lfe,
+        pairs,
+        aspx_cfg,
+        b_iframe,
+        transform_length,
+        max_sfb,
+        &two_ch,
+    )
+}
+
+/// [`write_22_2_body`] with **real** (synthesis-driven) A-SPX payload
+/// rows: one [`IceAspx2chRows`] per Table 21 channel pair in
+/// transmission order (ignored — pass an empty slice — for the Simple
+/// mode).
+#[allow(clippy::too_many_arguments)]
+pub fn write_22_2_body_real(
+    bw: &mut BitWriter,
+    lfe: [(&[f32], u32); 2],
+    pairs: &[[&[f32]; 2]; 11],
+    aspx_cfg: Option<&AspxConfig>,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+    aspx_rows: &[IceAspx2chRows],
+) -> Result<()> {
+    if aspx_cfg.is_some() && aspx_rows.len() != 11 {
+        return Err(Error::invalid("ac4: 22_2 aspx payload count"));
+    }
     bw.write_bit(aspx_cfg.is_some()); // 22_2_codec_mode (Table 98)
     if let (true, Some(cfg)) = (b_iframe, aspx_cfg) {
         crate::encoder_acpl3::write_aspx_config(bw, cfg);
@@ -1442,9 +1693,8 @@ pub fn write_22_2_body(
         )?;
     }
     if let Some(cfg) = aspx_cfg {
-        let rows = MinimalAspxRows::derive(cfg)?;
-        for _ in 0..11 {
-            rows.write_2ch(bw, cfg, b_iframe)?;
+        for r in aspx_rows {
+            r.write(bw, cfg, b_iframe)?;
         }
     }
     Ok(())

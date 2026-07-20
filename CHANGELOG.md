@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 419 — **encoder ICE synthesis parity** (ETSI TS 103
+  190-2 §6.2.4.1-3):
+  1. Real-A-SPX payload plumbing for the immersive body writers:
+     `IceAspxChannelRows` / `IceAspx2chRows` / `IceAspx1chRows` /
+     `IceAspxRows` carry per-payload SIGNAL / NOISE FREQ-DPCM
+     quant-index rows plus `aspx_tna_mode` / `aspx_add_harmonic`, and
+     the new `write_ice_body_aspx_scpl_real` /
+     `write_ice_body_acpl_real` / `write_22_2_body_real` writers
+     splice them onto the wire at the mode's roster positions. The
+     historical minimal writers delegate with floored-noise rows —
+     wire bytes unchanged.
 - ac4 round 417 — **immersive synthesis remainders to PCM** (ETSI
   TS 103 190-1/-2). Seven landings:
   1. **`sap_mode == 2` fix** (part-1 Table 114): the chparam_info
