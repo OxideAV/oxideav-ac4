@@ -893,6 +893,24 @@ pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
     apply_companding_on_qmf_with_mode(q, sbx, sbz, CompandingMode::PerSlot);
 }
 
+/// PCM scale applied entering the §5.7.6.2 analysis filterbank (and
+/// removed after the §5.7.6.5 synthesis) on the A-SPX extension chain.
+///
+/// The A-SPX envelope machinery anchors **absolute** levels at an
+/// integer-PCM scale: Pseudocode 82 dequantises `scf = 64·2^(q/a)`
+/// against the **unsigned** SIGNAL F0 codebooks (Tables A.16/A.19 —
+/// index 0 is the darkest representable envelope), Pseudocode 95 adds
+/// `ε = 1` to the estimated tile energy, and the §5.7.5.2 companding
+/// levels are raised to `(1−α)/α` directly. Running the in-tree float
+/// (±1,0) pipeline through those anchors parks real signals at the
+/// codebook floor — a genuinely HF-silent channel and a full-scale one
+/// quantise to nearly the same F0. Scaling by 2¹⁵ on the way into the
+/// QMF domain (and back out after synthesis) puts the anchors at
+/// their intended magnitudes; the parametric tools between analysis
+/// and synthesis are level-linear, so only the absolute-anchored
+/// stages change behaviour.
+pub const ASPX_QMF_PCM_SCALE: f32 = 32768.0;
+
 /// Companding alpha coefficient per §5.7.5.2.
 const COMPANDING_ALPHA: f32 = 0.65;
 

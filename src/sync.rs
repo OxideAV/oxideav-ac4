@@ -43,6 +43,23 @@ pub struct SyncFrame<'a> {
 
 /// Find the next AC-4 sync frame in `data`. Returns `None` if no valid
 /// sync word is found or if the frame extends past the buffer.
+/// Parse a sync frame anchored at the **start** of `data` — the
+/// packet-boundary form used by the decoder's per-packet dispatch. A
+/// packet either is sync-wrapped (sync word first) or is a bare
+/// `raw_ac4_frame`; scanning for a sync word at arbitrary offsets
+/// (see [`find_sync_frame`]) would let a chance `0xAC40` byte pair
+/// inside a bare frame's payload hijack the parse.
+pub fn parse_sync_frame_at_start(data: &[u8]) -> Option<SyncFrame<'_>> {
+    if data.len() < 4 {
+        return None;
+    }
+    let sync = u16::from_be_bytes([data[0], data[1]]);
+    if sync != SYNC_WORD_PLAIN && sync != SYNC_WORD_CRC {
+        return None;
+    }
+    try_parse_frame_at(data, 0).ok()
+}
+
 pub fn find_sync_frame(data: &[u8]) -> Option<SyncFrame<'_>> {
     if data.len() < 4 {
         return None;

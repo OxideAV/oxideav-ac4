@@ -241,7 +241,8 @@ impl Ac4Decoder {
         }
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         let n_slots = pcm.len() / NUM_QMF;
-        let slots = self.ice_track_ana[track].process_block(pcm);
+        let scaled: Vec<f32> = pcm.iter().map(|&v| v * aspx::ASPX_QMF_PCM_SCALE).collect();
+        let slots = self.ice_track_ana[track].process_block(&scaled);
         let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF)
             .map(|_| vec![(0.0f32, 0.0f32); n_slots])
             .collect();
@@ -263,7 +264,7 @@ impl Ac4Decoder {
     }
 
     fn extract_raw_frame<'a>(&self, pkt: &'a Packet) -> Result<(&'a [u8], bool)> {
-        if let Some(f) = sync::find_sync_frame(&pkt.data) {
+        if let Some(f) = sync::parse_sync_frame_at_start(&pkt.data) {
             // Annex G.4.2: verify the 0xAC41 crc_word over frame_size +
             // raw_ac4_frame; a mismatch means the frame is corrupt.
             if f.crc_valid == Some(false) {
@@ -402,7 +403,13 @@ impl Ac4Decoder {
         // Forward QMF analysis on the low-band PCM through the
         // channel's streaming bank (§5.7.6.2) — the delay line carries
         // across frames so there is no per-frame warm-up transient.
-        let slots = state.analysis.process_block(pcm_in);
+        // The A-SPX QMF domain runs at the spec's integer-PCM scale
+        // (see [`aspx::ASPX_QMF_PCM_SCALE`]); synthesis removes it.
+        let scaled: Vec<f32> = pcm_in
+            .iter()
+            .map(|&v| v * aspx::ASPX_QMF_PCM_SCALE)
+            .collect();
+        let slots = state.analysis.process_block(&scaled);
         // Re-layout to q[sb][ts].
         let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF)
             .map(|_| vec![(0.0f32, 0.0f32); n_slots])
@@ -630,6 +637,7 @@ impl Ac4Decoder {
             return Vec::new();
         }
         let n_slots = out_len / NUM_QMF;
+        let inv_scale = 1.0 / aspx::ASPX_QMF_PCM_SCALE;
         let mut out = Vec::with_capacity(out_len);
         #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-2 §4.4.7 q[sb][ts] indexing
         for ts in 0..n_slots {
@@ -638,7 +646,7 @@ impl Ac4Decoder {
                 *s = q[sb][ts];
             }
             let row = syn.process_slot(&slot);
-            out.extend_from_slice(&row);
+            out.extend(row.iter().map(|&v| v * inv_scale));
         }
         out
     }
@@ -2000,7 +2008,8 @@ impl Ac4Decoder {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         let n_slots = pcm.len() / NUM_QMF;
         let mut ana = qmf::QmfAnalysisBank::new();
-        let slots = ana.process_block(pcm);
+        let scaled: Vec<f32> = pcm.iter().map(|&v| v * aspx::ASPX_QMF_PCM_SCALE).collect();
+        let slots = ana.process_block(&scaled);
         let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF)
             .map(|_| vec![(0.0f32, 0.0f32); n_slots])
             .collect();
@@ -2478,13 +2487,14 @@ impl Ac4Decoder {
                                     (12, 10),
                                 ]
                             };
+                            let inv_scale = 1.0 / aspx::ASPX_QMF_PCM_SCALE;
                             for &(zi, slot) in z_to_slot {
                                 let Some(zm) = &z[zi] else { continue };
                                 let syn = self.ice_out_syn_bank(slot);
                                 let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
                                 for col in zm.iter().take(num_ts) {
                                     let row = syn.process_slot(col);
-                                    pcm.extend_from_slice(&row);
+                                    pcm.extend(row.iter().map(|&v| v * inv_scale));
                                 }
                                 chans[slot] = pcm;
                             }
@@ -2591,13 +2601,14 @@ impl Ac4Decoder {
                         } else {
                             vec![0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12]
                         };
+                        let inv_scale = 1.0 / aspx::ASPX_QMF_PCM_SCALE;
                         for (out_idx, zi) in z_order.into_iter().enumerate() {
                             let zm = &z[zi];
                             let syn = self.ice_out_syn_bank(out_idx);
                             let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
                             for col in zm.iter().take(num_ts) {
                                 let row = syn.process_slot(col);
-                                pcm.extend_from_slice(&row);
+                                pcm.extend(row.iter().map(|&v| v * inv_scale));
                             }
                             chans[out_idx] = pcm;
                         }

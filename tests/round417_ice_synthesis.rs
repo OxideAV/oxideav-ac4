@@ -744,13 +744,16 @@ fn ice_ajcc_companding_applies_per_input_channel() {
         d_r < 1.0,
         "the R input stays uncompanded — R decodes identically ({d_r})"
     );
-    // Sanity: companding reshapes the slot gains — it neither
-    // silences nor blows up the channel (the full-scale test HF plus
-    // i16 clipping makes finer tone-level pins unreliable here).
+    // Sanity: companding reshapes the slot gains without silencing
+    // the channel. With the §5.7.5.2 levels now anchored at the
+    // integer-PCM scale the decoder-side expansion applies a large
+    // absolute gain when no encoder-side pre-companding preceded it
+    // (this synthetic frame never was companded on the way in), so the
+    // upper bound only guards against a runaway beyond the i16 clamp.
     let e_ratio = energy(&companded[0]) / energy(&plain[0]).max(1.0);
     assert!(
-        (0.1..=10.0).contains(&e_ratio),
-        "companded L stays at a sane level ({e_ratio})"
+        (0.1..=1.0e4).contains(&e_ratio),
+        "companded L stays within the clamp-bounded range ({e_ratio})"
     );
 }
 

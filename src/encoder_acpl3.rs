@@ -5258,6 +5258,216 @@ pub fn extract_aspx_noise_envelope_scf_from_qmf(
         .collect()
 }
 
+/// Extract a single-envelope per-noise-SBG **ratio** `scf_noise`
+/// vector from an HF QMF matrix — the tonal-to-noise semantics the
+/// decoder's §5.7.6.4.2.1 Pseudocode 94 consumes (`noise_lev² =
+/// scf_sig · noise/(1 + noise)`, i.e. `scf_noise` splits the SIGNAL
+/// envelope's energy between the patched/tonal part and injected
+/// noise), rather than an absolute band energy.
+///
+/// Per noise subband group the noise fraction is estimated from the
+/// group's spectral peakiness: with `e_peak` the loudest subband's
+/// mean energy and `e_total` the group total,
+/// `noise_frac = 1 − e_peak / e_total` — a single dominant partial
+/// (tonal content the HF generator can transpose) drives the fraction
+/// to 0, while energy spread evenly across the group's `n` subbands
+/// drives it to `1 − 1/n`. The coded ratio is
+/// `noise_frac / (1 − noise_frac)`, which the decoder's
+/// `noise/(1 + noise)` maps back onto exactly `noise_frac`. A
+/// zero-energy group returns ratio 0 (the noise row then quantises to
+/// the dark end of Pseudocode 83).
+///
+/// The estimator itself is an encoder policy (the spec leaves noise
+/// estimation informative); the mapping onto the wire is the exact
+/// Pseudocode 83/94 inverse.
+pub fn extract_aspx_noise_ratio_scf_from_qmf(
+    q_high: &[Vec<(f32, f32)>],
+    sbg_noise_borders: &[u32],
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+    sbx: u32,
+) -> Vec<f32> {
+    if sbg_noise_borders.len() < 2 || aspx_frame_ts_count == 0 || num_ts_in_ats == 0 {
+        return Vec::new();
+    }
+    let tsz = (aspx_frame_ts_count * num_ts_in_ats) as usize;
+    let num_sbg = sbg_noise_borders.len() - 1;
+    let mut out = Vec::with_capacity(num_sbg);
+    for sbg in 0..num_sbg {
+        let lo = sbg_noise_borders[sbg].max(sbx) as usize;
+        let hi = sbg_noise_borders[sbg + 1].max(sbx) as usize;
+        let mut e_total = 0.0f64;
+        let mut e_peak = 0.0f64;
+        for row in q_high.iter().take(hi).skip(lo) {
+            let mut e_sb = 0.0f64;
+            for &(re, im) in row.iter().take(tsz) {
+                e_sb += (re as f64) * (re as f64) + (im as f64) * (im as f64);
+            }
+            e_total += e_sb;
+            if e_sb > e_peak {
+                e_peak = e_sb;
+            }
+        }
+        let ratio = if e_total > 0.0 && e_peak < e_total {
+            let noise_frac = 1.0 - e_peak / e_total;
+            (noise_frac / (1.0 - noise_frac)).max(0.0)
+        } else {
+            0.0
+        };
+        out.push(ratio as f32);
+    }
+    out
+}
+
+/// Predict, per NOISE subband group, the fraction of the target
+/// envelope energy the decoder's HF generator can deliver from its
+/// patch tiles — the encoder-side mirror of the §5.7.6.4.1.4
+/// Pseudocode 89 tile mapping composed with the §5.7.6.4.2.2
+/// Pseudocode 95 gain (`patched_out = est/(1+est) · scf/(1+noise)`;
+/// with an (near-)empty patch source `est ≪ 1` the compensatory gain
+/// cannot resurrect energy that is not there, and the envelope's
+/// energy must instead be carried by injected noise).
+///
+/// For each regenerated subband the tile source subband is derived
+/// from the same Pseudocode 71 patch tables the decoder uses, its
+/// per-sample energy `est` is measured on the encoder's own low band
+/// (which is what the decoder will patch from, up to core coding
+/// error), and the deliverable fraction `est/(1+est)` is averaged
+/// across each noise group weighted by the target subband energies.
+/// Groups with a silent target return fraction 1 (nothing needs
+/// compensating).
+#[allow(clippy::too_many_arguments)]
+pub fn predict_aspx_patch_delivery_fraction_from_qmf(
+    q: &[Vec<(f32, f32)>],
+    tables: &crate::aspx::AspxFrequencyTables,
+    master_freq_scale_highres: bool,
+    sbg_noise_borders: &[u32],
+    tna_mode: &[u8],
+    preflat: bool,
+    num_ts_in_ats: u32,
+    aspx_frame_ts_count: u32,
+) -> Vec<f32> {
+    let num_groups = sbg_noise_borders.len().saturating_sub(1);
+    let mut out = vec![1.0f32; num_groups];
+    let patches = crate::aspx::derive_patch_tables(
+        &tables.sbg_master,
+        tables.num_sbg_master,
+        tables.sba,
+        tables.sbx,
+        tables.num_sb_aspx,
+        true,
+        master_freq_scale_highres,
+    );
+    if patches.num_sbg_patches == 0 || num_groups == 0 || tables.sba == 0 {
+        return out;
+    }
+    let mean_energy = |sb: usize| -> f64 {
+        let Some(row) = q.get(sb) else { return 0.0 };
+        if row.is_empty() {
+            return 0.0;
+        }
+        row.iter()
+            .map(|&(re, im)| (re as f64) * (re as f64) + (im as f64) * (im as f64))
+            .sum::<f64>()
+            / row.len() as f64
+    };
+    // Mirror the tile-generation front half on the encoder's own low
+    // band: Pseudocode 86-88 covariance → alphas → steady-state chirp
+    // per group (TAB_NEW_CHIRP[t][t] — the smoothing fixed point for a
+    // stationary tna decision), then the Pseudocode 89 inverse filter
+    // + optional inverse pre-flatten gain, measuring the post-filter
+    // (residual) source energy per subband.
+    let sba = tables.sba as usize;
+    let q_low: Vec<Vec<(f32, f32)>> = q.iter().take(sba).map(|row| row.to_vec()).collect();
+    let q_low_ext = crate::aspx_tns::build_q_low_ext(&q_low, &[], tables.sba);
+    let cov = crate::aspx_tns::compute_covariance(&q_low_ext, tables.sba);
+    let (alpha0, alpha1) = crate::aspx_tns::compute_alphas(&cov);
+    let preflat_gains = if preflat && aspx_frame_ts_count > 0 {
+        let atsg_sig = [0u32, aspx_frame_ts_count];
+        Some(crate::aspx_tns::compute_preflat_gains(
+            &q_low,
+            tables.sbx,
+            &atsg_sig,
+            num_ts_in_ats,
+        ))
+    } else {
+        None
+    };
+    let resid_energy = |p: usize, c: f32| -> f64 {
+        let Some(row) = q_low_ext.get(p) else {
+            return 0.0;
+        };
+        if row.len() < 5 {
+            return mean_energy(p);
+        }
+        let a0 = alpha0.get(p).copied().unwrap_or((0.0, 0.0));
+        let a1 = alpha1.get(p).copied().unwrap_or((0.0, 0.0));
+        let c2 = c * c;
+        let mut acc = 0.0f64;
+        let mut n_cnt = 0usize;
+        for n in 4..row.len() {
+            let x = row[n];
+            let mut s = x;
+            if c > 0.0 {
+                let z = row[n - 2];
+                s.0 += c * (a0.0 * z.0 - a0.1 * z.1);
+                s.1 += c * (a0.0 * z.1 + a0.1 * z.0);
+                let z = row[n - 4];
+                s.0 += c2 * (a1.0 * z.0 - a1.1 * z.1);
+                s.1 += c2 * (a1.0 * z.1 + a1.1 * z.0);
+            }
+            let mut e = (s.0 as f64) * (s.0 as f64) + (s.1 as f64) * (s.1 as f64);
+            if let Some(gv) = &preflat_gains {
+                if let Some(&g_p) = gv.get(p) {
+                    if g_p != 0.0 {
+                        e /= (g_p as f64) * (g_p as f64);
+                    }
+                }
+            }
+            acc += e;
+            n_cnt += 1;
+        }
+        if n_cnt == 0 {
+            0.0
+        } else {
+            acc / n_cnt as f64
+        }
+    };
+    // Per regenerated subband: target energy + deliverable fraction.
+    let sbz = tables.sbz as usize;
+    let mut acc_num = vec![0.0f64; num_groups];
+    let mut acc_den = vec![0.0f64; num_groups];
+    let mut sum_sb_patches = 0u32;
+    for i in 0..(patches.num_sbg_patches as usize) {
+        for sb_off in 0..patches.sbg_patch_num_sb[i] {
+            let sb_high = (tables.sbx + sum_sb_patches + sb_off) as usize;
+            if sb_high >= sbz {
+                continue;
+            }
+            let g = sbg_noise_borders
+                .iter()
+                .take(num_groups)
+                .rposition(|&b| (b as usize) <= sb_high)
+                .unwrap_or(0);
+            let t = tna_mode.get(g).copied().unwrap_or(0).min(3) as usize;
+            let c = crate::aspx_tns::TAB_NEW_CHIRP[t][t];
+            let src = (patches.sbg_patch_start_sb[i] + sb_off) as usize;
+            let est = resid_energy(src, c);
+            let f = est / (1.0 + est);
+            let target = mean_energy(sb_high);
+            acc_num[g] += target * f;
+            acc_den[g] += target;
+        }
+        sum_sb_patches += patches.sbg_patch_num_sb[i];
+    }
+    for g in 0..num_groups {
+        if acc_den[g] > 0.0 {
+            out[g] = (acc_num[g] / acc_den[g]) as f32;
+        }
+    }
+    out
+}
+
 /// Per-channel HF QMF + SBG-border bundle consumed by
 /// [`build_aspx_real_envelope_channel_from_qmf`].
 ///

@@ -431,6 +431,16 @@ impl Ac4ImsEncoder {
     }
 }
 
+/// Scale a PCM slice into the A-SPX QMF integer-PCM domain
+/// ([`crate::aspx::ASPX_QMF_PCM_SCALE`]) before feeding an analysis
+/// bank — the encoder-side mirror of the decoder's scaled analysis,
+/// keeping the envelope quantisers' absolute anchors calibrated.
+fn aspx_scaled_pcm(pcm: &[f32]) -> Vec<f32> {
+    pcm.iter()
+        .map(|&v| v * crate::aspx::ASPX_QMF_PCM_SCALE)
+        .collect()
+}
+
 impl Default for Ac4ImsEncoder {
     fn default() -> Self {
         Self::new()
@@ -3040,8 +3050,8 @@ impl Ac4ImsEncoder {
         let usable = n_slots * 64;
         let mut bank_l = crate::qmf::QmfAnalysisBank::new();
         let mut bank_r = crate::qmf::QmfAnalysisBank::new();
-        let slots_l = bank_l.process_block(&pcm_l[..usable]);
-        let slots_r = bank_r.process_block(&pcm_r[..usable]);
+        let slots_l = bank_l.process_block(&aspx_scaled_pcm(&pcm_l[..usable]));
+        let slots_r = bank_r.process_block(&aspx_scaled_pcm(&pcm_r[..usable]));
         let q_high_l = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots_l);
         let q_high_r = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots_r);
 
@@ -3097,7 +3107,7 @@ impl Ac4ImsEncoder {
         }
         let usable = n_slots * 64;
         let mut bank = crate::qmf::QmfAnalysisBank::new();
-        let slots = bank.process_block(&pcm_l[..usable]);
+        let slots = bank.process_block(&aspx_scaled_pcm(&pcm_l[..usable]));
         let q_sb_major = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
         // Take the low band (subbands 0..sba) and build the extended
         // low-band matrix the covariance analysis consumes.
@@ -3153,7 +3163,7 @@ impl Ac4ImsEncoder {
         }
         let usable = n_slots * 64;
         let mut bank = crate::qmf::QmfAnalysisBank::new();
-        let slots = bank.process_block(&pcm[..usable]);
+        let slots = bank.process_block(&aspx_scaled_pcm(&pcm[..usable]));
         let q_sb_major = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
         let sba = tables.sba as usize;
         let q_low: Vec<Vec<(f32, f32)>> = q_sb_major
@@ -3194,7 +3204,7 @@ impl Ac4ImsEncoder {
         }
         let usable = n_slots * 64;
         let mut bank = crate::qmf::QmfAnalysisBank::new();
-        let slots = bank.process_block(&pcm[..usable]);
+        let slots = bank.process_block(&aspx_scaled_pcm(&pcm[..usable]));
         let q_high = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
         crate::aspx_ah_select::select_add_harmonic(&q_high, &tables.sbg_sig_highres, tables.sbx)
     }
@@ -3244,8 +3254,8 @@ impl Ac4ImsEncoder {
         let usable = n_slots * 64;
         let mut bank_l = crate::qmf::QmfAnalysisBank::new();
         let mut bank_r = crate::qmf::QmfAnalysisBank::new();
-        let slots_l = bank_l.process_block(&pcm_l[..usable]);
-        let slots_r = bank_r.process_block(&pcm_r[..usable]);
+        let slots_l = bank_l.process_block(&aspx_scaled_pcm(&pcm_l[..usable]));
+        let slots_r = bank_r.process_block(&aspx_scaled_pcm(&pcm_r[..usable]));
         let q_high_l = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots_l);
         let q_high_r = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots_r);
 
@@ -4123,7 +4133,7 @@ impl Ac4ImsEncoder {
         }
         let usable = n_slots * 64;
         let mut bank = crate::qmf::QmfAnalysisBank::new();
-        let slots = bank.process_block(&pcm[..usable]);
+        let slots = bank.process_block(&aspx_scaled_pcm(&pcm[..usable]));
         let q_high = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
 
         let ch = crate::encoder_acpl3::AspxQmfEnvelopeChannel {
@@ -4180,7 +4190,7 @@ impl Ac4ImsEncoder {
         }
         let usable = n_slots * 64;
         let mut bank = crate::qmf::QmfAnalysisBank::new();
-        let slots = bank.process_block(&pcm[..usable]);
+        let slots = bank.process_block(&aspx_scaled_pcm(&pcm[..usable]));
         let q_high = crate::encoder_acpl3::qmf_slots_to_sb_major(&slots);
 
         let max_num_env = 1u32 << ((1u32 << aspx_cfg.fixfix_tmp_num_env_bits()) - 1);
@@ -6594,7 +6604,7 @@ impl Ac4ImsEncoder {
         }
         let n_slots = pcm.len() / 64;
         let usable = n_slots * 64;
-        let slots = self.ice_env_ana[chan_idx].process_block(&pcm[..usable]);
+        let slots = self.ice_env_ana[chan_idx].process_block(&aspx_scaled_pcm(&pcm[..usable]));
         crate::encoder_acpl3::qmf_slots_to_sb_major(&slots)
     }
 
@@ -6608,6 +6618,8 @@ impl Ac4ImsEncoder {
         aspx_cfg: &crate::aspx::AspxConfig,
         frame_len: u32,
         q: &[Vec<(f32, f32)>],
+        tna_mode: &[u8],
+        preflat: bool,
     ) -> crate::ice::IceAspxChannelRows {
         let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
             return crate::ice::IceAspxChannelRows {
@@ -6625,19 +6637,94 @@ impl Ac4ImsEncoder {
                 ah: Vec::new(),
             };
         }
-        let ch = crate::encoder_acpl3::AspxQmfEnvelopeChannel {
-            q_high: q,
-            sbg_sig_borders: &tables.sbg_sig_highres,
-            sbg_noise_borders: &tables.sbg_noise,
-        };
-        let (sig, noise) = crate::encoder_acpl3::build_aspx_real_envelope_channel_from_qmf(
-            &ch,
-            aspx_cfg.quant_mode_env,
-            64,
+        // SIGNAL: absolute per-SBG envelope energies (Pseudocode 82
+        // inverse). NOISE: tonal-to-noise **ratios** (Pseudocode 94
+        // semantics) rather than absolute band energies.
+        let sig_scf = crate::encoder_acpl3::extract_aspx_sig_envelope_scf_from_qmf(
+            q,
+            &tables.sbg_sig_highres,
             num_ts_in_ats,
             aspx_frame_ts_count,
             tables.sbx,
         );
+        let noise_scf = crate::encoder_acpl3::extract_aspx_noise_ratio_scf_from_qmf(
+            q,
+            &tables.sbg_noise,
+            num_ts_in_ats,
+            aspx_frame_ts_count,
+            tables.sbx,
+        );
+        // Patch-delivery compensation. The decoder reconstructs each
+        // regenerated band as `scf·(f + κ·n)/(1 + n)`: `f = est/(1+est)`
+        // is the fraction the Pseudocode-95 gain can deliver from the
+        // (TNS-whitened) patch tile, `n` the coded noise ratio, and
+        // `κ` the synthesis efficiency of i.i.d. injected subband
+        // noise through the real-output filterbank (the §5.7.6.4.3
+        // noise samples lack the inter-slot correlation of analysed
+        // content, so the overlapped synthesis realises only ~40 % of
+        // their subband energy in PCM — calibrated against the
+        // in-tree §5.7.6.2/5.7.6.5 banks). The encoder (1) raises the
+        // noise ratio where the tile source cannot carry the target,
+        // and (2) scales the coded SIGNAL envelope by the inverse
+        // predicted delivery so the decoded band lands on the true
+        // level (everything downstream is linear in `scf`).
+        const NOISE_SYNTH_EFF: f32 = 0.4; // κ
+        let delivery = crate::encoder_acpl3::predict_aspx_patch_delivery_fraction_from_qmf(
+            q,
+            &tables,
+            matches!(
+                aspx_cfg.master_freq_scale,
+                crate::aspx::AspxMasterFreqScale::HighRes
+            ),
+            &tables.sbg_noise,
+            tna_mode,
+            preflat,
+            num_ts_in_ats,
+            aspx_frame_ts_count,
+        );
+        let mut t_group = vec![1.0f32; noise_scf.len()];
+        let noise_scf: Vec<f32> = noise_scf
+            .iter()
+            .enumerate()
+            .map(|(g, &tonality)| {
+                let f = delivery.get(g).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+                let n = if f >= 0.95 || f >= NOISE_SYNTH_EFF {
+                    tonality
+                } else {
+                    // Patch cannot carry the band: lean on noise.
+                    tonality.max(16.0)
+                };
+                let t = ((f + NOISE_SYNTH_EFF * n) / (1.0 + n)).clamp(0.2, 1.0);
+                t_group[g] = t;
+                n
+            })
+            .collect();
+        // (2) inverse-delivery boost on the SIGNAL envelope, per
+        // signal subband group (keyed into its covering noise group).
+        let sig_scf: Vec<f32> = sig_scf
+            .iter()
+            .enumerate()
+            .map(|(sg, &v)| {
+                let lo = tables
+                    .sbg_sig_highres
+                    .get(sg)
+                    .copied()
+                    .unwrap_or(tables.sbx);
+                let g = tables
+                    .sbg_noise
+                    .iter()
+                    .take(t_group.len())
+                    .rposition(|&b| b <= lo)
+                    .unwrap_or(0);
+                v / t_group.get(g).copied().unwrap_or(1.0).max(0.2)
+            })
+            .collect();
+        let sig = crate::encoder_acpl3::extract_aspx_sig_envelope_indices(
+            &sig_scf,
+            aspx_cfg.quant_mode_env,
+            64,
+        );
+        let noise = crate::encoder_acpl3::extract_aspx_noise_envelope_indices(&noise_scf);
         let noise = if noise.is_empty() { vec![30] } else { noise };
         let ah = crate::aspx_ah_select::select_add_harmonic(q, &tables.sbg_sig_highres, tables.sbx);
         crate::ice::IceAspxChannelRows { sig, noise, ah }
@@ -6685,33 +6772,42 @@ impl Ac4ImsEncoder {
         crate::aspx_preflat_select::select_preflat(&q_low, tables.sba, &atsg_sig, num_ts_in_ats)
     }
 
-    /// Assemble one real `aspx_data_2ch()` payload row set from two
-    /// already-analysed channel matrices (`aspx_tna_mode` derives from
-    /// the primary and mirrors to the secondary under the balance
-    /// coding).
-    fn ice_2ch_rows_from_matrices(
+    /// Assemble one real `aspx_data_2ch()` ICE payload row set from two
+    /// analysed channel matrices — public for round-trip validation
+    /// harnesses that re-derive the wire rows independently.
+    #[doc(hidden)]
+    pub fn ice_2ch_rows_from_matrices(
         aspx_cfg: &crate::aspx::AspxConfig,
         frame_len: u32,
         q0: &[Vec<(f32, f32)>],
         q1: &[Vec<(f32, f32)>],
     ) -> crate::ice::IceAspx2chRows {
+        let tna = Self::ice_tna_from_matrix(aspx_cfg, q0);
+        // The balance-coded secondary carries no aspx_hfgen_iwc of its
+        // own — the decoder runs it through the bare tile copy (no TNS
+        // whitening, no pre-flattening), so its delivery prediction
+        // models an unfiltered patch.
+        let ch1 = Self::ice_rows_from_matrix(aspx_cfg, frame_len, q1, &[], false);
         crate::ice::IceAspx2chRows {
-            ch0: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q0),
-            ch1: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q1),
-            tna: Self::ice_tna_from_matrix(aspx_cfg, q0),
+            ch0: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q0, &tna, aspx_cfg.preflat),
+            ch1,
+            tna,
         }
     }
 
-    /// Assemble one real `aspx_data_1ch()` payload row set from an
-    /// already-analysed channel matrix.
-    fn ice_1ch_rows_from_matrix(
+    /// Assemble one real `aspx_data_1ch()` ICE payload row set from an
+    /// analysed channel matrix — public for round-trip validation
+    /// harnesses.
+    #[doc(hidden)]
+    pub fn ice_1ch_rows_from_matrix(
         aspx_cfg: &crate::aspx::AspxConfig,
         frame_len: u32,
         q: &[Vec<(f32, f32)>],
     ) -> crate::ice::IceAspx1chRows {
+        let tna = Self::ice_tna_from_matrix(aspx_cfg, q);
         crate::ice::IceAspx1chRows {
-            ch: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q),
-            tna: Self::ice_tna_from_matrix(aspx_cfg, q),
+            ch: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q, &tna, aspx_cfg.preflat),
+            tna,
         }
     }
 

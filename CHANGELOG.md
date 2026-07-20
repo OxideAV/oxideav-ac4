@@ -28,6 +28,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      did. A fresh per-frame bank put a ~640-sample broadband warm-up
      transient at the head of every decoded frame on every
      A-SPX-extended channel.
+  3. **Integer-PCM scale anchors on the A-SPX QMF domain**
+     (`ASPX_QMF_PCM_SCALE`): the envelope machinery anchors absolute
+     levels (Pseudocode 82's `scf = 64·2^(q/a)` against unsigned F0
+     codebooks, Pseudocode 95's `ε = 1`, the §5.7.5.2 companding
+     levels); running the float ±1,0 pipeline through them parked
+     every real signal at the codebook floor, so a genuinely
+     HF-silent channel and a full-scale one coded nearly the same
+     envelope. PCM scales by 2¹⁵ into the analysis bank and back out
+     after synthesis on the extension chain (decoder + encoder
+     extraction alike).
+  4. **Packet sync detection anchored at offset 0**
+     (`parse_sync_frame_at_start`): the per-packet dispatch scanned
+     the whole payload for `0xAC40`/`0xAC41`, letting a chance byte
+     pair inside a bare `raw_ac4_frame` hijack the decode.
+  5. **ASPX_SCPL encode from PCM** — `encode_frame_pcm_7_0_4_ice_aspx_scpl`
+     / `encode_frame_pcm_7_1_4_ice_aspx_scpl`: exact Table 23 +
+     §4.8.3.11.3 matrix inverse to the eleven SMP tracks, persistent
+     per-track TDAC MDCT states, and real per-Table-8-group A-SPX
+     synthesis — SIGNAL envelopes from the decoupled channels' HF,
+     NOISE coded as the Pseudocode-94 tonal-to-noise **ratio**
+     (`extract_aspx_noise_ratio_scf_from_qmf`), and a patch-delivery
+     model (`predict_aspx_patch_delivery_fraction_from_qmf` —
+     Pseudocode 71 tile mapping + Pseudocode 86-89 TNS whitening on
+     the encoder's own low band) that raises the noise ratio where
+     the tile source cannot carry the target and scales the coded
+     SIGNAL envelope by the inverse predicted delivery. Round-trip:
+     ≤ 6,2 % settled relative RMS error on all 11 channels (LFE
+     3,6 %), regenerated HF within 3 dB of the input band with
+     HF-silent channels ≥ 13 dB down, and the emitted bitstream
+     re-reads to exactly the extractor's envelope rows.
 - ac4 round 417 — **immersive synthesis remainders to PCM** (ETSI
   TS 103 190-1/-2). Seven landings:
   1. **`sap_mode == 2` fix** (part-1 Table 114): the chparam_info

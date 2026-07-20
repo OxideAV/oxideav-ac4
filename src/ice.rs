@@ -1081,7 +1081,7 @@ pub fn write_ice_body_ajcc_with_companding(
     write_five_channel_data_simple(bw, core, transform_length, max_sfb)?;
     // A-SPX: 2× aspx_data_2ch + 1× aspx_data_1ch (5CH_DYNAMIC).
     let rows = if loud_hf {
-        MinimalAspxRows::derive_with_noise_floor(aspx_cfg, 0)?
+        MinimalAspxRows::derive_loud(aspx_cfg)?
     } else {
         MinimalAspxRows::derive(aspx_cfg)?
     };
@@ -1111,6 +1111,20 @@ struct MinimalAspxRows {
 impl MinimalAspxRows {
     fn derive(aspx_cfg: &AspxConfig) -> Result<Self> {
         Self::derive_with_noise_floor(aspx_cfg, 30)
+    }
+
+    /// Loud-HF variant for the companding round-trip harness: a
+    /// mid-codebook SIGNAL F0 (`qsig = 46` → `scf = 64·2²³`, near a
+    /// full-scale subband at the [`crate::aspx::ASPX_QMF_PCM_SCALE`]
+    /// integer-PCM anchor) plus the full `qnoise = 0` noise ratio, so
+    /// the §5.7.5 companding gains act on a measurable regenerated
+    /// band.
+    fn derive_loud(aspx_cfg: &AspxConfig) -> Result<Self> {
+        let mut rows = Self::derive_with_noise_floor(aspx_cfg, 0)?;
+        if let Some(f0) = rows.sig_row.first_mut() {
+            *f0 = 46;
+        }
+        Ok(rows)
     }
 
     fn derive_with_noise_floor(aspx_cfg: &AspxConfig, noise_f0: i32) -> Result<Self> {
