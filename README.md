@@ -292,9 +292,47 @@ an S16 `AudioFrame`:
   A-SPX subband-group borders (Pseudocodes 90/91), quantises + FREQ-DPCM
   packs it (Pseudocodes 80–83), and emits a real-envelope
   `aspx_data_2ch()` instead of the minimum-bit-cost scaffold.
+- **Immersive channel element (ICE) synthesis routes** (TS 103 190-2
+  §6.2.4.1, r419): `encode_frame_pcm_7_{0,1}_4_ice_aspx_scpl` (exact
+  Table 23 + §4.8.3.11.3 matrix inverse to the eleven SMP tracks +
+  real per-Table-8-group A-SPX synthesis; ≤ 6,2 % settled relative
+  RMS on all 11 channels, LFE 3,6 %, regenerated HF within 3 dB) and
+  `encode_frame_pcm_7_{0,1}_4_ice_acpl{1,2}` (§5.5.2 Table 27 module
+  mid carriers with per-band `(α, β)` from the pair mid/side
+  statistics; ACPL_1 codes the sides below `acpl_qmf_band` as exact
+  M/S residual tracks — ≤ 5,2 % settled RMS; ACPL_2 dry-exact on
+  correlated pairs with β decorrelator fill on independent content).
+  The A-SPX synthesis stack behind them: streaming §5.7.6.2/§5.7.6.5
+  QMF banks carried across frames, integer-PCM scale anchors
+  (`ASPX_QMF_PCM_SCALE` — the Pseudocode 82/95 absolute anchors sit
+  at their intended magnitudes, so HF-silence is representable),
+  ratio-coded NOISE envelopes (Pseudocode 94 semantics) and a
+  patch-delivery model (Pseudocode 71 tile map + Pseudocode 86-89
+  TNS whitening replicated on the encoder's own low band) driving
+  both the noise ratio and an inverse-delivery SIGNAL boost.
+- **22.2 encode** (`encode_frame_pcm_22_2_{simple,aspx}`, §6.2.4.3):
+  both Table 98 codec modes from PCM — Simple ≤ 6,0 % settled RMS on
+  all 24 channels, A-SPX with real per-pair synthesis rows.
+- **Encoder companding decision** (`select_compand_on_from_qmf`):
+  §5.7.5.2 level-crest transient detection feeding the immersive
+  `companding_control(5)` writers.
 
 ## Not yet supported
 
+- **A-SPX balance stereo decoding** (Pseudocode 84): the in-tree
+  chain decodes the secondary channel of an `aspx_data_2ch()` pair as
+  absolute LEVEL rows through the BALANCE codebooks instead of the
+  §5.7.6.3.5 sum/pan joint dequantisation (`PAN_OFFSET = 12`, with
+  the Pseudocode 80/81 `delta = 2` for the balance channel). The
+  encoder writes matching absolute rows, so in-tree round-trips are
+  consistent, but real-HF secondaries can clamp at the balance
+  codebook range and interoperability with the spec convention needs
+  the joint decode on both sides.
+- ICE encode arms cover the non-`b_5fronts` layouts (7.0.4 / 7.1.4);
+  the 9.0.4 / 9.1.4 encode-side matrix inverse and the SAP
+  (`b_use_sap_add_ch` / step-5/6) encode decisions are pending, as is
+  an A-JCC parameter *extractor* (the ASPX_AJCC write path takes a
+  caller-built `ajcc_data()`).
 - **Immersive remainders** — core decoding mode (the reduced
   7-channel operating point of §5.3.3.2 / §5.6.3.5.3 / §4.8.3.11.2;
   the A-JCC core-decode reconstruction itself is implemented, but no
