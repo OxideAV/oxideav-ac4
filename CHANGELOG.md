@@ -74,6 +74,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      independent noise-like pair content (β decorrelator fill);
      `acpl_data_1ch()` rows re-read through the decoder's
      differential decode to exactly the extractor's α/β rows.
+  7. **22.2 encode from PCM** (`encode_frame_pcm_22_2_simple` /
+     `encode_frame_pcm_22_2_aspx`, §6.2.4.3 both Table 98 modes):
+     24 persistent TDAC states over the Table 21 pair order + two
+     LFEs, with real per-pair A-SPX synthesis rows in the A-SPX mode.
+     Round-trip: Simple ≤ 6,0 % settled relative RMS on all 24
+     channels; A-SPX low band ≤ 6,0 % with regenerated HF within
+     3 dB (ratio 0,81) and HF-silent partners ≥ 13 dB down.
+  8. **Encoder companding decision** (`select_compand_on_from_qmf`):
+     the §5.7.5.2 per-slot level crest over the companding band
+     drives `b_compand_on` — transient bursts trip it, stationary
+     content and silence do not — feeding the immersive
+     `companding_control(5)` writers.
 - ac4 round 417 — **immersive synthesis remainders to PCM** (ETSI
   TS 103 190-1/-2). Seven landings:
   1. **`sap_mode == 2` fix** (part-1 Table 114): the chparam_info

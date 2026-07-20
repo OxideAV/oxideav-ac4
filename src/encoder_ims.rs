@@ -7286,6 +7286,116 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// 22.2 channel-element encode from PCM (TS 103 190-2 §6.2.4.3,
+    /// `22_2_codec_mode = Simple`).
+    ///
+    /// `frames` carries the 22 fullband channels in the §5.2.4
+    /// Table 21 order (`[L, R, C, Tc, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl,
+    /// Tbr, Tsl, Tsr, Tfc, Tbc, Bfl, Bfr, Bfc, Cb, Lw, Rw]`) followed
+    /// by the two LFEs **last** (`LFE, LFE2`); the decoder emits both
+    /// LFEs on the two leading output slots.
+    pub fn encode_frame_pcm_22_2_simple(&mut self, frames: &[&[f32]; 24]) -> Vec<u8> {
+        self.encode_frame_pcm_22_2_inner(frames, false, 40)
+    }
+
+    /// [`Self::encode_frame_pcm_22_2_simple`] with the A-SPX codec
+    /// mode (Table 98): each of the eleven `two_channel_data()` pairs
+    /// carries a real-synthesis `aspx_data_2ch()` payload extracted
+    /// from its own channels.
+    pub fn encode_frame_pcm_22_2_aspx(&mut self, frames: &[&[f32]; 24]) -> Vec<u8> {
+        self.encode_frame_pcm_22_2_inner(frames, true, 40)
+    }
+
+    /// Shared 22.2 body + frame assembly.
+    fn encode_frame_pcm_22_2_inner(
+        &mut self,
+        frames: &[&[f32]; 24],
+        aspx: bool,
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_22_2: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // MDCT: 22 named + 2 LFE states.
+        let n_states = 24;
+        while self.mdct_states_multi.len() < n_states {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let coeffs: Vec<Vec<f32>> = frames
+            .iter()
+            .enumerate()
+            .map(|(t, pcm)| self.mdct_states_multi[t].analyse_frame(pcm))
+            .collect();
+
+        let b_iframe = self.b_iframe_global;
+        let mut body = BitWriter::new();
+        let pairs: [[&[f32]; 2]; 11] =
+            std::array::from_fn(|p| [coeffs[2 * p].as_slice(), coeffs[2 * p + 1].as_slice()]);
+        let lfe = [(coeffs[22].as_slice(), 7u32), (coeffs[23].as_slice(), 7u32)];
+        if aspx {
+            let mut aspx_cfg = Self::ice_live_aspx_cfg();
+            let q_ch: Vec<Vec<Vec<(f32, f32)>>> = (0..22)
+                .map(|c| self.ice_qmf_analyse(c, frames[c]))
+                .collect();
+            aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_ch[0]);
+            let rows: Vec<crate::ice::IceAspx2chRows> = (0..11)
+                .map(|p| {
+                    Self::ice_2ch_rows_from_matrices(
+                        &aspx_cfg,
+                        frame_len,
+                        &q_ch[2 * p],
+                        &q_ch[2 * p + 1],
+                    )
+                })
+                .collect();
+            crate::ice::write_22_2_body_real(
+                &mut body,
+                lfe,
+                &pairs,
+                Some(&aspx_cfg),
+                b_iframe,
+                frame_len,
+                max_sfb,
+                &rows,
+            )
+            .expect("encoder: 22_2 body");
+        } else {
+            crate::ice::write_22_2_body_real(
+                &mut body,
+                lfe,
+                &pairs,
+                None,
+                b_iframe,
+                frame_len,
+                max_sfb,
+                &[],
+            )
+            .expect("encoder: 22_2 body");
+        }
+        let out = crate::ice::encode_22_2_raw_frame(self.sequence_counter as u32, b_iframe, body)
+            .expect("encoder: 22_2 frame assembly");
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a mono SIMPLE/ASF substream
     /// whose injected tone falls on the spectral pair nearest the
     /// requested frequency. With `tl = 1920` at 48 kHz the bin spacing

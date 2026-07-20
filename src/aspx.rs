@@ -911,6 +911,55 @@ pub fn apply_companding_on_qmf(q: &mut [Vec<(f32, f32)>], sbx: u32, sbz: u32) {
 /// stages change behaviour.
 pub const ASPX_QMF_PCM_SCALE: f32 = 32768.0;
 
+/// Encoder-side `b_compand_on` decision for one channel from its
+/// post-extension QMF matrix: measure the §5.7.5.2 per-slot levels
+/// `L(ts)` over the companding band `[sb0, sb1)` and enable companding
+/// when the temporal envelope is transient — crest
+/// `max L(ts) / mean L(ts)` above `threshold` (2,5 is a reasonable
+/// default; the tool reshapes short-time gains, which only helps when
+/// the band's energy is unevenly distributed in time). The measure is
+/// level-independent; the spec leaves the selection informative.
+pub fn select_compand_on_from_qmf(
+    q: &[Vec<(f32, f32)>],
+    sb0: u32,
+    sb1: u32,
+    threshold: f32,
+) -> bool {
+    let sb0_u = sb0 as usize;
+    let sb1_u = sb1 as usize;
+    if sb1_u <= sb0_u || q.len() < sb1_u {
+        return false;
+    }
+    let n_slots = q
+        .iter()
+        .take(sb1_u)
+        .skip(sb0_u)
+        .map(|r| r.len())
+        .min()
+        .unwrap_or(0);
+    if n_slots == 0 {
+        return false;
+    }
+    let k = (sb1_u - sb0_u) as f32;
+    let mut peak = 0.0f32;
+    let mut sum = 0.0f32;
+    for ts in 0..n_slots {
+        let mut acc = 0.0f32;
+        for row in q.iter().take(sb1_u).skip(sb0_u) {
+            let (re, im) = row[ts];
+            let (ar, ai) = (re.abs(), im.abs());
+            acc += ar.max(ai) + 0.5 * ar.min(ai);
+        }
+        let l = 0.9105 * (acc / k);
+        sum += l;
+        if l > peak {
+            peak = l;
+        }
+    }
+    let mean = sum / n_slots as f32;
+    mean > 0.0 && peak / mean > threshold
+}
+
 /// Companding alpha coefficient per §5.7.5.2.
 const COMPANDING_ALPHA: f32 = 0.65;
 
