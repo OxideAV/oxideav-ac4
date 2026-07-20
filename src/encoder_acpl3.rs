@@ -7714,6 +7714,85 @@ pub fn extract_beta_q_per_band(
         .collect()
 }
 
+/// Extract the per-parameter-band `(alpha_q, beta_q)` rows for one
+/// **immersive** A-CPL module (TS 103 190-2 §5.5.2 Table 27 driving
+/// the part-1 §5.7.7.5 Pseudocode 115/116 pair synthesis with the √2
+/// immersive output scale).
+///
+/// The decoder reconstructs the channel pair `(P, Q)` from the coded
+/// mid carrier `x = (P+Q)/(2√2)` as
+///
+/// ```text
+///   P̂ = √2·(x·(1+α) + w)      Q̂ = √2·(x·(1−α) − w)
+/// ```
+///
+/// (`w` = β-scaled ducked decorrelator output with
+/// `E[w²]·2 ≈ β²·E[mid²]`). With `mid = (P+Q)/2`, `side = (P−Q)/2`
+/// the sum is reconstructed exactly and the optimal parameters per
+/// band are
+///
+/// ```text
+///   α* = Σ(mid·side) / Σ(mid²)
+///   β² = max(0, Σ(side²)/Σ(mid²) − α_dq²)
+/// ```
+///
+/// — α carries the correlated part of the inter-channel difference,
+/// β fills the residual (decorrelated) energy. Both quantise through
+/// the Tables 203-206 codebook lanes.
+///
+/// `mid_coeffs` / `side_coeffs` are the MDCT spectra of `(P+Q)/2`
+/// and `(P−Q)/2`; bands below `start_pb` return 0 (the PARTIAL
+/// config codes them as M/S residuals instead).
+pub fn extract_ice_acpl_pair_alpha_beta_q(
+    mid_coeffs: &[f32],
+    side_coeffs: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    qm: crate::acpl::AcplQuantMode,
+) -> (Vec<i32>, Vec<i32>) {
+    let (num, den) = compute_per_band_correlations(
+        mid_coeffs,
+        side_coeffs,
+        transform_length,
+        num_param_bands,
+        start_pb,
+    );
+    let (e_mid, e_side) = compute_per_band_energies(
+        mid_coeffs,
+        side_coeffs,
+        transform_length,
+        num_param_bands,
+        start_pb,
+    );
+    let n = num_param_bands as usize;
+    let mut alpha_q = Vec::with_capacity(n);
+    let mut beta_q = Vec::with_capacity(n);
+    #[allow(clippy::needless_range_loop)] // per-band lockstep over four arrays
+    for pb in 0..n {
+        let d = den.get(pb).copied().unwrap_or(0.0);
+        if d <= 0.0 || !d.is_finite() {
+            alpha_q.push(0);
+            beta_q.push(0);
+            continue;
+        }
+        let alpha = (num[pb] / d).clamp(-2.0, 2.0);
+        let a_q = quantise_alpha(alpha, qm);
+        let a_dq = crate::acpl_synth::dequantize_alpha_index(qm, a_q).0;
+        let em = e_mid.get(pb).copied().unwrap_or(0.0);
+        let es = e_side.get(pb).copied().unwrap_or(0.0);
+        let beta_sq = if em > 0.0 { es / em - a_dq * a_dq } else { 0.0 };
+        let beta = if beta_sq > 0.0 && beta_sq.is_finite() {
+            beta_sq.sqrt().clamp(0.0, 4.0)
+        } else {
+            0.0
+        };
+        alpha_q.push(a_q);
+        beta_q.push(quantise_beta_magnitude(beta, qm));
+    }
+    (alpha_q, beta_q)
+}
+
 /// Public entry point that returns the per-parameter-band α_q the
 /// encoder would emit for a given (carrier, surround) MDCT pair.
 pub fn extract_alpha_q_per_band(

@@ -7000,6 +7000,292 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// 7.0.4 immersive-channel-element ASPX_ACPL_2 encode from PCM
+    /// (TS 103 190-2 §6.2.4.1, `immersive_codec_mode = ASPX_ACPL_2`).
+    ///
+    /// `frames` is `[L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`.
+    /// The seven coded tracks are `A = L/2`, `B = R/2`, `C = C/2` and
+    /// the four module mid carriers `(P+Q)/(2√2)` for the §5.5.2
+    /// Table 27 pairs `(Ls, Lb)` / `(Rs, Rb)` / `(Tfl, Tbl)` /
+    /// `(Tfr, Tbr)` on tracks D / E / F / G; each module's per-band
+    /// `(α, β)` comes from
+    /// [`crate::encoder_acpl3::extract_ice_acpl_pair_alpha_beta_q`]
+    /// over the pair's mid / side MDCT spectra, and the four A-SPX
+    /// payloads carry real synthesis rows extracted from the carrier
+    /// tracks themselves (Table 8 grouping `(A, B)` / `(D, F)` /
+    /// `(E, G)` / `C`).
+    pub fn encode_frame_pcm_7_0_4_ice_acpl2(&mut self, frames: &[&[f32]; 11]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_4_ice_acpl2_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_0_4_ice_acpl2`].
+    pub fn encode_frame_pcm_7_0_4_ice_acpl2_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 11],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_acpl_inner(frames, None, max_sfb, false)
+    }
+
+    /// 7.1.4 form of [`Self::encode_frame_pcm_7_0_4_ice_acpl2`] (LFE
+    /// **last**; the decoder emits it on the leading output slot).
+    pub fn encode_frame_pcm_7_1_4_ice_acpl2(&mut self, frames: &[&[f32]; 12]) -> Vec<u8> {
+        let named: &[&[f32]; 11] = frames[..11].try_into().expect("11 named channels");
+        self.encode_ice_acpl_inner(named, Some(frames[11]), 40, false)
+    }
+
+    /// 7.0.4 immersive-channel-element ASPX_ACPL_1 encode from PCM
+    /// (`immersive_codec_mode = ASPX_ACPL_1`, PARTIAL A-CPL config).
+    ///
+    /// Same layout as [`Self::encode_frame_pcm_7_0_4_ice_acpl2`], but
+    /// the module pairs additionally code their **side** signals as
+    /// M/S residual tracks below `acpl_qmf_band` (F / G in the
+    /// additional pair for the surround modules; J / K in the S-CPL
+    /// section for the top modules, whose mid carriers ride H / I),
+    /// so the band below the split reconstructs exactly while the
+    /// bands above run parametric per-module `(α, β)`.
+    pub fn encode_frame_pcm_7_0_4_ice_acpl1(&mut self, frames: &[&[f32]; 11]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_4_ice_acpl1_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_0_4_ice_acpl1`].
+    pub fn encode_frame_pcm_7_0_4_ice_acpl1_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 11],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_acpl_inner(frames, None, max_sfb, true)
+    }
+
+    /// 7.1.4 form of [`Self::encode_frame_pcm_7_0_4_ice_acpl1`] (LFE
+    /// **last**).
+    pub fn encode_frame_pcm_7_1_4_ice_acpl1(&mut self, frames: &[&[f32]; 12]) -> Vec<u8> {
+        let named: &[&[f32]; 11] = frames[..11].try_into().expect("11 named channels");
+        self.encode_ice_acpl_inner(named, Some(frames[11]), 40, true)
+    }
+
+    /// Shared ASPX_ACPL_1 / ASPX_ACPL_2 ICE body + frame assembly.
+    ///
+    /// The `acpl_qmf_band` for the PARTIAL (ACPL_1) config is fixed at
+    /// QMF subband 6 (2 250 Hz — comfortably below the live config's
+    /// crossover), giving `start_band = sb_to_pb(6)` parametric bands
+    /// above an exactly-coded M/S band.
+    fn encode_ice_acpl_inner(
+        &mut self,
+        named: &[&[f32]; 11],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        is_acpl1: bool,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in named.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_ice_acpl: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(l) = lfe {
+            assert_eq!(l.len(), frame_len as usize, "LFE input length");
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        let n = frame_len as usize;
+
+        // Module pairs (P, Q) in §5.5.2 module order.
+        let pairs: [(usize, usize); 4] = [(3, 5), (4, 6), (7, 9), (8, 10)];
+        let isq2 = std::f32::consts::FRAC_1_SQRT_2;
+        let mix = |a: &[f32], b: &[f32], sign: f32, g: f32| -> Vec<f32> {
+            (0..n).map(|i| g * 0.5 * (a[i] + sign * b[i])).collect()
+        };
+        // Coded tracks: A, B, C then the four module mid carriers
+        // (`mid/√2`); ACPL_1 additionally codes the four `side/√2`
+        // residual tracks (band-limited below acpl_qmf_band).
+        let half = |x: &[f32]| -> Vec<f32> { x.iter().map(|&v| v * 0.5).collect() };
+        let mut track_pcm: Vec<Vec<f32>> = vec![
+            half(named[0]), // A
+            half(named[1]), // B
+            half(named[2]), // C
+        ];
+        for &(p, q) in &pairs {
+            track_pcm.push(mix(named[p], named[q], 1.0, isq2)); // mid/√2
+        }
+        // Side signals (α/β spectra source; ACPL_1 residual tracks).
+        let sides: Vec<Vec<f32>> = pairs
+            .iter()
+            .map(|&(p, q)| mix(named[p], named[q], -1.0, isq2))
+            .collect();
+
+        // MDCT: states 0..7 = coded A..G(mid), 7..11 = side spectra,
+        // 11 = LFE.
+        let n_states = 12;
+        while self.mdct_states_multi.len() < n_states {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs: Vec<Vec<f32>> = Vec::with_capacity(7);
+        for (t, pcm) in track_pcm.iter().enumerate() {
+            coeffs.push(self.mdct_states_multi[t].analyse_frame(pcm));
+        }
+        let side_coeffs: Vec<Vec<f32>> = sides
+            .iter()
+            .enumerate()
+            .map(|(m, pcm)| self.mdct_states_multi[7 + m].analyse_frame(pcm))
+            .collect();
+        let lfe_coeffs = lfe.map(|pcm| self.mdct_states_multi[11].analyse_frame(pcm));
+
+        // A-CPL parameters per module: α/β over the (mid, side)
+        // spectra (mid = √2 · coded carrier spectrum).
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+        let num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+        let acpl_qmf_band: u8 = if is_acpl1 { 6 } else { 0 };
+        let start_pb = if is_acpl1 {
+            crate::acpl::sb_to_pb(acpl_qmf_band as u32, num_bands)
+        } else {
+            0
+        };
+        let sq2 = std::f32::consts::SQRT_2;
+        let modules_q: Vec<(Vec<i32>, Vec<i32>)> = (0..4)
+            .map(|m| {
+                let mid_spec: Vec<f32> = coeffs[3 + m].iter().map(|&v| v * sq2).collect();
+                let side_spec: Vec<f32> = side_coeffs[m].iter().map(|&v| v * sq2).collect();
+                crate::encoder_acpl3::extract_ice_acpl_pair_alpha_beta_q(
+                    &mid_spec,
+                    &side_spec,
+                    frame_len,
+                    num_bands,
+                    start_pb,
+                    acpl_quant_mode,
+                )
+            })
+            .collect();
+
+        // A-SPX: preflat from the primary carrier, real rows per
+        // Table 8 payload group — carriers themselves are the
+        // extension targets on the ACPL routes. QMF extraction
+        // channel layout (this route): 0..7 = tracks A..G(mid).
+        let mut aspx_cfg = Self::ice_live_aspx_cfg();
+        let q_tracks: Vec<Vec<Vec<(f32, f32)>>> = (0..7)
+            .map(|t| self.ice_qmf_analyse(t, &track_pcm[t]))
+            .collect();
+        aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_tracks[0]);
+        // On the wire tracks F / G are the mid carriers of the top
+        // modules for ACPL_2, but the **band-limited surround
+        // residuals** for ACPL_1 — whose payload secondaries must then
+        // carry dark envelopes (the module only reads the residual
+        // below acpl_qmf_band; nothing legitimate lives above the
+        // crossover). Analyse the residual signals and zero their
+        // rows from acpl_qmf_band up so the extraction sees exactly
+        // the coded band.
+        type QmfMat = Vec<Vec<(f32, f32)>>;
+        let (q_f, q_g): (QmfMat, QmfMat) = if is_acpl1 {
+            let mut q_f = self.ice_qmf_analyse(7, &sides[0]);
+            let mut q_g = self.ice_qmf_analyse(8, &sides[1]);
+            for q in [&mut q_f, &mut q_g] {
+                for row in q.iter_mut().skip(acpl_qmf_band as usize) {
+                    for v in row.iter_mut() {
+                        *v = (0.0, 0.0);
+                    }
+                }
+            }
+            (q_f, q_g)
+        } else {
+            (q_tracks[5].clone(), q_tracks[6].clone())
+        };
+        let two_ch = vec![
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[0], &q_tracks[1]), // (A, B)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[3], &q_f), // (D, F)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[4], &q_g), // (E, G)
+        ];
+        let one_ch = Self::ice_1ch_rows_from_matrix(&aspx_cfg, frame_len, &q_tracks[2]); // C
+
+        // Assemble the coded spectra per mode. ACPL_2: carriers D..G
+        // ride the core + additional pair. ACPL_1: the surround
+        // residuals ride F/G, the top carriers H/I + residuals J/K
+        // ride the S-CPL section; residual spectra are band-limited
+        // below acpl_qmf_band (30 MDCT bins per QMF subband at
+        // tl = 1920).
+        let residual_limit = (acpl_qmf_band as usize) * (frame_len as usize / 64);
+        let limit = |spec: &[f32]| -> Vec<f32> {
+            spec.iter()
+                .enumerate()
+                .map(|(i, &v)| if i < residual_limit { v } else { 0.0 })
+                .collect()
+        };
+        let res_spec: Vec<Vec<f32>> = if is_acpl1 {
+            side_coeffs.iter().map(|s| limit(s)).collect()
+        } else {
+            Vec::new()
+        };
+        let mode = if is_acpl1 {
+            crate::ice::IceCodecMode::AspxAcpl1
+        } else {
+            crate::ice::IceCodecMode::AspxAcpl2
+        };
+        let modules_ref: Vec<(&[i32], &[i32])> = modules_q
+            .iter()
+            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+            .collect();
+        let acpl = crate::ice::IceAcplParams {
+            num_param_bands_id: acpl_num_param_bands_id,
+            quant_mode: acpl_quant_mode,
+            qmf_band: acpl_qmf_band,
+            modules: &modules_ref,
+        };
+        let b_iframe = self.b_iframe_global;
+        let mut body = BitWriter::new();
+        let core: [&[f32]; 5] = [&coeffs[0], &coeffs[1], &coeffs[2], &coeffs[3], &coeffs[4]];
+        let (add_pair, scpl_pairs): ([&[f32]; 2], Vec<[&[f32]; 2]>) = if is_acpl1 {
+            (
+                [&res_spec[0], &res_spec[1]],
+                vec![[&coeffs[5], &coeffs[6]], [&res_spec[2], &res_spec[3]]],
+            )
+        } else {
+            ([&coeffs[5], &coeffs[6]], Vec::new())
+        };
+        crate::ice::write_ice_body_acpl_real(
+            &mut body,
+            mode,
+            &core,
+            add_pair,
+            &scpl_pairs,
+            &acpl,
+            &aspx_cfg,
+            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            false,
+            b_iframe,
+            frame_len,
+            max_sfb,
+            &crate::ice::IceAspxRows {
+                two_ch: &two_ch,
+                one_ch: &one_ch,
+            },
+        )
+        .expect("encoder: ice acpl body");
+        let out = crate::ice::encode_ice_raw_frame(
+            self.sequence_counter as u32,
+            lfe.is_some(),
+            false,
+            b_iframe,
+            body,
+        )
+        .expect("encoder: ice frame assembly");
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        out
+    }
+
     /// Encode one IMS v2 frame containing a mono SIMPLE/ASF substream
     /// whose injected tone falls on the spectral pair nearest the
     /// requested frequency. With `tl = 1920` at 48 kHz the bin spacing

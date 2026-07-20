@@ -58,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      3,6 %), regenerated HF within 3 dB of the input band with
      HF-silent channels ≥ 13 dB down, and the emitted bitstream
      re-reads to exactly the extractor's envelope rows.
+  6. **ASPX_ACPL_1 / ASPX_ACPL_2 encode from PCM**
+     (`encode_frame_pcm_7_{0,1}_4_ice_acpl{1,2}`): tracks `A = L/2`,
+     `B = R/2`, `C = C/2` plus four §5.5.2 Table 27 module mid
+     carriers `(P+Q)/(2√2)`; per-module `(α, β)` from the pair's
+     mid/side statistics (`extract_ice_acpl_pair_alpha_beta_q` —
+     `α* = Σmid·side/Σmid²`, `β² = Σside²/Σmid² − α²`, Tables
+     203-206 lanes); ACPL_1 additionally codes the side signals below
+     `acpl_qmf_band = 6` as exact M/S residual tracks (F/G + the
+     S-CPL J/K with top mids on H/I) with dark residual envelopes.
+     Round-trip: ACPL_1 ≤ 5,2 % settled relative RMS on all 11
+     channels; ACPL_2 ≤ 22 % settled RMS on correlated pairs
+     (dry-exact mid + lane-quantised α) with pair level ratios
+     preserved, and per-channel settled energy within ~3 dB on
+     independent noise-like pair content (β decorrelator fill);
+     `acpl_data_1ch()` rows re-read through the decoder's
+     differential decode to exactly the extractor's α/β rows.
 - ac4 round 417 — **immersive synthesis remainders to PCM** (ETSI
   TS 103 190-1/-2). Seven landings:
   1. **`sap_mode == 2` fix** (part-1 Table 114): the chparam_info
