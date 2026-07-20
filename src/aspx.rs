@@ -3525,6 +3525,15 @@ pub struct AspxChannelExtState {
     /// TIME-direction references (P-frames and intra-stream envelopes
     /// alike).
     pub env_prev: AspxEnvPrev,
+    /// Streaming QMF analysis bank (§5.7.6.2): carries the filterbank
+    /// delay line across frames so consecutive frames of one channel
+    /// analyse as a single continuous stream — a per-frame fresh bank
+    /// puts a ~640-sample warm-up transient at the head of every
+    /// decoded frame.
+    pub analysis: crate::qmf::QmfAnalysisBank,
+    /// Streaming QMF synthesis bank (§5.7.6.5 inverse) — same
+    /// continuity argument on the output side.
+    pub synthesis: crate::qmf::QmfSynthesisBank,
 }
 
 impl AspxChannelExtState {
@@ -3543,6 +3552,8 @@ impl AspxChannelExtState {
         self.tns.reset();
         self.q_low_prev.clear();
         self.env_prev.reset();
+        self.analysis = crate::qmf::QmfAnalysisBank::new();
+        self.synthesis = crate::qmf::QmfSynthesisBank::new();
     }
 }
 

@@ -333,6 +333,7 @@ pub fn qmf_synthesis_slot(
 ///   order, matching `qmf_filt[sb] = pcm[ts*64 + 63 - sb]`.
 /// * After the shift+feed, the 64 complex QMF subband samples are
 ///   computed via the shared core routine.
+#[derive(Debug, Clone)]
 pub struct QmfAnalysisBank {
     qmf_filt: [f32; NUM_QMF_WIN_COEF],
 }
@@ -398,6 +399,7 @@ impl QmfAnalysisBank {
 /// Wraps [`qmf_synthesis_slot`] with the 1 280-sample circular delay
 /// line (`qsyn_filt`) whose shift-by-128 + tap-sum layout is the
 /// inverse of the analysis bank.
+#[derive(Debug, Clone)]
 pub struct QmfSynthesisBank {
     qsyn_filt: [f64; 1280],
 }

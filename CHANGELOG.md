@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      splice them onto the wire at the mode's roster positions. The
      historical minimal writers delegate with floored-noise rows —
      wire bytes unchanged.
+  2. **Streaming QMF filterbanks on the A-SPX extension chain**
+     (§5.7.6.2 / §5.7.6.5): the per-channel analysis + synthesis banks
+     now live on `AspxChannelExtState` (plus per-track / per-output
+     banks for the immersive A-CPL / A-JCC routes), carrying the
+     filterbank delay lines across frames like the A-JOC route always
+     did. A fresh per-frame bank put a ~640-sample broadband warm-up
+     transient at the head of every decoded frame on every
+     A-SPX-extended channel.
 - ac4 round 417 — **immersive synthesis remainders to PCM** (ETSI
   TS 103 190-1/-2). Seven landings:
   1. **`sap_mode == 2` fix** (part-1 Table 114): the chparam_info

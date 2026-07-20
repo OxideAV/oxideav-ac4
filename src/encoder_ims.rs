@@ -143,6 +143,13 @@ pub struct Ac4ImsEncoder {
     /// multi-envelope body is emitted.
     #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub acpl3_param_prev: crate::encoder_acpl3::Acpl3ParamPrevRows,
+    /// Streaming QMF analysis banks for the ICE A-SPX envelope /
+    /// decision extraction — one per decoupled extraction channel, so
+    /// consecutive frames analyse as one continuous stream (a fresh
+    /// per-frame bank leaks a broadband warm-up splash into the HF
+    /// envelope measurement).
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
+    pub ice_env_ana: Vec<crate::qmf::QmfAnalysisBank>,
 }
 
 impl Ac4ImsEncoder {
@@ -164,6 +171,7 @@ impl Ac4ImsEncoder {
             mdct_states_multi: Vec::new(),
             acpl3_env_prev: None,
             acpl3_param_prev: crate::encoder_acpl3::Acpl3ParamPrevRows::default(),
+            ice_env_ana: Vec::new(),
         }
     }
 
@@ -6530,6 +6538,369 @@ impl Ac4ImsEncoder {
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// Derive the eleven coded ICE SMP track signals `A..K` from the
+    /// named 7.0.4 channels — the encode-side inverse of the decoder's
+    /// §5.3.3.1 Table 23 S-CPL full-decoding matrix composed with the
+    /// mode's output gain ladder (`c_gain = m_gain = 1` +
+    /// §4.8.3.11.3 Table 10 gains 2 / 2 / 2 / √2·… for ASPX_SCPL —
+    /// identical totals to the SCPL `c_gain = 2` / `m_gain = √2`
+    /// ladder, so one inverse serves both §5.2.3.2 modes):
+    ///
+    /// ```text
+    ///   A = L/2          B = R/2          C = C/2
+    ///   D = (Ls + Lb)/(2√2)    F = (Ls − Lb)/(2√2)
+    ///   E = (Rs + Rb)/(2√2)    G = (Rs − Rb)/(2√2)
+    ///   H = (Tfl + Tbl)/(2√2)  J = (Tfl − Tbl)/(2√2)
+    ///   I = (Tfr + Tbr)/(2√2)  K = (Tfr − Tbr)/(2√2)
+    /// ```
+    ///
+    /// `named` is `[L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`;
+    /// the return order is `[A, B, C, D, E, F, G, H, I, J, K]`
+    /// (core, additional pair, S-CPL pairs `[H, I]` / `[J, K]`).
+    fn ice_scpl_tracks_from_named(named: &[&[f32]; 11]) -> Vec<Vec<f32>> {
+        let n = named[0].len();
+        let half = |x: &[f32]| -> Vec<f32> { x.iter().map(|&v| v * 0.5).collect() };
+        let q = 0.5 * std::f32::consts::FRAC_1_SQRT_2; // 1/(2√2)
+        let mix = |x: &[f32], y: &[f32], sign: f32| -> Vec<f32> {
+            (0..n).map(|i| q * (x[i] + sign * y[i])).collect()
+        };
+        vec![
+            half(named[0]),                 // A
+            half(named[1]),                 // B
+            half(named[2]),                 // C
+            mix(named[3], named[5], 1.0),   // D  = (Ls + Lb)/(2√2)
+            mix(named[4], named[6], 1.0),   // E  = (Rs + Rb)/(2√2)
+            mix(named[3], named[5], -1.0),  // F = (Ls − Lb)/(2√2)
+            mix(named[4], named[6], -1.0),  // G = (Rs − Rb)/(2√2)
+            mix(named[7], named[9], 1.0),   // H  = (Tfl + Tbl)/(2√2)
+            mix(named[8], named[10], 1.0),  // I = (Tfr + Tbr)/(2√2)
+            mix(named[7], named[9], -1.0),  // J = (Tfl − Tbl)/(2√2)
+            mix(named[8], named[10], -1.0), // K = (Tfr − Tbr)/(2√2)
+        ]
+    }
+
+    /// QMF-analyse one ICE extraction channel through its persistent
+    /// (per-`chan_idx`) streaming analysis bank. Returns the
+    /// `[absolute_sb][ts]` matrix for the current frame. Streaming
+    /// matters here: a fresh bank per frame leaks a broadband warm-up
+    /// splash into the HF measurement that quantises to a near
+    /// full-scale SIGNAL envelope on genuinely HF-silent channels.
+    fn ice_qmf_analyse(&mut self, chan_idx: usize, pcm: &[f32]) -> Vec<Vec<(f32, f32)>> {
+        while self.ice_env_ana.len() <= chan_idx {
+            self.ice_env_ana.push(crate::qmf::QmfAnalysisBank::new());
+        }
+        let n_slots = pcm.len() / 64;
+        let usable = n_slots * 64;
+        let slots = self.ice_env_ana[chan_idx].process_block(&pcm[..usable]);
+        crate::encoder_acpl3::qmf_slots_to_sb_major(&slots)
+    }
+
+    /// Build one channel's real A-SPX payload rows (SIGNAL / NOISE
+    /// FREQ-DPCM quant indices + per-SBG `aspx_add_harmonic`) from an
+    /// already-analysed QMF matrix. When the frequency tables cannot
+    /// be derived the NOISE row falls back to the floored `qnoise =
+    /// 30` scaffold so the regenerated band never lands on the
+    /// full-scale Pseudocode-83 noise floor.
+    fn ice_rows_from_matrix(
+        aspx_cfg: &crate::aspx::AspxConfig,
+        frame_len: u32,
+        q: &[Vec<(f32, f32)>],
+    ) -> crate::ice::IceAspxChannelRows {
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return crate::ice::IceAspxChannelRows {
+                sig: Vec::new(),
+                noise: vec![30],
+                ah: Vec::new(),
+            };
+        };
+        let num_ts_in_ats = crate::aspx::num_ts_in_ats(frame_len);
+        let aspx_frame_ts_count = crate::aspx::num_aspx_timeslots(frame_len);
+        if num_ts_in_ats == 0 || aspx_frame_ts_count == 0 {
+            return crate::ice::IceAspxChannelRows {
+                sig: Vec::new(),
+                noise: vec![30],
+                ah: Vec::new(),
+            };
+        }
+        let ch = crate::encoder_acpl3::AspxQmfEnvelopeChannel {
+            q_high: q,
+            sbg_sig_borders: &tables.sbg_sig_highres,
+            sbg_noise_borders: &tables.sbg_noise,
+        };
+        let (sig, noise) = crate::encoder_acpl3::build_aspx_real_envelope_channel_from_qmf(
+            &ch,
+            aspx_cfg.quant_mode_env,
+            64,
+            num_ts_in_ats,
+            aspx_frame_ts_count,
+            tables.sbx,
+        );
+        let noise = if noise.is_empty() { vec![30] } else { noise };
+        let ah = crate::aspx_ah_select::select_add_harmonic(q, &tables.sbg_sig_highres, tables.sbx);
+        crate::ice::IceAspxChannelRows { sig, noise, ah }
+    }
+
+    /// Derive the per-noise-SBG `aspx_tna_mode` vector from an
+    /// already-analysed QMF matrix (low band `0..sba`).
+    fn ice_tna_from_matrix(aspx_cfg: &crate::aspx::AspxConfig, q: &[Vec<(f32, f32)>]) -> Vec<u8> {
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return Vec::new();
+        };
+        if tables.sba == 0 {
+            return Vec::new();
+        }
+        let sba = tables.sba as usize;
+        let q_low: Vec<Vec<(f32, f32)>> = q.iter().take(sba).map(|row| row.to_vec()).collect();
+        let q_low_ext = crate::aspx_tns::build_q_low_ext(&q_low, &[], tables.sba);
+        crate::aspx_tna_select::select_tna_mode(
+            &q_low_ext,
+            &tables,
+            aspx_cfg.master_freq_scale,
+            true,
+        )
+    }
+
+    /// Decide `aspx_preflat` from an already-analysed QMF matrix (the
+    /// primary carrier's low band) — matrix-level counterpart of
+    /// [`Self::extract_aspx_preflat`].
+    fn ice_preflat_from_matrix(
+        aspx_cfg: &crate::aspx::AspxConfig,
+        frame_len: u32,
+        q: &[Vec<(f32, f32)>],
+    ) -> bool {
+        let Ok(tables) = crate::aspx::derive_aspx_frequency_tables(aspx_cfg, 0) else {
+            return false;
+        };
+        let num_ts_in_ats = crate::aspx::num_ts_in_ats(frame_len);
+        let aspx_frame_ts_count = crate::aspx::num_aspx_timeslots(frame_len);
+        if num_ts_in_ats == 0 || aspx_frame_ts_count == 0 || tables.sba == 0 {
+            return false;
+        }
+        let sba = tables.sba as usize;
+        let q_low: Vec<Vec<(f32, f32)>> = q.iter().take(sba).map(|row| row.to_vec()).collect();
+        let atsg_sig = [0u32, aspx_frame_ts_count];
+        crate::aspx_preflat_select::select_preflat(&q_low, tables.sba, &atsg_sig, num_ts_in_ats)
+    }
+
+    /// Assemble one real `aspx_data_2ch()` payload row set from two
+    /// already-analysed channel matrices (`aspx_tna_mode` derives from
+    /// the primary and mirrors to the secondary under the balance
+    /// coding).
+    fn ice_2ch_rows_from_matrices(
+        aspx_cfg: &crate::aspx::AspxConfig,
+        frame_len: u32,
+        q0: &[Vec<(f32, f32)>],
+        q1: &[Vec<(f32, f32)>],
+    ) -> crate::ice::IceAspx2chRows {
+        crate::ice::IceAspx2chRows {
+            ch0: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q0),
+            ch1: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q1),
+            tna: Self::ice_tna_from_matrix(aspx_cfg, q0),
+        }
+    }
+
+    /// Assemble one real `aspx_data_1ch()` payload row set from an
+    /// already-analysed channel matrix.
+    fn ice_1ch_rows_from_matrix(
+        aspx_cfg: &crate::aspx::AspxConfig,
+        frame_len: u32,
+        q: &[Vec<(f32, f32)>],
+    ) -> crate::ice::IceAspx1chRows {
+        crate::ice::IceAspx1chRows {
+            ch: Self::ice_rows_from_matrix(aspx_cfg, frame_len, q),
+            tna: Self::ice_tna_from_matrix(aspx_cfg, q),
+        }
+    }
+
+    /// The live A-SPX config shared by the ICE encode paths — the same
+    /// shape as the 5_X / 7_X live paths (Fine quant, `start_freq = 0`,
+    /// LowRes master scale, one noise subband group, FIXFIX-only).
+    fn ice_live_aspx_cfg() -> crate::aspx::AspxConfig {
+        crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        }
+    }
+
+    /// 7.0.4 immersive-channel-element ASPX_SCPL encode from PCM
+    /// (TS 103 190-2 §6.2.4.1, `immersive_codec_mode = ASPX_SCPL`).
+    ///
+    /// `frames` is `[L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`
+    /// (the decoder's output slot order). The encoder derives the
+    /// eleven SMP tracks with [`Self::ice_scpl_tracks_from_named`],
+    /// forward-MDCTs them on persistent per-track TDAC states, and
+    /// emits a grouping-3 ASPX_SCPL body whose six A-SPX payloads
+    /// carry **real** SIGNAL / NOISE envelopes + `aspx_tna_mode` +
+    /// `aspx_add_harmonic` extracted from the decoupled channels the
+    /// decoder extends (Table 8 grouping `(L, R)`, `(Ls, Lb)`, `C`,
+    /// `(Rs, Rb)`, `(Tfl, Tbl)`, `(Tfr, Tbr)`, each pre-scaled by the
+    /// inverse §4.8.3.11.3 Table 10 output gain).
+    ///
+    /// The output round-trips through [`crate::decoder::Ac4Decoder`]
+    /// to an 11-channel `AudioFrame`.
+    pub fn encode_frame_pcm_7_0_4_ice_aspx_scpl(&mut self, frames: &[&[f32]; 11]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_4_ice_aspx_scpl_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_0_4_ice_aspx_scpl`].
+    pub fn encode_frame_pcm_7_0_4_ice_aspx_scpl_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 11],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_aspx_scpl_inner(frames, None, max_sfb)
+    }
+
+    /// 7.1.4 form of [`Self::encode_frame_pcm_7_0_4_ice_aspx_scpl`]:
+    /// `frames` is the 7.0.4 order plus the LFE channel **last**
+    /// (`[L, …, Tbr, LFE]`); the decoder emits the LFE on the leading
+    /// output slot.
+    pub fn encode_frame_pcm_7_1_4_ice_aspx_scpl(&mut self, frames: &[&[f32]; 12]) -> Vec<u8> {
+        self.encode_frame_pcm_7_1_4_ice_aspx_scpl_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_1_4_ice_aspx_scpl`].
+    pub fn encode_frame_pcm_7_1_4_ice_aspx_scpl_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 12],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let named: &[&[f32]; 11] = frames[..11].try_into().expect("11 named channels");
+        self.encode_ice_aspx_scpl_inner(named, Some(frames[11]), max_sfb)
+    }
+
+    /// Shared 7.0.4 / 7.1.4 ASPX_SCPL body + frame assembly.
+    fn encode_ice_aspx_scpl_inner(
+        &mut self,
+        named: &[&[f32]; 11],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in named.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_ice_aspx_scpl: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(l) = lfe {
+            assert_eq!(l.len(), frame_len as usize, "LFE input length");
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Track derivation + forward MDCT (11 tracks; LFE on state 11).
+        let tracks = Self::ice_scpl_tracks_from_named(named);
+        let n_states = 12;
+        while self.mdct_states_multi.len() < n_states {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let coeffs: Vec<Vec<f32>> = tracks
+            .iter()
+            .enumerate()
+            .map(|(t, pcm)| self.mdct_states_multi[t].analyse_frame(pcm))
+            .collect();
+        let lfe_coeffs = lfe.map(|pcm| self.mdct_states_multi[11].analyse_frame(pcm));
+
+        // A-SPX real payload rows per Table 8 group, extracted from
+        // the decoupled channels the decoder extends (output channel ÷
+        // its §4.8.3.11.3 Table 10 gain): L/2, R/2, C/2 are exactly
+        // tracks A / B / C; the mixing-row channels divide by √2. Each
+        // decoupled channel runs through its own persistent streaming
+        // QMF bank (fixed `chan_idx` layout below).
+        let aspx_cfg = Self::ice_live_aspx_cfg();
+        let scale = |x: &[f32], g: f32| -> Vec<f32> { x.iter().map(|&v| v * g).collect() };
+        let isq2 = std::f32::consts::FRAC_1_SQRT_2;
+        let dec: [Vec<f32>; 8] = [
+            scale(named[3], isq2),  // Ls/√2
+            scale(named[5], isq2),  // Lb/√2
+            scale(named[4], isq2),  // Rs/√2
+            scale(named[6], isq2),  // Rb/√2
+            scale(named[7], isq2),  // Tfl/√2
+            scale(named[9], isq2),  // Tbl/√2
+            scale(named[8], isq2),  // Tfr/√2
+            scale(named[10], isq2), // Tbr/√2
+        ];
+        // chan_idx layout: 0 = L, 1 = R, 2 = C, 3.. = the eight
+        // decoupled mixing-row channels in `dec` order.
+        let q_l = self.ice_qmf_analyse(0, &tracks[0]);
+        let q_r = self.ice_qmf_analyse(1, &tracks[1]);
+        let q_c = self.ice_qmf_analyse(2, &tracks[2]);
+        let q_dec: Vec<Vec<Vec<(f32, f32)>>> = dec
+            .iter()
+            .enumerate()
+            .map(|(i, pcm)| self.ice_qmf_analyse(3 + i, pcm))
+            .collect();
+        // preflat: one per-config flag, decided from the primary (L)
+        // carrier's low band.
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_l);
+        let two_ch = vec![
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_l, &q_r), // (L, R)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[0], &q_dec[1]), // (Ls, Lb)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[2], &q_dec[3]), // (Rs, Rb)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[4], &q_dec[5]), // (Tfl, Tbl)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[6], &q_dec[7]), // (Tfr, Tbr)
+        ];
+        let one_ch = Self::ice_1ch_rows_from_matrix(&aspx_cfg, frame_len, &q_c); // C
+
+        let core: [&[f32]; 5] = [&coeffs[0], &coeffs[1], &coeffs[2], &coeffs[3], &coeffs[4]];
+        let scpl_pairs: [[&[f32]; 2]; 2] = [[&coeffs[7], &coeffs[8]], [&coeffs[9], &coeffs[10]]];
+        let spectra = crate::ice::IceScplSpectra {
+            core: &core,
+            add_pair: [&coeffs[5], &coeffs[6]],
+            scpl_pairs: &scpl_pairs,
+        };
+        let b_iframe = self.b_iframe_global;
+        let mut body = BitWriter::new();
+        crate::ice::write_ice_body_aspx_scpl_real(
+            &mut body,
+            &spectra,
+            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            false,
+            &aspx_cfg,
+            b_iframe,
+            frame_len,
+            max_sfb,
+            &crate::ice::IceAspxRows {
+                two_ch: &two_ch,
+                one_ch: &one_ch,
+            },
+        )
+        .expect("encoder: ice aspx_scpl body");
+        let out = crate::ice::encode_ice_raw_frame(
+            self.sequence_counter as u32,
+            lfe.is_some(),
+            false,
+            b_iframe,
+            body,
+        )
+        .expect("encoder: ice frame assembly");
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         out
     }
 

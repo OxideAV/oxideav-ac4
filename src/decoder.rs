@@ -106,6 +106,15 @@ pub struct Ac4Decoder {
     /// Allocated on the first ASPX_ACPL_1 / ASPX_ACPL_2 immersive
     /// frame.
     ice_acpl: Option<IceAcplState>,
+    /// Streaming per-track QMF **analysis** banks for the immersive
+    /// routes that analyse plain (extension-free) track PCM — keyed by
+    /// SMP track index. Carrying the §5.7.6.2 delay line across frames
+    /// removes the per-frame filterbank warm-up transient.
+    ice_track_ana: Vec<qmf::QmfAnalysisBank>,
+    /// Streaming per-output-slot QMF **synthesis** banks for the
+    /// immersive A-CPL / A-JCC output stages (same continuity
+    /// argument, output side).
+    ice_out_syn: Vec<qmf::QmfSynthesisBank>,
 }
 
 /// Per-decoder immersive A-CPL state — see [`Ac4Decoder::ice_acpl`].
@@ -218,7 +227,39 @@ impl Ac4Decoder {
             ajoc_dec: None,
             ice_ajcc: None,
             ice_acpl: None,
+            ice_track_ana: Vec::new(),
+            ice_out_syn: Vec::new(),
         }
+    }
+
+    /// Streaming counterpart of [`Self::ice_plain_qmf`] — analyse one
+    /// immersive track's PCM through the per-track persistent bank so
+    /// consecutive frames form one continuous stream.
+    fn ice_plain_qmf_streaming(&mut self, track: usize, pcm: &[f32]) -> aspx::QmfMatrix {
+        while self.ice_track_ana.len() <= track {
+            self.ice_track_ana.push(qmf::QmfAnalysisBank::new());
+        }
+        const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
+        let n_slots = pcm.len() / NUM_QMF;
+        let slots = self.ice_track_ana[track].process_block(pcm);
+        let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF)
+            .map(|_| vec![(0.0f32, 0.0f32); n_slots])
+            .collect();
+        for (ts, slot) in slots.iter().take(n_slots).enumerate() {
+            for (sb, s) in slot.iter().enumerate() {
+                q[sb][ts] = *s;
+            }
+        }
+        q
+    }
+
+    /// Fetch (grow-on-demand) the streaming output-synthesis bank for
+    /// one immersive output slot.
+    fn ice_out_syn_bank(&mut self, slot: usize) -> &mut qmf::QmfSynthesisBank {
+        while self.ice_out_syn.len() <= slot {
+            self.ice_out_syn.push(qmf::QmfSynthesisBank::new());
+        }
+        &mut self.ice_out_syn[slot]
     }
 
     fn extract_raw_frame<'a>(&self, pkt: &'a Packet) -> Result<(&'a [u8], bool)> {
@@ -307,7 +348,7 @@ impl Ac4Decoder {
             Some((mut q, sbx_eff, sbz_eff)) => {
                 let compand_sb0 = compand_sb0_override.unwrap_or(sbx_eff);
                 aspx::apply_companding_on_qmf_with_mode(&mut q, compand_sb0, sbz_eff, compand_mode);
-                Self::qmf_synthesise_pcm(&q, pcm_in.len())
+                Self::qmf_synthesise_pcm_stateful(&mut state.synthesis, &q, pcm_in.len())
             }
             None => pcm_in.to_vec(),
         }
@@ -358,9 +399,10 @@ impl Ac4Decoder {
             return None;
         }
         let n_slots = pcm_in.len() / NUM_QMF;
-        // Forward QMF analysis on the low-band PCM.
-        let mut ana = qmf::QmfAnalysisBank::new();
-        let slots = ana.process_block(pcm_in);
+        // Forward QMF analysis on the low-band PCM through the
+        // channel's streaming bank (§5.7.6.2) — the delay line carries
+        // across frames so there is no per-frame warm-up transient.
+        let slots = state.analysis.process_block(pcm_in);
         // Re-layout to q[sb][ts].
         let mut q: Vec<Vec<(f32, f32)>> = (0..NUM_QMF)
             .map(|_| vec![(0.0f32, 0.0f32); n_slots])
@@ -571,12 +613,23 @@ impl Ac4Decoder {
     /// [`aspx::apply_companding_on_qmf_with_mode`] or cross-channel
     /// via [`aspx::apply_synchronised_companding_across_channels`]).
     fn qmf_synthesise_pcm(q: &[Vec<(f32, f32)>], out_len: usize) -> Vec<f32> {
+        let mut syn = qmf::QmfSynthesisBank::new();
+        Self::qmf_synthesise_pcm_stateful(&mut syn, q, out_len)
+    }
+
+    /// [`Self::qmf_synthesise_pcm`] driving a caller-held streaming
+    /// synthesis bank, so consecutive frames of one channel synthesise
+    /// as a single continuous stream (no per-frame warm-up transient).
+    fn qmf_synthesise_pcm_stateful(
+        syn: &mut qmf::QmfSynthesisBank,
+        q: &[Vec<(f32, f32)>],
+        out_len: usize,
+    ) -> Vec<f32> {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         if q.len() < NUM_QMF || out_len == 0 {
             return Vec::new();
         }
         let n_slots = out_len / NUM_QMF;
-        let mut syn = qmf::QmfSynthesisBank::new();
         let mut out = Vec::with_capacity(out_len);
         #[allow(clippy::needless_range_loop)] // ETSI TS 103 190-2 §4.4.7 q[sb][ts] indexing
         for ts in 0..n_slots {
@@ -1005,7 +1058,11 @@ impl Ac4Decoder {
         let mut out: Vec<(usize, Vec<f32>)> = Vec::with_capacity(entries.len());
         for (i, (slot, pcm_len, q_opt)) in phase1.into_iter().enumerate() {
             let pcm = match q_opt {
-                Some((q, _, _)) => Self::qmf_synthesise_pcm(&q, pcm_len),
+                Some((q, _, _)) => Self::qmf_synthesise_pcm_stateful(
+                    &mut self.aspx_ext_state[slot].synthesis,
+                    &q,
+                    pcm_len,
+                ),
                 None => entries[i].1.to_vec(),
             };
             out.push((slot, pcm));
@@ -1112,9 +1169,13 @@ impl Ac4Decoder {
         // Phase 3: synthesise per-channel PCM. Channels whose phase-1
         // returned None fall back to the unmodified input PCM (same
         // contract as `aspx_extend_pcm`).
-        let pcm_out = |idx: usize, fallback: &[f32]| -> Vec<f32> {
+        let mut pcm_out = |idx: usize, fallback: &[f32]| -> Vec<f32> {
             match &phase1[idx].2 {
-                Some((q, _, _)) => Self::qmf_synthesise_pcm(q, phase1[idx].1),
+                Some((q, _, _)) => Self::qmf_synthesise_pcm_stateful(
+                    &mut self.aspx_ext_state[phase1[idx].0].synthesis,
+                    q,
+                    phase1[idx].1,
+                ),
                 None => fallback.to_vec(),
             }
         };
@@ -2227,8 +2288,11 @@ impl Ac4Decoder {
                     // on the §6.2.4.1 payload roster tracks (Table 8:
                     // (A'', B''), (D'', F''), (E'', G'') pairs + C'').
                     let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
-                    let mut q_tr: Vec<aspx::QmfMatrix> =
-                        t.iter().map(|p| Self::ice_plain_qmf(p)).collect();
+                    let mut q_tr: Vec<aspx::QmfMatrix> = Vec::with_capacity(t.len());
+                    for (tr, p) in t.iter().enumerate() {
+                        let q = self.ice_plain_qmf_streaming(tr, p);
+                        q_tr.push(q);
+                    }
                     if let Some(cfg) = sub_aspx_cfg {
                         let mapping: [(usize, usize, bool); 7] = [
                             (0, 0, false), // payload 0 → (A, B)
@@ -2416,7 +2480,7 @@ impl Ac4Decoder {
                             };
                             for &(zi, slot) in z_to_slot {
                                 let Some(zm) = &z[zi] else { continue };
-                                let mut syn = qmf::QmfSynthesisBank::new();
+                                let syn = self.ice_out_syn_bank(slot);
                                 let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
                                 for col in zm.iter().take(num_ts) {
                                     let row = syn.process_slot(col);
@@ -2447,8 +2511,9 @@ impl Ac4Decoder {
                     let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
                     let mut q_ch: Vec<aspx::QmfMatrix> = Vec::with_capacity(5);
                     let mut bands: Vec<Option<(u32, u32)>> = vec![None; 5];
-                    for pcm in pcm_core.iter().take(5) {
-                        q_ch.push(Self::ice_plain_qmf(pcm));
+                    for (tr, pcm) in pcm_core.iter().take(5).enumerate() {
+                        let q = self.ice_plain_qmf_streaming(tr, pcm);
+                        q_ch.push(q);
                     }
                     if let Some(cfg) = sub_aspx_cfg {
                         let mapping: [(usize, usize, bool); 5] = [
@@ -2528,7 +2593,7 @@ impl Ac4Decoder {
                         };
                         for (out_idx, zi) in z_order.into_iter().enumerate() {
                             let zm = &z[zi];
-                            let mut syn = qmf::QmfSynthesisBank::new();
+                            let syn = self.ice_out_syn_bank(out_idx);
                             let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
                             for col in zm.iter().take(num_ts) {
                                 let row = syn.process_slot(col);
