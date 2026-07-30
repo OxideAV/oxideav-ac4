@@ -360,7 +360,7 @@ fn acpl3_full_chain_preserves_hf_pan() {
         // De-interleave S16 to per-channel f32.
         let buf = &af.data[0];
         assert_eq!(buf.len(), N * 5 * 2, "interleaved buffer size");
-        let mut chans: Vec<Vec<f32>> = vec![Vec::with_capacity(N); 5];
+        let mut chans: Vec<Vec<f32>> = (0..5).map(|_| Vec::with_capacity(N)).collect();
         for i in 0..N {
             for (ch, out) in chans.iter_mut().enumerate() {
                 let idx = (i * 5 + ch) * 2;
