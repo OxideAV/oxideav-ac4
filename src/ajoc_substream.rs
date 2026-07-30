@@ -747,6 +747,31 @@ impl AjocSubstreamDecoder {
         let mut ext: Vec<Option<(crate::aspx::QmfMatrix, u32, u32)>> =
             (0..self.num_dmx).map(|_| None).collect();
         if let Some((elem, cfg)) = &aspx_elem {
+            // Pair-level aspx_balance == 1 joint decode (ETSI TS
+            // 103 190-1 §5.7.6.3.5 Pseudocode 84) once per 2ch
+            // payload: pair p covers downmix channels (2p, 2p + 1).
+            let mut pre: Vec<Option<crate::aspx::AspxDecodedScf>> = vec![None; self.num_dmx];
+            for (p, tr) in elem.aspx_pair_trailers.iter().enumerate() {
+                let Some(t) = tr.as_deref() else { continue };
+                if !t.balance {
+                    continue;
+                }
+                let (a, b) = (2 * p, 2 * p + 1);
+                if b >= self.num_dmx {
+                    continue;
+                }
+                while self.aspx_ext_state.len() <= b {
+                    self.aspx_ext_state
+                        .push(crate::aspx::AspxChannelExtState::new());
+                }
+                let (lo, hi) = self.aspx_ext_state.split_at_mut(b);
+                if let Some((scf_a, scf_b)) =
+                    crate::decoder::Ac4Decoder::trailer_balance_scf(t, &mut lo[a], &mut hi[0])
+                {
+                    pre[a] = Some(scf_a);
+                    pre[b] = Some(scf_b);
+                }
+            }
             for (ch, slot) in ext.iter_mut().enumerate() {
                 let n_paired = 2 * elem.aspx_pair_trailers.len();
                 let trailer = if ch < n_paired {
@@ -779,6 +804,7 @@ impl AjocSubstreamDecoder {
                     Some(&chd.delta_dir),
                     chd.add_harmonic.as_deref(),
                     chd.tna_mode.as_deref(),
+                    pre[ch].as_ref(),
                     &mut self.aspx_ext_state[ch],
                     crate::aspx::num_ts_in_ats(frame_len_base.max(1)),
                 );

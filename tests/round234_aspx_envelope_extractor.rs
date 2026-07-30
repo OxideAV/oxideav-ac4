@@ -31,7 +31,7 @@
 //! * §4.2.12.4 Table 52 (`aspx_data_2ch()`).
 
 use oxideav_ac4::aspx::{
-    delta_decode_noise, delta_decode_sig, dequantize_noise_scf, dequantize_sig_scf,
+    delta_decode_noise, delta_decode_sig, dequantize_noise_scf_balance, dequantize_sig_scf_balance,
     derive_aspx_frequency_tables, num_aspx_timeslots, parse_aspx_delta_dir, parse_aspx_ec_data,
     parse_aspx_framing, parse_aspx_hfgen_iwc_2ch, AspxConfig, AspxDataType, AspxFreqResMode,
     AspxIntClass, AspxMasterFreqScale, AspxQuantStep, AspxStereoMode,
@@ -371,19 +371,19 @@ fn aspx_2ch_real_envelope_writer_round_trips_scf_through_decoder() {
     )
     .expect("ch1 noise");
 
-    // Run the decoder's delta-decode + dequantize, confirm we recover
-    // the input scf vectors within the per-band rounding.
+    // Run the decoder's §5.7.6.3.4-5 joint balance decode: delta = 1
+    // on the sum channel, delta = 2 on the balance channel
+    // (Pseudocode 80/81), then the Pseudocode 84 joint dequantization.
+    // The recovered per-channel scf must match the inputs within the
+    // (sum, pan) grid's quantization error — half a sum step plus half
+    // a pan wire step, comfortably under 2 dB for the Fine step.
     let qscf0_sig = delta_decode_sig(&sig0, num_sbg_sig, &[], 1);
-    let qscf1_sig = delta_decode_sig(&sig1, num_sbg_sig, &[], 1);
+    let qscf1_sig = delta_decode_sig(&sig1, num_sbg_sig, &[], 2);
     let qscf0_noise = delta_decode_noise(&noise0, num_sbg_noise, &[], 1);
-    let qscf1_noise = delta_decode_noise(&noise1, num_sbg_noise, &[], 1);
+    let qscf1_noise = delta_decode_noise(&noise1, num_sbg_noise, &[], 2);
 
-    let dd0_sig_bits: Vec<bool> = dd0.sig_delta_dir.to_vec();
-    let dd1_sig_bits: Vec<bool> = dd1.sig_delta_dir.to_vec();
-    let scf0_sig = dequantize_sig_scf(&qscf0_sig, qmode, &dd0_sig_bits, 64);
-    let scf1_sig = dequantize_sig_scf(&qscf1_sig, qmode, &dd1_sig_bits, 64);
-    let scf0_noise = dequantize_noise_scf(&qscf0_noise);
-    let scf1_noise = dequantize_noise_scf(&qscf1_noise);
+    let (scf0_sig, scf1_sig) = dequantize_sig_scf_balance(&qscf0_sig, &qscf1_sig, qmode, 64);
+    let (scf0_noise, scf1_noise) = dequantize_noise_scf_balance(&qscf0_noise, &qscf1_noise);
 
     // scf_*[sbg][atsg=0]: pull the first envelope column out and compare.
     let column = |m: &Vec<Vec<f32>>| -> Vec<f32> { m.iter().map(|row| row[0]).collect() };
@@ -392,22 +392,19 @@ fn aspx_2ch_real_envelope_writer_round_trips_scf_through_decoder() {
     let scf0_noise_col = column(&scf0_noise);
     let scf1_noise_col = column(&scf1_noise);
 
-    for (e, g) in ch0_sig_scf.iter().zip(scf0_sig_col.iter()) {
-        let rel = (g - e).abs() / e.abs().max(1e-9);
-        assert!(rel < 1e-5, "ch0 sig scf mismatch: expected {e}, got {g}");
-    }
-    for (e, g) in ch1_sig_scf.iter().zip(scf1_sig_col.iter()) {
-        let rel = (g - e).abs() / e.abs().max(1e-9);
-        assert!(rel < 1e-5, "ch1 sig scf mismatch: expected {e}, got {g}");
-    }
-    for (e, g) in ch0_noise_scf.iter().zip(scf0_noise_col.iter()) {
-        let rel = (g - e).abs() / e.abs().max(1e-9);
-        assert!(rel < 1e-5, "ch0 noise scf mismatch: expected {e}, got {g}");
-    }
-    for (e, g) in ch1_noise_scf.iter().zip(scf1_noise_col.iter()) {
-        let rel = (g - e).abs() / e.abs().max(1e-9);
-        assert!(rel < 1e-5, "ch1 noise scf mismatch: expected {e}, got {g}");
-    }
+    let check = |name: &str, expected: &[f32], got: &[f32], max_db: f32| {
+        for (e, g) in expected.iter().zip(got.iter()) {
+            let err_db = 10.0 * (g / e).log10().abs();
+            assert!(
+                err_db < max_db,
+                "{name} scf mismatch: expected {e}, got {g} ({err_db} dB)"
+            );
+        }
+    };
+    check("ch0 sig", &ch0_sig_scf, &scf0_sig_col, 2.0);
+    check("ch1 sig", &ch1_sig_scf, &scf1_sig_col, 2.0);
+    check("ch0 noise", &ch0_noise_scf, &scf0_noise_col, 2.5);
+    check("ch1 noise", &ch1_noise_scf, &scf1_noise_col, 2.5);
 }
 
 /// Determinism: same input scf vectors produce identical extractor

@@ -37,9 +37,39 @@ use oxideav_ac4::aspx::{
     AspxStereoMode,
 };
 use oxideav_ac4::encoder_acpl3::{
-    write_aspx_data_1ch_real_envelope, write_aspx_data_2ch_real_envelope, AspxRealEnvelopeChannel,
+    balance_encode_noise_rows, balance_encode_sig_rows, freq_dpcm_encode_qscf,
+    qscf_row_from_freq_dpcm_extended, write_aspx_data_1ch_real_envelope,
+    write_aspx_data_2ch_real_envelope, AspxRealEnvelopeChannel,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
+
+/// Expected wire rows for a 2ch pair under the §5.7.6.3.5 joint
+/// (sum, balance) coding: the writer converts the caller's (L, R)
+/// LEVEL rows through the Pseudocode 84 inverse before emitting, so
+/// the parsed ec_data recovers the converted rows, not the raw inputs.
+#[allow(clippy::type_complexity)]
+fn expected_wire_rows(
+    ch0_sig: &[i32],
+    ch1_sig: &[i32],
+    ch0_noise: &[i32],
+    ch1_noise: &[i32],
+    qmode: AspxQuantStep,
+    num_sbg_sig: usize,
+    num_sbg_noise: usize,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    let l_sig = qscf_row_from_freq_dpcm_extended(ch0_sig, num_sbg_sig);
+    let r_sig = qscf_row_from_freq_dpcm_extended(ch1_sig, num_sbg_sig);
+    let (sum_sig, pan_sig) = balance_encode_sig_rows(&l_sig, &r_sig, qmode);
+    let l_noise = qscf_row_from_freq_dpcm_extended(ch0_noise, num_sbg_noise);
+    let r_noise = qscf_row_from_freq_dpcm_extended(ch1_noise, num_sbg_noise);
+    let (sum_noise, pan_noise) = balance_encode_noise_rows(&l_noise, &r_noise);
+    (
+        freq_dpcm_encode_qscf(&sum_sig),
+        freq_dpcm_encode_qscf(&pan_sig),
+        freq_dpcm_encode_qscf(&sum_noise),
+        freq_dpcm_encode_qscf(&pan_noise),
+    )
+}
 
 /// A small, well-behaved config: signals_freq_res = false so the
 /// SIGNAL band count comes from the high-res template; noise_sbg = 0
@@ -172,10 +202,21 @@ fn write_aspx_data_2ch_real_envelope_round_trips_through_parser() {
     assert_eq!(sig1.len(), 1);
     assert_eq!(noise0.len(), 1);
     assert_eq!(noise1.len(), 1);
-    assert_eq!(sig0[0].values, ch0_sig);
-    assert_eq!(sig1[0].values, ch1_sig);
-    assert_eq!(noise0[0].values, ch0_noise);
-    assert_eq!(noise1[0].values, ch1_noise);
+    // §5.7.6.3.5 joint coding: the writer emits the (sum, pan) wire
+    // pair derived from the (L, R) inputs (Pseudocode 84 inverse).
+    let (exp_sig0, exp_sig1, exp_noise0, exp_noise1) = expected_wire_rows(
+        &ch0_sig,
+        &ch1_sig,
+        &ch0_noise,
+        &ch1_noise,
+        qmode,
+        num_sbg_sig as usize,
+        num_sbg_noise as usize,
+    );
+    assert_eq!(sig0[0].values, exp_sig0);
+    assert_eq!(sig1[0].values, exp_sig1);
+    assert_eq!(noise0[0].values, exp_noise0);
+    assert_eq!(noise1[0].values, exp_noise1);
 }
 
 /// 1-ch round-trip: same shape but only one channel through Table 51.
@@ -349,22 +390,30 @@ fn write_aspx_data_2ch_real_envelope_zero_pads_short_inputs() {
     )
     .expect("ch1 noise");
 
-    // ch0 SIGNAL: F0 = 6, trailing = 0; ch1 SIGNAL: all zeros.
-    assert_eq!(sig0[0].values[0], 6);
+    // Short slices extend with a constant tail (missing DFs read 0),
+    // then the §5.7.6.3.5 (sum, pan) conversion applies: constant
+    // (L, R) rows produce a constant sum row and a constant pan row —
+    // i.e. an F0 followed by all-zero DFs on both channels.
+    let num_sbg_noise = counts.num_sbg_noise;
+    let (exp_sig0, exp_sig1, exp_noise0, exp_noise1) = expected_wire_rows(
+        &ch_sig_short,
+        &[],
+        &ch_noise_short,
+        &[],
+        AspxQuantStep::Fine,
+        num_sbg_sig as usize,
+        num_sbg_noise as usize,
+    );
+    assert_eq!(sig0[0].values, exp_sig0);
+    assert_eq!(sig1[0].values, exp_sig1);
     for v in &sig0[0].values[1..] {
-        assert_eq!(*v, 0);
+        assert_eq!(*v, 0, "constant sum row must have zero DFs");
     }
-    for v in &sig1[0].values {
-        assert_eq!(*v, 0);
+    for v in &sig1[0].values[1..] {
+        assert_eq!(*v, 0, "constant pan row must have zero DFs");
     }
-    // NOISE: ch0 = [2, 0, ...] (or just [2] if num_sbg_noise == 1).
-    assert_eq!(noise0[0].values[0], 2);
-    for v in &noise0[0].values[1..] {
-        assert_eq!(*v, 0);
-    }
-    for v in &noise1[0].values {
-        assert_eq!(*v, 0);
-    }
+    assert_eq!(noise0[0].values, exp_noise0);
+    assert_eq!(noise1[0].values, exp_noise1);
 }
 
 /// Determinism: the same input pair produces the same byte stream
@@ -398,9 +447,11 @@ fn write_aspx_data_2ch_real_envelope_is_byte_deterministic() {
     assert_eq!(run(), run());
 }
 
-/// All-zero envelope inputs reproduce the round-219 zero-pick stream
-/// the parser's F0 decode resolves to symbol 0, exercising the
-/// boundary between the two writer families.
+/// All-zero envelope inputs: the sum channel decodes to zero and the
+/// balance channel decodes to the neutral pan (wire F0 = 6a = 12 for
+/// the Fine quant step) — under the decoder's Pseudocode 84 joint
+/// dequantization both channels then recover the Pseudocode 82 value
+/// of the zero sum row, matching the historical all-zero decode.
 #[test]
 fn write_aspx_data_2ch_real_envelope_all_zero_inputs_decode_to_zero() {
     let cfg = small_cfg();
@@ -463,10 +514,13 @@ fn write_aspx_data_2ch_real_envelope_all_zero_inputs_decode_to_zero() {
     )
     .expect("ch1 sig");
     for v in &sig0[0].values {
-        assert_eq!(*v, 0);
+        assert_eq!(*v, 0, "sum channel row must be all-zero");
     }
-    for v in &sig1[0].values {
-        assert_eq!(*v, 0);
+    // Balance channel: neutral pan F0 (12 wire steps for Fine —
+    // qscf_b = 2 · 12 = a · PAN_OFFSET) then zero DFs.
+    assert_eq!(sig1[0].values[0], 12);
+    for v in &sig1[0].values[1..] {
+        assert_eq!(*v, 0, "neutral pan row must have zero DFs");
     }
 }
 

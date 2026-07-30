@@ -1258,6 +1258,12 @@ pub struct FiveXAspxTrailer {
     pub primary: FiveXAspxChannelTrailer,
     /// Secondary channel — `None` for 1ch trailers.
     pub secondary: Option<FiveXAspxChannelTrailer>,
+    /// `aspx_balance` (Table 52) — `true` when the pair is jointly
+    /// coded as a (sum, balance) pair and must be dequantized with the
+    /// §5.7.6.3.5 Pseudocode 84 joint decode ([`decode_scf_balance_pair`])
+    /// instead of the per-channel Pseudocode 82 / 83 path. Always
+    /// `false` for 1ch trailers.
+    pub balance: bool,
 }
 
 /// Per-channel slice of [`FiveXAspxTrailer`] — what

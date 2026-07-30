@@ -354,33 +354,30 @@ fn acpl3_real_aspx_body_recovers_envelope_through_parser() {
     )
     .expect("ch1 noise");
 
-    // The round-226 writer clamps the SIGNAL F0 codeword to the
-    // ASPX_HCB_ENV_LEVEL_15_F0 codebook range [0, 70] (cb_off = 0 — F0
-    // carries a non-negative quantised log-energy); the DF deltas reach
-    // the wire unchanged. Assert recovery equals the clamped caller
-    // input entry-for-entry. (A very low HF band-0 energy quantises
-    // below the codebook floor and clamps to 0 — that is the spec's F0
-    // range, not a loss specific to this path.)
-    // ch0 SIGNAL = LEVEL (ASPX_HCB_ENV_LEVEL_15_F0, range [0, 70]);
-    // ch1 SIGNAL = BALANCE (ASPX_HCB_ENV_BALANCE_15_F0, range [0, 24]).
-    let clamp_f0 = |v: &[i32], hi: i32| {
-        let mut c = v.to_vec();
-        if let Some(f0) = c.first_mut() {
-            *f0 = (*f0).clamp(0, hi);
-        }
-        c
+    // §5.7.6.3.5 joint coding: the writer converts the (L, R) LEVEL
+    // rows to the (sum, pan) wire pair through the Pseudocode 84
+    // inverse before emitting, so the parser recovers the converted
+    // rows (sum on the LEVEL codebooks, pan wire steps on the BALANCE
+    // codebooks with the decoder's delta = 2 accumulation).
+    use oxideav_ac4::encoder_acpl3::{
+        balance_encode_noise_rows, balance_encode_sig_rows, freq_dpcm_encode_qscf,
+        qscf_row_from_freq_dpcm_extended,
     };
-    assert_eq!(sig0[0].values, clamp_f0(&l_sig, 70));
-    assert_eq!(sig1[0].values, clamp_f0(&r_sig, 24));
-    // ch0 NOISE = LEVEL (ASPX_HCB_NOISE_LEVEL_F0, range [0, 29]);
-    // ch1 NOISE = BALANCE (ASPX_HCB_NOISE_BALANCE_F0, range [0, 12]).
-    assert_eq!(noise0[0].values, clamp_f0(&l_noise, 29));
-    assert_eq!(noise1[0].values, clamp_f0(&r_noise, 12));
-    // Independent of the F0 clamp, every DF delta must survive the
-    // round trip verbatim — the real per-band envelope shape reaches the
-    // wire.
-    assert_eq!(sig0[0].values[1..], l_sig[1..]);
-    assert_eq!(sig1[0].values[1..], r_sig[1..]);
+    let n_sig = counts.num_sbg_sig_highres as usize;
+    let n_noise = counts.num_sbg_noise as usize;
+    let (exp_sum_sig, exp_pan_sig) = balance_encode_sig_rows(
+        &qscf_row_from_freq_dpcm_extended(&l_sig, n_sig),
+        &qscf_row_from_freq_dpcm_extended(&r_sig, n_sig),
+        AspxQuantStep::Fine,
+    );
+    let (exp_sum_noise, exp_pan_noise) = balance_encode_noise_rows(
+        &qscf_row_from_freq_dpcm_extended(&l_noise, n_noise),
+        &qscf_row_from_freq_dpcm_extended(&r_noise, n_noise),
+    );
+    assert_eq!(sig0[0].values, freq_dpcm_encode_qscf(&exp_sum_sig));
+    assert_eq!(sig1[0].values, freq_dpcm_encode_qscf(&exp_pan_sig));
+    assert_eq!(noise0[0].values, freq_dpcm_encode_qscf(&exp_sum_noise));
+    assert_eq!(noise1[0].values, freq_dpcm_encode_qscf(&exp_pan_noise));
 }
 
 /// Wire liveness: HF-rich L / R inputs drive a non-zero recovered

@@ -295,17 +295,52 @@ fn ice_aspx_scpl_bitstream_re_reads_to_extracted_rows() {
         &analyse(&dec_l),
         &analyse(&dec_r),
     );
+    // §5.7.6.3.5 joint coding: the 2ch writer converts each pair's
+    // (L, R) LEVEL rows to the (sum, pan) wire pair (Pseudocode 84
+    // inverse), so the parsed primary carries the sum rows.
+    use oxideav_ac4::encoder_acpl3::{
+        balance_encode_noise_rows, balance_encode_sig_rows, freq_dpcm_encode_qscf,
+        qscf_row_from_freq_dpcm_extended,
+    };
+    let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+        oxideav_ac4::aspx::AspxQuantStep::Fine
+    } else {
+        cfg.quant_mode_env
+    };
+    let expect_sum = |ch0_sig: &[i32], ch1_sig: &[i32], ch0_noise: &[i32], ch1_noise: &[i32]| {
+        let n_sig = ch0_sig.len().max(ch1_sig.len());
+        let n_noise = ch0_noise.len().max(ch1_noise.len());
+        let (sum_sig, _) = balance_encode_sig_rows(
+            &qscf_row_from_freq_dpcm_extended(ch0_sig, n_sig),
+            &qscf_row_from_freq_dpcm_extended(ch1_sig, n_sig),
+            qmode_sig,
+        );
+        let (sum_noise, _) = balance_encode_noise_rows(
+            &qscf_row_from_freq_dpcm_extended(ch0_noise, n_noise),
+            &qscf_row_from_freq_dpcm_extended(ch1_noise, n_noise),
+        );
+        (
+            freq_dpcm_encode_qscf(&sum_sig),
+            freq_dpcm_encode_qscf(&sum_noise),
+        )
+    };
     let IceAspxElement::TwoCh(Some(t0)) = &ice.aspx_elements[0] else {
         panic!("payload 0 must be a parsed 2ch element");
     };
     assert!(!t0.primary.data_sig.is_empty(), "payload 0 sig envelope");
-    assert_eq!(
-        t0.primary.data_sig[0].values, rows0.ch0.sig,
-        "payload 0 primary SIGNAL row re-reads to the extractor output"
+    let (exp_sig0, exp_noise0) = expect_sum(
+        &rows0.ch0.sig,
+        &rows0.ch1.sig,
+        &rows0.ch0.noise,
+        &rows0.ch1.noise,
     );
     assert_eq!(
-        t0.primary.data_noise[0].values, rows0.ch0.noise,
-        "payload 0 primary NOISE row re-reads to the extractor output"
+        t0.primary.data_sig[0].values, exp_sig0,
+        "payload 0 primary SIGNAL row re-reads to the converted (sum) extractor output"
+    );
+    assert_eq!(
+        t0.primary.data_noise[0].values, exp_noise0,
+        "payload 0 primary NOISE row re-reads to the converted (sum) extractor output"
     );
     // The 1ch payload (roster position 2) carries the decoupled C.
     let dec_c: Vec<f32> = input[2].iter().map(|&v| v * 0.5).collect();
@@ -339,8 +374,14 @@ fn ice_aspx_scpl_bitstream_re_reads_to_extracted_rows() {
     let IceAspxElement::TwoCh(Some(t1)) = &ice.aspx_elements[1] else {
         panic!("payload 1 must be a parsed 2ch element");
     };
-    assert_eq!(t1.primary.data_sig[0].values, rows1.ch0.sig);
-    assert_eq!(t1.primary.data_noise[0].values, rows1.ch0.noise);
+    let (exp_sig1, exp_noise1) = expect_sum(
+        &rows1.ch0.sig,
+        &rows1.ch1.sig,
+        &rows1.ch0.noise,
+        &rows1.ch1.noise,
+    );
+    assert_eq!(t1.primary.data_sig[0].values, exp_sig1);
+    assert_eq!(t1.primary.data_noise[0].values, exp_noise1);
 }
 
 #[test]

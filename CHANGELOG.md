@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 435 — **A-SPX balance stereo joint decoding** (ETSI TS
+  103 190-1 §5.7.6.3.4-5), closing the long-standing "A-SPX balance
+  stereo decoding" gap: an `aspx_data_2ch()` pair with
+  `aspx_balance = 1` is now decoded as the spec's jointly coded
+  (sum, balance) pair instead of two absolute LEVEL rows.
+  1. **Pseudocode 84 joint dequantization**
+     (`aspx::dequantize_sig_scf_balance` /
+     `aspx::dequantize_noise_scf_balance`, `PAN_OFFSET = 12`) plus
+     the Pseudocode 80/81 `delta = 2` accumulation on the balance
+     channel, packaged as the pair-level
+     `aspx::decode_scf_balance_pair` (per-channel cross-interval
+     `AspxEnvPrev` state maintained exactly as the per-channel path
+     does). `AspxEnvelopeAdjuster::from_scf` splits the P90/91/95
+     tail out of `from_deltas_stateful` so jointly decoded scale
+     factors drive the envelope adjustment.
+  2. **Decoder wiring on every 2ch A-SPX consumer**: the stereo CPE
+     paths (synced + per-channel), the 5_X trailer dispatch
+     (`extend_5x_entries`, pair detection over shared trailers), the
+     ICE ASPX_SCPL / ASPX_ACPL_1/2 / ASPX_AJCC payload rosters, the
+     22.2 pair loop, and the A-JOC A-SPX downmix
+     (`ajoc_substream`). `FiveXAspxTrailer` gains the Table 52
+     `balance` flag; phase-1 (`aspx_extend_to_qmf`) accepts the
+     pair-level precomputed scale factors and skips its per-channel
+     Pseudocode 80-83 decode when present.
+  3. **Encoder inverse on every live `aspx_balance = 1` writer**:
+     the single-envelope FREQ writers, the multi-envelope 2ch
+     builder, the minimal scaffold (now an explicit neutral pan
+     instead of min-length picks), and the flagship 5_X ACPL_3
+     directional (P-frame TIME-DPCM) path all transmit the exact
+     Pseudocode 84 inverse — `q_sum = a·log2(2^(q_l/a) + 2^(q_r/a)) − a`
+     on the LEVEL channel and pan wire steps
+     `(a·PAN_OFFSET + q_l − q_r)/2` (clamped to the Annex A.2
+     BALANCE codebook ranges) on the BALANCE channel
+     (`balance_encode_sig_rows` / `balance_encode_noise_rows` +
+     matrix/cell forms). Cross-frame P-frame bookkeeping
+     (`Acpl3EnvPrevRows`) now lives in the converted wire domain on
+     both sides.
+  Real-HF secondaries no longer clamp at the balance codebook range
+  (only the pan difference does, per the spec's ±`a·PAN_OFFSET`
+  window), and streams from a spec-conformant encoder now dequantize
+  correctly.
+
 - ac4 round 419 — **encoder ICE synthesis parity** (ETSI TS 103
   190-2 §6.2.4.1-3):
   1. Real-A-SPX payload plumbing for the immersive body writers:

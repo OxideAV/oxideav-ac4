@@ -39,7 +39,8 @@ use oxideav_ac4::aspx::{
     AspxMasterFreqScale, AspxQuantStep, AspxStereoMode,
 };
 use oxideav_ac4::encoder_acpl3::{
-    aggregate_qmf_to_sbg_atsg_uniform, build_aspx_multi_envelope_2ch_from_qmf,
+    aggregate_qmf_to_sbg_atsg_uniform, balance_encode_noise_matrix, balance_encode_sig_matrix,
+    build_aspx_multi_envelope_2ch_from_qmf, dpcm_encode_qscf_envelopes,
     quantize_noise_energy_matrix, quantize_sig_energy_matrix, write_aspx_data_2ch_multi_envelope,
     AspxMultiEnvelope2chRows, AspxMultiEnvelopeChannel, AspxMultiEnvelopePrevLast,
     AspxQmfMultiEnvelopeChannel,
@@ -269,10 +270,14 @@ fn build_2ch_from_qmf_round_trips_both_channels() {
         let e = aggregate_qmf_to_sbg_atsg_uniform(q, &sbg_noise_borders, 2, g.num_ats, g.nts, SBX);
         quantize_noise_energy_matrix(&e)
     };
-    let exp_sig0 = expect_sig(&q0);
-    let exp_sig1 = expect_sig(&q1);
-    let exp_noise0 = expect_noise(&q0);
-    let exp_noise1 = expect_noise(&q1);
+    // §5.7.6.3.5: the coupled pair transmits (sum, pan) — the builder
+    // applies the Pseudocode 84 inverse cell-wise, so the wire carries
+    // the converted matrices (ch1 in pan wire steps; the decoder's
+    // delta = 2 accumulation recovers qscf_b = 2 · pan).
+    let (exp_sum_sig, exp_pan_sig) =
+        balance_encode_sig_matrix(&expect_sig(&q0), &expect_sig(&q1), cfg.quant_mode_env);
+    let (exp_sum_noise, exp_pan_noise) =
+        balance_encode_noise_matrix(&expect_noise(&q0), &expect_noise(&q1));
 
     // Emit the coupled body.
     let mut bw = BitWriter::new();
@@ -295,6 +300,9 @@ fn build_2ch_from_qmf_round_trips_both_channels() {
 
     let (sig0, sig1, noise0, noise1) = parse_2ch_body(&bytes, &cfg, num_env);
 
+    // Compare in the transmitted-symbol domain: delta = 1 accumulation
+    // recovers the sum matrix on ch0 and the pan wire-step matrix on
+    // ch1.
     let qscf_sig0 = delta_decode_sig(&sig0, num_sbg_sig, &[], delta);
     let qscf_sig1 = delta_decode_sig(&sig1, num_sbg_sig, &[], delta);
     let qscf_noise0 = delta_decode_noise(&noise0, num_sbg_noise, &[], delta);
@@ -303,24 +311,24 @@ fn build_2ch_from_qmf_round_trips_both_channels() {
     for sbg in 0..num_sbg_sig as usize {
         for atsg in 0..num_env as usize {
             assert_eq!(
-                qscf_sig0[sbg][atsg], exp_sig0[sbg][atsg],
-                "ch0 SIGNAL sbg={sbg} atsg={atsg}"
+                qscf_sig0[sbg][atsg], exp_sum_sig[sbg][atsg],
+                "ch0 (sum) SIGNAL sbg={sbg} atsg={atsg}"
             );
             assert_eq!(
-                qscf_sig1[sbg][atsg], exp_sig1[sbg][atsg],
-                "ch1 SIGNAL sbg={sbg} atsg={atsg}"
+                qscf_sig1[sbg][atsg], exp_pan_sig[sbg][atsg],
+                "ch1 (pan) SIGNAL sbg={sbg} atsg={atsg}"
             );
         }
     }
     for sbg in 0..num_sbg_noise as usize {
         for atsg in 0..2usize {
             assert_eq!(
-                qscf_noise0[sbg][atsg], exp_noise0[sbg][atsg],
-                "ch0 NOISE sbg={sbg} atsg={atsg}"
+                qscf_noise0[sbg][atsg], exp_sum_noise[sbg][atsg],
+                "ch0 (sum) NOISE sbg={sbg} atsg={atsg}"
             );
             assert_eq!(
-                qscf_noise1[sbg][atsg], exp_noise1[sbg][atsg],
-                "ch1 NOISE sbg={sbg} atsg={atsg}"
+                qscf_noise1[sbg][atsg], exp_pan_noise[sbg][atsg],
+                "ch1 (pan) NOISE sbg={sbg} atsg={atsg}"
             );
         }
     }
@@ -392,6 +400,15 @@ fn transient_2ch_round_trips() {
     // Precondition: every expected SIGNAL qscf is in the F0 range.
     assert!(exp_sig0.iter().all(|r| r.iter().all(|&v| v >= 0)));
     assert!(exp_sig1.iter().all(|r| r.iter().all(|&v| v >= 0)));
+    // §5.7.6.3.5 wire domain: (sum, pan) via the Pseudocode 84 inverse.
+    // The sum matrix inherits the transient (both channels are loud in
+    // the second half).
+    let (exp_sum_sig, exp_pan_sig) =
+        balance_encode_sig_matrix(&exp_sig0, &exp_sig1, cfg.quant_mode_env);
+    assert!(
+        exp_sum_sig[0][1] > exp_sum_sig[0][0],
+        "sum channel keeps the transient"
+    );
 
     let mut bw = BitWriter::new();
     write_aspx_data_2ch_multi_envelope(
@@ -417,12 +434,12 @@ fn transient_2ch_round_trips() {
     for sbg in 0..num_sbg_sig as usize {
         for atsg in 0..num_env as usize {
             assert_eq!(
-                qscf_sig0[sbg][atsg], exp_sig0[sbg][atsg],
-                "ch0 sbg{sbg} env{atsg}"
+                qscf_sig0[sbg][atsg], exp_sum_sig[sbg][atsg],
+                "ch0 (sum) sbg{sbg} env{atsg}"
             );
             assert_eq!(
-                qscf_sig1[sbg][atsg], exp_sig1[sbg][atsg],
-                "ch1 sbg{sbg} env{atsg}"
+                qscf_sig1[sbg][atsg], exp_pan_sig[sbg][atsg],
+                "ch1 (pan) sbg{sbg} env{atsg}"
             );
         }
     }
@@ -488,13 +505,12 @@ fn force_freq_emits_all_freq_rows_both_channels() {
     );
 }
 
-/// The 2ch builder is the exact per-channel composition of the 1ch
-/// builder: each channel's rows equal the round-310 single-channel output
-/// for the same QMF input + parameters.
+/// The 2ch builder is the composition of the per-channel Pseudocode
+/// 82/83 quantisation, the §5.7.6.3.5 (sum, pan) conversion
+/// (Pseudocode 84 inverse, cell-wise), and the Pseudocode 80/81 DPCM
+/// packing in the transmitted-symbol domain.
 #[test]
 fn matches_per_channel_1ch_builder() {
-    use oxideav_ac4::encoder_acpl3::build_aspx_multi_envelope_channel_from_qmf;
-
     let cfg = multi_cfg();
     let num_env = 2u32;
     let g = geo();
@@ -534,37 +550,29 @@ fn matches_per_channel_1ch_builder() {
         false,
     );
 
-    let (s0, n0) = build_aspx_multi_envelope_channel_from_qmf(
-        &ch0,
-        num_env,
-        cfg.quant_mode_env,
-        N_SUBBANDS,
-        g.nts,
-        g.num_ats,
-        SBX,
-        &[],
-        &[],
-        1,
-        false,
-    );
-    let (s1, n1) = build_aspx_multi_envelope_channel_from_qmf(
-        &ch1,
-        num_env,
-        cfg.quant_mode_env,
-        N_SUBBANDS,
-        g.nts,
-        g.num_ats,
-        SBX,
-        &[],
-        &[],
-        1,
-        false,
-    );
+    // Compose the same pipeline by hand: per-channel quant matrices →
+    // (sum, pan) conversion → DPCM packing.
+    let quant_sig = |q: &[Vec<(f32, f32)>]| {
+        let e =
+            aggregate_qmf_to_sbg_atsg_uniform(q, &sbg_sig_borders, num_env, g.num_ats, g.nts, SBX);
+        quantize_sig_energy_matrix(&e, cfg.quant_mode_env, N_SUBBANDS)
+    };
+    let quant_noise = |q: &[Vec<(f32, f32)>]| {
+        let e = aggregate_qmf_to_sbg_atsg_uniform(q, &sbg_noise_borders, 2, g.num_ats, g.nts, SBX);
+        quantize_noise_energy_matrix(&e)
+    };
+    let (sum_sig, pan_sig) =
+        balance_encode_sig_matrix(&quant_sig(&q0), &quant_sig(&q1), cfg.quant_mode_env);
+    let (sum_noise, pan_noise) = balance_encode_noise_matrix(&quant_noise(&q0), &quant_noise(&q1));
+    let s0 = dpcm_encode_qscf_envelopes(&sum_sig, &[], 1, false);
+    let n0 = dpcm_encode_qscf_envelopes(&sum_noise, &[], 1, false);
+    let s1 = dpcm_encode_qscf_envelopes(&pan_sig, &[], 1, false);
+    let n1 = dpcm_encode_qscf_envelopes(&pan_noise, &[], 1, false);
 
-    assert_eq!(rows.ch0_sig, s0, "ch0 sig matches 1ch builder");
-    assert_eq!(rows.ch0_noise, n0, "ch0 noise matches 1ch builder");
-    assert_eq!(rows.ch1_sig, s1, "ch1 sig matches 1ch builder");
-    assert_eq!(rows.ch1_noise, n1, "ch1 noise matches 1ch builder");
+    assert_eq!(rows.ch0_sig, s0, "ch0 sig matches composed pipeline");
+    assert_eq!(rows.ch0_noise, n0, "ch0 noise matches composed pipeline");
+    assert_eq!(rows.ch1_sig, s1, "ch1 sig matches composed pipeline");
+    assert_eq!(rows.ch1_noise, n1, "ch1 noise matches composed pipeline");
 }
 
 /// Determinism: identical stereo QMF input produces identical builder

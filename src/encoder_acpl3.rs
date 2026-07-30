@@ -818,10 +818,18 @@ pub(crate) fn write_aspx_data_2ch_minimal_framed(
     for _ in 1..num_sbg_sig {
         write_aspx_sig_df_zero(bw, qmode_ch0, aspx::AspxStereoMode::Level);
     }
-    // ch1 SIGNAL: stereo_mode = BALANCE when balance = 1 else LEVEL.
+    // ch1 SIGNAL: stereo_mode = BALANCE (aspx_balance = 1). The
+    // scaffold pans neutrally: per §5.7.6.3.5 Pseudocode 84 the
+    // neutral balance is qscf_b = a · PAN_OFFSET, i.e. a wire F0 of
+    // 6a under the decoder's delta = 2 accumulation — both channels
+    // then dequantize to the Pseudocode 82 value of the sum row.
     let qmode_ch1 = qmode_ch0; // shared framing
+    let sig_neutral = match qmode_ch1 {
+        aspx::AspxQuantStep::Fine => 12,
+        aspx::AspxQuantStep::Coarse => 6,
+    };
     if num_sbg_sig >= 1 {
-        write_aspx_sig_f0(bw, qmode_ch1, aspx::AspxStereoMode::Balance);
+        write_aspx_sig_f0_value(bw, qmode_ch1, aspx::AspxStereoMode::Balance, sig_neutral);
     }
     for _ in 1..num_sbg_sig {
         write_aspx_sig_df_zero(bw, qmode_ch1, aspx::AspxStereoMode::Balance);
@@ -835,9 +843,10 @@ pub(crate) fn write_aspx_data_2ch_minimal_framed(
     for _ in 1..num_sbg_noise {
         write_aspx_noise_df_zero(bw, aspx::AspxStereoMode::Level);
     }
-    // ch1 NOISE: stereo_mode = BALANCE.
+    // ch1 NOISE: stereo_mode = BALANCE, neutral pan (wire F0 = 6 ⇒
+    // qscf_b = PAN_OFFSET).
     if num_sbg_noise >= 1 {
-        write_aspx_noise_f0(bw, aspx::AspxStereoMode::Balance);
+        write_aspx_noise_f0_value(bw, aspx::AspxStereoMode::Balance, 6);
     }
     for _ in 1..num_sbg_noise {
         write_aspx_noise_df_zero(bw, aspx::AspxStereoMode::Balance);
@@ -3694,28 +3703,78 @@ pub fn write_aspx_data_2ch_real_envelope(
         cfg.quant_mode_env
     };
 
-    // ch0 SIGNAL: stereo_mode = LEVEL.
+    // §5.7.6.3.5: with aspx_balance = 1 the pair is jointly coded —
+    // convert the caller's per-channel (L, R) LEVEL rows into the
+    // (sum, pan) wire pair (the Pseudocode 84 inverse; the decoder's
+    // joint dequantization recovers each channel's level).
+    let (ch0_sig_w, ch1_sig_w, ch0_noise_w, ch1_noise_w) = balance_convert_packed_rows(
+        ch0.sig,
+        ch1.sig,
+        ch0.noise,
+        ch1.noise,
+        qmode_sig,
+        num_sbg_sig as usize,
+        num_sbg_noise as usize,
+    );
+    // ch0 SIGNAL (sum): stereo_mode = LEVEL.
     write_aspx_sig_envelope_values(
         bw,
         qmode_sig,
         aspx::AspxStereoMode::Level,
-        ch0.sig,
+        &ch0_sig_w,
         num_sbg_sig,
     );
-    // ch1 SIGNAL: stereo_mode = BALANCE (aspx_balance = 1).
+    // ch1 SIGNAL (pan): stereo_mode = BALANCE (aspx_balance = 1).
     write_aspx_sig_envelope_values(
         bw,
         qmode_sig,
         aspx::AspxStereoMode::Balance,
-        ch1.sig,
+        &ch1_sig_w,
         num_sbg_sig,
     );
 
-    // ch0 NOISE: stereo_mode = LEVEL. Per Table 52 NOISE qmode = Fine.
-    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, ch0.noise, num_sbg_noise);
-    // ch1 NOISE: stereo_mode = BALANCE.
-    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Balance, ch1.noise, num_sbg_noise);
+    // ch0 NOISE (sum): stereo_mode = LEVEL. Per Table 52 NOISE qmode = Fine.
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, &ch0_noise_w, num_sbg_noise);
+    // ch1 NOISE (pan): stereo_mode = BALANCE.
+    write_aspx_noise_envelope_values(
+        bw,
+        aspx::AspxStereoMode::Balance,
+        &ch1_noise_w,
+        num_sbg_noise,
+    );
     Ok(())
+}
+
+/// Shared §5.7.6.3.5-inverse conversion for the single-envelope
+/// `aspx_data_2ch()` FREQ writers: unpack both channels' packed
+/// `[F0, DF₁, …]` LEVEL rows to absolute quant rows (constant-tail
+/// extension to the band count), apply the Pseudocode 84 inverse
+/// ([`balance_encode_sig_rows`] / [`balance_encode_noise_rows`]), and
+/// repack. Returns `(ch0_sig, ch1_sig, ch0_noise, ch1_noise)` wire
+/// rows — sum on channel 0 (LEVEL codebooks), pan wire steps on
+/// channel 1 (BALANCE codebooks, `delta = 2` accumulation on the
+/// decoder side).
+pub(crate) fn balance_convert_packed_rows(
+    ch0_sig: &[i32],
+    ch1_sig: &[i32],
+    ch0_noise: &[i32],
+    ch1_noise: &[i32],
+    qmode_sig: aspx::AspxQuantStep,
+    num_sbg_sig: usize,
+    num_sbg_noise: usize,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    let l_sig = qscf_row_from_freq_dpcm_extended(ch0_sig, num_sbg_sig);
+    let r_sig = qscf_row_from_freq_dpcm_extended(ch1_sig, num_sbg_sig);
+    let (sum_sig, pan_sig) = balance_encode_sig_rows(&l_sig, &r_sig, qmode_sig);
+    let l_noise = qscf_row_from_freq_dpcm_extended(ch0_noise, num_sbg_noise);
+    let r_noise = qscf_row_from_freq_dpcm_extended(ch1_noise, num_sbg_noise);
+    let (sum_noise, pan_noise) = balance_encode_noise_rows(&l_noise, &r_noise);
+    (
+        freq_dpcm_encode_qscf(&sum_sig),
+        freq_dpcm_encode_qscf(&pan_sig),
+        freq_dpcm_encode_qscf(&sum_noise),
+        freq_dpcm_encode_qscf(&pan_noise),
+    )
 }
 
 /// `aspx_data_2ch()` real-envelope writer that additionally carries a
@@ -3838,22 +3897,38 @@ pub fn write_aspx_data_2ch_real_envelope_tna_ah_framed(
         cfg.quant_mode_env
     };
 
+    // §5.7.6.3.5 joint (sum, pan) conversion — see
+    // [`balance_convert_packed_rows`].
+    let (ch0_sig_w, ch1_sig_w, ch0_noise_w, ch1_noise_w) = balance_convert_packed_rows(
+        ch0.sig,
+        ch1.sig,
+        ch0.noise,
+        ch1.noise,
+        qmode_sig,
+        num_sbg_sig as usize,
+        num_sbg_noise as usize,
+    );
     write_aspx_sig_envelope_values(
         bw,
         qmode_sig,
         aspx::AspxStereoMode::Level,
-        ch0.sig,
+        &ch0_sig_w,
         num_sbg_sig,
     );
     write_aspx_sig_envelope_values(
         bw,
         qmode_sig,
         aspx::AspxStereoMode::Balance,
-        ch1.sig,
+        &ch1_sig_w,
         num_sbg_sig,
     );
-    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, ch0.noise, num_sbg_noise);
-    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Balance, ch1.noise, num_sbg_noise);
+    write_aspx_noise_envelope_values(bw, aspx::AspxStereoMode::Level, &ch0_noise_w, num_sbg_noise);
+    write_aspx_noise_envelope_values(
+        bw,
+        aspx::AspxStereoMode::Balance,
+        &ch1_noise_w,
+        num_sbg_noise,
+    );
     Ok(())
 }
 
@@ -4805,6 +4880,18 @@ pub fn qscf_row_from_freq_dpcm(packed: &[i32]) -> Vec<i32> {
         .collect()
 }
 
+/// [`qscf_row_from_freq_dpcm`] extended to exactly `n` subband groups
+/// by repeating the last accumulated value — the same "missing deltas
+/// read 0 ⇒ constant tail" semantics the envelope writers apply when a
+/// packed row is shorter than the band count. An empty row extends to
+/// all-zero.
+pub fn qscf_row_from_freq_dpcm_extended(packed: &[i32], n: usize) -> Vec<i32> {
+    let mut row = qscf_row_from_freq_dpcm(packed);
+    let last = row.last().copied().unwrap_or(0);
+    row.resize(n, last);
+    row
+}
+
 // ====================================================================
 // §5.7.6.3.5 Pseudocode 84 inverse — (L, R) LEVEL rows → (sum, pan)
 // wire rows for aspx_balance = 1 pairs.
@@ -4833,18 +4920,14 @@ pub fn qscf_row_from_freq_dpcm(packed: &[i32]) -> Vec<i32> {
 /// the same domain the cross-frame [`Acpl3EnvPrevRows`] bookkeeping
 /// and the decoder's [`crate::aspx::AspxEnvPrev`] use. Length-
 /// mismatched inputs zero-extend the shorter row.
-pub fn balance_encode_sig_rows(
-    q_l: &[i32],
-    q_r: &[i32],
-    qmode: crate::aspx::AspxQuantStep,
-) -> (Vec<i32>, Vec<i32>) {
+/// Single-cell inverse of the Pseudocode 84 signal loop: `(q_l, q_r)`
+/// LEVEL quant values → `(sum, pan-wire-step)`. See
+/// [`balance_encode_sig_rows`] for the derivation.
+pub fn balance_encode_sig_cell(ql: i32, qr: i32, qmode: crate::aspx::AspxQuantStep) -> (i32, i32) {
     let a = match qmode {
         crate::aspx::AspxQuantStep::Fine => 2i32,
         crate::aspx::AspxQuantStep::Coarse => 1i32,
     };
-    let n = q_l.len().max(q_r.len());
-    let mut sum = Vec::with_capacity(n);
-    let mut pan = Vec::with_capacity(n);
     let af = a as f64;
     let pan_max = a * crate::aspx::ASPX_PAN_OFFSET;
     // LEVEL F0 codebook upper bound (Annex A.2: 71 entries Fine, 36
@@ -4854,19 +4937,32 @@ pub fn balance_encode_sig_rows(
         crate::aspx::AspxQuantStep::Fine => 70i32,
         crate::aspx::AspxQuantStep::Coarse => 35i32,
     };
+    // q_a = a·log2(2^(ql/a) + 2^(qr/a)) − a, computed around the
+    // larger level for numeric stability.
+    let hi = ql.max(qr);
+    let lo = ql.min(qr);
+    let qa = af * (1.0 + 2f64.powf((lo - hi) as f64 / af)).log2() + hi as f64 - af;
+    let sum = (qa.round() as i32).clamp(0, sum_max);
+    // p = (a·PAN_OFFSET + ql − qr) / 2, round-half-up.
+    let num = a * crate::aspx::ASPX_PAN_OFFSET + ql - qr;
+    let p = ((num as f64 / 2.0).round() as i32).clamp(0, pan_max);
+    (sum, p)
+}
+
+pub fn balance_encode_sig_rows(
+    q_l: &[i32],
+    q_r: &[i32],
+    qmode: crate::aspx::AspxQuantStep,
+) -> (Vec<i32>, Vec<i32>) {
+    let n = q_l.len().max(q_r.len());
+    let mut sum = Vec::with_capacity(n);
+    let mut pan = Vec::with_capacity(n);
     for i in 0..n {
         let ql = q_l.get(i).copied().unwrap_or(0);
         let qr = q_r.get(i).copied().unwrap_or(0);
-        // q_a = a·log2(2^(ql/a) + 2^(qr/a)) − a, computed around the
-        // larger level for numeric stability.
-        let hi = ql.max(qr);
-        let lo = ql.min(qr);
-        let qa = af * (1.0 + 2f64.powf((lo - hi) as f64 / af)).log2() + hi as f64 - af;
-        sum.push((qa.round() as i32).clamp(0, sum_max));
-        // p = (a·PAN_OFFSET + ql − qr) / 2, round-half-up.
-        let num = a * crate::aspx::ASPX_PAN_OFFSET + ql - qr;
-        let p = (num as f64 / 2.0).round() as i32;
-        pan.push(p.clamp(0, pan_max));
+        let (s, p) = balance_encode_sig_cell(ql, qr, qmode);
+        sum.push(s);
+        pan.push(p);
     }
     (sum, pan)
 }
@@ -4879,24 +4975,73 @@ pub fn balance_encode_sig_rows(
 /// clamped to `[0, PAN_OFFSET]` (note the sign flip versus the signal
 /// pan: noise levels quantize inverted, `scf_a/scf_b =
 /// 2^(qscf_b − PAN_OFFSET)`).
+/// Single-cell inverse of the Pseudocode 84 noise loop: `(q_l, q_r)`
+/// LEVEL noise quant values → `(sum, pan-wire-step)`. See
+/// [`balance_encode_noise_rows`].
+pub fn balance_encode_noise_cell(ql: i32, qr: i32) -> (i32, i32) {
+    // NOISE_LEVEL_F0 codebook range: 30 entries (Annex A.2).
+    const SUM_MAX: i32 = 29;
+    // q_a = 7 − log2(2^(6−ql) + 2^(6−qr)), computed around the
+    // louder (numerically larger scf ⇒ smaller q) channel.
+    let lo_q = ql.min(qr); // louder channel
+    let hi_q = ql.max(qr);
+    let qa = 7.0 - ((1.0 + 2f64.powi(lo_q - hi_q)).log2() + (6 - lo_q) as f64);
+    let sum = (qa.round() as i32).clamp(0, SUM_MAX);
+    let num = crate::aspx::ASPX_PAN_OFFSET + qr - ql;
+    let p = ((num as f64 / 2.0).round() as i32).clamp(0, crate::aspx::ASPX_PAN_OFFSET);
+    (sum, p)
+}
+
 pub fn balance_encode_noise_rows(q_l: &[i32], q_r: &[i32]) -> (Vec<i32>, Vec<i32>) {
     let n = q_l.len().max(q_r.len());
     let mut sum = Vec::with_capacity(n);
     let mut pan = Vec::with_capacity(n);
-    // NOISE_LEVEL_F0 codebook range: 30 entries (Annex A.2).
-    const SUM_MAX: i32 = 29;
     for i in 0..n {
         let ql = q_l.get(i).copied().unwrap_or(0);
         let qr = q_r.get(i).copied().unwrap_or(0);
-        // q_a = 7 − log2(2^(6−ql) + 2^(6−qr)), computed around the
-        // louder (numerically larger scf ⇒ smaller q) channel.
-        let lo_q = ql.min(qr); // louder channel
-        let hi_q = ql.max(qr);
-        let qa = 7.0 - ((1.0 + 2f64.powi(lo_q - hi_q)).log2() + (6 - lo_q) as f64);
-        sum.push((qa.round() as i32).clamp(0, SUM_MAX));
-        let num = crate::aspx::ASPX_PAN_OFFSET + qr - ql;
-        let p = (num as f64 / 2.0).round() as i32;
-        pan.push(p.clamp(0, crate::aspx::ASPX_PAN_OFFSET));
+        let (s, p) = balance_encode_noise_cell(ql, qr);
+        sum.push(s);
+        pan.push(p);
+    }
+    (sum, pan)
+}
+
+/// Matrix (`[sbg][atsg]`) forms of [`balance_encode_sig_cell`] /
+/// [`balance_encode_noise_cell`] for the multi-envelope builder: apply
+/// the Pseudocode 84 inverse cell-wise across a channel pair's quant
+/// matrices. Missing / short partner cells read 0.
+pub fn balance_encode_sig_matrix(
+    q_l: &[Vec<i32>],
+    q_r: &[Vec<i32>],
+    qmode: crate::aspx::AspxQuantStep,
+) -> (Vec<Vec<i32>>, Vec<Vec<i32>>) {
+    let mut sum = q_l.to_vec();
+    let mut pan = q_l.to_vec();
+    for (sbg, row) in q_l.iter().enumerate() {
+        for (atsg, &ql) in row.iter().enumerate() {
+            let qr = q_r.get(sbg).and_then(|r| r.get(atsg)).copied().unwrap_or(0);
+            let (s, p) = balance_encode_sig_cell(ql, qr, qmode);
+            sum[sbg][atsg] = s;
+            pan[sbg][atsg] = p;
+        }
+    }
+    (sum, pan)
+}
+
+/// See [`balance_encode_sig_matrix`].
+pub fn balance_encode_noise_matrix(
+    q_l: &[Vec<i32>],
+    q_r: &[Vec<i32>],
+) -> (Vec<Vec<i32>>, Vec<Vec<i32>>) {
+    let mut sum = q_l.to_vec();
+    let mut pan = q_l.to_vec();
+    for (sbg, row) in q_l.iter().enumerate() {
+        for (atsg, &ql) in row.iter().enumerate() {
+            let qr = q_r.get(sbg).and_then(|r| r.get(atsg)).copied().unwrap_or(0);
+            let (s, p) = balance_encode_noise_cell(ql, qr);
+            sum[sbg][atsg] = s;
+            pan[sbg][atsg] = p;
+        }
     }
     (sum, pan)
 }
@@ -5900,32 +6045,45 @@ pub fn build_aspx_multi_envelope_2ch_from_qmf(
     delta: i32,
     force_freq: bool,
 ) -> AspxMultiEnvelope2chRows {
-    let (ch0_sig, ch0_noise) = build_aspx_multi_envelope_channel_from_qmf(
-        ch0,
-        num_env,
-        qmode_env,
-        num_qmf_subbands,
-        num_ts_in_ats,
-        aspx_frame_ts_count,
-        sbx,
-        prev0.sig,
-        prev0.noise,
-        delta,
-        force_freq,
-    );
-    let (ch1_sig, ch1_noise) = build_aspx_multi_envelope_channel_from_qmf(
-        ch1,
-        num_env,
-        qmode_env,
-        num_qmf_subbands,
-        num_ts_in_ats,
-        aspx_frame_ts_count,
-        sbx,
-        prev1.sig,
-        prev1.noise,
-        delta,
-        force_freq,
-    );
+    let num_noise = if num_env > 1 { 2 } else { 1 };
+    // Per-channel §5.7.6.4.2.1 energy aggregation + Pseudocode 82 / 83
+    // inverse quantization on the shared FIXFIX partition.
+    let quantize_channel = |ch: &AspxQmfMultiEnvelopeChannel<'_>| {
+        let sig_energy = aggregate_qmf_to_sbg_atsg_uniform(
+            ch.q_high,
+            ch.sbg_sig_borders,
+            num_env,
+            aspx_frame_ts_count,
+            num_ts_in_ats,
+            sbx,
+        );
+        let noise_energy = aggregate_qmf_to_sbg_atsg_uniform(
+            ch.q_high,
+            ch.sbg_noise_borders,
+            num_noise,
+            aspx_frame_ts_count,
+            num_ts_in_ats,
+            sbx,
+        );
+        (
+            quantize_sig_energy_matrix(&sig_energy, qmode_env, num_qmf_subbands),
+            quantize_noise_energy_matrix(&noise_energy),
+        )
+    };
+    let (l_sig_q, l_noise_q) = quantize_channel(ch0);
+    let (r_sig_q, r_noise_q) = quantize_channel(ch1);
+    // §5.7.6.3.5: the aspx_balance = 1 pair transmits (sum, pan) —
+    // apply the Pseudocode 84 inverse cell-wise, then DPCM-pack both
+    // channels in the transmitted-symbol domain (the decoder's
+    // delta = 2 accumulation on the balance channel recovers
+    // qscf_b = 2 · pan). `prev0` / `prev1` carry previous-frame
+    // last-envelope rows in the same (sum / pan-wire-step) domain.
+    let (sum_sig_q, pan_sig_q) = balance_encode_sig_matrix(&l_sig_q, &r_sig_q, qmode_env);
+    let (sum_noise_q, pan_noise_q) = balance_encode_noise_matrix(&l_noise_q, &r_noise_q);
+    let ch0_sig = dpcm_encode_qscf_envelopes(&sum_sig_q, prev0.sig, delta, force_freq);
+    let ch0_noise = dpcm_encode_qscf_envelopes(&sum_noise_q, prev0.noise, delta, force_freq);
+    let ch1_sig = dpcm_encode_qscf_envelopes(&pan_sig_q, prev1.sig, delta, force_freq);
+    let ch1_noise = dpcm_encode_qscf_envelopes(&pan_noise_q, prev1.noise, delta, force_freq);
     AspxMultiEnvelope2chRows {
         ch0_sig,
         ch0_noise,
@@ -10942,9 +11100,14 @@ mod tests {
 
     #[test]
     fn directional_writer_all_freq_matches_tna_ah_framed_writer() {
-        // The directional single-envelope 2ch writer with all-FREQ rows
-        // must be byte-identical to the historical framed writer, on
-        // both I- and P-frame forms.
+        // Contract split by the §5.7.6.3.5 joint (sum, balance)
+        // coding: the framed FREQ writer takes per-channel (L, R)
+        // LEVEL rows and converts internally (Pseudocode 84 inverse),
+        // while the directional writer takes the already-converted
+        // wire rows verbatim. Feeding the directional writer the
+        // conversion of the same (L, R) rows must therefore be
+        // byte-identical to the framed writer, on both I- and P-frame
+        // forms.
         let cfg = r389_test_cfg();
         let counts = aspx::derive_aspx_frequency_tables(&cfg, 0)
             .expect("tables")
@@ -10954,6 +11117,27 @@ mod tests {
             .collect();
         let noise: Vec<i32> = vec![1; counts.num_sbg_noise as usize];
         let tna: Vec<u8> = vec![2; counts.num_sbg_noise as usize];
+        // The writers select low-res SIGNAL bands when the config
+        // signals a freq_res bit; mirror that band count here.
+        let num_sbg_sig = if cfg.signals_freq_res() {
+            counts.num_sbg_sig_lowres
+        } else {
+            counts.num_sbg_sig_highres
+        };
+        let qmode_sig = if cfg.fixfix_tmp_num_env_bits() == 1 {
+            aspx::AspxQuantStep::Fine
+        } else {
+            cfg.quant_mode_env
+        };
+        let (sum_sig, pan_sig, sum_noise, pan_noise) = balance_convert_packed_rows(
+            &sig,
+            &sig,
+            &noise,
+            &noise,
+            qmode_sig,
+            num_sbg_sig as usize,
+            counts.num_sbg_noise as usize,
+        );
         for b_iframe in [true, false] {
             let mut bw_a = BitWriter::new();
             write_aspx_data_2ch_real_envelope_tna_ah_framed(
@@ -10981,10 +11165,10 @@ mod tests {
             write_aspx_data_2ch_directional_envelope_tna_ah_framed(
                 &mut bw_b,
                 &cfg,
-                &f(&sig),
-                &f(&noise),
-                &f(&sig),
-                &f(&noise),
+                &f(&sum_sig),
+                &f(&sum_noise),
+                &f(&pan_sig),
+                &f(&pan_noise),
                 &tna,
                 &[],
                 &[],

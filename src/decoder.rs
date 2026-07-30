@@ -165,6 +165,7 @@ type SyncCompandingChannelEntry<'a> = (
     &'a aspx::FiveXAspxChannelTrailer, // channel trailer
     &'a aspx::AspxConfig,              // aspx config
     Option<u32>,                       // sb0 override (acpl_qmf_band)
+    Option<aspx::AspxDecodedScf>,      // aspx_balance == 1 joint-decode scf
 );
 
 /// One per-channel entry consumed by [`Ac4Decoder::extend_5x_entries`]:
@@ -203,6 +204,10 @@ struct StereoCpeChannelInput<'a> {
     add_harmonic: Option<&'a [bool]>,
     /// `aspx_hfgen_iwc.tna_mode[ch]` for the chirp + α0 + α1 TNS body.
     tna_mode: Option<&'a [u8]>,
+    /// Pair-level §5.7.6.3.5 Pseudocode 84 joint-decode output for
+    /// this channel (`aspx_balance == 1`); `None` runs the
+    /// per-channel Pseudocode 80-83 path inside phase-1.
+    precomputed_scf: Option<aspx::AspxDecodedScf>,
 }
 
 impl Ac4Decoder {
@@ -318,6 +323,10 @@ impl Ac4Decoder {
         // subband group, drives chirp + α0 + α1 TNS path. `None` falls
         // back to the bare HF tile copy.
         tna_mode: Option<&[u8]>,
+        // Pair-level §5.7.6.3.5 Pseudocode 84 joint decode output for
+        // this channel (`aspx_balance == 1`); `None` runs the
+        // per-channel Pseudocode 80-83 path.
+        precomputed_scf: Option<&aspx::AspxDecodedScf>,
         state: &mut aspx::AspxChannelExtState,
         num_ts_in_ats: u32,
         // Round 43: §5.7.5 companding tool — applied on the QMF matrix
@@ -342,6 +351,7 @@ impl Ac4Decoder {
             delta_dir,
             add_harmonic,
             tna_mode,
+            precomputed_scf,
             state,
             num_ts_in_ats,
         );
@@ -374,6 +384,14 @@ impl Ac4Decoder {
     /// geometric-mean gain across them, then apply the synced gain
     /// uniformly before each channel runs its own synthesis via
     /// [`Self::qmf_synthesise_pcm`].
+    ///
+    /// `precomputed_scf` carries the channel's already-dequantized
+    /// §5.7.6.3.5 scale factors when the envelope decode ran at the
+    /// pair level — the `aspx_balance == 1` joint (sum, balance)
+    /// Pseudocode 84 path via [`aspx::decode_scf_balance_pair`]. When
+    /// `Some`, the per-channel Pseudocode 80–83 decode (and its
+    /// `env_prev` update, which the pair decode already performed) is
+    /// skipped and the adjuster builds from the provided matrices.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn aspx_extend_to_qmf(
         pcm_in: &[f32],
@@ -386,6 +404,7 @@ impl Ac4Decoder {
         delta_dir: Option<&aspx::AspxDeltaDir>,
         add_harmonic: Option<&[bool]>,
         tna_mode: Option<&[u8]>,
+        precomputed_scf: Option<&aspx::AspxDecodedScf>,
         state: &mut aspx::AspxChannelExtState,
         num_ts_in_ats: u32,
     ) -> Option<AspxQmfPhase1> {
@@ -517,28 +536,51 @@ impl Ac4Decoder {
         // are available. Otherwise fall back to the flat-gain scaffold
         // so output PCM still has audible HF content.
         let mut used_envelope = false;
-        if let (Some(frm), Some(sig), Some(noise), Some(qm), Some(dd)) =
-            (framing, sig_deltas, noise_deltas, qmode_env, delta_dir)
-        {
+        if let Some(frm) = framing {
             let num_aspx_ts = (n_slots as u32) / num_ts_in_ats.max(1);
             // §5.7.6.3.3.1 Pseudocode 76 (FIXFIX) or §5.7.6.3.3.2
             // Pseudocode 77 (FIXVAR / VARFIX / VARVAR) border derivation.
             if let Some((atsg_sig, atsg_noise)) = aspx::derive_atsg_borders(num_aspx_ts, frm) {
-                if sig.len() as u32 == frm.num_env {
-                    let adjuster = aspx::AspxEnvelopeAdjuster::from_deltas_stateful(
-                        &q,
-                        tables,
-                        sig,
-                        noise,
-                        qm,
-                        &dd.sig_delta_dir,
-                        &frm.freq_res,
-                        &atsg_sig,
-                        &atsg_noise,
-                        num_ts_in_ats,
-                        cfg.interpolation,
-                        &mut state.env_prev,
-                    );
+                // Build the envelope adjuster: either from the
+                // pair-level joint decode's precomputed scale factors
+                // (aspx_balance == 1, Pseudocode 84) or through the
+                // per-channel Pseudocode 80-83 path.
+                let adjuster_opt = if let Some(pscf) = precomputed_scf {
+                    let n_env = pscf.scf_sig_sbg.first().map(|row| row.len()).unwrap_or(0);
+                    (n_env as u32 == frm.num_env).then(|| {
+                        aspx::AspxEnvelopeAdjuster::from_scf(
+                            &q,
+                            tables,
+                            pscf,
+                            &atsg_sig,
+                            &atsg_noise,
+                            num_ts_in_ats,
+                            cfg.interpolation,
+                        )
+                    })
+                } else if let (Some(sig), Some(noise), Some(qm), Some(dd)) =
+                    (sig_deltas, noise_deltas, qmode_env, delta_dir)
+                {
+                    (sig.len() as u32 == frm.num_env).then(|| {
+                        aspx::AspxEnvelopeAdjuster::from_deltas_stateful(
+                            &q,
+                            tables,
+                            sig,
+                            noise,
+                            qm,
+                            &dd.sig_delta_dir,
+                            &frm.freq_res,
+                            &atsg_sig,
+                            &atsg_noise,
+                            num_ts_in_ats,
+                            cfg.interpolation,
+                            &mut state.env_prev,
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(adjuster) = adjuster_opt {
                     // Noise + tone injection on top of the
                     // envelope-adjusted HF. `add_harmonic` is sized
                     // to `num_sbg_sig_highres`; if the caller didn't
@@ -903,6 +945,7 @@ impl Ac4Decoder {
         num_ts_in_ats: u32,
         compand_mode: aspx::CompandingMode,
         compand_sb0_override: Option<u32>,
+        precomputed_scf: Option<&aspx::AspxDecodedScf>,
     ) -> Vec<f32> {
         while self.aspx_ext_state.len() <= slot {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
@@ -919,11 +962,76 @@ impl Ac4Decoder {
             Some(&ch.delta_dir),
             ch.add_harmonic.as_deref(),
             ch.tna_mode.as_deref(),
+            precomputed_scf,
             state,
             num_ts_in_ats,
             compand_mode,
             compand_sb0_override,
         )
+    }
+
+    /// Split-borrow two distinct per-slot A-SPX extension states,
+    /// growing the vector on demand. Used by the `aspx_balance == 1`
+    /// joint decode, which updates both channels' cross-interval
+    /// [`aspx::AspxEnvPrev`] in one pair-level pass.
+    fn two_ext_states(
+        &mut self,
+        a: usize,
+        b: usize,
+    ) -> (
+        &mut aspx::AspxChannelExtState,
+        &mut aspx::AspxChannelExtState,
+    ) {
+        debug_assert_ne!(a, b);
+        let need = a.max(b) + 1;
+        while self.aspx_ext_state.len() < need {
+            self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
+        }
+        if a < b {
+            let (lo, hi) = self.aspx_ext_state.split_at_mut(b);
+            (&mut lo[a], &mut hi[0])
+        } else {
+            let (lo, hi) = self.aspx_ext_state.split_at_mut(a);
+            (&mut hi[0], &mut lo[b])
+        }
+    }
+
+    /// Run the pair-level §5.7.6.3.4-5 joint envelope decode for a
+    /// captured 2ch trailer with `aspx_balance == 1` (Pseudocode 80/81
+    /// `delta = 2` on the balance channel + the Pseudocode 84 joint
+    /// dequantization), updating both slots' cross-interval envelope
+    /// state. Returns the per-channel dequantized scale factors to
+    /// feed each channel's phase-1 as `precomputed_scf`.
+    ///
+    /// `None` when the trailer is not balance-coded (per-channel
+    /// Pseudocode 82/83 applies), has no secondary channel, or carries
+    /// no envelopes.
+    pub(crate) fn trailer_balance_scf(
+        trailer: &aspx::FiveXAspxTrailer,
+        st_pri: &mut aspx::AspxChannelExtState,
+        st_sec: &mut aspx::AspxChannelExtState,
+    ) -> Option<(aspx::AspxDecodedScf, aspx::AspxDecodedScf)> {
+        if !trailer.balance {
+            return None;
+        }
+        let sec = trailer.secondary.as_ref()?;
+        let pri = &trailer.primary;
+        if pri.data_sig.is_empty() {
+            return None;
+        }
+        Some(aspx::decode_scf_balance_pair(
+            &trailer.frequency_tables,
+            &pri.data_sig,
+            &pri.data_noise,
+            &sec.data_sig,
+            &sec.data_noise,
+            // Table 52: aspx_qmode_env[1] = aspx_qmode_env[0] under
+            // aspx_balance == 1 (shared framing, shared quant step).
+            pri.qmode_env,
+            &pri.framing.freq_res,
+            &mut st_pri.env_prev,
+            &mut st_sec.env_prev,
+        ))
     }
 
     /// Round 43: per-output-channel companding mode from the captured
@@ -1018,7 +1126,7 @@ impl Ac4Decoder {
         // through unchanged).
         let mut phase1: Vec<(usize, usize, Option<AspxQmfPhase1>)> =
             Vec::with_capacity(entries.len());
-        for (slot, pcm_in, trailer, ch, cfg, sb0_override) in entries.iter() {
+        for (slot, pcm_in, trailer, ch, cfg, sb0_override, pre_scf) in entries.iter() {
             while self.aspx_ext_state.len() <= *slot {
                 self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
             }
@@ -1034,6 +1142,7 @@ impl Ac4Decoder {
                 Some(&ch.delta_dir),
                 ch.add_harmonic.as_deref(),
                 ch.tna_mode.as_deref(),
+                pre_scf.as_ref(),
                 state,
                 num_ts_in_ats,
             );
@@ -1151,6 +1260,7 @@ impl Ac4Decoder {
                 input.delta_dir,
                 input.add_harmonic,
                 input.tna_mode,
+                input.precomputed_scf.as_ref(),
                 state,
                 num_ts_in_ats,
             )
@@ -1235,6 +1345,34 @@ impl Ac4Decoder {
         pcm_per_channel: &mut [Option<Vec<i16>>],
     ) {
         let synced = Self::five_x_synced_mode(companding);
+        // Pair-level §5.7.6.3.5 joint decode for aspx_balance == 1
+        // trailers: find (primary, secondary) entries sharing one 2ch
+        // trailer and run the Pseudocode 84 joint dequantization once
+        // per pair, updating both slots' cross-interval envelope
+        // state. `pre_scf[i]` then feeds entry i's phase-1.
+        let mut pre_scf: Vec<Option<aspx::AspxDecodedScf>> = vec![None; entries.len()];
+        for i in 0..entries.len() {
+            let Some((t_pri, false)) = entries[i].2 else {
+                continue;
+            };
+            if !t_pri.balance {
+                continue;
+            }
+            let Some(j) = entries.iter().position(
+                |(_, _, tp)| matches!(tp, Some((t_sec, true)) if std::ptr::eq(*t_sec, t_pri)),
+            ) else {
+                continue;
+            };
+            let (slot_pri, slot_sec) = (entries[i].0, entries[j].0);
+            if slot_pri == slot_sec {
+                continue;
+            }
+            let (st_pri, st_sec) = self.two_ext_states(slot_pri, slot_sec);
+            if let Some((scf_pri, scf_sec)) = Self::trailer_balance_scf(t_pri, st_pri, st_sec) {
+                pre_scf[i] = Some(scf_pri);
+                pre_scf[j] = Some(scf_sec);
+            }
+        }
         if let (Some(mode), Some(cfg)) = (synced, aspx_cfg) {
             // Cross-channel synced path. Build the entries-with-trailer
             // list (skipping any whose trailer is missing — those fall
@@ -1243,7 +1381,7 @@ impl Ac4Decoder {
             // Track which entries had no trailer — they pass through
             // the PCM unchanged.
             let mut passthrough: Vec<(usize, &[f32])> = Vec::new();
-            for (slot, pcm_f, trailer_pair) in entries.iter() {
+            for ((slot, pcm_f, trailer_pair), pre) in entries.iter().zip(pre_scf.iter()) {
                 match trailer_pair {
                     Some((trailer, is_secondary)) => {
                         let ch = if *is_secondary {
@@ -1251,7 +1389,15 @@ impl Ac4Decoder {
                         } else {
                             &trailer.primary
                         };
-                        sync_entries.push((*slot, pcm_f.as_slice(), trailer, ch, &cfg, None));
+                        sync_entries.push((
+                            *slot,
+                            pcm_f.as_slice(),
+                            trailer,
+                            ch,
+                            &cfg,
+                            None,
+                            pre.clone(),
+                        ));
                     }
                     None => {
                         passthrough.push((*slot, pcm_f.as_slice()));
@@ -1269,7 +1415,7 @@ impl Ac4Decoder {
             return;
         }
         // Per-channel path (sync_flag == 0 or sync_flag == 1 + Off).
-        for (slot, pcm_f, trailer_pair) in entries.into_iter() {
+        for ((slot, pcm_f, trailer_pair), pre) in entries.into_iter().zip(pre_scf) {
             let pcm_i16 = match (aspx_cfg, trailer_pair) {
                 (Some(cfg), Some((trailer, is_secondary))) => {
                     let ch = if is_secondary {
@@ -1287,6 +1433,7 @@ impl Ac4Decoder {
                         num_ts_in_ats,
                         compand_mode,
                         None,
+                        pre.as_ref(),
                     );
                     Self::pcm_f32_to_i16(&extended)
                 }
@@ -1569,6 +1716,9 @@ impl Ac4Decoder {
                     compand_mode,
                     // SIMPLE/ASPX cfg{0,1,3} dispatchers never run on
                     // ASPX_ACPL_1, so sb0 stays at aspx_xover_band.
+                    None,
+                    // Legacy slot-by-slot helper (dead code) — no pair
+                    // context, so no joint-balance precompute.
                     None,
                 );
                 Self::pcm_f32_to_i16(&extended)
@@ -2037,6 +2187,7 @@ impl Ac4Decoder {
         cfg: &aspx::AspxConfig,
         slot: usize,
         num_ts_in_ats: u32,
+        precomputed_scf: Option<&aspx::AspxDecodedScf>,
     ) -> (aspx::QmfMatrix, Option<(u32, u32)>) {
         while self.aspx_ext_state.len() <= slot {
             self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
@@ -2057,12 +2208,55 @@ impl Ac4Decoder {
             Some(&ch.delta_dir),
             ch.add_harmonic.as_deref(),
             ch.tna_mode.as_deref(),
+            precomputed_scf,
             &mut self.aspx_ext_state[slot],
             num_ts_in_ats,
         ) {
             Some((q, sb0, sb1)) => (q, Some((sb0, sb1))),
             None => (Self::ice_plain_qmf(pcm), None),
         }
+    }
+
+    /// Pair-level `aspx_balance == 1` joint decode over an ICE-style
+    /// payload mapping `(elem_idx, slot, is_secondary)`: for every 2ch
+    /// element whose trailer is balance-coded and whose primary +
+    /// secondary both appear in the mapping, run
+    /// [`Self::trailer_balance_scf`] once and return the per-mapping-row
+    /// precomputed scale factors (parallel to `mapping`).
+    fn ice_mapping_balance_scf<F>(
+        &mut self,
+        mapping: &[(usize, usize, bool)],
+        get_trailer: F,
+    ) -> Vec<Option<aspx::AspxDecodedScf>>
+    where
+        F: Fn(usize) -> Option<aspx::FiveXAspxTrailer>,
+    {
+        let mut out: Vec<Option<aspx::AspxDecodedScf>> = vec![None; mapping.len()];
+        for i in 0..mapping.len() {
+            let (elem_idx, slot_pri, is_sec) = mapping[i];
+            if is_sec || out[i].is_some() {
+                continue;
+            }
+            let Some(trailer) = get_trailer(elem_idx) else {
+                continue;
+            };
+            if !trailer.balance {
+                continue;
+            }
+            let Some(j) = mapping.iter().position(|&(e, _, s)| e == elem_idx && s) else {
+                continue;
+            };
+            let slot_sec = mapping[j].1;
+            if slot_pri == slot_sec {
+                continue;
+            }
+            let (st_pri, st_sec) = self.two_ext_states(slot_pri, slot_sec);
+            if let Some((scf_pri, scf_sec)) = Self::trailer_balance_scf(&trailer, st_pri, st_sec) {
+                out[i] = Some(scf_pri);
+                out[j] = Some(scf_sec);
+            }
+        }
+        out
     }
 
     /// Transpose a `q[sb][ts]` matrix into the `[ts][sb]`
@@ -2224,7 +2418,18 @@ impl Ac4Decoder {
                                 (5, 10, true),
                             ]
                         };
-                        for &(elem_idx, slot, is_secondary) in mapping {
+                        // Pair-level aspx_balance == 1 joint decode
+                        // (Pseudocode 84) once per 2ch element.
+                        let pre = self.ice_mapping_balance_scf(mapping, |e| {
+                            match ice_el.aspx_elements.get(e) {
+                                Some(
+                                    ice::IceAspxElement::TwoCh(Some(t))
+                                    | ice::IceAspxElement::OneCh(Some(t)),
+                                ) => Some((**t).clone()),
+                                _ => None,
+                            }
+                        });
+                        for (row, &(elem_idx, slot, is_secondary)) in mapping.iter().enumerate() {
                             let trailer = match ice_el.aspx_elements.get(elem_idx) {
                                 Some(
                                     ice::IceAspxElement::TwoCh(Some(t))
@@ -2251,6 +2456,7 @@ impl Ac4Decoder {
                                 Some(&ch.delta_dir),
                                 ch.add_harmonic.as_deref(),
                                 ch.tna_mode.as_deref(),
+                                pre[row].as_ref(),
                                 &mut self.aspx_ext_state[slot],
                                 num_ts_in_ats,
                                 aspx::CompandingMode::Off,
@@ -2312,7 +2518,18 @@ impl Ac4Decoder {
                             (2, 6, true),
                             (3, 2, false), // payload 3 (1ch) → C
                         ];
-                        for (elem_idx, tr, is_secondary) in mapping {
+                        // Pair-level aspx_balance == 1 joint decode
+                        // (Pseudocode 84) once per 2ch element.
+                        let pre = self.ice_mapping_balance_scf(&mapping, |e| {
+                            match ice_el.aspx_elements.get(e) {
+                                Some(
+                                    ice::IceAspxElement::TwoCh(Some(t))
+                                    | ice::IceAspxElement::OneCh(Some(t)),
+                                ) => Some((**t).clone()),
+                                _ => None,
+                            }
+                        });
+                        for (row, &(elem_idx, tr, is_secondary)) in mapping.iter().enumerate() {
                             let trailer = match ice_el.aspx_elements.get(elem_idx) {
                                 Some(
                                     ice::IceAspxElement::TwoCh(Some(t))
@@ -2327,6 +2544,7 @@ impl Ac4Decoder {
                                 &cfg,
                                 tr,
                                 num_ts_in_ats,
+                                pre[row].as_ref(),
                             );
                         }
                     }
@@ -2533,7 +2751,18 @@ impl Ac4Decoder {
                             (1, 4, true),  // payload 1 secondary → E
                             (2, 2, false), // payload 2 (1ch)     → C
                         ];
-                        for (elem_idx, ch, is_secondary) in mapping {
+                        // Pair-level aspx_balance == 1 joint decode
+                        // (Pseudocode 84) once per 2ch element.
+                        let pre = self.ice_mapping_balance_scf(&mapping, |e| {
+                            match ice_el.aspx_elements.get(e) {
+                                Some(
+                                    ice::IceAspxElement::TwoCh(Some(t))
+                                    | ice::IceAspxElement::OneCh(Some(t)),
+                                ) => Some((**t).clone()),
+                                _ => None,
+                            }
+                        });
+                        for (row, &(elem_idx, ch, is_secondary)) in mapping.iter().enumerate() {
                             let trailer = match ice_el.aspx_elements.get(elem_idx) {
                                 Some(
                                     ice::IceAspxElement::TwoCh(Some(t))
@@ -2548,6 +2777,7 @@ impl Ac4Decoder {
                                 &cfg,
                                 ch,
                                 num_ts_in_ats,
+                                pre[row].as_ref(),
                             );
                         }
                     }
@@ -2715,6 +2945,27 @@ impl Ac4Decoder {
                 if el.aspx_mode {
                     if let Some(cfg) = sub_aspx_cfg {
                         let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+                        // Pair-level aspx_balance == 1 joint decode
+                        // (Pseudocode 84): payload p covers channels
+                        // (2p, 2p + 1).
+                        let mut pre: Vec<Option<aspx::AspxDecodedScf>> = vec![None; 22];
+                        for p in 0..11usize {
+                            let Some(trailer) = el.aspx_elements.get(p).and_then(|t| t.as_deref())
+                            else {
+                                continue;
+                            };
+                            if !trailer.balance {
+                                continue;
+                            }
+                            let trailer = trailer.clone();
+                            let (st_a, st_b) = self.two_ext_states(2 * p, 2 * p + 1);
+                            if let Some((scf_a, scf_b)) =
+                                Self::trailer_balance_scf(&trailer, st_a, st_b)
+                            {
+                                pre[2 * p] = Some(scf_a);
+                                pre[2 * p + 1] = Some(scf_b);
+                            }
+                        }
                         for (ch, chan) in chans.iter_mut().enumerate().take(22) {
                             let Some(trailer) =
                                 el.aspx_elements.get(ch / 2).and_then(|t| t.as_deref())
@@ -2741,6 +2992,7 @@ impl Ac4Decoder {
                                 Some(&chd.delta_dir),
                                 chd.add_harmonic.as_deref(),
                                 chd.tna_mode.as_deref(),
+                                pre[ch].as_ref(),
                                 &mut self.aspx_ext_state[ch],
                                 num_ts_in_ats,
                                 aspx::CompandingMode::Off,
@@ -3425,6 +3677,68 @@ impl Decoder for Ac4Decoder {
             && primary_in.is_some()
             && secondary_in.is_some()
             && primary_in.as_ref().map(|(_, n)| *n) == secondary_in.as_ref().map(|(_, n)| *n);
+        // Pair-level §5.7.6.3.4-5 joint decode for a stereo-CPE
+        // aspx_balance == 1 pair (Table 52): the balance channel's
+        // envelopes accumulate with delta = 2 and both channels
+        // dequantize jointly through Pseudocode 84. Runs once per
+        // frame, updating both channels' cross-interval envelope
+        // state; the per-channel phase-1 then consumes the
+        // precomputed scale factors instead of re-running the
+        // per-channel Pseudocode 80-83 path.
+        let (pre_scf_pri, pre_scf_sec): (
+            Option<aspx::AspxDecodedScf>,
+            Option<aspx::AspxDecodedScf>,
+        ) = {
+            let is_balance = self
+                .last_substream
+                .as_ref()
+                .and_then(|sub| sub.tools.aspx_balance)
+                .unwrap_or(false);
+            let pair = if is_balance && use_aspx_ext && channels as usize >= 2 {
+                if let (
+                    Some(tables),
+                    Some(frm),
+                    Some(sig_p),
+                    Some(noise_p),
+                    Some(sig_s),
+                    Some(noise_s),
+                    Some(qm),
+                ) = (
+                    aspx_tables.as_ref(),
+                    framing_pri.as_ref(),
+                    sig_pri.as_ref(),
+                    noise_pri.as_ref(),
+                    sig_sec.as_ref(),
+                    noise_sec.as_ref(),
+                    qmode_pri,
+                ) {
+                    if sig_p.is_empty() {
+                        None
+                    } else {
+                        let (st0, st1) = self.two_ext_states(0, 1);
+                        Some(aspx::decode_scf_balance_pair(
+                            tables,
+                            sig_p,
+                            noise_p,
+                            sig_s,
+                            noise_s,
+                            qm,
+                            &frm.freq_res,
+                            &mut st0.env_prev,
+                            &mut st1.env_prev,
+                        ))
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match pair {
+                Some((a, b)) => (Some(a), Some(b)),
+                None => (None, None),
+            }
+        };
         if use_stereo_cpe_synced {
             // Synced stereo-CPE pipeline. IMDCT each channel, then
             // run the M=2 phase-1 / sync-apply / phase-2 helper.
@@ -3447,6 +3761,7 @@ impl Decoder for Ac4Decoder {
                     delta_dir: delta_dir_pri.as_ref(),
                     add_harmonic: ah_pri.as_deref(),
                     tna_mode: tna_pri.as_deref(),
+                    precomputed_scf: pre_scf_pri.clone(),
                 };
                 let sec_input = StereoCpeChannelInput {
                     ch_index: 1,
@@ -3458,6 +3773,7 @@ impl Decoder for Ac4Decoder {
                     delta_dir: delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
                     add_harmonic: ah_sec.as_deref().or(ah_pri.as_deref()),
                     tna_mode: tna_sec.as_deref().or(tna_pri.as_deref()),
+                    precomputed_scf: pre_scf_sec.clone(),
                 };
                 let (ext_pri, ext_sec) = self.extend_stereo_cpe_pair_with_sync_companding(
                     &pri_input,
@@ -3494,6 +3810,7 @@ impl Decoder for Ac4Decoder {
                             delta_dir_pri.as_ref(),
                             ah_pri.as_deref(),
                             tna_pri.as_deref(),
+                            pre_scf_pri.as_ref(),
                             state,
                             num_ts_in_ats,
                             compand_mode_pri,
@@ -3567,6 +3884,7 @@ impl Decoder for Ac4Decoder {
                                 delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
                                 ah_sec.as_deref().or(ah_pri.as_deref()),
                                 tna_sec.as_deref().or(tna_pri.as_deref()),
+                                pre_scf_sec.as_ref(),
                                 state,
                                 num_ts_in_ats,
                                 compand_mode_sec,
@@ -4724,6 +5042,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut state,
             1,
             aspx::CompandingMode::Off,
@@ -4815,6 +5134,7 @@ mod tests {
             None,
             None,
             Some(&tna_mode_heavy),
+            None,
             &mut state_a,
             2,
             aspx::CompandingMode::Off,
@@ -4832,6 +5152,7 @@ mod tests {
             None,
             None,
             Some(&tna_mode_zero),
+            None,
             &mut state_b,
             2,
             aspx::CompandingMode::Off,
@@ -5587,12 +5908,14 @@ mod tests {
             frequency_tables: tables.clone(),
             primary: mk_ch(),
             secondary: Some(mk_ch()),
+            balance: false,
         };
         let trailer_1ch = aspx::FiveXAspxTrailer {
             xover: 0,
             frequency_tables: tables,
             primary: mk_ch(),
             secondary: None,
+            balance: false,
         };
         let mut dec_aspx = Ac4Decoder::new(&params);
         let mut pcm_aspx: Vec<Option<Vec<i16>>> = vec![None; 5];
@@ -5951,12 +6274,14 @@ mod tests {
             frequency_tables: tables.clone(),
             primary: mk_ch(),
             secondary: Some(mk_ch()),
+            balance: false,
         };
         let trailer_1ch = aspx::FiveXAspxTrailer {
             xover: 0,
             frequency_tables: tables,
             primary: mk_ch(),
             secondary: None,
+            balance: false,
         };
         let params = CodecParameters::audio(CodecId::new("ac4"));
 
@@ -6223,6 +6548,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut state_off,
             1,
             aspx::CompandingMode::Off,
@@ -6233,6 +6559,7 @@ mod tests {
             &pcm,
             &tables,
             &cfg,
+            None,
             None,
             None,
             None,
@@ -6510,6 +6837,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut state_a,
             1,
             aspx::CompandingMode::PerSlot,
@@ -6528,6 +6856,7 @@ mod tests {
             &pcm,
             &tables,
             &cfg,
+            None,
             None,
             None,
             None,
@@ -6598,6 +6927,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut state_off,
             1,
             aspx::CompandingMode::Off,
@@ -6615,6 +6945,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut state_per,
             1,
             aspx::CompandingMode::PerSlot,
@@ -6625,6 +6956,7 @@ mod tests {
             &pcm,
             &tables,
             &cfg,
+            None,
             None,
             None,
             None,
@@ -6784,6 +7116,7 @@ mod tests {
             delta_dir: None,
             add_harmonic: None,
             tna_mode: None,
+            precomputed_scf: None,
         };
         let sec_input = StereoCpeChannelInput {
             ch_index: 1,
@@ -6795,6 +7128,7 @@ mod tests {
             delta_dir: None,
             add_harmonic: None,
             tna_mode: None,
+            precomputed_scf: None,
         };
         let (sync_a, sync_b) = dec_sync.extend_stereo_cpe_pair_with_sync_companding(
             &pri_input,
@@ -6823,6 +7157,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut state_a,
             1,
             aspx::CompandingMode::PerSlot,
@@ -6833,6 +7168,7 @@ mod tests {
             &pcm_b,
             &tables,
             &cfg,
+            None,
             None,
             None,
             None,
@@ -6860,6 +7196,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut state_off_a,
             1,
             aspx::CompandingMode::Off,
@@ -6870,6 +7207,7 @@ mod tests {
             &pcm_b,
             &tables,
             &cfg,
+            None,
             None,
             None,
             None,
@@ -6986,6 +7324,7 @@ mod tests {
             frequency_tables: tables,
             primary: ch.clone(),
             secondary: Some(ch.clone()),
+            balance: false,
         };
         let n_slots = 24usize;
         let n = n_slots * 64;
@@ -7000,13 +7339,14 @@ mod tests {
         let params = CodecParameters::audio(CodecId::new("ac4"));
         let mut dec = Ac4Decoder::new(&params);
         let entries: Vec<SyncCompandingChannelEntry<'_>> = vec![
-            (0, &pcm_a, &trailer, &trailer.primary, &cfg, None),
+            (0, &pcm_a, &trailer, &trailer.primary, &cfg, None, None),
             (
                 3,
                 &pcm_b,
                 &trailer,
                 trailer.secondary.as_ref().unwrap(),
                 &cfg,
+                None,
                 None,
             ),
         ];

@@ -2899,8 +2899,32 @@ impl Ac4ImsEncoder {
         // A-SPX signal / noise subband-group borders into per-channel
         // [F0, DF₁, …] quant-index vectors. The frequency tables provide
         // the absolute SBG borders + the cross-over subband `sbx`.
-        let (l_sig, l_noise, r_sig, r_noise) =
+        let (l_sig_lvl, l_noise_lvl, r_sig_lvl, r_noise_lvl) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
+        // §5.7.6.3.5: the pair is transmitted as (sum, pan) under
+        // aspx_balance = 1 (Pseudocode 84). Convert here — before the
+        // FREQ/TIME direction decision — so the cross-frame
+        // `Acpl3EnvPrevRows` bookkeeping, the direction pricing, and
+        // the directional writer all operate in the wire domain
+        // (channel 0 = sum LEVEL rows, channel 1 = pan wire steps for
+        // the decoder's delta = 2 accumulation).
+        let (l_sig, l_noise, r_sig, r_noise) = {
+            let qmode_sig = if aspx_cfg.fixfix_tmp_num_env_bits() == 1 {
+                crate::aspx::AspxQuantStep::Fine
+            } else {
+                aspx_cfg.quant_mode_env
+            };
+            let (s0, s1, n0, n1) = crate::encoder_acpl3::balance_convert_packed_rows(
+                &l_sig_lvl,
+                &r_sig_lvl,
+                &l_noise_lvl,
+                &r_noise_lvl,
+                qmode_sig,
+                l_sig_lvl.len().max(r_sig_lvl.len()),
+                l_noise_lvl.len().max(r_noise_lvl.len()),
+            );
+            (s0, n0, s1, n1)
+        };
 
         // Encoder-side A-SPX inverse-filtering decision for the L carrier
         // (mirrored to R under aspx_balance = 1). Heavier where the low

@@ -2316,6 +2316,10 @@ pub(crate) fn capture_aspx_data_2ch_trailer(
             frequency_tables,
             primary,
             secondary: Some(secondary),
+            // Table 52 aspx_balance — selects the §5.7.6.3.5
+            // Pseudocode 84 joint (sum, balance) dequantization for
+            // the pair.
+            balance: tools.aspx_balance.unwrap_or(false),
         })
     } else {
         None
@@ -2369,6 +2373,7 @@ pub(crate) fn capture_aspx_data_1ch_trailer(
                 tna_mode,
             },
             secondary: None,
+            balance: false,
         })
     } else {
         None
