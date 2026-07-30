@@ -40,19 +40,17 @@
 //!   lets the encoder mirror the left-channel TIC pattern into the
 //!   right. Mirrors the pseudocode in Table 56 byte-for-byte.
 //!
-//! We deliberately stop short of:
-//!
-//! * `aspx_ec_data()` and the A-SPX Huffman tables in Annex A.2 —
-//!   envelope and noise scale factors are Huffman-coded with dedicated
-//!   codebooks (different ones per delta direction, quantization step,
-//!   signal vs noise etc.) and would double the crate's line count.
-//!   See the module-level roadmap in `lib.rs`.
-//!
-//! Even so, `parse_aspx_config()` is useful on its own: it unblocks the
-//! `mono_codec_mode == ASPX` I-frame path in the outer `audio_data()`
-//! walker, so the substream walker no longer bails out silently on
-//! ASPX substreams. It just stops one syntax element earlier — after
-//! the config — instead of at the `mono_codec_mode` flag.
+//! * **`aspx_ec_data()`** (Table 57, §4.2.12.8) over the eighteen
+//!   Annex A.2 Huffman codebooks (`aspx_huffman`), the §5.7.6.3.4
+//!   Pseudocode 80/81 delta decode (including the `delta = 2` balance
+//!   channel arms), and the §5.7.6.3.5 dequantization — both the
+//!   per-channel Pseudocode 82/83 path and the Pseudocode 84 joint
+//!   (sum, balance) stereo decode ([`decode_scf_balance_pair`],
+//!   `PAN_OFFSET = 12`) for `aspx_balance == 1` pairs.
+//! * The §5.7.6.3.1-3 frequency-table / border derivations and the
+//!   §5.7.6.4 HF construction chain (generation, envelope adjustment,
+//!   noise + tone injection, limiter) driven from the decoded scale
+//!   factors.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};

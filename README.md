@@ -74,7 +74,16 @@ an S16 `AudioFrame`:
   IMDCT (`mdct`) with overlap-add.
 - **A-SPX** bandwidth extension — `aspx_config()` / `companding_control`
   parse, the FIXFIX / FIXVAR / VARFIX / VARVAR ATSG border derivation,
-  envelope / noise / tone payload decode, QMF analysis/synthesis, and the
+  envelope / noise / tone payload decode, QMF analysis/synthesis, the
+  **§5.7.6.3.5 balance stereo joint decode** (an `aspx_data_2ch()`
+  pair with `aspx_balance = 1` decodes as the spec's jointly coded
+  sum/pan pair — Pseudocode 84 with `PAN_OFFSET = 12` plus the
+  Pseudocode 80/81 `delta = 2` accumulation on the balance channel,
+  wired on every 2ch consumer: stereo CPE, the 5_X trailers, the ICE
+  payload rosters, the 22.2 pairs, and the A-JOC A-SPX downmix; every
+  live `aspx_balance = 1` writer emits the exact Pseudocode 84
+  inverse, so encoded pans survive the joint decode — measured
+  ≈ 20 dB preserved on a hard-panned ACPL_3 chain), and the
   §5.7.6.4.1.2–4 temporal-noise-shaping chirp / order-2 LPC inverse
   filtering driven by `aspx_tna_mode`. The encoder now **selects** a real
   per-noise-subband-group `aspx_tna_mode` (§4.3.10.6.1 None / Light /
@@ -319,15 +328,6 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **A-SPX balance stereo decoding** (Pseudocode 84): the in-tree
-  chain decodes the secondary channel of an `aspx_data_2ch()` pair as
-  absolute LEVEL rows through the BALANCE codebooks instead of the
-  §5.7.6.3.5 sum/pan joint dequantisation (`PAN_OFFSET = 12`, with
-  the Pseudocode 80/81 `delta = 2` for the balance channel). The
-  encoder writes matching absolute rows, so in-tree round-trips are
-  consistent, but real-HF secondaries can clamp at the balance
-  codebook range and interoperability with the spec convention needs
-  the joint decode on both sides.
 - ICE encode arms cover the non-`b_5fronts` layouts (7.0.4 / 7.1.4);
   the 9.0.4 / 9.1.4 encode-side matrix inverse and the SAP
   (`b_use_sap_add_ch` / step-5/6) encode decisions are pending, as is
