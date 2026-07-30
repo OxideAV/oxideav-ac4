@@ -10953,6 +10953,45 @@ mod tests {
     }
 
     #[test]
+    fn balance_encode_clamps_match_annex_a2_codebook_ranges() {
+        // The (sum, pan) converters clamp to the Annex A.2 F0
+        // codebook ranges (ETSI TS 103 190-1 electronic annex, staged:
+        // docs/audio/ac4/ts_10319001v010401p0-tables.c). Tie the clamp
+        // constants to the transcribed table lengths so a codebook
+        // change can never silently desynchronise the encoder range.
+        use crate::aspx_huffman as h;
+        // Sum channel (LEVEL): F0 range = codebook_length − 1.
+        assert_eq!(h::ASPX_HCB_ENV_LEVEL_15_F0_LEN.len() - 1, 70);
+        assert_eq!(h::ASPX_HCB_ENV_LEVEL_30_F0_LEN.len() - 1, 35);
+        assert_eq!(h::ASPX_HCB_NOISE_LEVEL_F0_LEN.len() - 1, 29);
+        // Pan channel (BALANCE): wire-step range = codebook_length − 1
+        // = a · PAN_OFFSET (delta = 2 ⇒ qscf_b range [0, 2·a·PAN_OFFSET]).
+        assert_eq!(
+            h::ASPX_HCB_ENV_BALANCE_15_F0_LEN.len() as i32 - 1,
+            2 * crate::aspx::ASPX_PAN_OFFSET
+        );
+        assert_eq!(
+            h::ASPX_HCB_ENV_BALANCE_30_F0_LEN.len() as i32 - 1,
+            crate::aspx::ASPX_PAN_OFFSET
+        );
+        assert_eq!(
+            h::ASPX_HCB_NOISE_BALANCE_F0_LEN.len() as i32 - 1,
+            crate::aspx::ASPX_PAN_OFFSET
+        );
+        // And the converters saturate exactly at those edges.
+        let (_, pan_hi) = balance_encode_sig_cell(100, 0, crate::aspx::AspxQuantStep::Fine);
+        let (_, pan_lo) = balance_encode_sig_cell(0, 100, crate::aspx::AspxQuantStep::Fine);
+        assert_eq!(pan_hi, 24);
+        assert_eq!(pan_lo, 0);
+        let (sum_hi, _) = balance_encode_sig_cell(80, 80, crate::aspx::AspxQuantStep::Fine);
+        assert_eq!(sum_hi, 70);
+        let (_, npan_hi) = balance_encode_noise_cell(0, 100);
+        let (_, npan_lo) = balance_encode_noise_cell(100, 0);
+        assert_eq!(npan_hi, 12);
+        assert_eq!(npan_lo, 0);
+    }
+
+    #[test]
     fn balance_encode_noise_rows_round_trips_through_p84() {
         let q_l = [0, 3, 10, 6];
         let q_r = [0, 9, 2, 6];
