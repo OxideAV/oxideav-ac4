@@ -2986,6 +2986,217 @@ pub fn dequantize_noise_scf(qscf: &[Vec<i32>]) -> Vec<Vec<f32>> {
 }
 
 // ---------------------------------------------------------------------
+// §5.7.6.3.5 Pseudocode 84 — joint (sum, balance) stereo decoding.
+// ---------------------------------------------------------------------
+
+/// `PAN_OFFSET` from ETSI TS 103 190-1 §5.7.6.3.5 Pseudocode 84 — the
+/// quantized-domain bias that centres the balance channel's pan range.
+/// A balance value of `a · PAN_OFFSET` (signal, `a` per the quant mode)
+/// or `PAN_OFFSET` (noise) is the neutral pan: both channels receive
+/// equal scale factors.
+pub const ASPX_PAN_OFFSET: i32 = 12;
+
+/// Jointly dequantize a stereo-coded (`aspx_balance == 1`) signal
+/// envelope pair per ETSI TS 103 190-1 §5.7.6.3.5 Pseudocode 84
+/// (signal loop).
+///
+/// * `qscf_a` — the sum channel A's quantized scale factors
+///   (`[sbg][atsg]`, from the Pseudocode 80 delta decode with
+///   `delta = 1`).
+/// * `qscf_b` — the balance channel B's quantized values (`delta = 2`
+///   accumulation — the Pseudocode 80 `(ch == 1 && aspx_balance == 1)`
+///   arm).
+///
+/// Returns `(scf_sig_sbg_a, scf_sig_sbg_b)`. The two outputs satisfy
+/// `scf_a + scf_b == 2 · num_qmf_subbands · 2^(qscf_a/a)` for every
+/// tile (the identity `1/denom_a + 1/denom_b == 1` from the pseudocode),
+/// so the sum channel's level splits between the two outputs according
+/// to the pan `qscf_b/a − PAN_OFFSET`. Missing / short `qscf_b` rows
+/// read as the neutral pan (`a · PAN_OFFSET`), which degenerates each
+/// output to half the Pseudocode 82 dequantization of `qscf_a`.
+pub fn dequantize_sig_scf_balance(
+    qscf_a: &[Vec<i32>],
+    qscf_b: &[Vec<i32>],
+    qmode_env: AspxQuantStep,
+    num_qmf_subbands: u32,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let a: f32 = match qmode_env {
+        AspxQuantStep::Fine => 2.0,
+        AspxQuantStep::Coarse => 1.0,
+    };
+    let neutral = (a as i32) * ASPX_PAN_OFFSET;
+    let n_subbands = num_qmf_subbands as f32;
+    let num_sbg = qscf_a.len();
+    if num_sbg == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let num_env = qscf_a[0].len();
+    let mut scf_a: Vec<Vec<f32>> = vec![vec![0.0_f32; num_env]; num_sbg];
+    let mut scf_b: Vec<Vec<f32>> = vec![vec![0.0_f32; num_env]; num_sbg];
+    for atsg in 0..num_env {
+        for sbg in 0..num_sbg {
+            let qa = qscf_a[sbg][atsg] as f32;
+            let qb = qscf_b
+                .get(sbg)
+                .and_then(|row| row.get(atsg))
+                .copied()
+                .unwrap_or(neutral) as f32;
+            // Pseudocode 84 (signal): nom / denom_a / denom_b.
+            let nom = 2_f32.powf(qa / a + 1.0) * n_subbands;
+            let denom_a = 1.0 + 2_f32.powf(ASPX_PAN_OFFSET as f32 - qb / a);
+            let denom_b = 1.0 + 2_f32.powf(qb / a - ASPX_PAN_OFFSET as f32);
+            scf_a[sbg][atsg] = nom / denom_a;
+            scf_b[sbg][atsg] = nom / denom_b;
+        }
+    }
+    (scf_a, scf_b)
+}
+
+/// Jointly dequantize a stereo-coded (`aspx_balance == 1`) noise
+/// envelope pair per ETSI TS 103 190-1 §5.7.6.3.5 Pseudocode 84
+/// (noise loop).
+///
+/// * `qscf_a` — sum channel A noise quant values (Pseudocode 81,
+///   `delta = 1`).
+/// * `qscf_b` — balance channel B values (`delta = 2` accumulation).
+///
+/// Returns `(scf_noise_sbg_a, scf_noise_sbg_b)` with
+/// `scf_a + scf_b == 2^(NOISE_FLOOR_OFFSET − qscf_a + 1)`. Missing
+/// `qscf_b` entries read as the neutral pan (`PAN_OFFSET`).
+pub fn dequantize_noise_scf_balance(
+    qscf_a: &[Vec<i32>],
+    qscf_b: &[Vec<i32>],
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    const NOISE_FLOOR_OFFSET: i32 = 6;
+    let num_sbg = qscf_a.len();
+    if num_sbg == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let num_env = qscf_a[0].len();
+    let mut scf_a: Vec<Vec<f32>> = vec![vec![0.0_f32; num_env]; num_sbg];
+    let mut scf_b: Vec<Vec<f32>> = vec![vec![0.0_f32; num_env]; num_sbg];
+    for atsg in 0..num_env {
+        for sbg in 0..num_sbg {
+            let qa = qscf_a[sbg][atsg];
+            let qb = qscf_b
+                .get(sbg)
+                .and_then(|row| row.get(atsg))
+                .copied()
+                .unwrap_or(ASPX_PAN_OFFSET);
+            // Pseudocode 84 (noise): nom / denom_a / denom_b.
+            let nom = 2_f32.powi(NOISE_FLOOR_OFFSET - qa + 1);
+            let denom_a = 1.0 + 2_f32.powi(ASPX_PAN_OFFSET - qb);
+            let denom_b = 1.0 + 2_f32.powi(qb - ASPX_PAN_OFFSET);
+            scf_a[sbg][atsg] = nom / denom_a;
+            scf_b[sbg][atsg] = nom / denom_b;
+        }
+    }
+    (scf_a, scf_b)
+}
+
+/// One channel's dequantized §5.7.6.3.5 output — the signal + noise
+/// scale-factor matrices (`[sbg][atsg]`, signal on the high-resolution
+/// subband-group grid) that feed the §5.7.6.4.2 envelope adjustment.
+///
+/// Produced either per channel by the Pseudocode 82 / 83 path (inside
+/// [`AspxEnvelopeAdjuster::from_deltas_stateful`]) or jointly for an
+/// `aspx_balance == 1` pair by [`decode_scf_balance_pair`]
+/// (Pseudocode 84).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AspxDecodedScf {
+    /// Dequantized signal envelope scale factors (`scf_sig_sbg`).
+    pub scf_sig_sbg: Vec<Vec<f32>>,
+    /// Dequantized noise envelope scale factors (`scf_noise_sbg`).
+    pub scf_noise_sbg: Vec<Vec<f32>>,
+}
+
+/// Decode a jointly coded (`aspx_balance == 1`) A-SPX channel pair's
+/// envelopes to dequantized scale factors per ETSI TS 103 190-1
+/// §5.7.6.3.4 + §5.7.6.3.5:
+///
+/// 1. Pseudocode 80 / 81 delta decode per channel — `delta = 1` for
+///    the sum channel A, `delta = 2` for the balance channel B (the
+///    `(ch == 1) && (aspx_balance == 1)` arms).
+/// 2. Pseudocode 84 joint dequantization producing each channel's
+///    `scf_sig_sbg` / `scf_noise_sbg`.
+///
+/// With `aspx_balance == 1` the pair shares one `aspx_framing()` (and
+/// therefore `freq_res` and the envelope counts — §5.7.6.3.5: "the
+/// time envelopes, atsg_sig and atsg_noise, are identical for the
+/// channels"), while each channel carries its own delta directions
+/// ([`AspxHuffEnv::direction_time`]) and its own cross-interval
+/// [`AspxEnvPrev`] state (updated here exactly as the per-channel
+/// Pseudocode 82 / 83 path would).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_scf_balance_pair(
+    tables: &AspxFrequencyTables,
+    sig_a: &[AspxHuffEnv],
+    noise_a: &[AspxHuffEnv],
+    sig_b: &[AspxHuffEnv],
+    noise_b: &[AspxHuffEnv],
+    qmode_env: AspxQuantStep,
+    freq_res: &[bool],
+    env_prev_a: &mut AspxEnvPrev,
+    env_prev_b: &mut AspxEnvPrev,
+) -> (AspxDecodedScf, AspxDecodedScf) {
+    let sbg_sig = &tables.sbg_sig_highres;
+    let num_sbg_noise = (tables.sbg_noise.len() as u32).saturating_sub(1);
+    // Pseudocode 80: delta = 1 (channel A) / 2 (balance channel B).
+    let qscf_sig_a = delta_decode_sig_p80(
+        sig_a,
+        freq_res,
+        sbg_sig,
+        &tables.sbg_sig_lowres,
+        &env_prev_a.qscf_sig_last,
+        1,
+    );
+    let qscf_sig_b = delta_decode_sig_p80(
+        sig_b,
+        freq_res,
+        sbg_sig,
+        &tables.sbg_sig_lowres,
+        &env_prev_b.qscf_sig_last,
+        2,
+    );
+    // Pseudocode 81: same delta split for the noise envelopes.
+    let qscf_noise_a = delta_decode_noise(noise_a, num_sbg_noise, &env_prev_a.qscf_noise_last, 1);
+    let qscf_noise_b = delta_decode_noise(noise_b, num_sbg_noise, &env_prev_b.qscf_noise_last, 2);
+    // Snapshot each channel's last envelope for the next interval's
+    // Pseudocode 80 / 81 references (quantized domain, per channel).
+    let snapshot = |qscf: &[Vec<i32>]| -> Vec<i32> {
+        qscf.iter()
+            .map(|row| row.last().copied().unwrap_or(0))
+            .collect()
+    };
+    if !sig_a.is_empty() {
+        env_prev_a.qscf_sig_last = snapshot(&qscf_sig_a);
+    }
+    if !sig_b.is_empty() {
+        env_prev_b.qscf_sig_last = snapshot(&qscf_sig_b);
+    }
+    if !noise_a.is_empty() {
+        env_prev_a.qscf_noise_last = snapshot(&qscf_noise_a);
+    }
+    if !noise_b.is_empty() {
+        env_prev_b.qscf_noise_last = snapshot(&qscf_noise_b);
+    }
+    // Pseudocode 84 joint dequantization.
+    let (scf_sig_a, scf_sig_b) =
+        dequantize_sig_scf_balance(&qscf_sig_a, &qscf_sig_b, qmode_env, 64);
+    let (scf_noise_a, scf_noise_b) = dequantize_noise_scf_balance(&qscf_noise_a, &qscf_noise_b);
+    (
+        AspxDecodedScf {
+            scf_sig_sbg: scf_sig_a,
+            scf_noise_sbg: scf_noise_a,
+        },
+        AspxDecodedScf {
+            scf_sig_sbg: scf_sig_b,
+            scf_noise_sbg: scf_noise_b,
+        },
+    )
+}
+
+// ---------------------------------------------------------------------
 // §5.7.6.4.2.1 Pseudocode 90 — envelope-energy estimation.
 // ---------------------------------------------------------------------
 
@@ -3505,6 +3716,41 @@ impl AspxEnvelopeAdjuster {
         }
         let scf_sig_sbg = dequantize_sig_scf(&qscf_sig, qmode_env, delta_dir_sig, 64);
         let scf_noise_sbg = dequantize_noise_scf(&qscf_noise);
+        Self::from_scf(
+            q_high,
+            tables,
+            &AspxDecodedScf {
+                scf_sig_sbg,
+                scf_noise_sbg,
+            },
+            atsg_sig,
+            atsg_noise,
+            num_ts_in_ats,
+            aspx_interpolation,
+        )
+    }
+
+    /// Build the envelope-adjuster payload from already-dequantized
+    /// §5.7.6.3.5 scale factors: estimate (Pseudocode 90) → map
+    /// (Pseudocode 91) → compensate (Pseudocode 95).
+    ///
+    /// This is the shared tail of [`Self::from_deltas_stateful`]; it is
+    /// also the entry point for jointly decoded (`aspx_balance == 1`)
+    /// channel pairs, whose Pseudocode 84 dequantization runs at the
+    /// pair level in [`decode_scf_balance_pair`] before each channel
+    /// builds its own adjuster.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_scf(
+        q_high: &[Vec<(f32, f32)>],
+        tables: &AspxFrequencyTables,
+        scf: &AspxDecodedScf,
+        atsg_sig: &[u32],
+        atsg_noise: &[u32],
+        num_ts_in_ats: u32,
+        aspx_interpolation: bool,
+    ) -> Self {
+        let sbg_sig = &tables.sbg_sig_highres;
+        let sbg_noise = &tables.sbg_noise;
         let est_sig_sb = estimate_envelope_energy(
             q_high,
             sbg_sig,
@@ -3515,8 +3761,8 @@ impl AspxEnvelopeAdjuster {
             aspx_interpolation,
         );
         let mapped = map_scf_to_qmf_subbands(
-            &scf_sig_sbg,
-            &scf_noise_sbg,
+            &scf.scf_sig_sbg,
+            &scf.scf_noise_sbg,
             sbg_sig,
             sbg_noise,
             atsg_sig,
@@ -5925,6 +6171,165 @@ mod tests {
         assert!((scf[0][0] - 64.0).abs() < 1e-4);
         assert!((scf[0][1] - 1.0).abs() < 1e-4);
         assert!((scf[0][2] - (1.0 / 64.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dequantize_sig_scf_balance_neutral_pan_matches_p82() {
+        // ETSI TS 103 190-1 §5.7.6.3.5 Pseudocode 84: at the neutral
+        // pan (qscf_b = a · PAN_OFFSET) both denominators are 2, so
+        // each channel receives nom/2 = 64 · 2^(qa/a) — exactly the
+        // Pseudocode 82 dequantization of the sum row.
+        let qscf_a = vec![vec![0, 2], vec![4, 6]];
+        let neutral = 2 * ASPX_PAN_OFFSET; // Fine: a = 2.
+        let qscf_b = vec![vec![neutral; 2]; 2];
+        let (scf_a, scf_b) = dequantize_sig_scf_balance(&qscf_a, &qscf_b, AspxQuantStep::Fine, 64);
+        let p82 = dequantize_sig_scf(&qscf_a, AspxQuantStep::Fine, &[false, false], 64);
+        for sbg in 0..2 {
+            for atsg in 0..2 {
+                assert!((scf_a[sbg][atsg] - p82[sbg][atsg]).abs() < 1e-3);
+                assert!((scf_b[sbg][atsg] - p82[sbg][atsg]).abs() < 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn dequantize_sig_scf_balance_sum_invariant_and_pan_ratio() {
+        // Pseudocode 84 identity: 1/denom_a + 1/denom_b == 1, so
+        // scf_a + scf_b == nom == 2 · 64 · 2^(qa/a) for any pan; and
+        // scf_a/scf_b == 2^(qb/a − PAN_OFFSET).
+        let qscf_a = vec![vec![6]];
+        for qb in [0, 8, 16, 24, 32, 40, 48] {
+            let qscf_b = vec![vec![qb]];
+            let (scf_a, scf_b) =
+                dequantize_sig_scf_balance(&qscf_a, &qscf_b, AspxQuantStep::Fine, 64);
+            let nom = 2.0 * 64.0 * 2_f32.powf(6.0 / 2.0);
+            assert!(
+                (scf_a[0][0] + scf_b[0][0] - nom).abs() / nom < 1e-5,
+                "sum invariant broken at qb = {qb}"
+            );
+            let expect_ratio = 2_f32.powf(qb as f32 / 2.0 - ASPX_PAN_OFFSET as f32);
+            let ratio = scf_a[0][0] / scf_b[0][0];
+            assert!(
+                (ratio / expect_ratio - 1.0).abs() < 1e-4,
+                "pan ratio broken at qb = {qb}: {ratio} vs {expect_ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn dequantize_noise_scf_balance_neutral_matches_p83() {
+        // Neutral noise pan (qscf_b = PAN_OFFSET): denominators = 2,
+        // nom/2 = 2^(6 − qa) — the Pseudocode 83 dequantization.
+        let qscf_a = vec![vec![0, 6, 12]];
+        let qscf_b = vec![vec![ASPX_PAN_OFFSET; 3]];
+        let (scf_a, scf_b) = dequantize_noise_scf_balance(&qscf_a, &qscf_b);
+        let p83 = dequantize_noise_scf(&qscf_a);
+        for atsg in 0..3 {
+            assert!((scf_a[0][atsg] - p83[0][atsg]).abs() < 1e-5);
+            assert!((scf_b[0][atsg] - p83[0][atsg]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn dequantize_noise_scf_balance_extreme_pan_silences_one_side() {
+        // qscf_b = 0 pans fully toward channel B (denom_a = 1 + 2^12);
+        // qscf_b = 24 pans fully toward channel A.
+        let qscf_a = vec![vec![6]];
+        let (scf_a, scf_b) = dequantize_noise_scf_balance(&qscf_a, &[vec![0]]);
+        assert!(scf_a[0][0] < scf_b[0][0] * 1e-3);
+        let (scf_a2, scf_b2) = dequantize_noise_scf_balance(&qscf_a, &[vec![24]]);
+        assert!(scf_b2[0][0] < scf_a2[0][0] * 1e-3);
+    }
+
+    #[test]
+    fn dequantize_sig_scf_balance_missing_partner_reads_neutral() {
+        // A short / empty qscf_b row degrades to the neutral pan.
+        let qscf_a = vec![vec![4], vec![8]];
+        let (scf_a, scf_b) = dequantize_sig_scf_balance(&qscf_a, &[], AspxQuantStep::Fine, 64);
+        let p82 = dequantize_sig_scf(&qscf_a, AspxQuantStep::Fine, &[false], 64);
+        for sbg in 0..2 {
+            assert!((scf_a[sbg][0] - p82[sbg][0]).abs() < 1e-3);
+            assert!((scf_b[sbg][0] - p82[sbg][0]).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn decode_scf_balance_pair_applies_delta_2_on_balance_channel() {
+        // Build minimal frequency tables and a 1-envelope FREQ pair.
+        // The balance channel's transmitted symbols accumulate with
+        // delta = 2 (Pseudocode 80/81 `(ch == 1 && aspx_balance)` arm):
+        // wire steps [6, 3] ⇒ qscf_b = [12, 18].
+        let cfg = AspxConfig {
+            quant_mode_env: AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: AspxFreqResMode::DurationDependent,
+        };
+        let tables = derive_aspx_frequency_tables(&cfg, 0).expect("tables");
+        let num_sig = tables.sbg_sig_highres.len() - 1;
+        let num_noise = tables.sbg_noise.len() - 1;
+        let sig_a = vec![AspxHuffEnv {
+            values: vec![6; num_sig],
+            direction_time: false,
+        }];
+        let noise_a = vec![AspxHuffEnv {
+            values: vec![6; num_noise],
+            direction_time: false,
+        }];
+        // Balance rows: F0 = 6 wire steps, then 0 deltas ⇒ constant
+        // qscf_b = 12 across sbg (after the delta = 2 multiply).
+        let mut sig_b_vals = vec![0; num_sig];
+        sig_b_vals[0] = 6;
+        let sig_b = vec![AspxHuffEnv {
+            values: sig_b_vals,
+            direction_time: false,
+        }];
+        let mut noise_b_vals = vec![0; num_noise];
+        noise_b_vals[0] = 6;
+        let noise_b = vec![AspxHuffEnv {
+            values: noise_b_vals,
+            direction_time: false,
+        }];
+        let mut prev_a = AspxEnvPrev::default();
+        let mut prev_b = AspxEnvPrev::default();
+        let (scf_a, scf_b) = decode_scf_balance_pair(
+            &tables,
+            &sig_a,
+            &noise_a,
+            &sig_b,
+            &noise_b,
+            AspxQuantStep::Fine,
+            &[],
+            &mut prev_a,
+            &mut prev_b,
+        );
+        // qscf_b = 2·6 = 12 < neutral 24 ⇒ signal pans toward B:
+        // scf_b > scf_a on every signal group.
+        for sbg in 0..num_sig {
+            assert!(
+                scf_b.scf_sig_sbg[sbg][0] > scf_a.scf_sig_sbg[sbg][0],
+                "sig sbg {sbg} did not pan toward B"
+            );
+        }
+        // Noise: qscf_nb = 12 == PAN_OFFSET ⇒ neutral; equals P83 of
+        // the sum row on both channels.
+        let qscf_noise_a = vec![vec![6]; num_noise];
+        let p83 = dequantize_noise_scf(&qscf_noise_a);
+        for (sbg, p83_row) in p83.iter().enumerate().take(num_noise) {
+            assert!((scf_a.scf_noise_sbg[sbg][0] - p83_row[0]).abs() < 1e-5);
+            assert!((scf_b.scf_noise_sbg[sbg][0] - p83_row[0]).abs() < 1e-5);
+        }
+        // Cross-interval state: the balance channel's env_prev holds
+        // the delta = 2 accumulated row (qscf domain).
+        assert_eq!(prev_b.qscf_sig_last[0], 12);
+        assert_eq!(prev_b.qscf_noise_last[0], 12);
+        assert_eq!(prev_a.qscf_sig_last[0], 6);
     }
 
     #[test]

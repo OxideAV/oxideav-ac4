@@ -4805,6 +4805,102 @@ pub fn qscf_row_from_freq_dpcm(packed: &[i32]) -> Vec<i32> {
         .collect()
 }
 
+// ====================================================================
+// §5.7.6.3.5 Pseudocode 84 inverse — (L, R) LEVEL rows → (sum, pan)
+// wire rows for aspx_balance = 1 pairs.
+// ====================================================================
+
+/// Convert a per-channel pair of **absolute** SIGNAL envelope quant
+/// rows (LEVEL domain — `scf = 64 · 2^(q/a)`) into the jointly coded
+/// `(sum, pan)` pair the `aspx_balance == 1` bitstream carries, i.e.
+/// the exact inverse of ETSI TS 103 190-1 §5.7.6.3.5 Pseudocode 84
+/// (signal loop) on the quantization grid:
+///
+/// * sum channel A: `q_a = a · log2(2^(q_l/a) + 2^(q_r/a)) − a`
+///   (so the joint `nom = 2 · 64 · 2^(q_a/a)` equals
+///   `scf_l + scf_r`), rounded to the LEVEL grid;
+/// * balance channel B **wire steps**: `p = (a · PAN_OFFSET + q_l −
+///   q_r) / 2`, rounded and clamped to the BALANCE codebook range
+///   `[0, a · PAN_OFFSET]`. The decoder's Pseudocode 80 `delta = 2`
+///   accumulation turns the transmitted steps back into
+///   `qscf_b = 2 · p`, and `qscf_b/a − PAN_OFFSET` recovers the pan
+///   `(q_l − q_r)/a` exactly (up to the balance grid's 2-step
+///   quantization).
+///
+/// Both outputs are absolute rows in the transmitted-symbol
+/// accumulation domain (`delta = 1` for A, wire steps for B), ready
+/// for [`freq_dpcm_encode_qscf`] / [`time_dpcm_encode_qscf`] packing —
+/// the same domain the cross-frame [`Acpl3EnvPrevRows`] bookkeeping
+/// and the decoder's [`crate::aspx::AspxEnvPrev`] use. Length-
+/// mismatched inputs zero-extend the shorter row.
+pub fn balance_encode_sig_rows(
+    q_l: &[i32],
+    q_r: &[i32],
+    qmode: crate::aspx::AspxQuantStep,
+) -> (Vec<i32>, Vec<i32>) {
+    let a = match qmode {
+        crate::aspx::AspxQuantStep::Fine => 2i32,
+        crate::aspx::AspxQuantStep::Coarse => 1i32,
+    };
+    let n = q_l.len().max(q_r.len());
+    let mut sum = Vec::with_capacity(n);
+    let mut pan = Vec::with_capacity(n);
+    let af = a as f64;
+    let pan_max = a * crate::aspx::ASPX_PAN_OFFSET;
+    // LEVEL F0 codebook upper bound (Annex A.2: 71 entries Fine, 36
+    // Coarse) — keeps the sum row inside the range every LEVEL
+    // codeword path can carry.
+    let sum_max = match qmode {
+        crate::aspx::AspxQuantStep::Fine => 70i32,
+        crate::aspx::AspxQuantStep::Coarse => 35i32,
+    };
+    for i in 0..n {
+        let ql = q_l.get(i).copied().unwrap_or(0);
+        let qr = q_r.get(i).copied().unwrap_or(0);
+        // q_a = a·log2(2^(ql/a) + 2^(qr/a)) − a, computed around the
+        // larger level for numeric stability.
+        let hi = ql.max(qr);
+        let lo = ql.min(qr);
+        let qa = af * (1.0 + 2f64.powf((lo - hi) as f64 / af)).log2() + hi as f64 - af;
+        sum.push((qa.round() as i32).clamp(0, sum_max));
+        // p = (a·PAN_OFFSET + ql − qr) / 2, round-half-up.
+        let num = a * crate::aspx::ASPX_PAN_OFFSET + ql - qr;
+        let p = (num as f64 / 2.0).round() as i32;
+        pan.push(p.clamp(0, pan_max));
+    }
+    (sum, pan)
+}
+
+/// NOISE counterpart of [`balance_encode_sig_rows`] — inverse of the
+/// Pseudocode 84 noise loop. Inputs are absolute LEVEL-domain noise
+/// quant rows (`scf = 2^(6 − q)`); outputs are the sum channel row
+/// (`q_a = 7 − log2(2^(6−q_l) + 2^(6−q_r))`, LEVEL noise grid) and the
+/// balance channel **wire steps** `p = (PAN_OFFSET + q_r − q_l) / 2`
+/// clamped to `[0, PAN_OFFSET]` (note the sign flip versus the signal
+/// pan: noise levels quantize inverted, `scf_a/scf_b =
+/// 2^(qscf_b − PAN_OFFSET)`).
+pub fn balance_encode_noise_rows(q_l: &[i32], q_r: &[i32]) -> (Vec<i32>, Vec<i32>) {
+    let n = q_l.len().max(q_r.len());
+    let mut sum = Vec::with_capacity(n);
+    let mut pan = Vec::with_capacity(n);
+    // NOISE_LEVEL_F0 codebook range: 30 entries (Annex A.2).
+    const SUM_MAX: i32 = 29;
+    for i in 0..n {
+        let ql = q_l.get(i).copied().unwrap_or(0);
+        let qr = q_r.get(i).copied().unwrap_or(0);
+        // q_a = 7 − log2(2^(6−ql) + 2^(6−qr)), computed around the
+        // louder (numerically larger scf ⇒ smaller q) channel.
+        let lo_q = ql.min(qr); // louder channel
+        let hi_q = ql.max(qr);
+        let qa = 7.0 - ((1.0 + 2f64.powi(lo_q - hi_q)).log2() + (6 - lo_q) as f64);
+        sum.push((qa.round() as i32).clamp(0, SUM_MAX));
+        let num = crate::aspx::ASPX_PAN_OFFSET + qr - ql;
+        let p = (num as f64 / 2.0).round() as i32;
+        pan.push(p.clamp(0, crate::aspx::ASPX_PAN_OFFSET));
+    }
+    (sum, pan)
+}
+
 /// P-frame envelope direction decision for a single FIXFIX envelope
 /// (ETSI TS 103 190-1 §4.2.12.5 / §5.7.6.3.4): given the current
 /// envelope's packed FREQ-DPCM vector and the previous frame's last
@@ -10642,6 +10738,83 @@ mod tests {
             noise_sbg: 0,
             num_env_bits_fixfix: 0,
             freq_res_mode: aspx::AspxFreqResMode::DurationDependent,
+        }
+    }
+
+    #[test]
+    fn balance_encode_sig_rows_round_trips_through_p84() {
+        // (L, R) LEVEL rows → (sum, pan) → Pseudocode 84 joint
+        // dequantization must recover each channel's LEVEL scf within
+        // the (sum, pan) grid's quantization error: half a sum step
+        // (0,75 dB Fine) plus half a pan wire step (1,5 dB Fine) per
+        // channel ⇒ comfortably under 3 dB.
+        for qmode in [aspx::AspxQuantStep::Fine, aspx::AspxQuantStep::Coarse] {
+            let a = match qmode {
+                aspx::AspxQuantStep::Fine => 2.0f32,
+                aspx::AspxQuantStep::Coarse => 1.0f32,
+            };
+            // Pan differences stay inside the balance codebook range
+            // (|q_l − q_r| ≤ a · PAN_OFFSET); beyond it the encoder
+            // clamps at the codebook edge — the spec's own range limit.
+            let q_l = [8, 12, 5, 20, 0, 16];
+            let q_r = [8, 6, 15, 20, 4, 6];
+            let (sum, pan) = balance_encode_sig_rows(&q_l, &q_r, qmode);
+            assert_eq!(sum.len(), 6);
+            assert_eq!(pan.len(), 6);
+            // Decoder side: qscf_b = 2 · pan (delta = 2 accumulation).
+            let qscf_a: Vec<Vec<i32>> = sum.iter().map(|&q| vec![q]).collect();
+            let qscf_b: Vec<Vec<i32>> = pan.iter().map(|&p| vec![2 * p]).collect();
+            let (scf_a, scf_b) =
+                crate::aspx::dequantize_sig_scf_balance(&qscf_a, &qscf_b, qmode, 64);
+            for i in 0..6 {
+                let want_l = 64.0 * 2f32.powf(q_l[i] as f32 / a);
+                let want_r = 64.0 * 2f32.powf(q_r[i] as f32 / a);
+                let err_db_l = 10.0 * (scf_a[i][0] / want_l).log10().abs();
+                let err_db_r = 10.0 * (scf_b[i][0] / want_r).log10().abs();
+                assert!(
+                    err_db_l < 3.0 && err_db_r < 3.0,
+                    "{qmode:?} sbg {i}: L err {err_db_l} dB, R err {err_db_r} dB"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn balance_encode_sig_rows_equal_channels_are_exact() {
+        // Equal L/R levels sit exactly on the (sum, pan) grid: sum
+        // row == the common level, pan == neutral, and the joint
+        // decode is bit-exact against Pseudocode 82.
+        let q = [0, 4, 9, 31];
+        let (sum, pan) = balance_encode_sig_rows(&q, &q, aspx::AspxQuantStep::Fine);
+        assert_eq!(sum, q.to_vec());
+        // Fine-mode neutral: qscf_b = a · PAN_OFFSET = 24 ⇒ 12 wire steps.
+        assert!(pan.iter().all(|&p| p == 12));
+        let (sum_c, pan_c) = balance_encode_sig_rows(&q, &q, aspx::AspxQuantStep::Coarse);
+        assert_eq!(sum_c, q.to_vec());
+        assert!(pan_c.iter().all(|&p| p == 6));
+    }
+
+    #[test]
+    fn balance_encode_noise_rows_round_trips_through_p84() {
+        let q_l = [0, 3, 10, 6];
+        let q_r = [0, 9, 2, 6];
+        let (sum, pan) = balance_encode_noise_rows(&q_l, &q_r);
+        // Equal channels: exact sum + neutral pan.
+        assert_eq!(sum[0], 0);
+        assert_eq!(pan[0], 6); // wire steps: qscf_b = 12 = PAN_OFFSET.
+        assert_eq!(sum[3], 6);
+        let qscf_a: Vec<Vec<i32>> = sum.iter().map(|&q| vec![q]).collect();
+        let qscf_b: Vec<Vec<i32>> = pan.iter().map(|&p| vec![2 * p]).collect();
+        let (scf_a, scf_b) = crate::aspx::dequantize_noise_scf_balance(&qscf_a, &qscf_b);
+        for i in 0..4 {
+            let want_l = 2f32.powi(6 - q_l[i]);
+            let want_r = 2f32.powi(6 - q_r[i]);
+            let err_db_l = 10.0 * (scf_a[i][0] / want_l).log10().abs();
+            let err_db_r = 10.0 * (scf_b[i][0] / want_r).log10().abs();
+            assert!(
+                err_db_l < 4.0 && err_db_r < 4.0,
+                "sbg {i}: L err {err_db_l} dB, R err {err_db_r} dB"
+            );
         }
     }
 
