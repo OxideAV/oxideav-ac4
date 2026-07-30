@@ -5086,13 +5086,15 @@ pub fn choose_envelope_direction(
 /// [`choose_envelope_direction`] on P-frames.
 #[derive(Debug, Clone, Default)]
 pub struct Acpl3EnvPrevRows {
-    /// L carrier SIGNAL row (`delta = 1` accumulation domain).
+    /// Channel-0 SIGNAL row — the §5.7.6.3.5 **sum** row (LEVEL
+    /// domain, `delta = 1` accumulation).
     pub l_sig: Vec<i32>,
-    /// L carrier NOISE row.
+    /// Channel-0 NOISE row (sum, LEVEL noise domain).
     pub l_noise: Vec<i32>,
-    /// R carrier SIGNAL row (BALANCE-coded transmitted values).
+    /// Channel-1 SIGNAL row — the balance **pan wire steps** (the
+    /// decoder's `delta = 2` accumulation recovers `qscf_b = 2 · pan`).
     pub r_sig: Vec<i32>,
-    /// R carrier NOISE row.
+    /// Channel-1 NOISE row (pan wire steps).
     pub r_noise: Vec<i32>,
 }
 
