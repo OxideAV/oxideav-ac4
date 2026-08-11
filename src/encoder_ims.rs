@@ -7024,6 +7024,237 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// Derive the thirteen coded ICE SMP track signals `A..M` from the
+    /// named 9.0.4 channels — the `b_5fronts` encode-side inverse of
+    /// the decoder's §5.3.3.1 Table 23 S-CPL full-decoding matrix
+    /// composed with the mode's output gain ladder. The Table 23
+    /// `b_5fronts` front rows carry the fixed ×2 matrix (independent
+    /// of `c_gain` / `m_gain`; the ×2 · ½ entries cancel), so the
+    /// front inverse is shared by SCPL and ASPX_SCPL exactly like the
+    /// surround / top rows:
+    ///
+    /// ```text
+    ///   A  = (L + Lscr)/2       B  = (R + Rscr)/2       C = C/2
+    ///   D  = (Ls + Lb)/(2√2)    F  = (Ls − Lb)/(2√2)
+    ///   E  = (Rs + Rb)/(2√2)    G  = (Rs − Rb)/(2√2)
+    ///   H  = (Tfl + Tbl)/(2√2)  J  = (Tfl − Tbl)/(2√2)
+    ///   I  = (Tfr + Tbr)/(2√2)  K  = (Tfr − Tbr)/(2√2)
+    ///   L″ = (L − Lscr)/2       M″ = (R − Rscr)/2
+    /// ```
+    ///
+    /// `named` is `[L, R, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl, Tfr,
+    /// Tbl, Tbr]` (the decoder's 13-slot output order; the L / R slots
+    /// carry the Table 23 `Lw` / `Rw` outputs); the return order is
+    /// `[A, B, C, D, E, F, G, H, I, J, K, L″, M″]` (core, additional
+    /// pair, S-CPL pairs `[H, I]` / `[J, K]` / `[L″, M″]`).
+    fn ice_scpl_tracks_from_named_5fronts(named: &[&[f32]; 13]) -> Vec<Vec<f32>> {
+        let n = named[0].len();
+        let q2 = 0.5f32; // 1/2 — front rows
+        let q = 0.5 * std::f32::consts::FRAC_1_SQRT_2; // 1/(2√2)
+        let mix = |x: &[f32], y: &[f32], sign: f32, g: f32| -> Vec<f32> {
+            (0..n).map(|i| g * (x[i] + sign * y[i])).collect()
+        };
+        let half = |x: &[f32]| -> Vec<f32> { x.iter().map(|&v| v * 0.5).collect() };
+        vec![
+            mix(named[0], named[3], 1.0, q2),   // A  = (L + Lscr)/2
+            mix(named[1], named[4], 1.0, q2),   // B  = (R + Rscr)/2
+            half(named[2]),                     // C
+            mix(named[5], named[7], 1.0, q),    // D  = (Ls + Lb)/(2√2)
+            mix(named[6], named[8], 1.0, q),    // E  = (Rs + Rb)/(2√2)
+            mix(named[5], named[7], -1.0, q),   // F  = (Ls − Lb)/(2√2)
+            mix(named[6], named[8], -1.0, q),   // G  = (Rs − Rb)/(2√2)
+            mix(named[9], named[11], 1.0, q),   // H  = (Tfl + Tbl)/(2√2)
+            mix(named[10], named[12], 1.0, q),  // I  = (Tfr + Tbr)/(2√2)
+            mix(named[9], named[11], -1.0, q),  // J  = (Tfl − Tbl)/(2√2)
+            mix(named[10], named[12], -1.0, q), // K  = (Tfr − Tbr)/(2√2)
+            mix(named[0], named[3], -1.0, q2),  // L″ = (L − Lscr)/2
+            mix(named[1], named[4], -1.0, q2),  // M″ = (R − Rscr)/2
+        ]
+    }
+
+    /// 9.0.4 immersive-channel-element ASPX_SCPL encode from PCM
+    /// (TS 103 190-2 §6.2.4.1, `immersive_codec_mode = ASPX_SCPL`,
+    /// `b_5fronts = 1`).
+    ///
+    /// `frames` is `[L, R, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl, Tfr,
+    /// Tbl, Tbr]` (the decoder's output slot order). The encoder
+    /// derives the thirteen SMP tracks with
+    /// [`Self::ice_scpl_tracks_from_named_5fronts`], forward-MDCTs
+    /// them on persistent per-track TDAC states, and emits a
+    /// grouping-3 ASPX_SCPL body whose seven A-SPX payloads carry
+    /// **real** SIGNAL / NOISE envelopes + `aspx_tna_mode` +
+    /// `aspx_add_harmonic` extracted from the decoupled channels the
+    /// decoder extends (the `b_5fronts` Table 8 grouping
+    /// `(L, Lscr)`, `(R, Rscr)`, `C`, `(Ls, Lb)`, `(Rs, Rb)`,
+    /// `(Tfl, Tbl)`, `(Tfr, Tbr)`, each pre-scaled by the inverse
+    /// §4.8.3.11.3 Table 11 output gain — 1 on the four front
+    /// channels, 2 on C, √2 elsewhere).
+    ///
+    /// The output round-trips through [`crate::decoder::Ac4Decoder`]
+    /// to a 13-channel `AudioFrame`.
+    pub fn encode_frame_pcm_9_0_4_ice_aspx_scpl(&mut self, frames: &[&[f32]; 13]) -> Vec<u8> {
+        self.encode_frame_pcm_9_0_4_ice_aspx_scpl_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_9_0_4_ice_aspx_scpl`].
+    pub fn encode_frame_pcm_9_0_4_ice_aspx_scpl_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 13],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_aspx_scpl_inner_5fronts(frames, None, max_sfb)
+    }
+
+    /// 9.1.4 form of [`Self::encode_frame_pcm_9_0_4_ice_aspx_scpl`]:
+    /// `frames` is the 9.0.4 order plus the LFE channel **last**
+    /// (`[L, …, Tbr, LFE]`); the decoder emits the LFE on the leading
+    /// output slot.
+    pub fn encode_frame_pcm_9_1_4_ice_aspx_scpl(&mut self, frames: &[&[f32]; 14]) -> Vec<u8> {
+        self.encode_frame_pcm_9_1_4_ice_aspx_scpl_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_9_1_4_ice_aspx_scpl`].
+    pub fn encode_frame_pcm_9_1_4_ice_aspx_scpl_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 14],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let named: &[&[f32]; 13] = frames[..13].try_into().expect("13 named channels");
+        self.encode_ice_aspx_scpl_inner_5fronts(named, Some(frames[13]), max_sfb)
+    }
+
+    /// Shared 9.0.4 / 9.1.4 ASPX_SCPL body + frame assembly
+    /// (`b_5fronts` counterpart of [`Self::encode_ice_aspx_scpl_inner`]).
+    fn encode_ice_aspx_scpl_inner_5fronts(
+        &mut self,
+        named: &[&[f32]; 13],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in named.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_9_x_4_ice_aspx_scpl: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(l) = lfe {
+            assert_eq!(l.len(), frame_len as usize, "LFE input length");
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Track derivation + forward MDCT (13 tracks; LFE on state 13).
+        let tracks = Self::ice_scpl_tracks_from_named_5fronts(named);
+        let n_states = 14;
+        while self.mdct_states_multi.len() < n_states {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let coeffs: Vec<Vec<f32>> = tracks
+            .iter()
+            .enumerate()
+            .map(|(t, pcm)| self.mdct_states_multi[t].analyse_frame(pcm))
+            .collect();
+        let lfe_coeffs = lfe.map(|pcm| self.mdct_states_multi[13].analyse_frame(pcm));
+
+        // A-SPX real payload rows per the b_5fronts Table 8 grouping,
+        // extracted from the decoupled channels the decoder extends
+        // (output channel ÷ its §4.8.3.11.3 Table 11 gain): the four
+        // front channels L / R / Lscr / Rscr carry gain 1 (decoupled =
+        // the named channel itself), C carries gain 2 (decoupled =
+        // C/2 = track C), the surround / top channels √2.
+        let aspx_cfg = Self::ice_live_aspx_cfg();
+        let scale = |x: &[f32], g: f32| -> Vec<f32> { x.iter().map(|&v| v * g).collect() };
+        let isq2 = std::f32::consts::FRAC_1_SQRT_2;
+        let dec: [Vec<f32>; 12] = [
+            named[0].to_vec(),      // L
+            named[3].to_vec(),      // Lscr
+            named[1].to_vec(),      // R
+            named[4].to_vec(),      // Rscr
+            scale(named[5], isq2),  // Ls/√2
+            scale(named[7], isq2),  // Lb/√2
+            scale(named[6], isq2),  // Rs/√2
+            scale(named[8], isq2),  // Rb/√2
+            scale(named[9], isq2),  // Tfl/√2
+            scale(named[11], isq2), // Tbl/√2
+            scale(named[10], isq2), // Tfr/√2
+            scale(named[12], isq2), // Tbr/√2
+        ];
+        // chan_idx layout: 0..12 = the twelve decoupled pair channels
+        // in `dec` order, 12 = the decoupled C (= track C).
+        let q_dec: Vec<Vec<Vec<(f32, f32)>>> = dec
+            .iter()
+            .enumerate()
+            .map(|(i, pcm)| self.ice_qmf_analyse(i, pcm))
+            .collect();
+        let q_c = self.ice_qmf_analyse(12, &tracks[2]);
+        // preflat: one per-config flag, decided from the primary (L)
+        // carrier's low band.
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_dec[0]);
+        let two_ch = vec![
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[0], &q_dec[1]), // (L, Lscr)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[2], &q_dec[3]), // (R, Rscr)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[4], &q_dec[5]), // (Ls, Lb)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[6], &q_dec[7]), // (Rs, Rb)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[8], &q_dec[9]), // (Tfl, Tbl)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[10], &q_dec[11]), // (Tfr, Tbr)
+        ];
+        let one_ch = Self::ice_1ch_rows_from_matrix(&aspx_cfg, frame_len, &q_c); // C
+
+        let core: [&[f32]; 5] = [&coeffs[0], &coeffs[1], &coeffs[2], &coeffs[3], &coeffs[4]];
+        let scpl_pairs: [[&[f32]; 2]; 3] = [
+            [&coeffs[7], &coeffs[8]],
+            [&coeffs[9], &coeffs[10]],
+            [&coeffs[11], &coeffs[12]],
+        ];
+        let spectra = crate::ice::IceScplSpectra {
+            core: &core,
+            add_pair: [&coeffs[5], &coeffs[6]],
+            scpl_pairs: &scpl_pairs,
+        };
+        let b_iframe = self.b_iframe_global;
+        let mut body = BitWriter::new();
+        crate::ice::write_ice_body_aspx_scpl_real(
+            &mut body,
+            &spectra,
+            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            true,
+            &aspx_cfg,
+            b_iframe,
+            frame_len,
+            max_sfb,
+            &crate::ice::IceAspxRows {
+                two_ch: &two_ch,
+                one_ch: &one_ch,
+            },
+        )
+        .expect("encoder: ice aspx_scpl 5fronts body");
+        let out = crate::ice::encode_ice_raw_frame(
+            self.sequence_counter as u32,
+            lfe.is_some(),
+            true,
+            b_iframe,
+            body,
+        )
+        .expect("encoder: ice frame assembly");
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        out
+    }
+
     /// 7.0.4 immersive-channel-element ASPX_ACPL_2 encode from PCM
     /// (TS 103 190-2 §6.2.4.1, `immersive_codec_mode = ASPX_ACPL_2`).
     ///
