@@ -545,6 +545,8 @@ pub mod emdf;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_acpl3;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod encoder_ajcc;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_ajoc;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_asf;

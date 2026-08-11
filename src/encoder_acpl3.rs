@@ -7890,7 +7890,7 @@ fn analytic_alpha_per_band(num: &[f32], den: &[f32], qm: crate::acpl::AcplQuantM
 /// signed range `-N/2..=+N/2` (where `N + 1 == ALPHA_DQ_*.len()`), per the
 /// dequantisation tables [`ALPHA_DQ_FINE`] (Table 203) /
 /// [`ALPHA_DQ_COARSE`] (Table 205).
-fn quantise_alpha(alpha: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
+pub(crate) fn quantise_alpha(alpha: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
     let (table, cb_off): (&[f32], i32) = match qm {
         crate::acpl::AcplQuantMode::Fine => (&ALPHA_DQ_FINE, 16),
         crate::acpl::AcplQuantMode::Coarse => (&ALPHA_DQ_COARSE, 8),
@@ -8826,7 +8826,7 @@ fn analytic_beta_per_band(
 /// 2.55 / 3.2375 / 4.0 fine, or 0.0 / 0.55 / 1.4 / 2.55 / 4.0 coarse).
 /// This keeps the F0-only path's quantisation deterministic and matches
 /// the decoder's column-0 lookup when no α delta-table mismatch occurs.
-fn quantise_beta_magnitude(beta_mag: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
+pub(crate) fn quantise_beta_magnitude(beta_mag: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
     let table: &[f32] = match qm {
         crate::acpl::AcplQuantMode::Fine => {
             &[0.0, 0.2375, 0.55, 0.9375, 1.4, 1.9375, 2.55, 3.2375, 4.0]
