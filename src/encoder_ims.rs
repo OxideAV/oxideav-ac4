@@ -150,6 +150,11 @@ pub struct Ac4ImsEncoder {
     /// envelope measurement).
     #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub ice_env_ana: Vec<crate::qmf::QmfAnalysisBank>,
+    /// Encoder-side A-JCC differential-coding state (the decoder-side
+    /// `ajcc_<SET>_q_prev` mirror) for the ICE ASPX_AJCC encode arms —
+    /// drives the P-frame FREQ-vs-TIME row selection.
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
+    pub ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState,
 }
 
 impl Ac4ImsEncoder {
@@ -172,6 +177,7 @@ impl Ac4ImsEncoder {
             acpl3_env_prev: None,
             acpl3_param_prev: crate::encoder_acpl3::Acpl3ParamPrevRows::default(),
             ice_env_ana: Vec::new(),
+            ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState::new(),
         }
     }
 
@@ -7843,6 +7849,248 @@ impl Ac4ImsEncoder {
             self.sequence_counter as u32,
             lfe.is_some(),
             true,
+            b_iframe,
+            body,
+        )
+        .expect("encoder: ice frame assembly");
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        out
+    }
+
+    /// 7.0.4 immersive-channel-element ASPX_AJCC encode from PCM
+    /// (TS 103 190-2 §6.2.4.1 + §5.6, `immersive_codec_mode =
+    /// ASPX_AJCC`, core layout) — driven by the
+    /// [`crate::encoder_ajcc`] **parameter extractor**.
+    ///
+    /// `frames` is `[L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`
+    /// (the decoder's output slot order). The encoder derives the
+    /// five-channel core as the exact per-module output sums of the
+    /// decoder's §5.6.3.5.2 Table 35 / Table 38 reconstruction (dry
+    /// gains sum to 1, wet rows cancel, input scale `k = 2 + 1/√2`):
+    ///
+    /// ```text
+    ///   A = (L + Tfl/√2)/k         B = (R + Tfr/√2)/k    C = C/k
+    ///   D = (Ls + Lb + Tbl)/(√2k)  E = (Rs + Rb + Tbr)/(√2k)
+    /// ```
+    ///
+    /// extracts the per-band alpha / beta / dry / wet rows from the
+    /// named channels' QMF statistics
+    /// ([`crate::encoder_ajcc::extract_ajcc_core_rows`]), assembles a
+    /// GOP-aware `ajcc_data()`
+    /// ([`crate::encoder_ajcc::build_ajcc_data`] — FREQ rows on
+    /// I-frames, per-SET FREQ-vs-TIME bit pricing on P-frames), and
+    /// emits the ASPX_AJCC body with real A-SPX payload rows on the
+    /// core tracks.
+    pub fn encode_frame_pcm_7_0_4_ice_ajcc(&mut self, frames: &[&[f32]; 11]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_4_ice_ajcc_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_0_4_ice_ajcc`].
+    pub fn encode_frame_pcm_7_0_4_ice_ajcc_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 11],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_ajcc_inner(frames.as_slice(), None, max_sfb)
+    }
+
+    /// 7.1.4 form of [`Self::encode_frame_pcm_7_0_4_ice_ajcc`] (LFE
+    /// **last**; the decoder emits it on the leading output slot).
+    pub fn encode_frame_pcm_7_1_4_ice_ajcc(&mut self, frames: &[&[f32]; 12]) -> Vec<u8> {
+        self.encode_ice_ajcc_inner(&frames[..11], Some(frames[11]), 40)
+    }
+
+    /// 9.0.4 immersive-channel-element ASPX_AJCC encode from PCM
+    /// (`b_5fronts = 1` — the Table 37 module layout).
+    ///
+    /// `frames` is `[L, R, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl, Tfr,
+    /// Tbl, Tbr]`. Core downmix (per-module output sums of the
+    /// Table 35 / Table 37 reconstruction):
+    ///
+    /// ```text
+    ///   A = (L + Tfl/√2 + Lscr)/k  B = (R + Tfr/√2 + Rscr)/k
+    ///   C = C/k
+    ///   D = (Ls + Lb + Tbl)/(√2k)  E = (Rs + Rb + Tbr)/(√2k)
+    /// ```
+    pub fn encode_frame_pcm_9_0_4_ice_ajcc(&mut self, frames: &[&[f32]; 13]) -> Vec<u8> {
+        self.encode_frame_pcm_9_0_4_ice_ajcc_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_9_0_4_ice_ajcc`].
+    pub fn encode_frame_pcm_9_0_4_ice_ajcc_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 13],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_ajcc_inner(frames.as_slice(), None, max_sfb)
+    }
+
+    /// 9.1.4 form of [`Self::encode_frame_pcm_9_0_4_ice_ajcc`] (LFE
+    /// **last**).
+    pub fn encode_frame_pcm_9_1_4_ice_ajcc(&mut self, frames: &[&[f32]; 14]) -> Vec<u8> {
+        self.encode_ice_ajcc_inner(&frames[..13], Some(frames[13]), 40)
+    }
+
+    /// Shared ASPX_AJCC ICE body + frame assembly for both layouts
+    /// (`named.len()` selects: 11 → core layout, 13 → `b_5fronts`).
+    fn encode_ice_ajcc_inner(
+        &mut self,
+        named: &[&[f32]],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let b_5fronts = match named.len() {
+            11 => false,
+            13 => true,
+            n => panic!("encode_ice_ajcc_inner: {n} named channels (want 11 or 13)"),
+        };
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in named.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_ice_ajcc: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(l) = lfe {
+            assert_eq!(l.len(), frame_len as usize, "LFE input length");
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        let n = frame_len as usize;
+        let n_named = named.len();
+
+        // Core downmix (see the public arms' docs). Named slot layout:
+        // core: [L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr];
+        // 5fronts: [L, R, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl, Tfr,
+        // Tbl, Tbr].
+        let isq2 = std::f32::consts::FRAC_1_SQRT_2;
+        let k = 2.0f32 + isq2;
+        let combo = |terms: &[(usize, f32)], g: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| g * terms.iter().map(|&(ch, w)| w * named[ch][i]).sum::<f32>())
+                .collect()
+        };
+        let core_pcm: [Vec<f32>; 5] = if b_5fronts {
+            [
+                combo(&[(0, 1.0), (9, isq2), (3, 1.0)], 1.0 / k), // A
+                combo(&[(1, 1.0), (10, isq2), (4, 1.0)], 1.0 / k), // B
+                combo(&[(2, 1.0)], 1.0 / k),                      // C
+                combo(&[(5, 1.0), (7, 1.0), (11, 1.0)], isq2 / k), // D
+                combo(&[(6, 1.0), (8, 1.0), (12, 1.0)], isq2 / k), // E
+            ]
+        } else {
+            [
+                combo(&[(0, 1.0), (7, isq2)], 1.0 / k),            // A
+                combo(&[(1, 1.0), (8, isq2)], 1.0 / k),            // B
+                combo(&[(2, 1.0)], 1.0 / k),                       // C
+                combo(&[(3, 1.0), (5, 1.0), (9, 1.0)], isq2 / k),  // D
+                combo(&[(4, 1.0), (6, 1.0), (10, 1.0)], isq2 / k), // E
+            ]
+        };
+
+        // MDCT: 5 core tracks + LFE on state 5.
+        let n_states = 6;
+        while self.mdct_states_multi.len() < n_states {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let coeffs: Vec<Vec<f32>> = core_pcm
+            .iter()
+            .enumerate()
+            .map(|(t, pcm)| self.mdct_states_multi[t].analyse_frame(pcm))
+            .collect();
+        let lfe_coeffs = lfe.map(|pcm| self.mdct_states_multi[5].analyse_frame(pcm));
+
+        // QMF analysis on persistent streaming banks: chan_idx 0..5 =
+        // the core tracks (A-SPX row extraction), 5..5+n_named = the
+        // named target channels (parameter extraction).
+        let q_core: Vec<Vec<Vec<(f32, f32)>>> = (0..5)
+            .map(|t| self.ice_qmf_analyse(t, &core_pcm[t]))
+            .collect();
+        let q_named: Vec<Vec<Vec<(f32, f32)>>> = (0..n_named)
+            .map(|c| self.ice_qmf_analyse(5 + c, named[c]))
+            .collect();
+
+        // A-JCC parameter extraction + GOP-aware ajcc_data assembly.
+        let b_iframe = self.b_iframe_global;
+        let cfg_build = crate::encoder_ajcc::AjccBuildConfig::default();
+        let nb = crate::ajcc::AJCC_NUM_BANDS_TABLE[(cfg_build.num_param_bands_id & 3) as usize];
+        let rows = if b_5fronts {
+            let named_q: [&crate::encoder_ajcc::QmfMat; 13] =
+                std::array::from_fn(|i| q_named[i].as_slice());
+            crate::encoder_ajcc::extract_ajcc_5fronts_rows(
+                &named_q,
+                nb,
+                cfg_build.qm_first,
+                cfg_build.qm_second,
+            )
+        } else {
+            let named_q: [&crate::encoder_ajcc::QmfMat; 11] =
+                std::array::from_fn(|i| q_named[i].as_slice());
+            crate::encoder_ajcc::extract_ajcc_core_rows(
+                &named_q,
+                nb,
+                cfg_build.qm_first,
+                cfg_build.qm_second,
+            )
+        };
+        let ajcc = crate::encoder_ajcc::build_ajcc_data(
+            &rows,
+            &cfg_build,
+            &mut self.ajcc_enc_state,
+            b_iframe,
+        );
+
+        // A-SPX real rows on the core-track payload roster (A, B),
+        // (D, E), C; preflat from the primary (A) carrier.
+        let mut aspx_cfg = Self::ice_live_aspx_cfg();
+        aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_core[0]);
+        let two_ch = vec![
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_core[0], &q_core[1]), // (A, B)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_core[3], &q_core[4]), // (D, E)
+        ];
+        let one_ch = Self::ice_1ch_rows_from_matrix(&aspx_cfg, frame_len, &q_core[2]); // C
+
+        // Companding off (§4.8.3.10.3): synced, not active.
+        let companding = crate::aspx::CompandingControl {
+            sync_flag: Some(true),
+            compand_on: vec![false],
+            compand_avg: Some(false),
+        };
+        let core: [&[f32]; 5] = [&coeffs[0], &coeffs[1], &coeffs[2], &coeffs[3], &coeffs[4]];
+        let mut body = BitWriter::new();
+        crate::ice::write_ice_body_ajcc_real(
+            &mut body,
+            &core,
+            &ajcc,
+            &aspx_cfg,
+            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            b_iframe,
+            frame_len,
+            max_sfb,
+            &companding,
+            &crate::ice::IceAspxRows {
+                two_ch: &two_ch,
+                one_ch: &one_ch,
+            },
+        )
+        .expect("encoder: ice ajcc body");
+        let out = crate::ice::encode_ice_raw_frame(
+            self.sequence_counter as u32,
+            lfe.is_some(),
+            b_5fronts,
             b_iframe,
             body,
         )

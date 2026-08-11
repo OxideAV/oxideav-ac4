@@ -1038,6 +1038,53 @@ pub fn write_ice_body_ajcc_with_companding(
     companding: &CompandingControl,
     loud_hf: bool,
 ) -> Result<()> {
+    let rows = if loud_hf {
+        MinimalAspxRows::derive_loud(aspx_cfg)?
+    } else {
+        MinimalAspxRows::derive(aspx_cfg)?
+    };
+    let two_ch = vec![rows.rows_2ch(); 2];
+    let one_ch = rows.rows_1ch();
+    write_ice_body_ajcc_real(
+        bw,
+        core,
+        ajcc,
+        aspx_cfg,
+        lfe,
+        b_iframe,
+        transform_length,
+        max_sfb,
+        companding,
+        &IceAspxRows {
+            two_ch: &two_ch,
+            one_ch: &one_ch,
+        },
+    )
+}
+
+/// [`write_ice_body_ajcc_with_companding`] with **real**
+/// (synthesis-driven) A-SPX payload rows. The 5CH_DYNAMIC ASPX_AJCC
+/// roster carries exactly 2× `aspx_data_2ch()` + 1× `aspx_data_1ch()`;
+/// per the decoder's association the payloads extend the core tracks
+/// `(A, B)`, `(D, E)` and `C`, so `rows.two_ch` (length 2) carries the
+/// per-track-pair rows in that order and `rows.one_ch` the C-track
+/// rows.
+#[allow(clippy::too_many_arguments)]
+pub fn write_ice_body_ajcc_real(
+    bw: &mut BitWriter,
+    core: &[&[f32]; 5],
+    ajcc: &AjccData,
+    aspx_cfg: &AspxConfig,
+    lfe: Option<(&[f32], u32)>,
+    b_iframe: bool,
+    transform_length: u32,
+    max_sfb: u32,
+    companding: &CompandingControl,
+    rows: &IceAspxRows<'_>,
+) -> Result<()> {
+    if rows.two_ch.len() != 2 {
+        return Err(Error::invalid("ac4: ice ajcc 2ch payload count"));
+    }
     IceCodecMode::AspxAjcc.write(bw);
     if b_iframe {
         crate::encoder_acpl3::write_aspx_config(bw, aspx_cfg);
@@ -1080,15 +1127,10 @@ pub fn write_ice_body_ajcc_with_companding(
     bw.write_u32(3, 2);
     write_five_channel_data_simple(bw, core, transform_length, max_sfb)?;
     // A-SPX: 2× aspx_data_2ch + 1× aspx_data_1ch (5CH_DYNAMIC).
-    let rows = if loud_hf {
-        MinimalAspxRows::derive_loud(aspx_cfg)?
-    } else {
-        MinimalAspxRows::derive(aspx_cfg)?
-    };
-    for _ in 0..2 {
-        rows.write_2ch(bw, aspx_cfg, b_iframe)?;
+    for r in rows.two_ch {
+        r.write(bw, aspx_cfg, b_iframe)?;
     }
-    rows.write_1ch(bw, aspx_cfg, b_iframe)?;
+    rows.one_ch.write(bw, aspx_cfg, b_iframe)?;
     write_ajcc_data(bw, ajcc)?;
     Ok(())
 }
