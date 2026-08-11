@@ -484,6 +484,199 @@ pub fn apply_sap_steps(specs: &mut [Vec<f32>], ice: &IceElement, transform_lengt
     }
 }
 
+/// Build a `sap_mode = 3` [`ChparamInfo`] from a per-sfb `alpha_q`
+/// row (0 on disengaged pairs; both halves of an sfb pair share the
+/// even half's value). Returns `None` when no pair engages.
+fn chparam_from_alpha_row(alpha_q: &[i32], max_sfb: u32) -> Option<ChparamInfo> {
+    let m = max_sfb as usize;
+    let mut used = vec![false; m];
+    let mut deltas = vec![0i32; m];
+    let mut any = false;
+    let mut sfb = 0usize;
+    while sfb < m {
+        let a = alpha_q.get(sfb).copied().unwrap_or(0);
+        if a != 0 {
+            any = true;
+            used[sfb] = true;
+            if sfb + 1 < m {
+                used[sfb + 1] = true;
+            }
+            // Parse-side reference: the previous even sfb's recovered
+            // alpha (0 when that pair was disengaged or sfb == 0).
+            let prev = if sfb >= 2 {
+                alpha_q.get(sfb - 2).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            deltas[sfb] = a - prev;
+        }
+        sfb += 2;
+    }
+    if !any {
+        return None;
+    }
+    Some(ChparamInfo {
+        sap_mode: 3,
+        ms_used: Vec::new(),
+        sap_data: Some(crate::asf::SapData {
+            sap_coeff_all: used.iter().all(|&u| u),
+            sap_coeff_used: vec![used],
+            delta_code_time: false,
+            dpcm_alpha_q: vec![deltas],
+        }),
+    })
+}
+
+/// Per-sfb-pair least-squares gain of `target` on `source`, quantised
+/// to the Pseudocode 59 `alpha_q · 0,1` grid (|alpha_q| ≤ `max_q`).
+fn sap_pair_alpha_row(
+    target: &[f32],
+    source: &[f32],
+    sfbo: &[u16],
+    max_sfb: u32,
+    n: usize,
+    max_q: i32,
+) -> Vec<i32> {
+    let m = max_sfb as usize;
+    let mut alpha_q = vec![0i32; m];
+    let mut sfb = 0usize;
+    while sfb < m {
+        let lo = sfbo.get(sfb).map(|&v| v as usize).unwrap_or(n).min(n);
+        let hi_sfb = (sfb + 2).min(m);
+        let hi = sfbo.get(hi_sfb).map(|&v| v as usize).unwrap_or(n).min(n);
+        let (mut num, mut den, mut e_t) = (0.0f64, 0.0f64, 0.0f64);
+        for k in lo..hi {
+            let t = target.get(k).copied().unwrap_or(0.0) as f64;
+            let s = source.get(k).copied().unwrap_or(0.0) as f64;
+            num += t * s;
+            den += s * s;
+            e_t += t * t;
+        }
+        if den > 0.0 && num.is_finite() {
+            let q = ((num / den) * 10.0).round() as i32;
+            let q = q.clamp(-max_q, max_q);
+            // Engage only where the quantised gain reduces the
+            // target's pair energy by a meaningful fraction:
+            // E(t) − E(t − g·s) = g·(2·num − g·den). A bare
+            // strictly-positive test lets leakage-level correlations
+            // against near-silent source bands engage with clamped
+            // gains (the classic least-squares small-denominator
+            // blow-up), so require ≥ 10 % of the pair's target
+            // energy — an encoder tuning choice.
+            let g = q as f64 * 0.1;
+            if q != 0 && g * (2.0 * num - g * den) > 0.1 * e_t {
+                alpha_q[sfb] = q;
+                if sfb + 1 < m {
+                    alpha_q[sfb + 1] = q;
+                }
+            }
+        }
+        sfb += 2;
+    }
+    alpha_q
+}
+
+/// Extract a §5.2.3.2 **step-5/6** SAP prediction element for one
+/// S-CPL track: per sfb-pair least-squares gain of `target` on
+/// `source`, quantised to the Pseudocode 59 `alpha_q · 0,1` grid.
+/// Returns the full-SAP `chparam_info()` plus the wire residual
+/// spectrum (`target − sap_gain·source` on engaged pairs) — the exact
+/// encoder inverse of the Table 20 additive rows
+/// (`H″ = H′ + a′·D′` etc.), or `None` when no pair engages (emit the
+/// identity element and the unmodified spectrum instead).
+///
+/// The per-pair engage rule (quantised gain strictly reduces the
+/// coded pair energy) and the `|alpha_q| ≤ 15` window are encoder
+/// tuning choices — the TS specifies only the decoder mapping.
+pub fn extract_sap_step56_prediction(
+    target: &[f32],
+    source: &[f32],
+    transform_length: u32,
+    max_sfb: u32,
+) -> Option<(ChparamInfo, Vec<f32>)> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)?;
+    let n = transform_length as usize;
+    let alpha_q = sap_pair_alpha_row(target, source, sfbo, max_sfb, n, 15);
+    let info = chparam_from_alpha_row(&alpha_q, max_sfb)?;
+    let mut wire: Vec<f32> = target.to_vec();
+    let m = max_sfb as usize;
+    for (sfb, &q) in alpha_q.iter().enumerate().take(m) {
+        if q == 0 {
+            continue;
+        }
+        let lo = sfbo.get(sfb).map(|&v| v as usize).unwrap_or(n).min(n);
+        let hi = sfbo.get(sfb + 1).map(|&v| v as usize).unwrap_or(n).min(n);
+        let g = q as f32 * 0.1;
+        if wire.len() < hi {
+            wire.resize(hi, 0.0);
+        }
+        for (k, w) in wire.iter_mut().enumerate().take(hi).skip(lo) {
+            let s = source.get(k).copied().unwrap_or(0.0);
+            *w -= g * s;
+        }
+    }
+    Some((info, wire))
+}
+
+/// Extract a §5.2.3.2 **step-3/4** `b_use_sap_add_ch` quartet coding
+/// decision for one `(D, F)` / `(E, G)` pair: per sfb-pair the wire
+/// pair becomes `(mid, side − g·mid)` with `mid = (X+Y)/2`,
+/// `side = (X−Y)/2` and the least-squares prediction gain `g` on the
+/// `alpha_q · 0,1` grid — the exact inverse of the Pseudocode 59
+/// quartet `(1+g, 1, 1−g, −1)` the decoder applies. Disengaged pairs
+/// stay identity (wire = the true tracks). Returns `None` when no
+/// pair engages.
+pub fn extract_sap_step34_pair(
+    x: &[f32],
+    y: &[f32],
+    transform_length: u32,
+    max_sfb: u32,
+) -> Option<(ChparamInfo, Vec<f32>, Vec<f32>)> {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)?;
+    let n = transform_length as usize;
+    let m = max_sfb as usize;
+    let len = x.len().max(y.len());
+    let mid: Vec<f32> = (0..len)
+        .map(|k| 0.5 * (x.get(k).copied().unwrap_or(0.0) + y.get(k).copied().unwrap_or(0.0)))
+        .collect();
+    let side: Vec<f32> = (0..len)
+        .map(|k| 0.5 * (x.get(k).copied().unwrap_or(0.0) - y.get(k).copied().unwrap_or(0.0)))
+        .collect();
+    let alpha_q = sap_pair_alpha_row(&side, &mid, sfbo, max_sfb, n, 15);
+    let info = chparam_from_alpha_row(&alpha_q, max_sfb)?;
+    let mut wire_x: Vec<f32> = x.to_vec();
+    let mut wire_y: Vec<f32> = y.to_vec();
+    for (sfb, &q) in alpha_q.iter().enumerate().take(m) {
+        if q == 0 {
+            continue;
+        }
+        let lo = sfbo.get(sfb).map(|&v| v as usize).unwrap_or(n).min(n);
+        let hi = sfbo.get(sfb + 1).map(|&v| v as usize).unwrap_or(n).min(n);
+        let g = q as f32 * 0.1;
+        if wire_x.len() < hi {
+            wire_x.resize(hi, 0.0);
+        }
+        if wire_y.len() < hi {
+            wire_y.resize(hi, 0.0);
+        }
+        for k in lo..hi {
+            wire_x[k] = mid.get(k).copied().unwrap_or(0.0);
+            wire_y[k] =
+                side.get(k).copied().unwrap_or(0.0) - g * mid.get(k).copied().unwrap_or(0.0);
+        }
+    }
+    Some((info, wire_x, wire_y))
+}
+
+/// The identity (`sap_mode = 0`) chparam element.
+pub fn identity_chparam() -> ChparamInfo {
+    ChparamInfo {
+        sap_mode: 0,
+        ms_used: Vec::new(),
+        sap_data: None,
+    }
+}
+
 /// The `max_sfb` context (single window group) of the channel-data
 /// element that carries the D / E tracks — used to bound the
 /// `b_use_sap_add_ch` `chparam_info()` walks (see the module notes).

@@ -325,14 +325,51 @@ an S16 `AudioFrame`:
 - **Encoder companding decision** (`select_compand_on_from_qmf`):
   §5.7.5.2 level-crest transient detection feeding the immersive
   `companding_control(5)` writers.
+- **9.0.4 / 9.1.4 (`b_5fronts`) ICE encode arms** (r440): the full
+  encode-side Table 23 `b_5fronts` matrix inverse
+  (`A = (L + Lscr)/2`, `L″ = (L − Lscr)/2` on the fixed ×2 front rows
+  plus the shared half-sum/half-difference surround / top rows) drives
+  `encode_frame_pcm_9_{0,1}_4_ice_aspx_scpl` (6× `aspx_data_2ch()` +
+  1× `aspx_data_1ch()` real-synthesis payloads on the `b_5fronts`
+  Table 8 groups, three S-CPL pairs; ≤ 6,3 % settled relative RMS on
+  all 13 channels, LFE 3,6 %) and
+  `encode_frame_pcm_9_{0,1}_4_ice_acpl{1,2}` (the six-module §5.5.2
+  Table 27 roster — the two front modules `(L, Lscr)` / `(R, Rscr)`
+  ride the A / B track positions plain, ACPL_1 codes the front sides
+  on the third S-CPL residual pair `L″ / M″`; ACPL_1 M/S band ≤ 7,1 %
+  settled RMS on all 13 channels).
+- **A-JCC parameter extractor + ASPX_AJCC encode from PCM** (r440,
+  `encoder_ajcc` + `encode_frame_pcm_{7,9}_{0,1}_4_ice_ajcc`): exact
+  Table 30/31 dry / wet quantiser inverses plus alpha (raw F0 lane) /
+  beta lanes; per-parameter-band least-squares dry projections
+  `⟨z, x⟩/⟨x, x⟩` against the exact per-module output sums (the
+  Table 35/37/38 dry gains sum to 1 and the wet rows cancel, so
+  `x = Σ outputs` is the natural core), wet gains filling the
+  projection residual through the decorrelator model (`wet3 = 0` —
+  an informative encoder choice), and alpha / beta from the pair
+  mid/side statistics. `build_ajcc_data()` assembles smooth-framing
+  single-set elements — FREQ rows on I-frames, per-SET FREQ-vs-TIME
+  rows priced by the real Annex A.1.2 codeword lengths on P-frames —
+  in decoder lockstep via an encoder-held `AjccState` mirror. The
+  encode arms derive the five-channel core as the per-module output
+  sums ÷ (2 + 1/√2) for **both** layouts; per-band-separated content
+  reconstructs at 0,90..1,08 settled energy ratios on all 11 / 13
+  channels and the emitted `ajcc_data()` differential-decodes to
+  exactly the extractor's quantised grid across I+P GOPs.
+- **SAP encode decisions** (r440, §5.2.3.2 steps 3-6):
+  `encode_frame_pcm_{7,9}_{0,1}_4_ice_scpl_sap` make both immersive
+  SAP decisions automatically — the step-3/4 `b_use_sap_add_ch`
+  quartets M/S + prediction code `(D, F)` / `(E, G)` per sfb pair
+  (`wire = (mid, side − g·mid)`, the exact Pseudocode 59 quartet
+  inverse), and the step-5/6 full-SAP `chparam_info()` elements
+  predict each S-CPL track from its Table 20 source carrier with
+  per-pair least-squares gains on the `alpha_q · 0,1` grid (the wire
+  track carries the residual). Correlated vertical content codes
+  measurably smaller than an identity encode and decodes back within
+  the ASF quantisation floor.
 
 ## Not yet supported
 
-- ICE encode arms cover the non-`b_5fronts` layouts (7.0.4 / 7.1.4);
-  the 9.0.4 / 9.1.4 encode-side matrix inverse and the SAP
-  (`b_use_sap_add_ch` / step-5/6) encode decisions are pending, as is
-  an A-JCC parameter *extractor* (the ASPX_AJCC write path takes a
-  caller-built `ajcc_data()`).
 - **Immersive remainders** — core decoding mode (the reduced
   7-channel operating point of §5.3.3.2 / §5.6.3.5.3 / §4.8.3.11.2;
   the A-JCC core-decode reconstruction itself is implemented, but no

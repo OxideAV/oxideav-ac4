@@ -9,6 +9,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 440 — **b_5fronts ICE encode + A-JCC parameter extractor
+  + SAP encode decisions** (ETSI TS 103 190-2 §5.2.3.2 / §5.5.2 /
+  §5.6 / §6.2.4.1), closing the immersive encoder "lacks" tail. Five
+  landings:
+  1. **9.0.4 / 9.1.4 ASPX_SCPL encode**
+     (`encode_frame_pcm_9_{0,1}_4_ice_aspx_scpl`): the thirteen SMP
+     tracks A..M as the exact encode-side inverse of the §5.3.3.1
+     Table 23 `b_5fronts` matrix (fixed ×2 front rows —
+     `A = (L + Lscr)/2`, `L″ = (L − Lscr)/2` — plus the shared
+     half-sum/half-difference surround / top rows) composed with the
+     §4.8.3.11.3 Table 11 output gains; 6× `aspx_data_2ch()` + 1×
+     `aspx_data_1ch()` real-synthesis payloads on the `b_5fronts`
+     Table 8 groups, three S-CPL pairs. Round-trip ≤ 6,3 % settled
+     relative RMS on all 13 channels (LFE 3,6 %), regenerated HF
+     within 3 dB with the HF-silent front partner ≥ 13 dB down.
+  2. **9.0.4 / 9.1.4 ASPX_ACPL_1 / ASPX_ACPL_2 encode**
+     (`encode_frame_pcm_9_{0,1}_4_ice_acpl{1,2}`): the six-module
+     §5.5.2 Table 27 roster — four surround / top mid carriers on
+     D..G (√2 output scale) plus the two **front modules**
+     `(L, Lscr)` / `(R, Rscr)` riding the A / B track positions plain
+     (`(P+Q)/2`, no output scale); ACPL_1 codes every pair's side as
+     an M/S residual below `acpl_qmf_band` — surround on F/G, top on
+     J/K, front on the third `b_5fronts` S-CPL pair L″/M″. ACPL_1
+     M/S band ≤ 7,1 % settled RMS on all 13 channels; ACPL_2 ≤ 23 %
+     on correlated pairs with level ratios preserved and
+     decorrelator-fill energy within window on independent content.
+  3. **A-JCC parameter extractor** (new `encoder_ajcc` module): exact
+     Table 30 / 31 dry / wet quantiser inverses plus alpha (raw F0
+     lane) / beta (signed magnitude lane) through the Part 1
+     Tables 202-205 machinery; per-parameter-band least-squares dry
+     projections `⟨z, x⟩/⟨x, x⟩` against the exact per-module output
+     sums (the Table 35/37/38 dry gains sum to 1 and the wet rows
+     cancel, so `x = Σ outputs` is the natural core downmix), wet
+     gains filling the projection residual through the decorrelator
+     model (`E[y] ≈ E[x]`, `wet3 = 0` — an informative encoder
+     choice), alpha / beta from the pair mid/side statistics; both
+     module shapes (Table 37 `b_5fronts` triple, Table 38
+     core-mode-0). `build_ajcc_data()` assembles smooth-framing
+     single-set elements — FREQ rows on I-frames, per-SET
+     FREQ-vs-TIME rows priced by the real Annex A.1.2 codeword
+     lengths on P-frames — in decoder lockstep via an encoder-held
+     `AjccState` mirror advanced through the decoder's own
+     differential decode.
+  4. **ASPX_AJCC encode from PCM for both layouts**
+     (`encode_frame_pcm_{7,9}_{0,1}_4_ice_ajcc` + the new
+     `write_ice_body_ajcc_real`; the historical writers delegate,
+     wire bytes unchanged): core = the per-module output sums ÷
+     `(2 + 1/√2)` (core layout `A = (L + Tfl/√2)/k`,
+     `D = (Ls + Lb + Tbl)/(√2·k)`; `b_5fronts` adds the screens on
+     the front sums). Per-band-separated content reconstructs at
+     0,90..1,08 settled energy ratios on all 11 / 13 channels, the
+     emitted `ajcc_data()` differential-decodes to exactly the
+     extractor's quantised grid, and a stationary I+5P GOP carries
+     TIME rows on the wire.
+  5. **SAP encode decisions** (§5.2.3.2 steps 3-6 —
+     `extract_sap_step34_pair` / `extract_sap_step56_prediction` +
+     `encode_frame_pcm_{7,9}_{0,1}_4_ice_scpl_sap`): the step-3/4
+     `b_use_sap_add_ch` quartets M/S + prediction code `(D, F)` /
+     `(E, G)` per sfb pair (`wire = (mid, side − g·mid)` — the exact
+     Pseudocode 59 quartet inverse) and the step-5/6 full-SAP
+     `chparam_info()` elements predict each S-CPL track from its
+     Table 20 source carrier with per-pair least-squares gains on the
+     `alpha_q · 0,1` grid (wire track = residual; pairs engage only
+     where the quantised gain clears a ≥ 10 % pair-energy-reduction
+     gate). Correlated vertical content codes ~8 % smaller than an
+     identity encode and decodes back ≤ 6,0 % settled RMS on both
+     layouts.
+
 - ac4 round 435 — **A-SPX balance stereo joint decoding** (ETSI TS
   103 190-1 §5.7.6.3.4-5), closing the long-standing "A-SPX balance
   stereo decoding" gap: an `aspx_data_2ch()` pair with

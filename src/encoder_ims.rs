@@ -7857,6 +7857,227 @@ impl Ac4ImsEncoder {
         out
     }
 
+    /// 7.0.4 immersive-channel-element **SCPL** encode from PCM with
+    /// automatic §5.2.3.2 SAP encode decisions (TS 103 190-2 §6.2.4.1,
+    /// `immersive_codec_mode = SCPL`).
+    ///
+    /// `frames` is `[L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`.
+    /// The thirteen/eleven SMP tracks come from the same Table 23
+    /// inverse as the ASPX_SCPL arms; on top of the plain matrix the
+    /// encoder makes both SAP decisions:
+    ///
+    /// * **Step 3/4** (`b_use_sap_add_ch`): each `(D, F)` / `(E, G)`
+    ///   quartet pair is M/S + prediction coded per sfb pair
+    ///   (`wire = (mid, side − g·mid)`, the exact inverse of the
+    ///   Pseudocode 59 quartet) wherever the least-squares gain
+    ///   engages — [`crate::ice::extract_sap_step34_pair`].
+    /// * **Step 5/6**: each S-CPL track predicts from its Table 20
+    ///   source carrier (`H ← D`, `I ← E`, `J ← F`, `K ← G`, and with
+    ///   `b_5fronts` `L″ ← A`, `M″ ← B`); the wire track carries the
+    ///   prediction residual and the full-SAP `chparam_info()` the
+    ///   per-pair gains — [`crate::ice::extract_sap_step56_prediction`].
+    ///
+    /// Correlated vertical content (top channels tracking their
+    /// surround carriers) codes dramatically darker S-CPL tracks while
+    /// the decoder's `apply_sap_steps` restores them exactly (up to
+    /// the `alpha_q · 0,1` gain grid).
+    pub fn encode_frame_pcm_7_0_4_ice_scpl_sap(&mut self, frames: &[&[f32]; 11]) -> Vec<u8> {
+        self.encode_frame_pcm_7_0_4_ice_scpl_sap_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_0_4_ice_scpl_sap`].
+    pub fn encode_frame_pcm_7_0_4_ice_scpl_sap_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 11],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_scpl_sap_inner(frames.as_slice(), None, max_sfb)
+    }
+
+    /// 7.1.4 form of [`Self::encode_frame_pcm_7_0_4_ice_scpl_sap`]
+    /// (LFE **last**; the decoder emits it on the leading output
+    /// slot).
+    pub fn encode_frame_pcm_7_1_4_ice_scpl_sap(&mut self, frames: &[&[f32]; 12]) -> Vec<u8> {
+        self.encode_ice_scpl_sap_inner(&frames[..11], Some(frames[11]), 40)
+    }
+
+    /// 9.0.4 form of [`Self::encode_frame_pcm_7_0_4_ice_scpl_sap`]
+    /// (`b_5fronts = 1`): `frames` is `[L, R, C, Lscr, Rscr, Ls, Rs,
+    /// Lb, Rb, Tfl, Tfr, Tbl, Tbr]`; the front residual pair `L″ / M″`
+    /// predicts from the front mid tracks A / B.
+    pub fn encode_frame_pcm_9_0_4_ice_scpl_sap(&mut self, frames: &[&[f32]; 13]) -> Vec<u8> {
+        self.encode_frame_pcm_9_0_4_ice_scpl_sap_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_9_0_4_ice_scpl_sap`].
+    pub fn encode_frame_pcm_9_0_4_ice_scpl_sap_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 13],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_scpl_sap_inner(frames.as_slice(), None, max_sfb)
+    }
+
+    /// 9.1.4 form of [`Self::encode_frame_pcm_9_0_4_ice_scpl_sap`]
+    /// (LFE **last**).
+    pub fn encode_frame_pcm_9_1_4_ice_scpl_sap(&mut self, frames: &[&[f32]; 14]) -> Vec<u8> {
+        self.encode_ice_scpl_sap_inner(&frames[..13], Some(frames[13]), 40)
+    }
+
+    /// Shared SCPL + SAP body + frame assembly for both layouts
+    /// (`named.len()` selects: 11 → 7.X.4, 13 → `b_5fronts` 9.X.4).
+    fn encode_ice_scpl_sap_inner(
+        &mut self,
+        named: &[&[f32]],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let b_5fronts = match named.len() {
+            11 => false,
+            13 => true,
+            n => panic!("encode_ice_scpl_sap_inner: {n} named channels (want 11 or 13)"),
+        };
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in named.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_ice_scpl_sap: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(l) = lfe {
+            assert_eq!(l.len(), frame_len as usize, "LFE input length");
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+
+        // Track derivation + forward MDCT.
+        let tracks = if b_5fronts {
+            let named13: &[&[f32]; 13] = named.try_into().expect("13 named channels");
+            Self::ice_scpl_tracks_from_named_5fronts(named13)
+        } else {
+            let named11: &[&[f32]; 11] = named.try_into().expect("11 named channels");
+            Self::ice_scpl_tracks_from_named(named11)
+        };
+        let n_tracks = tracks.len();
+        let n_states = n_tracks + 1;
+        while self.mdct_states_multi.len() < n_states {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let coeffs: Vec<Vec<f32>> = tracks
+            .iter()
+            .enumerate()
+            .map(|(t, pcm)| self.mdct_states_multi[t].analyse_frame(pcm))
+            .collect();
+        let lfe_coeffs = lfe.map(|pcm| self.mdct_states_multi[n_tracks].analyse_frame(pcm));
+
+        // Step 3/4 decision on the (D, F) / (E, G) quartets. The wire
+        // D/F/E/G spectra are replaced by the mid / predicted-side
+        // pairs where a chparam engages.
+        let mut wire: Vec<Vec<f32>> = coeffs.clone();
+        let mut sap_add: Option<[crate::asf::ChparamInfo; 2]> = None;
+        let s34_df =
+            crate::ice::extract_sap_step34_pair(&coeffs[3], &coeffs[5], frame_len, max_sfb);
+        let s34_eg =
+            crate::ice::extract_sap_step34_pair(&coeffs[4], &coeffs[6], frame_len, max_sfb);
+        if s34_df.is_some() || s34_eg.is_some() {
+            let mut pair = [
+                crate::ice::identity_chparam(),
+                crate::ice::identity_chparam(),
+            ];
+            if let Some((info, wx, wy)) = s34_df {
+                pair[0] = info;
+                wire[3] = wx;
+                wire[5] = wy;
+            }
+            if let Some((info, wx, wy)) = s34_eg {
+                pair[1] = info;
+                wire[4] = wx;
+                wire[6] = wy;
+            }
+            sap_add = Some(pair);
+        }
+        // Step 5/6 decision per S-CPL track against its Table 20
+        // source (the TRUE carrier — the decoder's step 3/4 restores
+        // the true D/E/F/G before the additive rows apply).
+        let targets: &[(usize, usize)] = if b_5fronts {
+            &[(7, 3), (8, 4), (9, 5), (10, 6), (11, 0), (12, 1)]
+        } else {
+            &[(7, 3), (8, 4), (9, 5), (10, 6)]
+        };
+        let mut scpl_chparam: Vec<crate::asf::ChparamInfo> = Vec::with_capacity(targets.len());
+        let mut any56 = false;
+        for &(tgt, src) in targets {
+            match crate::ice::extract_sap_step56_prediction(
+                &coeffs[tgt],
+                &coeffs[src],
+                frame_len,
+                max_sfb,
+            ) {
+                Some((info, residual)) => {
+                    scpl_chparam.push(info);
+                    wire[tgt] = residual;
+                    any56 = true;
+                }
+                None => scpl_chparam.push(crate::ice::identity_chparam()),
+            }
+        }
+        if !any56 {
+            scpl_chparam.clear();
+        }
+
+        let core: [&[f32]; 5] = [&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
+        let scpl_pairs: Vec<[&[f32]; 2]> = if b_5fronts {
+            vec![
+                [&wire[7], &wire[8]],
+                [&wire[9], &wire[10]],
+                [&wire[11], &wire[12]],
+            ]
+        } else {
+            vec![[&wire[7], &wire[8]], [&wire[9], &wire[10]]]
+        };
+        let spectra = crate::ice::IceScplSpectra {
+            core: &core,
+            add_pair: [&wire[5], &wire[6]],
+            scpl_pairs: &scpl_pairs,
+        };
+        let b_iframe = self.b_iframe_global;
+        let mut body = BitWriter::new();
+        crate::ice::write_ice_body_scpl_with_sap(
+            &mut body,
+            &spectra,
+            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            b_5fronts,
+            frame_len,
+            max_sfb,
+            sap_add.as_ref(),
+            &scpl_chparam,
+        )
+        .expect("encoder: ice scpl sap body");
+        let out = crate::ice::encode_ice_raw_frame(
+            self.sequence_counter as u32,
+            lfe.is_some(),
+            b_5fronts,
+            b_iframe,
+            body,
+        )
+        .expect("encoder: ice frame assembly");
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        out
+    }
+
     /// 7.0.4 immersive-channel-element ASPX_AJCC encode from PCM
     /// (TS 103 190-2 §6.2.4.1 + §5.6, `immersive_codec_mode =
     /// ASPX_AJCC`, core layout) — driven by the
