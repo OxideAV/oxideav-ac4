@@ -284,16 +284,18 @@ fn ice_aspx_scpl_bitstream_re_reads_to_extracted_rows() {
     // The encoder's config (preflat decided per frame — recompute the
     // parse side's view from the sticky slot).
     let cfg = sub.tools.aspx_config.expect("sticky aspx_config");
-    // Payload 0 extends the decoupled (L, R) = inputs / 2 — the same
-    // signals as SMP tracks A / B. First frame: both the encoder's and
-    // this reproduction's banks are fresh, so the rows match exactly.
-    let dec_l: Vec<f32> = input[0].iter().map(|&v| v * 0.5).collect();
-    let dec_r: Vec<f32> = input[1].iter().map(|&v| v * 0.5).collect();
+    // Payload 0 extends the decoupled (Ls, Lb) / √2 — the V1.3.1
+    // Table 8 roster leads with the surround pairs. First frame: both
+    // the encoder's and this reproduction's banks are fresh, so the
+    // rows match exactly.
+    let isq2 = std::f32::consts::FRAC_1_SQRT_2;
+    let dec_ls: Vec<f32> = input[3].iter().map(|&v| v * isq2).collect();
+    let dec_lb: Vec<f32> = input[5].iter().map(|&v| v * isq2).collect();
     let rows0 = Ac4ImsEncoder::ice_2ch_rows_from_matrices(
         &cfg,
         N as u32,
-        &analyse(&dec_l),
-        &analyse(&dec_r),
+        &analyse(&dec_ls),
+        &analyse(&dec_lb),
     );
     // §5.7.6.3.5 joint coding: the 2ch writer converts each pair's
     // (L, R) LEVEL rows to the (sum, pan) wire pair (Pseudocode 84
@@ -356,23 +358,18 @@ fn ice_aspx_scpl_bitstream_re_reads_to_extracted_rows() {
         t2.primary.data_noise[0].values, rows_c.ch.noise,
         "1ch payload NOISE row re-reads to the extractor output"
     );
-    // The surround payload (roster 1) extends (Ls, Lb) / √2.
-    let dec_ls: Vec<f32> = input[3]
-        .iter()
-        .map(|&v| v * std::f32::consts::FRAC_1_SQRT_2)
-        .collect();
-    let dec_lb: Vec<f32> = input[5]
-        .iter()
-        .map(|&v| v * std::f32::consts::FRAC_1_SQRT_2)
-        .collect();
+    // The front payload (roster 3) extends the decoupled (L, R) =
+    // inputs / 2 — the same signals as SMP tracks A / B.
+    let dec_l: Vec<f32> = input[0].iter().map(|&v| v * 0.5).collect();
+    let dec_r: Vec<f32> = input[1].iter().map(|&v| v * 0.5).collect();
     let rows1 = Ac4ImsEncoder::ice_2ch_rows_from_matrices(
         &cfg,
         N as u32,
-        &analyse(&dec_ls),
-        &analyse(&dec_lb),
+        &analyse(&dec_l),
+        &analyse(&dec_r),
     );
-    let IceAspxElement::TwoCh(Some(t1)) = &ice.aspx_elements[1] else {
-        panic!("payload 1 must be a parsed 2ch element");
+    let IceAspxElement::TwoCh(Some(t1)) = &ice.aspx_elements[3] else {
+        panic!("payload 3 must be a parsed 2ch element");
     };
     let (exp_sig1, exp_noise1) = expect_sum(
         &rows1.ch0.sig,

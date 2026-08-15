@@ -6591,11 +6591,16 @@ impl Ac4ImsEncoder {
     ///
     /// ```text
     ///   A = L/2          B = R/2          C = C/2
-    ///   D = (Ls + Lb)/(2√2)    F = (Ls − Lb)/(2√2)
-    ///   E = (Rs + Rb)/(2√2)    G = (Rs − Rb)/(2√2)
-    ///   H = (Tfl + Tbl)/(2√2)  J = (Tfl − Tbl)/(2√2)
-    ///   I = (Tfr + Tbr)/(2√2)  K = (Tfr − Tbr)/(2√2)
+    ///   D = (Ls + Lb)/(2√2)    H = (Ls − Lb)/(2√2)
+    ///   E = (Rs + Rb)/(2√2)    I = (Rs − Rb)/(2√2)
+    ///   F = (Tfl + Tbl)/(2√2)  J = (Tfl − Tbl)/(2√2)
+    ///   G = (Tfr + Tbr)/(2√2)  K = (Tfr − Tbr)/(2√2)
     /// ```
+    ///
+    /// (the Table 23 fold pairs `(D, H)` / `(E, I)` / `(F, J)` /
+    /// `(G, K)` — tracks `A..G` are the 7CH_STATIC 5.X.2 core with the
+    /// top-front mids on the `F` / `G` additional pair, and the four
+    /// S-CPL-section tracks `H..K` carry the pair sides).
     ///
     /// `named` is `[L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`;
     /// the return order is `[A, B, C, D, E, F, G, H, I, J, K]`
@@ -6611,12 +6616,12 @@ impl Ac4ImsEncoder {
             half(named[0]),                 // A
             half(named[1]),                 // B
             half(named[2]),                 // C
-            mix(named[3], named[5], 1.0),   // D  = (Ls + Lb)/(2√2)
-            mix(named[4], named[6], 1.0),   // E  = (Rs + Rb)/(2√2)
-            mix(named[3], named[5], -1.0),  // F = (Ls − Lb)/(2√2)
-            mix(named[4], named[6], -1.0),  // G = (Rs − Rb)/(2√2)
-            mix(named[7], named[9], 1.0),   // H  = (Tfl + Tbl)/(2√2)
-            mix(named[8], named[10], 1.0),  // I = (Tfr + Tbr)/(2√2)
+            mix(named[3], named[5], 1.0),   // D = (Ls + Lb)/(2√2)
+            mix(named[4], named[6], 1.0),   // E = (Rs + Rb)/(2√2)
+            mix(named[7], named[9], 1.0),   // F = (Tfl + Tbl)/(2√2)
+            mix(named[8], named[10], 1.0),  // G = (Tfr + Tbr)/(2√2)
+            mix(named[3], named[5], -1.0),  // H = (Ls − Lb)/(2√2)
+            mix(named[4], named[6], -1.0),  // I = (Rs − Rb)/(2√2)
             mix(named[7], named[9], -1.0),  // J = (Tfl − Tbl)/(2√2)
             mix(named[8], named[10], -1.0), // K = (Tfr − Tbr)/(2√2)
         ]
@@ -6985,10 +6990,13 @@ impl Ac4ImsEncoder {
         // carrier's low band.
         let mut aspx_cfg = aspx_cfg;
         aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_l);
+        // Payload transmission order per the V1.3.1 Table 8 ASPX_SCPL
+        // roster (NOTE 3 — listed order IS bitstream order):
+        // (Ls, Lb), (Rs, Rb), C, (L, R), (Tfl, Tbl), (Tfr, Tbr).
         let two_ch = vec![
-            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_l, &q_r), // (L, R)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[0], &q_dec[1]), // (Ls, Lb)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[2], &q_dec[3]), // (Rs, Rb)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_l, &q_r),           // (L, R)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[4], &q_dec[5]), // (Tfl, Tbl)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[6], &q_dec[7]), // (Tfr, Tbr)
         ];
@@ -7041,10 +7049,10 @@ impl Ac4ImsEncoder {
     ///
     /// ```text
     ///   A  = (L + Lscr)/2       B  = (R + Rscr)/2       C = C/2
-    ///   D  = (Ls + Lb)/(2√2)    F  = (Ls − Lb)/(2√2)
-    ///   E  = (Rs + Rb)/(2√2)    G  = (Rs − Rb)/(2√2)
-    ///   H  = (Tfl + Tbl)/(2√2)  J  = (Tfl − Tbl)/(2√2)
-    ///   I  = (Tfr + Tbr)/(2√2)  K  = (Tfr − Tbr)/(2√2)
+    ///   D  = (Ls + Lb)/(2√2)    H  = (Ls − Lb)/(2√2)
+    ///   E  = (Rs + Rb)/(2√2)    I  = (Rs − Rb)/(2√2)
+    ///   F  = (Tfl + Tbl)/(2√2)  J  = (Tfl − Tbl)/(2√2)
+    ///   G  = (Tfr + Tbr)/(2√2)  K  = (Tfr − Tbr)/(2√2)
     ///   L″ = (L − Lscr)/2       M″ = (R − Rscr)/2
     /// ```
     ///
@@ -7067,10 +7075,10 @@ impl Ac4ImsEncoder {
             half(named[2]),                     // C
             mix(named[5], named[7], 1.0, q),    // D  = (Ls + Lb)/(2√2)
             mix(named[6], named[8], 1.0, q),    // E  = (Rs + Rb)/(2√2)
-            mix(named[5], named[7], -1.0, q),   // F  = (Ls − Lb)/(2√2)
-            mix(named[6], named[8], -1.0, q),   // G  = (Rs − Rb)/(2√2)
-            mix(named[9], named[11], 1.0, q),   // H  = (Tfl + Tbl)/(2√2)
-            mix(named[10], named[12], 1.0, q),  // I  = (Tfr + Tbr)/(2√2)
+            mix(named[9], named[11], 1.0, q),   // F  = (Tfl + Tbl)/(2√2)
+            mix(named[10], named[12], 1.0, q),  // G  = (Tfr + Tbr)/(2√2)
+            mix(named[5], named[7], -1.0, q),   // H  = (Ls − Lb)/(2√2)
+            mix(named[6], named[8], -1.0, q),   // I  = (Rs − Rb)/(2√2)
             mix(named[9], named[11], -1.0, q),  // J  = (Tfl − Tbl)/(2√2)
             mix(named[10], named[12], -1.0, q), // K  = (Tfr − Tbr)/(2√2)
             mix(named[0], named[3], -1.0, q2),  // L″ = (L − Lscr)/2
@@ -7211,11 +7219,15 @@ impl Ac4ImsEncoder {
         // carrier's low band.
         let mut aspx_cfg = aspx_cfg;
         aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_dec[0]);
+        // Payload transmission order per the V1.3.1 Table 8 ASPX_SCPL
+        // b_5fronts roster (NOTE 3 — listed order IS bitstream order):
+        // (Ls, Lb), (Rs, Rb), C, (L, Lscr), (R, Rscr), (Tfl, Tbl),
+        // (Tfr, Tbr).
         let two_ch = vec![
-            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[0], &q_dec[1]), // (L, Lscr)
-            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[2], &q_dec[3]), // (R, Rscr)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[4], &q_dec[5]), // (Ls, Lb)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[6], &q_dec[7]), // (Rs, Rb)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[0], &q_dec[1]), // (L, Lscr)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[2], &q_dec[3]), // (R, Rscr)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[8], &q_dec[9]), // (Tfl, Tbl)
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_dec[10], &q_dec[11]), // (Tfr, Tbr)
         ];
@@ -7273,8 +7285,8 @@ impl Ac4ImsEncoder {
     /// [`crate::encoder_acpl3::extract_ice_acpl_pair_alpha_beta_q`]
     /// over the pair's mid / side MDCT spectra, and the four A-SPX
     /// payloads carry real synthesis rows extracted from the carrier
-    /// tracks themselves (Table 8 grouping `(A, B)` / `(D, F)` /
-    /// `(E, G)` / `C`).
+    /// tracks themselves (Table 8 grouping `(A, B)` / `(D, E)` /
+    /// `(F, G)` / `C`).
     pub fn encode_frame_pcm_7_0_4_ice_acpl2(&mut self, frames: &[&[f32]; 11]) -> Vec<u8> {
         self.encode_frame_pcm_7_0_4_ice_acpl2_with_max_sfb(frames, 40)
     }
@@ -7301,11 +7313,10 @@ impl Ac4ImsEncoder {
     ///
     /// Same layout as [`Self::encode_frame_pcm_7_0_4_ice_acpl2`], but
     /// the module pairs additionally code their **side** signals as
-    /// M/S residual tracks below `acpl_qmf_band` (F / G in the
-    /// additional pair for the surround modules; J / K in the S-CPL
-    /// section for the top modules, whose mid carriers ride H / I),
-    /// so the band below the split reconstructs exactly while the
-    /// bands above run parametric per-module `(α, β)`.
+    /// M/S residual tracks below `acpl_qmf_band` on the S-CPL-section
+    /// tracks (surround sides on H / I, top sides on J / K), so the
+    /// band below the split reconstructs exactly while the bands
+    /// above run parametric per-module `(α, β)`.
     pub fn encode_frame_pcm_7_0_4_ice_acpl1(&mut self, frames: &[&[f32]; 11]) -> Vec<u8> {
         self.encode_frame_pcm_7_0_4_ice_acpl1_with_max_sfb(frames, 40)
     }
@@ -7442,42 +7453,23 @@ impl Ac4ImsEncoder {
             .map(|t| self.ice_qmf_analyse(t, &track_pcm[t]))
             .collect();
         aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_tracks[0]);
-        // On the wire tracks F / G are the mid carriers of the top
-        // modules for ACPL_2, but the **band-limited surround
-        // residuals** for ACPL_1 — whose payload secondaries must then
-        // carry dark envelopes (the module only reads the residual
-        // below acpl_qmf_band; nothing legitimate lives above the
-        // crossover). Analyse the residual signals and zero their
-        // rows from acpl_qmf_band up so the extraction sees exactly
-        // the coded band.
-        type QmfMat = Vec<Vec<(f32, f32)>>;
-        let (q_f, q_g): (QmfMat, QmfMat) = if is_acpl1 {
-            let mut q_f = self.ice_qmf_analyse(7, &sides[0]);
-            let mut q_g = self.ice_qmf_analyse(8, &sides[1]);
-            for q in [&mut q_f, &mut q_g] {
-                for row in q.iter_mut().skip(acpl_qmf_band as usize) {
-                    for v in row.iter_mut() {
-                        *v = (0.0, 0.0);
-                    }
-                }
-            }
-            (q_f, q_g)
-        } else {
-            (q_tracks[5].clone(), q_tracks[6].clone())
-        };
+        // The four A-SPX payloads extend exactly the seven carrier
+        // tracks, per the V1.3.1 Table 8 ACPL roster (errata note A2):
+        // (A, B), (D, E), (F, G), C — for BOTH ACPL modes. The ACPL_1
+        // residual tracks H..K are not A-SPX targets (they carry only
+        // the band below acpl_qmf_band).
         let two_ch = vec![
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[0], &q_tracks[1]), // (A, B)
-            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[3], &q_f), // (D, F)
-            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[4], &q_g), // (E, G)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[3], &q_tracks[4]), // (D, E)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[5], &q_tracks[6]), // (F, G)
         ];
         let one_ch = Self::ice_1ch_rows_from_matrix(&aspx_cfg, frame_len, &q_tracks[2]); // C
 
-        // Assemble the coded spectra per mode. ACPL_2: carriers D..G
-        // ride the core + additional pair. ACPL_1: the surround
-        // residuals ride F/G, the top carriers H/I + residuals J/K
-        // ride the S-CPL section; residual spectra are band-limited
-        // below acpl_qmf_band (30 MDCT bins per QMF subband at
-        // tl = 1920).
+        // Assemble the coded spectra per mode. Both modes carry the
+        // four mid carriers on D..G (core + additional pair); ACPL_1
+        // additionally codes the four pair residuals on the
+        // S-CPL-section tracks H..K, band-limited below acpl_qmf_band
+        // (30 MDCT bins per QMF subband at tl = 1920).
         let residual_limit = (acpl_qmf_band as usize) * (frame_len as usize / 64);
         let limit = |spec: &[f32]| -> Vec<f32> {
             spec.iter()
@@ -7510,8 +7502,8 @@ impl Ac4ImsEncoder {
         let core: [&[f32]; 5] = [&coeffs[0], &coeffs[1], &coeffs[2], &coeffs[3], &coeffs[4]];
         let (add_pair, scpl_pairs): ([&[f32]; 2], Vec<[&[f32]; 2]>) = if is_acpl1 {
             (
-                [&res_spec[0], &res_spec[1]],
-                vec![[&coeffs[5], &coeffs[6]], [&res_spec[2], &res_spec[3]]],
+                [&coeffs[5], &coeffs[6]],
+                vec![[&res_spec[0], &res_spec[1]], [&res_spec[2], &res_spec[3]]],
             )
         } else {
             ([&coeffs[5], &coeffs[6]], Vec::new())
@@ -7592,12 +7584,12 @@ impl Ac4ImsEncoder {
     /// Same layout as [`Self::encode_frame_pcm_9_0_4_ice_acpl2`], but
     /// the module pairs additionally code their **side** signals as
     /// M/S residual tracks below `acpl_qmf_band`: the surround
-    /// residuals ride the additional pair (F / G), the top mid
-    /// carriers + residuals ride the S-CPL section (H / I + J / K),
-    /// and the **front residuals** `(L − Lscr)/2` / `(R − Rscr)/2`
-    /// ride the third b_5fronts S-CPL pair (L″ / M″), so every pair's
-    /// band below the split reconstructs exactly while the bands above
-    /// run parametric per-module `(α, β)`.
+    /// residuals ride the first S-CPL pair (H / I), the top residuals
+    /// the second (J / K), and the **front residuals**
+    /// `(L − Lscr)/2` / `(R − Rscr)/2` the third b_5fronts S-CPL pair
+    /// (L″ / M″), so every pair's band below the split reconstructs
+    /// exactly while the bands above run parametric per-module
+    /// `(α, β)`.
     pub fn encode_frame_pcm_9_0_4_ice_acpl1(&mut self, frames: &[&[f32]; 13]) -> Vec<u8> {
         self.encode_frame_pcm_9_0_4_ice_acpl1_with_max_sfb(frames, 40)
     }
@@ -7745,45 +7737,32 @@ impl Ac4ImsEncoder {
             .collect();
 
         // A-SPX: real rows per Table 8 payload group — payloads extend
-        // the wire tracks (A, B), (D, F), (E, G), C. QMF extraction
+        // the wire tracks (A, B), (D, E), (F, G), C. QMF extraction
         // channel layout: 0..7 = wire tracks A..G.
         let mut aspx_cfg = Self::ice_live_aspx_cfg();
         let q_tracks: Vec<Vec<Vec<(f32, f32)>>> = (0..7)
             .map(|t| self.ice_qmf_analyse(t, &track_pcm[t]))
             .collect();
         aspx_cfg.preflat = Self::ice_preflat_from_matrix(&aspx_cfg, frame_len, &q_tracks[0]);
-        // For ACPL_2 the wire tracks F / G are the top-module mid
-        // carriers; for ACPL_1 they are the band-limited surround
-        // residuals, whose payload secondaries must carry dark
-        // envelopes above the split.
-        type QmfMat = Vec<Vec<(f32, f32)>>;
-        let (q_f, q_g): (QmfMat, QmfMat) = if is_acpl1 {
-            let mut q_f = self.ice_qmf_analyse(7, &sides[0]);
-            let mut q_g = self.ice_qmf_analyse(8, &sides[1]);
-            for q in [&mut q_f, &mut q_g] {
-                for row in q.iter_mut().skip(acpl_qmf_band as usize) {
-                    for v in row.iter_mut() {
-                        *v = (0.0, 0.0);
-                    }
-                }
-            }
-            (q_f, q_g)
-        } else {
-            (q_tracks[5].clone(), q_tracks[6].clone())
-        };
+        // The four A-SPX payloads extend exactly the seven carrier
+        // tracks, per the V1.3.1 Table 8 ACPL roster (errata note A2):
+        // (A, B), (D, E), (F, G), C — for BOTH ACPL modes; the ACPL_1
+        // residual tracks (H..K + the front pair L″/M″) are not A-SPX
+        // targets.
         let two_ch = vec![
             Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[0], &q_tracks[1]), // (A, B)
-            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[3], &q_f), // (D, F)
-            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[4], &q_g), // (E, G)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[3], &q_tracks[4]), // (D, E)
+            Self::ice_2ch_rows_from_matrices(&aspx_cfg, frame_len, &q_tracks[5], &q_tracks[6]), // (F, G)
         ];
         let one_ch = Self::ice_1ch_rows_from_matrix(&aspx_cfg, frame_len, &q_tracks[2]); // C
 
-        // Assemble the coded spectra per mode. ACPL_2: top mid
-        // carriers ride the additional pair (F, G); no S-CPL section.
-        // ACPL_1: the surround residuals ride F/G, the top carriers
-        // H/I + residuals J/K ride the S-CPL section, and the front
-        // residuals ride the third S-CPL pair (L″, M″); residual
-        // spectra are band-limited below acpl_qmf_band.
+        // Assemble the coded spectra per mode. Both modes carry the
+        // four surround / top mid carriers on D..G (core + additional
+        // pair). ACPL_1 additionally codes the surround residuals on
+        // the first S-CPL pair (H, I), the top residuals on the
+        // second (J, K), and the front residuals on the third
+        // (L″, M″); residual spectra are band-limited below
+        // acpl_qmf_band.
         let residual_limit = (acpl_qmf_band as usize) * (frame_len as usize / 64);
         let limit = |spec: &[f32]| -> Vec<f32> {
             spec.iter()
@@ -7816,9 +7795,9 @@ impl Ac4ImsEncoder {
         let core: [&[f32]; 5] = [&coeffs[0], &coeffs[1], &coeffs[2], &coeffs[3], &coeffs[4]];
         let (add_pair, scpl_pairs): ([&[f32]; 2], Vec<[&[f32]; 2]>) = if is_acpl1 {
             (
-                [&res_spec[0], &res_spec[1]],
+                [&coeffs[5], &coeffs[6]],
                 vec![
-                    [&coeffs[5], &coeffs[6]],
+                    [&res_spec[0], &res_spec[1]],
                     [&res_spec[2], &res_spec[3]],
                     [&res_spec[4], &res_spec[5]],
                 ],

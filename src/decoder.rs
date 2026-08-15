@@ -2133,17 +2133,20 @@ impl Ac4Decoder {
             chans[2] = Self::ice_scale(&t[2], c_gain, n);
         }
         // Surround / top rows are position-independent of b_5fronts;
-        // the output slots shift by the two screen channels.
+        // the output slots shift by the two screen channels. Fold
+        // pairs per the V1.3.1 Table 23 input vector
+        // [D″, H″, E″, I″, F″, J″, G″, K″]: each 5.X.2-core mid
+        // (D..G) folds with its S-CPL-section side (H..K).
         let base = if b_5fronts { 5 } else { 3 };
         let rows: [(usize, usize, f32); 8] = [
-            (3, 5, 1.0),   // Ls  = m(D + F)
-            (4, 6, 1.0),   // Rs  = m(E + G)
-            (3, 5, -1.0),  // Lb  = m(D − F)
-            (4, 6, -1.0),  // Rb  = m(E − G)
-            (7, 9, 1.0),   // Tfl = m(H + J)
-            (8, 10, 1.0),  // Tfr = m(I + K)
-            (7, 9, -1.0),  // Tbl = m(H − J)
-            (8, 10, -1.0), // Tbr = m(I − K)
+            (3, 7, 1.0),   // Ls  = m(D + H)
+            (4, 8, 1.0),   // Rs  = m(E + I)
+            (3, 7, -1.0),  // Lb  = m(D − H)
+            (4, 8, -1.0),  // Rb  = m(E − I)
+            (5, 9, 1.0),   // Tfl = m(F + J)
+            (6, 10, 1.0),  // Tfr = m(G + K)
+            (5, 9, -1.0),  // Tbl = m(F − J)
+            (6, 10, -1.0), // Tbr = m(G − K)
         ];
         for (i, (a, b, sign)) in rows.into_iter().enumerate() {
             chans[base + i] = Self::ice_mix2(&t[a], &t[b], m_gain, sign, n);
@@ -2377,27 +2380,25 @@ impl Ac4Decoder {
                         t.push(self.imdct_channel_f32(slot, spec, n));
                     }
                     let mut ch_pcm = Self::ice_scpl_full_matrix(&t, b_5fronts, 1.0, 1.0, n);
-                    // A-SPX per decoupled channel. Table 8 groups the
-                    // channels as (L, R), C, (Ls, Lb), (Rs, Rb),
-                    // (Tfl, Tbl), (Tfr, Tbr) — with b_5fronts the
-                    // front groups become (L, Lscr) and (R, Rscr) —
-                    // associated with the §6.2.4.1 payload roster in
-                    // transmission order (2ch payloads to the pair
-                    // groups, the 1ch payload to C).
+                    // A-SPX per decoupled channel, on the V1.3.1
+                    // Table 8 ASPX_SCPL roster (NOTE 3 — listed order
+                    // IS bitstream order): (Ls, Lb), (Rs, Rb), C,
+                    // (L, R), (Tfl, Tbl), (Tfr, Tbr); with b_5fronts
+                    // the front groups are (L, Lscr) and (R, Rscr).
                     let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
                     if let Some(cfg) = sub_aspx_cfg {
                         // (payload index, output slot, is_secondary)
                         let mapping: &[(usize, usize, bool)] = if b_5fronts {
                             &[
-                                (0, 0, false), // (L, Lscr)
-                                (0, 3, true),
-                                (1, 1, false), // (R, Rscr)
-                                (1, 4, true),
+                                (0, 5, false), // (Ls, Lb)
+                                (0, 7, true),
+                                (1, 6, false), // (Rs, Rb)
+                                (1, 8, true),
                                 (2, 2, false), // C
-                                (3, 5, false), // (Ls, Lb)
-                                (3, 7, true),
-                                (4, 6, false), // (Rs, Rb)
-                                (4, 8, true),
+                                (3, 0, false), // (L, Lscr)
+                                (3, 3, true),
+                                (4, 1, false), // (R, Rscr)
+                                (4, 4, true),
                                 (5, 9, false), // (Tfl, Tbl)
                                 (5, 11, true),
                                 (6, 10, false), // (Tfr, Tbr)
@@ -2405,13 +2406,13 @@ impl Ac4Decoder {
                             ]
                         } else {
                             &[
-                                (0, 0, false), // (L, R)
-                                (0, 1, true),
-                                (1, 3, false), // (Ls, Lb)
-                                (1, 5, true),
+                                (0, 3, false), // (Ls, Lb)
+                                (0, 5, true),
+                                (1, 4, false), // (Rs, Rb)
+                                (1, 6, true),
                                 (2, 2, false), // C
-                                (3, 4, false), // (Rs, Rb)
-                                (3, 6, true),
+                                (3, 0, false), // (L, R)
+                                (3, 1, true),
                                 (4, 7, false), // (Tfl, Tbl)
                                 (4, 9, true),
                                 (5, 8, false), // (Tfr, Tbr)
@@ -2500,8 +2501,9 @@ impl Ac4Decoder {
                         t.push(self.imdct_channel_f32(slot, spec, n));
                     }
                     // QMF analysis per track, with the A-SPX extension
-                    // on the §6.2.4.1 payload roster tracks (Table 8:
-                    // (A'', B''), (D'', F''), (E'', G'') pairs + C'').
+                    // on the §6.2.4.1 payload roster tracks — the
+                    // V1.3.1 Table 8 ACPL row (errata note A2):
+                    // (A'', B''), (D'', E''), (F'', G'') pairs + C''.
                     let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
                     let mut q_tr: Vec<aspx::QmfMatrix> = Vec::with_capacity(t.len());
                     for (tr, p) in t.iter().enumerate() {
@@ -2512,9 +2514,9 @@ impl Ac4Decoder {
                         let mapping: [(usize, usize, bool); 7] = [
                             (0, 0, false), // payload 0 → (A, B)
                             (0, 1, true),
-                            (1, 3, false), // payload 1 → (D, F)
-                            (1, 5, true),
-                            (2, 4, false), // payload 2 → (E, G)
+                            (1, 3, false), // payload 1 → (D, E)
+                            (1, 4, true),
+                            (2, 5, false), // payload 2 → (F, G)
                             (2, 6, true),
                             (3, 2, false), // payload 3 (1ch) → C
                         ];
@@ -2568,19 +2570,20 @@ impl Ac4Decoder {
                             }
                             let st = self.ice_acpl.as_mut().expect("ice acpl state ensured");
                             // Module routing: (main track, ASPX_ACPL_1
-                            // residual track, (z_main, z_sub)). For
-                            // ASPX_ACPL_2 the coded F / G tracks
-                            // occupy the Tfl / Tfr carrier positions
-                            // (x9 / x10 — the Table 27 ACPL_2 branch
-                            // reads exactly x5, x6, x9, x10) and each
-                            // module runs decorrelator-only.
+                            // residual track, (z_main, z_sub)). The
+                            // carriers are the 5.X.2-core mids D..G
+                            // (tracks 3..6 — §5.5.2 Pseudocode 2 reads
+                            // x5, x6, x9, x10); ASPX_ACPL_1's residual
+                            // tracks are the S-CPL-section sides H..K
+                            // (tracks 7..10 — x7, x8, x11, x12), while
+                            // ASPX_ACPL_2 runs decorrelator-only.
                             let mut routing: Vec<(usize, Option<usize>, usize, usize, bool)> =
                                 if is_acpl1 {
                                     vec![
-                                        (3, Some(5), 5, 6, true),    // (Ls, Lb)
-                                        (4, Some(6), 7, 8, true),    // (Rs, Rb)
-                                        (7, Some(9), 9, 10, true),   // (Tfl, Tbl)
-                                        (8, Some(10), 11, 12, true), // (Tfr, Tbr)
+                                        (3, Some(7), 5, 6, true),    // (Ls, Lb)
+                                        (4, Some(8), 7, 8, true),    // (Rs, Rb)
+                                        (5, Some(9), 9, 10, true),   // (Tfl, Tbl)
+                                        (6, Some(10), 11, 12, true), // (Tfr, Tbr)
                                     ]
                                 } else {
                                     vec![
@@ -2732,10 +2735,9 @@ impl Ac4Decoder {
                         pcm_core.push(self.imdct_channel_f32(slot, coeffs, n));
                     }
                     // A-SPX QMF extension per core channel. Payload
-                    // mapping per the syntax order: first
-                    // aspx_data_2ch → (A, B), second → (D, E), the
-                    // aspx_data_1ch → C (see the ice module notes on
-                    // Table 8's (D'', F'') row).
+                    // mapping per the V1.3.1 Table 8 ASPX_AJCC row:
+                    // first aspx_data_2ch → (A, B), second → (D, E),
+                    // the aspx_data_1ch → C.
                     let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
                     let mut q_ch: Vec<aspx::QmfMatrix> = Vec::with_capacity(5);
                     let mut bands: Vec<Option<(u32, u32)>> = vec![None; 5];

@@ -30,26 +30,23 @@
 //!   channel-data element whose tracks they process — the D/E-carrying
 //!   core element for the `b_use_sap_add_ch` pair, and the
 //!   corresponding S-CPL `two_channel_data()` for the step-5 elements.
-//! * Table 8 prints the second ASPX_AJCC pair as `(D'', F'')`, but
-//!   §5.2.3.4 step 3 silences every track from F' on for that mode, so
-//!   the second `aspx_data_2ch()` payload's slave channel would carry
-//!   envelopes for guaranteed silence while E'' (the fifth A-JCC core
-//!   input) stayed band-limited. This implementation pairs the two
-//!   fullband surround tracks `(D'', E'')` instead.
-//! * Table 8's ASPX_ACPL_1 rows additionally list `(H'', J'')` /
-//!   `(I'', K'')` A-SPX groups (and, with b_5fronts, front groups
-//!   `(A'', L'')` / `(B'', M'')`), but the §6.2.4.1 syntax carries the
-//!   same four payloads (3× `aspx_data_2ch()` + 1× `aspx_data_1ch()`)
-//!   for the whole ACPL / AJCC family — there is no payload to apply
-//!   to the extra groups. This implementation associates the
-//!   transmitted payloads with `(A'', B'')` / `(D'', F'')` /
-//!   `(E'', G'')` / `C''` and passes the S-CPL-section tracks through
-//!   unextended.
-//! * §5.5.2 Table 27's ASPX_ACPL_2 branch reads exactly the carrier
-//!   positions x5 / x6 / x9 / x10 (plus x0..x2), while §5.2.3.3
-//!   silences tracks H' onward — so the coded F / G tracks must occupy
-//!   the Tfl / Tfr carrier positions (x9 / x10) in that mode (in
-//!   ASPX_ACPL_1 they are the Lb / Rb residuals at x7 / x8 instead).
+//! * The A-SPX payload↔track association follows the V1.3.1 Table 8
+//!   roster (its NOTE 3 makes the listed order the bitstream order;
+//!   the staged errata notes record the superseded V1.2.1 rows):
+//!   `(A'', B'')` / `(D'', E'')` / `(F'', G'')` / `C''` for the whole
+//!   ACPL / AJCC family (the third pair only with the 7CH_STATIC core
+//!   config), and `(Ls, Lb)`, `(Rs, Rb)`, `C`, `(L[, R| Lscr])`,
+//!   `(R, Rscr)?`, `(Tfl, Tbl)`, `(Tfr, Tbr)` for ASPX_SCPL. The
+//!   ACPL_1 S-CPL-section residual tracks `H''..K''` (and the
+//!   b_5fronts front residuals `L''` / `M''`) are not A-SPX targets.
+//! * The 7CH_STATIC track roles follow the V1.3.1 Table 23 fold
+//!   pairs `(D, H)` / `(E, I)` / `(F, J)` / `(G, K)`: tracks `A..G`
+//!   are the 5.X.2 core (fronts, surround mids `D` / `E`, top-front
+//!   mids on the additional pair `F` / `G`) and the S-CPL-section
+//!   tracks `H..K` carry the pair sides. In the ACPL modes the same
+//!   carriers `D..G` sit at the §5.5.2 Table 25 module positions
+//!   x5 / x6 / x9 / x10, with the ACPL_1 residuals `H..K` at
+//!   x7 / x8 / x11 / x12.
 //! * §5.2.3.2 step 5 extracts a single prediction gain `a'_j` per
 //!   element "as specified in [part-1] clause 5.3.2", whose
 //!   Pseudocode 59 produces the quartet `(a, b, c, d)`; the additive
@@ -1739,9 +1736,9 @@ pub fn write_ice_body_acpl(
 
 /// [`write_ice_body_acpl`] with **real** (synthesis-driven) A-SPX
 /// payload rows. The ACPL / AJCC-family roster carries exactly
-/// 3× `aspx_data_2ch()` + 1× `aspx_data_1ch()`; per the decoder's
+/// 3× `aspx_data_2ch()` + 1× `aspx_data_1ch()`; per the V1.3.1
 /// Table 8 association the payloads extend the **tracks** `(A, B)`,
-/// `(D, F)`, `(E, G)` and `C`, so `rows.two_ch` (length 3) carries the
+/// `(D, E)`, `(F, G)` and `C`, so `rows.two_ch` (length 3) carries the
 /// per-track-pair rows in that order and `rows.one_ch` the C-track
 /// rows.
 #[allow(clippy::too_many_arguments)]

@@ -66,17 +66,19 @@ fn energy(pcm: &[i16]) -> f64 {
 #[test]
 fn ice_scpl_7_0_4_full_decode_follows_table_23() {
     // Core A..E tones; D-track content deliberately duplicated on the
-    // F track (the additional pair's first channel) so Lb = m(D − F)
-    // cancels while Ls = m(D + F) reinforces.
+    // H track (the first S-CPL pair's first channel) so Lb = m(D − H)
+    // cancels while Ls = m(D + H) reinforces (the V1.3.1 Table 23
+    // fold pairs (D, H) / (E, I) / (F, J) / (G, K)).
     let a = tone_spectrum(10, 25.0);
     let b = tone_spectrum(14, 25.0);
     let c = tone_spectrum(18, 25.0);
     let d = tone_spectrum(22, 25.0);
     let e = tone_spectrum(26, 25.0);
     let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
-    let f = d.clone(); // F == D → Lb cancels.
-    let g = tone_spectrum(30, 25.0);
-    let hi = [tone_spectrum(40, 20.0), tone_spectrum(44, 20.0)];
+    // Additional pair (F, G) = the top-front mids.
+    let f = tone_spectrum(30, 25.0);
+    let g = tone_spectrum(34, 25.0);
+    let hi = [d.clone(), tone_spectrum(44, 20.0)]; // H == D → Lb cancels.
     let jk = [tone_spectrum(50, 20.0), tone_spectrum(54, 20.0)];
     let scpl_pairs: [[&[f32]; 2]; 2] = [[&hi[0], &hi[1]], [&jk[0], &jk[1]]];
     let spectra = IceScplSpectra {
@@ -107,14 +109,14 @@ fn ice_scpl_7_0_4_full_decode_follows_table_23() {
     let e_rb = energy(&chans[6]);
     let e_tfl = energy(&chans[7]);
     assert!(e_l > 1e6, "L carries the core-A tone (got {e_l})");
-    assert!(e_ls > 1e6, "Ls = m(D + F) reinforces (got {e_ls})");
+    assert!(e_ls > 1e6, "Ls = m(D + H) reinforces (got {e_ls})");
     assert!(
         e_lb < e_ls / 1e3,
-        "Lb = m(D − F) cancels for identical D/F ({e_lb} vs {e_ls})"
+        "Lb = m(D − H) cancels for identical D/H ({e_lb} vs {e_ls})"
     );
-    // E and G differ → both Rs and Rb carry energy.
+    // E and I differ → both Rs and Rb carry energy.
     assert!(e_rs > 1e6 && e_rb > 1e6, "Rs/Rb both live ({e_rs}/{e_rb})");
-    assert!(e_tfl > 1e6, "Tfl = m(H + J) live ({e_tfl})");
+    assert!(e_tfl > 1e6, "Tfl = m(F + J) live ({e_tfl})");
 }
 
 /// SCPL 9.1.4: 13 named channels + LFE; the Table 23 b_5fronts front

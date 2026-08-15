@@ -50,12 +50,13 @@ fn energy(pcm: &[i16]) -> f64 {
 }
 
 /// SCPL 7.0.4 with a `b_use_sap_add_ch` M/S-all chparam pair: step 4
-/// turns (D, F) into sum/difference tracks BEFORE the S-CPL matrix, so
-/// with a silent F the decoded Lb = m(D' − F') cancels (D' = F' = D)
-/// while a no-SAP decode of the same spectra splits the D tone evenly
-/// across Ls and Lb.
+/// turns (D, F) into sum/difference tracks BEFORE the Table 23 fold.
+/// With a silent F the additional pair's first track becomes
+/// F' = D − F = D, so the D tone lands on the top-front fold
+/// (Tfl / Tbl = m(F' ± J)) while the surround fold
+/// (Ls / Lb = m(D' ± H), D' = D + F = D) is unchanged.
 #[test]
-fn ice_scpl_sap_step4_msall_steers_surround_pair() {
+fn ice_scpl_sap_step4_msall_steers_top_pair() {
     let a = tone_spectrum(10, 25.0);
     let b = tone_spectrum(14, 25.0);
     let c = tone_spectrum(18, 25.0);
@@ -101,26 +102,24 @@ fn ice_scpl_sap_step4_msall_steers_surround_pair() {
     let plain = run(false);
     let sap = run(true);
     // Output order: [L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr].
-    let (p_ls, p_lb) = (energy(&plain[3]), energy(&plain[5]));
-    let (s_ls, s_lb) = (energy(&sap[3]), energy(&sap[5]));
-    // No SAP, F silent: Ls = m·D and Lb = m·D carry equal energy.
-    assert!(p_ls > 1e6 && p_lb > 1e6, "plain Ls/Lb live ({p_ls}/{p_lb})");
-    let bal = p_ls / p_lb;
+    let (p_tfl, p_ls) = (energy(&plain[7]), energy(&plain[3]));
+    let (s_tfl, s_ls) = (energy(&sap[7]), energy(&sap[3]));
+    // No SAP, F silent: Tfl = m·J carries the J tone only.
+    assert!(p_tfl > 1e6, "plain Tfl live from J ({p_tfl})");
+    // M/S-all SAP: F' = D − F = D → Tfl = m(D + J) gains the D tone
+    // (amp 25 vs J's amp 20 → energy ratio 1 + 625/400 ≈ 2,56).
+    let gain = s_tfl / p_tfl;
     assert!(
-        (0.8..=1.25).contains(&bal),
-        "plain decode splits D evenly ({bal})"
+        (2.0..=3.2).contains(&gain),
+        "SAP decode steers D onto the top fold (energy x{gain})"
     );
-    // M/S-all SAP: D' = D + F = D, F' = D − F = D → Ls = m·2D, Lb = 0.
+    // The surround fold is unchanged: D' = D + F = D.
+    let ls_ratio = s_ls / p_ls.max(1.0);
     assert!(
-        s_lb < s_ls / 1e3,
-        "SAP decode cancels Lb ({s_lb} vs {s_ls})"
+        (0.95..=1.05).contains(&ls_ratio),
+        "Ls unchanged by SAP ({ls_ratio})"
     );
-    let gain = s_ls / p_ls;
-    assert!(
-        (3.0..=5.0).contains(&gain),
-        "SAP decode doubles the Ls amplitude (energy x4, got x{gain})"
-    );
-    // L / R / C and the top rows are unaffected by step 4.
+    // L / R / C are unaffected by step 4.
     let l_ratio = energy(&sap[0]) / energy(&plain[0]).max(1.0);
     assert!(
         (0.95..=1.05).contains(&l_ratio),
@@ -129,11 +128,12 @@ fn ice_scpl_sap_step4_msall_steers_surround_pair() {
 }
 
 /// SCPL 7.0.4 with a full-SAP (`sap_mode == 3`) first S-CPL-section
-/// chparam element: step 6 adds `a'_0 · D'` into track H, which the
-/// Table 23 rows spread onto Tfl/Tbl — the D tone appears on the top
-/// row while a plain decode keeps it out.
+/// chparam element: step 6 adds `a'_0 · D'` into track H — the
+/// surround side track of the Table 23 (D, H) fold — so with a silent
+/// S-CPL section the prediction turns the plain decode's even
+/// Ls/Lb split (Ls = Lb = m·D) into Ls = m·2D / Lb = 0.
 #[test]
-fn ice_scpl_sap_step6_full_sap_predicts_top_from_surround() {
+fn ice_scpl_sap_step6_full_sap_predicts_surround_side() {
     let a = tone_spectrum(10, 25.0);
     let b = tone_spectrum(14, 25.0);
     let c = tone_spectrum(18, 25.0);
@@ -194,20 +194,32 @@ fn ice_scpl_sap_step6_full_sap_predicts_top_from_surround() {
     let plain = run(false);
     let sap = run(true);
     // Output order: [L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr].
-    let p_tfl = energy(&plain[7]);
-    let s_tfl = energy(&sap[7]);
-    let s_tbl = energy(&sap[9]);
-    let s_tfr = energy(&sap[8]);
-    assert!(p_tfl < 1e3, "plain decode keeps the top row silent");
-    // H'' = 1,0 · D' → Tfl = Tbl = m·H'' both carry the D tone.
-    assert!(s_tfl > 1e6, "SAP decode predicts Tfl from D' ({s_tfl})");
-    let tb = s_tfl / s_tbl.max(1.0);
+    let (p_ls, p_lb) = (energy(&plain[3]), energy(&plain[5]));
+    let (s_ls, s_lb) = (energy(&sap[3]), energy(&sap[5]));
+    let (s_rs, s_rb) = (energy(&sap[4]), energy(&sap[6]));
+    // Plain decode (H silent): Ls = Lb = m·D split evenly.
+    assert!(p_ls > 1e6 && p_lb > 1e6, "plain Ls/Lb live ({p_ls}/{p_lb})");
+    let bal = p_ls / p_lb;
     assert!(
-        (0.8..=1.25).contains(&tb),
-        "Tfl/Tbl split evenly from the H mid ({tb})"
+        (0.8..=1.25).contains(&bal),
+        "plain decode splits D evenly ({bal})"
     );
-    // The a'_1 element is identity → the right top row stays silent.
-    assert!(s_tfr < s_tfl / 1e3, "Tfr stays silent ({s_tfr})");
+    // H'' = 1,0 · D' → Ls = m·2D (energy x4), Lb = m(D − H'') = 0.
+    assert!(
+        s_lb < s_ls / 1e3,
+        "SAP decode cancels Lb ({s_lb} vs {s_ls})"
+    );
+    let gain = s_ls / p_ls;
+    assert!(
+        (3.0..=5.0).contains(&gain),
+        "SAP decode doubles the Ls amplitude (energy x4, got x{gain})"
+    );
+    // The a'_1 element is identity → Rs/Rb keep the even E split.
+    let rbal = s_rs / s_rb.max(1.0);
+    assert!(
+        (0.8..=1.25).contains(&rbal),
+        "Rs/Rb unaffected by the identity element ({rbal})"
+    );
 }
 
 fn test_aspx_config() -> AspxConfig {
@@ -293,10 +305,10 @@ fn ice_aspx_scpl_7_0_4_matches_scpl_low_band_and_extends() {
         (0, 6),  // L   <- A
         (1, 10), // R   <- B
         (2, 14), // C   <- C
-        (3, 18), // Ls  <- D (+F)
-        (4, 22), // Rs  <- E (+G)
-        (7, 34), // Tfl <- H (+J)
-        (9, 34), // Tbl <- H (−J)
+        (3, 18), // Ls  <- D (+H)
+        (4, 22), // Rs  <- E (+I)
+        (7, 26), // Tfl <- F (+J)
+        (9, 26), // Tbl <- F (−J)
     ];
     for (slot, bin) in checks {
         let p_ref = tone_power(&scpl[slot], bin);
@@ -542,9 +554,10 @@ fn ice_acpl2_alpha_steers_surround_pair() {
 /// ASPX_ACPL_1 7.0.4 full decoding across an I + P GOP: with
 /// acpl_qmf_band = 8 every test tone sits in the M/S-coded band, so
 /// each module reconstructs (main + residual) / (main − residual) —
-/// identical D / F tracks cancel in Lb, and a silent J residual splits
-/// H evenly across Tfl / Tbl. The P-frame reuses the sticky
-/// aspx_config + acpl_config.
+/// identical D / H tracks (carrier + S-CPL-section residual) cancel
+/// in Lb, and a silent J residual splits the top-front mid F evenly
+/// across Tfl / Tbl. The P-frame reuses the sticky aspx_config +
+/// acpl_config.
 #[test]
 fn ice_acpl1_7_0_4_ms_band_and_p_frame() {
     use oxideav_ac4::ice::IceCodecMode;
@@ -554,9 +567,9 @@ fn ice_acpl1_7_0_4_ms_band_and_p_frame() {
     let d = tone_spectrum(18, 200.0);
     let e = tone_spectrum(22, 200.0);
     let core: [&[f32]; 5] = [&a, &b, &c, &d, &e];
-    let f = d.clone(); // F == D → Lb = (D − F) cancels
+    let f = tone_spectrum(34, 150.0); // top-front mid on the add pair
     let g = tone_spectrum(30, 150.0);
-    let h = tone_spectrum(34, 150.0);
+    let h = d.clone(); // H == D → Lb = (D − H) cancels
     let silent = vec![0.0f32; a.len()];
     let jk = [tone_spectrum(42, 150.0), tone_spectrum(46, 150.0)];
     let scpl_pairs: [[&[f32]; 2]; 2] = [[&h, &silent], [&silent, &jk[1]]];
@@ -586,16 +599,16 @@ fn ice_acpl1_7_0_4_ms_band_and_p_frame() {
         let p_tfl = tone_power(&chans[7], 34);
         let p_tbl = tone_power(&chans[9], 34);
         assert!(p_l > 1e12, "{tag}: L carries the A tone ({p_l})");
-        assert!(p_ls > 1e11, "{tag}: Ls = D + F reinforces ({p_ls})");
+        assert!(p_ls > 1e11, "{tag}: Ls = D + H reinforces ({p_ls})");
         assert!(
             p_lb < p_ls / 1e3,
-            "{tag}: Lb = D − F cancels ({p_lb} vs {p_ls})"
+            "{tag}: Lb = D − H cancels ({p_lb} vs {p_ls})"
         );
-        assert!(p_tfl > 1e11, "{tag}: Tfl = H + J carries H ({p_tfl})");
+        assert!(p_tfl > 1e11, "{tag}: Tfl = F + J carries F ({p_tfl})");
         let t = p_tfl / p_tbl.max(1.0);
         assert!(
             (0.7..=1.4).contains(&t),
-            "{tag}: silent J splits H evenly across Tfl / Tbl ({t})"
+            "{tag}: silent J splits F evenly across Tfl / Tbl ({t})"
         );
     }
 }

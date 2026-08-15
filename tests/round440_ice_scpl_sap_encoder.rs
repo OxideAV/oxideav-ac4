@@ -89,12 +89,30 @@ fn rel_rms_err(reference: &[f32], dec: &[f32], lag: usize) -> f64 {
 /// surround carriers (`Tfl = 0,8·Ls`, `Tbl = 0,8·Lb`) and the backs
 /// track the surrounds (`Lb = 0,7·Ls`), so both SAP stages engage on
 /// the left side; the right side carries independent tones (identity
-/// elements).
+/// elements). The left-side base is a multi-tone (broadband-ish)
+/// signal so the predicted-to-residual tracks carry real bit cost.
 /// Order: `[L, R, C, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr]`.
 fn correlated_vertical_input() -> Vec<Vec<f32>> {
-    let ls = periodic_tone(24, 0.4, 0.4);
+    let parts: [(u32, f32, f32); 5] = [
+        (24, 0.10, 0.4),
+        (29, 0.09, 1.1),
+        (33, 0.08, 0.2),
+        (37, 0.07, 0.9),
+        (41, 0.06, 1.7),
+    ];
+    let mut ls = vec![0.0f32; N];
+    for &(c, a, p) in &parts {
+        for (dst, s) in ls.iter_mut().zip(periodic_tone(c, a, p)) {
+            *dst += s;
+        }
+    }
+    // Ratio 2/3 everywhere puts every SAP gain exactly on the
+    // alpha_q · 0,1 grid: the (D, F) quartet gain and both left-side
+    // step-5/6 predictions land on (1 − 2/3)/(1 + 2/3) = 0,2, so the
+    // predicted wire tracks are exactly zero.
+    const G: f32 = 2.0 / 3.0;
     let scale = |x: &Vec<f32>, g: f32| -> Vec<f32> { x.iter().map(|&v| v * g).collect() };
-    let lb = scale(&ls, 0.7);
+    let lb = scale(&ls, G);
     vec![
         periodic_tone(9, 0.35, 0.0),  // L
         periodic_tone(22, 0.35, 0.5), // R
@@ -103,9 +121,9 @@ fn correlated_vertical_input() -> Vec<Vec<f32>> {
         periodic_tone(28, 0.35, 0.9), // Rs
         lb.clone(),                   // Lb
         periodic_tone(32, 0.3, 1.4),  // Rb
-        scale(&ls, 0.8),              // Tfl = 0,8·Ls
+        scale(&ls, G),                // Tfl = ⅔·Ls
         periodic_tone(40, 0.3, 1.8),  // Tfr
-        scale(&lb, 0.8),              // Tbl = 0,8·Lb
+        scale(&lb, G),                // Tbl = ⅔·Lb
         periodic_tone(44, 0.3, 2.2),  // Tbr
     ]
 }
@@ -200,13 +218,15 @@ fn ice_scpl_sap_engages_and_gains_match_correlations() {
     let sub = dec.last_substream.as_ref().expect("substream parsed");
     let ice = sub.tools.ice.as_deref().expect("ice element parsed");
     assert_eq!(ice.mode, IceCodecMode::Scpl);
-    // Step 3/4: (D, F) is strongly correlated (Lb = 0,7·Ls) → the
-    // quartet pair engages.
+    // Step 3/4: the (D, F) quartet — surround mid D ∝ (5/3)·Ls vs
+    // top-front mid F = ⅔·D — is fully correlated, so the pair
+    // engages.
     assert_eq!(ice.b_use_sap_add_ch, Some(true), "b_use_sap_add_ch");
     let cp = ice.sap_add_chparam.as_deref().expect("sap add chparam");
     assert_eq!(cp[0].sap_mode, 3, "(D, F) chparam is full SAP");
-    // Step 5/6: the (H ← D) element engages with a′ ≈ 0,8 on the
-    // content band (Ls rides ~600 Hz; H = 0,8·D exactly).
+    // Step 5/6: the (H ← D) element engages. H = (Ls − Lb)/(2√2)
+    // ∝ (1/3)·Ls against D ∝ (5/3)·Ls → a′ = 0,2 exactly on the
+    // alpha_q · 0,1 grid.
     assert_eq!(ice.scpl_chparam.len(), 4, "four S-CPL chparam elements");
     let h_info = &ice.scpl_chparam[0];
     assert_eq!(h_info.sap_mode, 3, "(H ← D) element is full SAP");
@@ -214,8 +234,8 @@ fn ice_scpl_sap_engages_and_gains_match_correlations() {
     let row = a_prime.first().expect("a' row");
     let peak = row.iter().cloned().fold(0.0f32, f32::max);
     assert!(
-        (0.7..=0.9).contains(&peak),
-        "peak a' on the (H ← D) element ≈ 0,8 (got {peak})"
+        (0.1..=0.3).contains(&peak),
+        "peak a' on the (H ← D) element ≈ 0,2 (got {peak})"
     );
     // (No claim about the right-side elements: even nominally
     // independent tones share first-frame TDAC window-skirt leakage,
@@ -245,10 +265,10 @@ fn ice_scpl_sap_saves_bits_against_identity_encode() {
         half(&input[2]),
         mix(&input[3], &input[5], 1.0),
         mix(&input[4], &input[6], 1.0),
-        mix(&input[3], &input[5], -1.0),
-        mix(&input[4], &input[6], -1.0),
         mix(&input[7], &input[9], 1.0),
         mix(&input[8], &input[10], 1.0),
+        mix(&input[3], &input[5], -1.0),
+        mix(&input[4], &input[6], -1.0),
         mix(&input[7], &input[9], -1.0),
         mix(&input[8], &input[10], -1.0),
     ];
