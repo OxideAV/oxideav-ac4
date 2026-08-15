@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - ac4 round 443 — **immersive core decoding mode + V1.3.1 track-role
   reconciliation** (ETSI TS 103 190-2 §4.7.3 / §5.3.3.2 /
-  §4.8.3.11.2 / §4.8.3.14 / §5.6.3.5.3 / §5.10.2.6-7). Two landings:
+  §4.8.3.11.2 / §4.8.3.14 / §5.6.3.5.3 / §5.10.2.6-7). Four landings:
   1. **7CH_STATIC track roles reconciled to the V1.3.1 edition**
      (staged 2026-07-31; the in-repo errata notes A1/A2 record the
      superseded V1.2.1 rows): the S-CPL full-decoding fold pairs are
@@ -50,6 +50,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      `render_core_to_5_x_2(core)` reproduces the full decode folded
      to 5.X.2 with the same customized gains (the +3 dB static terms
      cancel the core fold exactly).
+  3. **A-JOC object substreams in core mode** (§4.8.2 step 4 /
+     §4.8.3.13: the A-JOC tool applies to full decoding only): the
+     core-mode output of an A-JOC substream is its **downmix signal
+     set** — the fullband downmix channels (A-SPX-extended and
+     companded on the dynamic A-SPX form, synthesised through new
+     per-channel core banks) plus the directly coded LFE — without
+     the §5.7.3.6 spatial reconstruction; the first OAMD portion
+     describes this presentation per §4.8.3.4 (surfaced on the
+     parsed body). `AjocSubstreamDecoder` gains
+     `decode_substream_pcm_core` / `decode_frame_pcm_core` over a
+     factored-out shared downmix stage. Gates: under an identity
+     selector the core downmix equals the full-decode objects —
+     exactly on the A-SPX form (same filterbank path), and up to the
+     QMF round-trip delay on the SIMPLE/static forms.
+  4. **A-JOC A-SPX-downmix domain-scale fix**: the extension chain
+     runs at the A-SPX integer-PCM anchor scale, but the r414 route
+     scattered the extended matrices into the spatial reconstruction
+     unscaled while SIMPLE-coded channels entered at unit scale —
+     objects decoded from the A-SPX form came out ×2¹⁵ hot (clipping
+     at the S16 stage; the existing energy gates were
+     level-insensitive). The scatter now removes the anchor scale so
+     both channel kinds enter the reconstruction in the same domain;
+     the companding gate is recalibrated to the corrected level.
 
 - ac4 round 440 — **b_5fronts ICE encode + A-JCC parameter extractor
   + SAP encode decisions** (ETSI TS 103 190-2 §5.2.3.2 / §5.5.2 /

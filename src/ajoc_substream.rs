@@ -600,6 +600,11 @@ pub struct AjocSubstreamDecoder {
     /// Per-downmix-channel A-SPX extension state (envelope / noise /
     /// tone / TNS carry-over).
     aspx_ext_state: Vec<crate::aspx::AspxChannelExtState>,
+    /// Per-downmix-channel QMF synthesis banks for the §4.7.3 core
+    /// decoding mode (the extended downmix is synthesised back to
+    /// PCM instead of feeding the spatial reconstruction). Grown on
+    /// demand on the first core-mode frame.
+    core_synthesis: Vec<crate::qmf::QmfSynthesisBank>,
 }
 
 impl AjocSubstreamDecoder {
@@ -624,6 +629,7 @@ impl AjocSubstreamDecoder {
             prev_de: None,
             sticky_aspx: None,
             aspx_ext_state: Vec::new(),
+            core_synthesis: Vec::new(),
         }
     }
 
@@ -674,6 +680,149 @@ impl AjocSubstreamDecoder {
         frame_len_base: u32,
     ) -> Result<AjocObjectPcm> {
         let n = frame_len_base as usize;
+        let (lfe_pcm, pcm_dmx, ext) = self.decode_dmx_stage(ajoc, frame_len_base)?;
+        let num_sb = crate::qmf::NUM_QMF_SUBBANDS;
+        let num_ts = n / num_sb;
+        let mut x = vec![vec![vec![(0.0f64, 0.0f64); self.num_dmx]; num_sb]; num_ts];
+        // Phase C: scatter into x[ts][sb][ch] (plain QMF analysis for
+        // channels without a usable extension). The extension chain
+        // runs at the A-SPX integer-PCM anchor scale
+        // (`ASPX_QMF_PCM_SCALE`); the scatter removes it so extended
+        // and plain channels enter the reconstruction in the same
+        // domain.
+        let inv_scale = 1.0f64 / crate::aspx::ASPX_QMF_PCM_SCALE as f64;
+        for (ch, slot) in ext.into_iter().enumerate() {
+            if let Some((q, _, _)) = slot {
+                for (ts, x_ts) in x.iter_mut().enumerate().take(num_ts) {
+                    for (sb, row) in q.iter().enumerate().take(num_sb) {
+                        let (re, im) = row.get(ts).copied().unwrap_or((0.0, 0.0));
+                        x_ts[sb][ch] = (re as f64 * inv_scale, im as f64 * inv_scale);
+                    }
+                }
+                continue;
+            }
+            let slots = self.analysis[ch].process_block(&pcm_dmx[ch]);
+            for (ts, slot) in slots.iter().take(num_ts).enumerate() {
+                for (sb, &(re, im)) in slot.iter().enumerate() {
+                    x[ts][sb][ch] = (re as f64, im as f64);
+                }
+            }
+        }
+        // 3. Spatial reconstruction.
+        let frame = &ajoc.ajoc_frame;
+        let geom = crate::ajoc::AjocGeometry {
+            num_dmx: self.num_dmx,
+            num_umx: self.num_umx,
+            num_decorr: frame.num_decorr as usize,
+            num_timeslots: num_ts,
+            num_subbands: num_sb,
+        };
+        let state_matches = matches!(
+            &self.recon,
+            Some((g, _)) if g.num_dmx == geom.num_dmx
+                && g.num_umx == geom.num_umx
+                && g.num_decorr == geom.num_decorr
+                && g.num_subbands == geom.num_subbands
+        );
+        if !state_matches {
+            self.recon = Some((geom, crate::ajoc::AjocReconState::new(&geom)));
+        }
+        let recon = &mut self.recon.as_mut().expect("recon state just ensured").1;
+        let z = crate::ajoc::ajoc_reconstruct(
+            &x,
+            &frame.matrices,
+            &frame.ctrl.data_point_info,
+            &frame.ctrl.object_present,
+            &geom,
+            recon,
+        );
+        // 4. QMF-synthesise each object.
+        let mut out = Vec::with_capacity(self.num_umx);
+        for o in 0..self.num_umx {
+            let mut pcm = Vec::with_capacity(num_ts * num_sb);
+            for z_ts in z.iter().take(num_ts) {
+                let mut slot = [(0.0f32, 0.0f32); crate::qmf::NUM_QMF_SUBBANDS];
+                for (sb, s) in slot.iter_mut().enumerate() {
+                    let (re, im) = z_ts[sb][o];
+                    *s = (re as f32, im as f32);
+                }
+                let row = self.synthesis[o].process_slot(&slot);
+                pcm.extend_from_slice(&row);
+            }
+            out.push(pcm);
+        }
+        Ok((out, lfe_pcm))
+    }
+
+    /// **Core decoding** (§4.7.3) of one parsed `audio_data_ajoc()`
+    /// frame: the A-JOC tool is applicable to full decoding only
+    /// (§4.8.2 step 4 / §4.8.3.13), so the core-mode output of an
+    /// A-JOC object substream is its **downmix signal set** — the
+    /// fullband downmix channels (A-SPX-extended and companded when
+    /// the element carries the A-SPX form) plus the directly coded
+    /// LFE — without the §5.7.3.6 spatial reconstruction. The first
+    /// OAMD portion in the bitstream describes this core presentation
+    /// (§4.8.3.4); it is surfaced on the parsed body.
+    pub fn decode_frame_pcm_core(
+        &mut self,
+        ajoc: &AudioDataAjoc,
+        frame_len_base: u32,
+    ) -> Result<AjocObjectPcm> {
+        let n = frame_len_base as usize;
+        let (lfe_pcm, pcm_dmx, ext) = self.decode_dmx_stage(ajoc, frame_len_base)?;
+        let num_sb = crate::qmf::NUM_QMF_SUBBANDS;
+        let num_ts = n / num_sb;
+        while self.core_synthesis.len() < self.num_dmx {
+            self.core_synthesis
+                .push(crate::qmf::QmfSynthesisBank::new());
+        }
+        let inv_scale = 1.0 / crate::aspx::ASPX_QMF_PCM_SCALE;
+        let mut out = Vec::with_capacity(self.num_dmx);
+        for (ch, slot) in ext.into_iter().enumerate() {
+            match slot {
+                Some((q, _, _)) => {
+                    // Extended channel: synthesise the post-extension
+                    // (post-companding) matrix back to PCM.
+                    let mut pcm = Vec::with_capacity(num_ts * num_sb);
+                    for ts in 0..num_ts {
+                        let mut col = [(0.0f32, 0.0f32); crate::qmf::NUM_QMF_SUBBANDS];
+                        for (sb, s) in col.iter_mut().enumerate() {
+                            *s = q
+                                .get(sb)
+                                .and_then(|row| row.get(ts))
+                                .copied()
+                                .unwrap_or((0.0, 0.0));
+                        }
+                        let row = self.core_synthesis[ch].process_slot(&col);
+                        pcm.extend(row.iter().map(|&v| v * inv_scale));
+                    }
+                    out.push(pcm);
+                }
+                // SIMPLE-coded channel: the IMDCT output IS the
+                // downmix signal (no filterbank round-trip needed).
+                None => out.push(pcm_dmx[ch].clone()),
+            }
+        }
+        Ok((out, lfe_pcm))
+    }
+
+    /// Steps 0-2 of the downmix decode, shared by both §4.7 decoding
+    /// modes: LFE IMDCT, per-channel IMDCT, the A-SPX QMF extension
+    /// (dynamic A-SPX form) and the §4.8.3.10.4 companding gains.
+    /// Returns `(lfe_pcm, pcm_dmx, ext)` where `ext[ch]` carries the
+    /// post-extension `(matrix, sb0, sbz)` at the A-SPX anchor scale
+    /// for every extended channel.
+    #[allow(clippy::type_complexity)]
+    fn decode_dmx_stage(
+        &mut self,
+        ajoc: &AudioDataAjoc,
+        frame_len_base: u32,
+    ) -> Result<(
+        Option<Vec<f32>>,
+        Vec<Vec<f32>>,
+        Vec<Option<(crate::aspx::QmfMatrix, u32, u32)>>,
+    )> {
+        let n = frame_len_base as usize;
         // Downmix spectra in channel order + the LFE body, from either
         // the static 5.X core or the dynamic var_channel_element.
         let (spectra, lfe_data): (Vec<Option<&[f32]>>, Option<&MonoLfeData>) =
@@ -720,14 +869,11 @@ impl AjocSubstreamDecoder {
         for (ch, spec) in spectra.iter().enumerate() {
             pcm_dmx.push(self.imdct_channel_f32(ch, spec, n));
         }
-        // 2. QMF-analyse each channel into x[ts][sb][ch]. For the
-        // A-SPX downmix form each channel is bandwidth-extended in the
-        // QMF domain from its captured payload (Tables 51/52) and the
-        // §4.8.3.10.4 / §5.7.5 companding gains apply from the
-        // element's companding_control(n_dmx_signals).
-        let num_sb = crate::qmf::NUM_QMF_SUBBANDS;
-        let num_ts = n / num_sb;
-        let mut x = vec![vec![vec![(0.0f64, 0.0f64); self.num_dmx]; num_sb]; num_ts];
+        // 2. For the A-SPX downmix form each channel is
+        // bandwidth-extended in the QMF domain from its captured
+        // payload (Tables 51/52) and the §4.8.3.10.4 / §5.7.5
+        // companding gains apply from the element's
+        // companding_control(n_dmx_signals).
         let aspx_elem = ajoc
             .var_element
             .as_ref()
@@ -835,69 +981,7 @@ impl AjocSubstreamDecoder {
                 }
             }
         }
-        // Phase C: scatter into x[ts][sb][ch] (plain QMF analysis for
-        // channels without a usable extension).
-        for (ch, slot) in ext.into_iter().enumerate() {
-            if let Some((q, _, _)) = slot {
-                for (ts, x_ts) in x.iter_mut().enumerate().take(num_ts) {
-                    for (sb, row) in q.iter().enumerate().take(num_sb) {
-                        let (re, im) = row.get(ts).copied().unwrap_or((0.0, 0.0));
-                        x_ts[sb][ch] = (re as f64, im as f64);
-                    }
-                }
-                continue;
-            }
-            let slots = self.analysis[ch].process_block(&pcm_dmx[ch]);
-            for (ts, slot) in slots.iter().take(num_ts).enumerate() {
-                for (sb, &(re, im)) in slot.iter().enumerate() {
-                    x[ts][sb][ch] = (re as f64, im as f64);
-                }
-            }
-        }
-        // 3. Spatial reconstruction.
-        let frame = &ajoc.ajoc_frame;
-        let geom = crate::ajoc::AjocGeometry {
-            num_dmx: self.num_dmx,
-            num_umx: self.num_umx,
-            num_decorr: frame.num_decorr as usize,
-            num_timeslots: num_ts,
-            num_subbands: num_sb,
-        };
-        let state_matches = matches!(
-            &self.recon,
-            Some((g, _)) if g.num_dmx == geom.num_dmx
-                && g.num_umx == geom.num_umx
-                && g.num_decorr == geom.num_decorr
-                && g.num_subbands == geom.num_subbands
-        );
-        if !state_matches {
-            self.recon = Some((geom, crate::ajoc::AjocReconState::new(&geom)));
-        }
-        let recon = &mut self.recon.as_mut().expect("recon state just ensured").1;
-        let z = crate::ajoc::ajoc_reconstruct(
-            &x,
-            &frame.matrices,
-            &frame.ctrl.data_point_info,
-            &frame.ctrl.object_present,
-            &geom,
-            recon,
-        );
-        // 4. QMF-synthesise each object.
-        let mut out = Vec::with_capacity(self.num_umx);
-        for o in 0..self.num_umx {
-            let mut pcm = Vec::with_capacity(num_ts * num_sb);
-            for z_ts in z.iter().take(num_ts) {
-                let mut slot = [(0.0f32, 0.0f32); crate::qmf::NUM_QMF_SUBBANDS];
-                for (sb, s) in slot.iter_mut().enumerate() {
-                    let (re, im) = z_ts[sb][o];
-                    *s = (re as f32, im as f32);
-                }
-                let row = self.synthesis[o].process_slot(&slot);
-                pcm.extend_from_slice(&row);
-            }
-            out.push(pcm);
-        }
-        Ok((out, lfe_pcm))
+        Ok((lfe_pcm, pcm_dmx, ext))
     }
 
     /// Parse + decode one complete part-2 `ac4_substream()` body
@@ -923,6 +1007,53 @@ impl AjocSubstreamDecoder {
         b_alternative: bool,
         frame_len_base: u32,
     ) -> Result<AjocSubstreamDecode> {
+        let (ajoc, metadata) = self.parse_substream(
+            substream_bytes,
+            params,
+            b_iframe,
+            b_alternative,
+            frame_len_base,
+        )?;
+        let (pcm, lfe) = self.decode_frame_pcm(&ajoc, frame_len_base)?;
+        Ok((pcm, lfe, ajoc, metadata))
+    }
+
+    /// **Core decoding** (§4.7.3) counterpart of
+    /// [`Self::decode_substream_pcm`]: same parse (audio envelope,
+    /// `audio_data_ajoc()`, sticky A-SPX config, post-audio
+    /// metadata), but the PCM grid carries the `num_dmx` **downmix
+    /// signals** via [`Self::decode_frame_pcm_core`] instead of the
+    /// reconstructed objects.
+    pub fn decode_substream_pcm_core(
+        &mut self,
+        substream_bytes: &[u8],
+        params: &AjocBodyParams,
+        b_iframe: bool,
+        b_alternative: bool,
+        frame_len_base: u32,
+    ) -> Result<AjocSubstreamDecode> {
+        let (ajoc, metadata) = self.parse_substream(
+            substream_bytes,
+            params,
+            b_iframe,
+            b_alternative,
+            frame_len_base,
+        )?;
+        let (pcm, lfe) = self.decode_frame_pcm_core(&ajoc, frame_len_base)?;
+        Ok((pcm, lfe, ajoc, metadata))
+    }
+
+    /// Shared substream parse: `audio_size` envelope →
+    /// `audio_data_ajoc()` (+ sticky A-SPX harvest) → post-audio
+    /// `metadata(…, sus_ver = 1)`.
+    fn parse_substream(
+        &mut self,
+        substream_bytes: &[u8],
+        params: &AjocBodyParams,
+        b_iframe: bool,
+        b_alternative: bool,
+        frame_len_base: u32,
+    ) -> Result<(AudioDataAjoc, Option<crate::metadata::MetadataV2>)> {
         let mut br = BitReader::new(substream_bytes);
         // §6.2.2.2: audio_size_value (15) + b_more_bits escape.
         let mut audio_size = br.read_u32(15)?;
@@ -983,8 +1114,7 @@ impl AjocSubstreamDecoder {
         } else {
             None
         };
-        let (pcm, lfe) = self.decode_frame_pcm(&ajoc, frame_len_base)?;
-        Ok((pcm, lfe, ajoc, metadata))
+        Ok((ajoc, metadata))
     }
 }
 

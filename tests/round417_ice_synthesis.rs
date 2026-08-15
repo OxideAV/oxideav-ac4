@@ -874,11 +874,14 @@ fn ajoc_aspx_downmix_companding_applies_per_channel() {
     };
     // Off is off, regardless of the wire form.
     assert_eq!(off_implicit, off_explicit, "off triple == explicit all-off");
-    // Companding channel 1 reshapes object 1 only.
+    // Companding channel 1 reshapes object 1 only. (The absolute
+    // magnitude is calibrated to the unit-scale object domain — the
+    // extension chain's anchor scale is removed before the
+    // reconstruction.)
     let d0 = d(&off_implicit[0], &on_ch1[0]);
     let d1 = d(&off_implicit[1], &on_ch1[1]);
     assert!(d0 < 1.0, "object 0 (uncompanded ch0) identical ({d0})");
-    assert!(d1 > 1e5, "object 1 (companded ch1) reshaped ({d1})");
+    assert!(d1 > 1e3, "object 1 (companded ch1) reshaped ({d1})");
     // Sanity: the reshaped object stays at a sane level.
     let e_ratio = energy(&on_ch1[1]) / energy(&off_implicit[1]).max(1.0);
     assert!(

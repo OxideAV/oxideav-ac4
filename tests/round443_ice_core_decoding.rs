@@ -739,3 +739,248 @@ fn core_acpl2_9_0_4_carrier_relations() {
         );
     }
 }
+
+// =====================================================================
+// A-JOC object substreams in core decoding mode (§4.8.2 step 4 /
+// §4.8.3.13: the A-JOC tool applies to full decoding only — the
+// core-mode output is the downmix signal set, described by the first
+// OAMD portion per §4.8.3.4).
+// =====================================================================
+
+mod ajoc_core {
+    use super::{decode_frame, energy, rel_rms_err};
+    use oxideav_ac4::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
+    use oxideav_ac4::ajoc_data::new_ajoc_diff_state;
+    use oxideav_ac4::ajoc_substream::{
+        encode_ajoc_raw_frame_aspx, encode_ajoc_raw_frame_static, AjocBodyParams,
+    };
+    use oxideav_ac4::aspx::{AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep};
+    use oxideav_ac4::decoder::{Ac4Decoder, DecodingMode};
+    use oxideav_ac4::encoder_ajoc::AjocQuantMatrices;
+    use oxideav_ac4::oamd::ObjType;
+    use oxideav_core::{CodecId, CodecParameters};
+
+    const MAX_SFB: u32 = 20;
+
+    fn tone_spectrum(bin: usize, amp: f32) -> Vec<f32> {
+        super::tone_spectrum(bin, amp)
+    }
+
+    fn best_circular_lag(reference: &[f32], dec: &[f32]) -> usize {
+        let n = reference.len();
+        let mut best = (0usize, f64::MIN);
+        for lag in 0..n {
+            let mut acc = 0.0f64;
+            for i in 0..n {
+                acc += reference[i] as f64 * dec[(i + lag) % n] as f64;
+            }
+            if acc > best.1 {
+                best = (lag, acc);
+            }
+        }
+        best.0
+    }
+
+    fn rel_rms_err_lag(reference: &[f32], dec: &[f32], lag: usize) -> f64 {
+        let n = reference.len();
+        let (mut err, mut sig) = (0.0f64, 0.0f64);
+        for i in 0..n {
+            let r = reference[i] as f64;
+            let d = dec[(i + lag) % n] as f64;
+            err += (d - r) * (d - r);
+            sig += r * r;
+        }
+        (err / sig.max(1e-30)).sqrt()
+    }
+
+    /// Identity selector: object `o` = downmix channel `o % num_dmx`
+    /// with unit dry gain and zero wet gain — the full-decode objects
+    /// then EQUAL the downmix signals, giving an exact core-vs-full
+    /// PCM relationship.
+    fn selector_setup(
+        num_dmx: usize,
+        num_umx: usize,
+        num_decorr: usize,
+    ) -> (AjocCtrlInfo, AjocQuantMatrices) {
+        let ctrl = AjocCtrlInfo {
+            decorr_enable: vec![true; num_decorr],
+            object_present: vec![true; num_umx],
+            data_point_info: AjocDataPointInfo {
+                num_dpoints: 1,
+                start_pos: vec![0],
+                ramp_len: vec![16],
+            },
+            num_bands_code: vec![7; num_umx],
+            num_bands: vec![1; num_umx],
+            quant_select: vec![AjocQuantMode::Fine; num_umx],
+            sparse_select: vec![false; num_umx],
+            mix_mtx_dry_present: vec![vec![true; num_dmx]; num_umx],
+            mix_mtx_wet_present: vec![vec![true; num_decorr]; num_umx],
+        };
+        let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|o| {
+                vec![(0..num_dmx)
+                    .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
+                    .collect()]
+            })
+            .collect();
+        let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|_| vec![vec![vec![0.0]; num_decorr]])
+            .collect();
+        let qmats = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
+        (ctrl, qmats)
+    }
+
+    fn test_aspx_config() -> AspxConfig {
+        AspxConfig {
+            quant_mode_env: AspxQuantStep::Fine,
+            start_freq: 7,
+            stop_freq: 0,
+            master_freq_scale: AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: AspxFreqResMode::Low,
+        }
+    }
+
+    /// Static-downmix (5.1 core) A-JOC substream in core mode: the
+    /// output is the six-signal downmix (LFE + the 5.X core), and
+    /// with the identity selector each core downmix channel matches
+    /// the corresponding full-decode object.
+    #[test]
+    fn core_ajoc_static_dmx_outputs_downmix() {
+        let num_dmx = 5usize;
+        let num_umx = 3usize;
+        let num_decorr = 1usize;
+        let params = AjocBodyParams {
+            b_lfe: true,
+            b_static_dmx: true,
+            n_fullband_dmx_signals: 5,
+            n_fullband_upmix_signals: num_umx as u32,
+            obj_type_dmx: vec![ObjType::Dyn; num_dmx + 1],
+            obj_type_umx: vec![ObjType::Dyn; num_umx + 1],
+        };
+        let (ctrl, qmats) = selector_setup(num_dmx, num_umx, num_decorr);
+        let chan: Vec<Vec<f32>> = (0..5).map(|i| tone_spectrum(12 + 8 * i, 40.0)).collect();
+        let chan_refs: [&[f32]; 5] = std::array::from_fn(|i| chan[i].as_slice());
+        let lfe = tone_spectrum(2, 25.0);
+        let dec_params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut enc_state_a = new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let mut enc_state_b = new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let mut dec_full = Ac4Decoder::new(&dec_params);
+        let mut dec_core = Ac4Decoder::new(&dec_params);
+        dec_core.set_decoding_mode(DecodingMode::Core);
+        let (mut full, mut core) = (Vec::new(), Vec::new());
+        for seq in 0..3u32 {
+            let build = |st: &mut _| {
+                encode_ajoc_raw_frame_static(
+                    seq,
+                    &params,
+                    &chan_refs,
+                    Some((&lfe, 4)),
+                    MAX_SFB,
+                    num_decorr as u32,
+                    &ctrl,
+                    &qmats,
+                    true,
+                    st,
+                )
+                .unwrap()
+            };
+            full = decode_frame(&mut dec_full, build(&mut enc_state_a), num_umx + 1);
+            core = decode_frame(&mut dec_core, build(&mut enc_state_b), num_dmx + 1);
+        }
+        // LFE identical on the leading slot (both modes IMDCT it
+        // directly — no filterbank delay on either side).
+        assert!(energy(&core[0]) > 1e-4, "core LFE live");
+        let e_lfe = rel_rms_err(&full[0], &core[0]);
+        assert!(e_lfe < 0.02, "LFE identical in both modes ({e_lfe})");
+        // Identity selector: full object o == downmix channel o —
+        // up to the QMF analysis+synthesis round-trip delay the full
+        // decode's reconstruction path carries and the core mode's
+        // direct SIMPLE path does not. Align by circular lag on the
+        // settled steady-state tones.
+        for o in 0..num_umx {
+            assert!(energy(&core[o + 1]) > 1e-4, "core dmx {o} live");
+            let lag = best_circular_lag(&core[o + 1], &full[o + 1]);
+            let e = rel_rms_err_lag(&core[o + 1], &full[o + 1], lag);
+            let ratio = energy(&core[o + 1]) / energy(&full[o + 1]).max(1e-30);
+            assert!(
+                (0.7..=1.4).contains(&ratio),
+                "core dmx channel {o} level matches the full-decode object ({ratio})"
+            );
+            assert!(
+                e < 0.15,
+                "core dmx channel {o} matches the delay-aligned full-decode object (err {e})"
+            );
+        }
+        // The two unselected core channels (Ls, Rs) are also live —
+        // core mode renders the whole downmix bed.
+        for ch in [4usize, 5] {
+            assert!(energy(&core[ch]) > 1e-4, "core dmx channel {ch} live");
+        }
+    }
+
+    /// Dynamic A-SPX-form A-JOC substream in core mode: the output is
+    /// the bandwidth-extended downmix pair, matching the full-decode
+    /// objects under the identity selector across an I + P + P GOP
+    /// (sticky aspx_config).
+    #[test]
+    fn core_ajoc_aspx_outputs_extended_downmix() {
+        let num_dmx = 2usize;
+        let num_umx = 2usize;
+        let num_decorr = 1usize;
+        let params = AjocBodyParams {
+            b_lfe: false,
+            b_static_dmx: false,
+            n_fullband_dmx_signals: num_dmx as u32,
+            n_fullband_upmix_signals: num_umx as u32,
+            obj_type_dmx: vec![ObjType::Dyn; num_dmx],
+            obj_type_umx: vec![ObjType::Dyn; num_umx],
+        };
+        let (ctrl, qmats) = selector_setup(num_dmx, num_umx, num_decorr);
+        let s0 = tone_spectrum(24, 40.0);
+        let s1 = tone_spectrum(60, 40.0);
+        let spectra: Vec<&[f32]> = vec![&s0, &s1];
+        let cfg = test_aspx_config();
+        let dec_params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut enc_state_a = new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let mut enc_state_b = new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let mut dec_full = Ac4Decoder::new(&dec_params);
+        let mut dec_core = Ac4Decoder::new(&dec_params);
+        dec_core.set_decoding_mode(DecodingMode::Core);
+        let (mut full, mut core) = (Vec::new(), Vec::new());
+        for (seq, iframe) in [(0u32, true), (1, false), (2, false)] {
+            let build = |st: &mut _| {
+                encode_ajoc_raw_frame_aspx(
+                    seq,
+                    &params,
+                    &spectra,
+                    &cfg,
+                    None,
+                    MAX_SFB,
+                    num_decorr as u32,
+                    &ctrl,
+                    &qmats,
+                    iframe,
+                    st,
+                    None,
+                )
+                .unwrap()
+            };
+            full = decode_frame(&mut dec_full, build(&mut enc_state_a), num_umx);
+            core = decode_frame(&mut dec_core, build(&mut enc_state_b), num_dmx);
+        }
+        for ch in 0..num_dmx {
+            assert!(energy(&core[ch]) > 1e-6, "core dmx channel {ch} live");
+            let e = rel_rms_err(&full[ch], &core[ch]);
+            assert!(
+                e < 0.1,
+                "core extended dmx channel {ch} matches the full-decode object (err {e})"
+            );
+        }
+    }
+}

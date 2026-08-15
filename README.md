@@ -220,7 +220,11 @@ an S16 `AudioFrame`:
   whole 7CH_STATIC track-role reading (Table 23 fold pairs
   `(D, H)/(E, I)/(F, J)/(G, K)`, Table 8 payload associations) was
   reconciled to the **V1.3.1** edition in the same round — the staged
-  errata notes record the superseded V1.2.1 rows.
+  errata notes record the superseded V1.2.1 rows. A-JOC object
+  substreams follow §4.8.2/§4.8.3.13 in core mode: the output is the
+  **downmix signal set** (A-SPX-extended + companded on the dynamic
+  form) + LFE, without the spatial reconstruction — the first OAMD
+  portion describes this presentation (§4.8.3.4).
 - **22.2 channel element** (TS 103 190-2 §6.2.4.3 + §5.2.4 — Table 78
   channel mode 15, 24 channels) — `22_2_channel_element()` parses and
   decodes in both Table 98 codec modes: the two LFE `mono_data(1)`

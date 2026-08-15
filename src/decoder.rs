@@ -2086,18 +2086,38 @@ impl Ac4Decoder {
                 crate::ajoc_substream::AjocSubstreamDecoder::new(num_dmx, num_umx),
             ));
         }
+        let core_mode = self.decoding_mode == DecodingMode::Core;
         let dec = &mut self.ajoc_dec.as_mut().expect("ajoc decoder ensured").2;
-        let (objects, lfe, _body, _metadata) = dec.decode_substream_pcm(
-            substream,
-            &params,
-            desc.b_iframe(),
-            false,
-            info.frame_length,
-        )?;
+        // §4.8.2 step 4: the A-JOC tool applies to full decoding only
+        // — in core decoding mode the substream renders its downmix
+        // signal set (described by the first OAMD portion, §4.8.3.4)
+        // without the spatial reconstruction.
+        let (objects, lfe, _body, _metadata) = if core_mode {
+            dec.decode_substream_pcm_core(
+                substream,
+                &params,
+                desc.b_iframe(),
+                false,
+                info.frame_length,
+            )?
+        } else {
+            dec.decode_substream_pcm(
+                substream,
+                &params,
+                desc.b_iframe(),
+                false,
+                info.frame_length,
+            )?
+        };
         let samples = info.frame_length;
-        // Output layout mirrors the upmix signal set: decoded LFE slot
-        // first when signalled, then the fullband objects.
-        let channels_out = desc.n_umx_signals() as usize;
+        // Output layout mirrors the rendered signal set: decoded LFE
+        // slot first when signalled, then the fullband objects (full
+        // decoding) or downmix signals (core decoding).
+        let channels_out = if core_mode {
+            num_dmx + usize::from(desc.b_lfe)
+        } else {
+            desc.n_umx_signals() as usize
+        };
         let lfe_slots = usize::from(desc.b_lfe);
         let mut buf = vec![0u8; samples as usize * channels_out * 2];
         let write_channel = |buf: &mut [u8], c: usize, pcm: &[f32]| {
