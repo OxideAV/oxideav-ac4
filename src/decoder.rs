@@ -29,6 +29,28 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac4Decoder::new(params)))
 }
 
+/// §4.7 decoding modes. The decoder defaults to **full decoding**
+/// (§4.7.2 — every coded channel, maximum output channel count). The
+/// **core decoding** mode (§4.7.3) renders the immersive experience
+/// with a reduced channel count for low-complexity operation: an
+/// `immersive_channel_element` substream decodes to at most seven
+/// fullband channels (`[L, R, C, Ls, Rs, Tsl, Tsr]` + LFE) with the
+/// A-CPL tool replaced by gain factors (§4.8.3.14), the A-JCC tool in
+/// its §5.6.3.5.3 core mode, S-CPL per §5.3.3.2 Table 24, and
+/// ASPX_SCPL per §4.8.3.11.2 (A-SPX postprocessing + `g = 2`).
+///
+/// Select via [`Ac4Decoder::set_decoding_mode`]. Substreams whose
+/// full decode already is the core operating point (mono / stereo /
+/// 5.X / 7.X channel substreams) decode identically in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodingMode {
+    /// §4.7.2 full decoding (default).
+    #[default]
+    Full,
+    /// §4.7.3 core decoding.
+    Core,
+}
+
 pub struct Ac4Decoder {
     codec_id: CodecId,
     /// Channel count hint supplied by the container (CodecParameters).
@@ -115,6 +137,13 @@ pub struct Ac4Decoder {
     /// immersive A-CPL / A-JCC output stages (same continuity
     /// argument, output side).
     ice_out_syn: Vec<qmf::QmfSynthesisBank>,
+    /// §4.7 decoding-mode selection (full vs core).
+    decoding_mode: DecodingMode,
+    /// Core-decoding A-JCC state (§5.6.3.5.3): the shared §5.6.3.2
+    /// differential reference plus the Table 39 module / decorrelator
+    /// / ducker state, keyed by `b_5fronts`. Allocated on the first
+    /// core-mode ASPX_AJCC immersive frame.
+    ice_ajcc_core: Option<(bool, crate::ajcc::AjccState, ajcc_synth::AjccCoreSynthState)>,
 }
 
 /// Per-decoder immersive A-CPL state — see [`Ac4Decoder::ice_acpl`].
@@ -234,7 +263,22 @@ impl Ac4Decoder {
             ice_acpl: None,
             ice_track_ana: Vec::new(),
             ice_out_syn: Vec::new(),
+            decoding_mode: DecodingMode::Full,
+            ice_ajcc_core: None,
         }
+    }
+
+    /// Select the §4.7 decoding mode (see [`DecodingMode`]). Switch
+    /// before feeding packets; a mid-stream switch changes the
+    /// immersive output channel count on the next decoded frame (with
+    /// one frame of filterbank / overlap transition).
+    pub fn set_decoding_mode(&mut self, mode: DecodingMode) {
+        self.decoding_mode = mode;
+    }
+
+    /// The currently selected §4.7 decoding mode.
+    pub fn decoding_mode(&self) -> DecodingMode {
+        self.decoding_mode
     }
 
     /// Streaming counterpart of [`Self::ice_plain_qmf`] — analyse one
@@ -2274,6 +2318,348 @@ impl Ac4Decoder {
         out
     }
 
+    /// Shared ASPX_AJCC front end (§5.6.3.5.1): IMDCT the 5-channel
+    /// core, A-SPX-extend each core channel in the QMF domain
+    /// (V1.3.1 Table 8 payload mapping `(A, B)` / `(D, E)` / `C`),
+    /// and run the §4.8.3.10.3 companding tool — the common input to
+    /// both the full (§5.6.3.5.2) and core (§5.6.3.5.3) A-JCC
+    /// decoding modes.
+    fn ice_ajcc_qmf_front_end(
+        &mut self,
+        ice_el: &ice::IceElement,
+        sub_aspx_cfg: Option<aspx::AspxConfig>,
+        samples: u32,
+        n: usize,
+    ) -> Vec<Vec<ajcc_synth::QmfCol>> {
+        let specs: Vec<Option<Vec<f32>>> = ice_el
+            .track_spectra()
+            .into_iter()
+            .take(5)
+            .map(|s| s.map(<[f32]>::to_vec))
+            .collect();
+        let mut pcm_core: Vec<Vec<f32>> = Vec::with_capacity(5);
+        for (slot, spec) in specs.iter().enumerate() {
+            let coeffs: &[f32] = spec.as_deref().unwrap_or(&[]);
+            pcm_core.push(self.imdct_channel_f32(slot, coeffs, n));
+        }
+        let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+        let mut q_ch: Vec<aspx::QmfMatrix> = Vec::with_capacity(5);
+        let mut bands: Vec<Option<(u32, u32)>> = vec![None; 5];
+        for (tr, pcm) in pcm_core.iter().take(5).enumerate() {
+            let q = self.ice_plain_qmf_streaming(tr, pcm);
+            q_ch.push(q);
+        }
+        if let Some(cfg) = sub_aspx_cfg {
+            let mapping: [(usize, usize, bool); 5] = [
+                (0, 0, false), // payload 0 primary   → A
+                (0, 1, true),  // payload 0 secondary → B
+                (1, 3, false), // payload 1 primary   → D
+                (1, 4, true),  // payload 1 secondary → E
+                (2, 2, false), // payload 2 (1ch)     → C
+            ];
+            // Pair-level aspx_balance == 1 joint decode (Pseudocode
+            // 84) once per 2ch element.
+            let pre =
+                self.ice_mapping_balance_scf(&mapping, |e| match ice_el.aspx_elements.get(e) {
+                    Some(
+                        ice::IceAspxElement::TwoCh(Some(t)) | ice::IceAspxElement::OneCh(Some(t)),
+                    ) => Some((**t).clone()),
+                    _ => None,
+                });
+            for (row, &(elem_idx, ch, is_secondary)) in mapping.iter().enumerate() {
+                let trailer = match ice_el.aspx_elements.get(elem_idx) {
+                    Some(
+                        ice::IceAspxElement::TwoCh(Some(t)) | ice::IceAspxElement::OneCh(Some(t)),
+                    ) => (**t).clone(),
+                    _ => continue,
+                };
+                (q_ch[ch], bands[ch]) = self.ice_extend_channel_qmf(
+                    &pcm_core[ch],
+                    &trailer,
+                    is_secondary,
+                    &cfg,
+                    ch,
+                    num_ts_in_ats,
+                    pre[row].as_ref(),
+                );
+            }
+        }
+        // §4.8.3.10.3: companding on the five input channels
+        // L, R, C, Ls, Rs — the same order as companding_control(5).
+        let cc = ice_el.companding.as_ref();
+        if let Some(mode) = Self::five_x_synced_mode(cc) {
+            let mut sync_view: Vec<aspx::SyncCompandingEntry<'_>> = Vec::new();
+            for (q, band) in q_ch.iter_mut().zip(bands.iter()) {
+                if let Some((sb0, sbz)) = band {
+                    sync_view.push((q, *sb0, *sbz));
+                }
+            }
+            aspx::apply_synchronised_companding_across_channels(&mut sync_view, mode);
+        } else {
+            for (slot, (q, band)) in q_ch.iter_mut().zip(bands.iter()).enumerate() {
+                let Some((sb0, sbz)) = band else { continue };
+                let mode = Self::five_x_compand_mode_for_slot(cc, slot);
+                aspx::apply_companding_on_qmf_with_mode(q, *sb0, *sbz, mode);
+            }
+        }
+        let num_ts = n / qmf::NUM_QMF_SUBBANDS;
+        q_ch.iter().map(|q| Self::ice_qmf_cols(q, num_ts)).collect()
+    }
+
+    /// QMF-synthesise one immersive core-mode output slot with the
+    /// persistent per-slot bank, applying `gain` on the way out (on
+    /// top of the `1/ASPX_QMF_PCM_SCALE` domain restore).
+    fn ice_core_synthesise_slot(
+        &mut self,
+        slot: usize,
+        cols: &[ajcc_synth::QmfCol],
+        num_ts: usize,
+        gain: f32,
+    ) -> Vec<f32> {
+        let scale = gain / aspx::ASPX_QMF_PCM_SCALE;
+        let syn = self.ice_out_syn_bank(slot);
+        let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
+        for col in cols.iter().take(num_ts) {
+            let row = syn.process_slot(col);
+            pcm.extend(row.iter().map(|&v| v * scale));
+        }
+        pcm
+    }
+
+    /// **Core decoding** (§4.7.3) of one `immersive_channel_element`
+    /// to the seven-channel core operating point
+    /// `[L, R, C, Ls, Rs, Tsl, Tsr]`:
+    ///
+    /// * **SCPL** — §5.3.3.2 Table 24: the first seven SMP tracks
+    ///   `A''..G''` (after the §5.2.3.2 SAP steps) times
+    ///   `c_gain = 2`.
+    /// * **ASPX_SCPL** — §4.8.3.11.2: Table 24 with `c_gain = 1`,
+    ///   A-SPX on the Table 8 core roster (`[Ls], [Rs], C, (L, R),
+    ///   [Tfl], [Tfr]` — bracket channels use the first channel of
+    ///   their pair payload per NOTE 6), the §5.4 A-SPX
+    ///   postprocessing tool (−1,5 dB above `sbx`) on the Table 9
+    ///   channels, then `g = 2` on every output.
+    /// * **ASPX_ACPL_1 / ASPX_ACPL_2** — §4.8.3.14: the seven carrier
+    ///   tracks A-SPX-extend exactly as in full decoding, the A-CPL
+    ///   tool is **not** run, and each present channel takes `g = 2`
+    ///   (the ACPL_1 S-CPL-section residual tracks are dropped).
+    /// * **ASPX_AJCC** — §5.6.3.5.3: the shared front end feeds
+    ///   [`ajcc_synth::ajcc_core_decode`] (Table 39; Pseudocode 12
+    ///   output addressing).
+    ///
+    /// The LFE (when present) is handled by the caller and is not
+    /// scaled (§4.8.3.14 excepts it explicitly).
+    fn ice_decode_core(
+        &mut self,
+        ice_el: &ice::IceElement,
+        sub_aspx_cfg: Option<aspx::AspxConfig>,
+        b_5fronts: bool,
+        samples: u32,
+    ) -> Result<Vec<Vec<f32>>> {
+        let n = samples as usize;
+        let mut chans: Vec<Vec<f32>> = vec![Vec::new(); 7];
+        match ice_el.mode {
+            ice::IceCodecMode::Scpl => {
+                let mut specs = ice_el.track_spectra_owned();
+                ice::apply_sap_steps(&mut specs, ice_el, samples);
+                for (slot, spec) in specs.iter().take(7).enumerate() {
+                    let t = self.imdct_channel_f32(slot, spec, n);
+                    chans[slot] = t.iter().map(|&v| v * 2.0).collect();
+                }
+            }
+            ice::IceCodecMode::AspxScpl => {
+                let mut specs = ice_el.track_spectra_owned();
+                ice::apply_sap_steps(&mut specs, ice_el, samples);
+                let mut t: Vec<Vec<f32>> = Vec::with_capacity(7);
+                for (slot, spec) in specs.iter().take(7).enumerate() {
+                    t.push(self.imdct_channel_f32(slot, spec, n));
+                }
+                let Some(cfg) = sub_aspx_cfg else {
+                    // No sticky aspx_config (e.g. leading P-frame):
+                    // fall back to the Table 24 fold alone.
+                    for (slot, tr) in t.iter().enumerate() {
+                        chans[slot] = tr.iter().map(|&v| v * 2.0).collect();
+                    }
+                    return Ok(chans);
+                };
+                let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+                // V1.3.1 Table 8 core roster in bitstream order:
+                // payloads 0..=1 are the surround pairs ([Ls] / [Rs]
+                // — first channel only), payload 2 the 1ch C,
+                // then the front payload(s) — the genuine (L, R)
+                // pair without b_5fronts, the first channels [L] /
+                // [R] of (L, Lscr) / (R, Rscr) with it — and the two
+                // top pairs as [Tfl] / [Tfr].
+                let mapping: &[(usize, usize, bool)] = if b_5fronts {
+                    &[
+                        (0, 3, false), // [Ls]
+                        (1, 4, false), // [Rs]
+                        (2, 2, false), // C
+                        (3, 0, false), // [L]
+                        (4, 1, false), // [R]
+                        (5, 5, false), // [Tfl]
+                        (6, 6, false), // [Tfr]
+                    ]
+                } else {
+                    &[
+                        (0, 3, false), // [Ls]
+                        (1, 4, false), // [Rs]
+                        (2, 2, false), // C
+                        (3, 0, false), // (L, R)
+                        (3, 1, true),
+                        (4, 5, false), // [Tfl]
+                        (5, 6, false), // [Tfr]
+                    ]
+                };
+                let pre =
+                    self.ice_mapping_balance_scf(mapping, |e| match ice_el.aspx_elements.get(e) {
+                        Some(
+                            ice::IceAspxElement::TwoCh(Some(t))
+                            | ice::IceAspxElement::OneCh(Some(t)),
+                        ) => Some((**t).clone()),
+                        _ => None,
+                    });
+                let mut q_t: Vec<aspx::QmfMatrix> = Vec::with_capacity(7);
+                let mut bands: Vec<Option<(u32, u32)>> = vec![None; 7];
+                for (tr, pcm) in t.iter().enumerate() {
+                    let q = self.ice_plain_qmf_streaming(tr, pcm);
+                    q_t.push(q);
+                }
+                for (row, &(elem_idx, tr, is_secondary)) in mapping.iter().enumerate() {
+                    let trailer = match ice_el.aspx_elements.get(elem_idx) {
+                        Some(
+                            ice::IceAspxElement::TwoCh(Some(t))
+                            | ice::IceAspxElement::OneCh(Some(t)),
+                        ) => (**t).clone(),
+                        _ => continue,
+                    };
+                    (q_t[tr], bands[tr]) = self.ice_extend_channel_qmf(
+                        &t[tr],
+                        &trailer,
+                        is_secondary,
+                        &cfg,
+                        tr,
+                        num_ts_in_ats,
+                        pre[row].as_ref(),
+                    );
+                }
+                // §5.4 A-SPX postprocessing tool: −1,5 dB on the
+                // regenerated band (sb ≥ sbx) of the Table 9
+                // channels (num_sig = 6 with b_5fronts, else 4).
+                const PP_GAIN: f32 = 0.841_395;
+                let pp_tracks: &[usize] = if b_5fronts {
+                    &[0, 1, 3, 4, 5, 6]
+                } else {
+                    &[3, 4, 5, 6]
+                };
+                for &tr in pp_tracks {
+                    let Some((sbx, _)) = bands[tr] else { continue };
+                    for row in q_t[tr].iter_mut().skip(sbx as usize) {
+                        for v in row.iter_mut() {
+                            v.0 *= PP_GAIN;
+                            v.1 *= PP_GAIN;
+                        }
+                    }
+                }
+                // §4.8.3.11.2: g = 2 on every output QMF subsample,
+                // applied on the synthesised PCM (full-band gain).
+                let num_ts = n / qmf::NUM_QMF_SUBBANDS;
+                for (tr, q) in q_t.iter().enumerate() {
+                    let cols = Self::ice_qmf_cols(q, num_ts);
+                    chans[tr] = self.ice_core_synthesise_slot(tr, &cols, num_ts, 2.0);
+                }
+            }
+            ice::IceCodecMode::AspxAcpl1 | ice::IceCodecMode::AspxAcpl2 => {
+                // §5.2.3.2 SAP steps (ACPL_1 only — apply_sap_steps
+                // gates on the mode), then the carrier tracks A..G.
+                let mut specs = ice_el.track_spectra_owned();
+                ice::apply_sap_steps(&mut specs, ice_el, samples);
+                let mut t: Vec<Vec<f32>> = Vec::with_capacity(7);
+                for (slot, spec) in specs.iter().take(7).enumerate() {
+                    t.push(self.imdct_channel_f32(slot, spec, n));
+                }
+                let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+                let mut q_t: Vec<aspx::QmfMatrix> = Vec::with_capacity(7);
+                for (tr, pcm) in t.iter().enumerate() {
+                    let q = self.ice_plain_qmf_streaming(tr, pcm);
+                    q_t.push(q);
+                }
+                if let Some(cfg) = sub_aspx_cfg {
+                    let mapping: [(usize, usize, bool); 7] = [
+                        (0, 0, false), // payload 0 → (A, B)
+                        (0, 1, true),
+                        (1, 3, false), // payload 1 → (D, E)
+                        (1, 4, true),
+                        (2, 5, false), // payload 2 → (F, G)
+                        (2, 6, true),
+                        (3, 2, false), // payload 3 (1ch) → C
+                    ];
+                    let pre = self.ice_mapping_balance_scf(&mapping, |e| {
+                        match ice_el.aspx_elements.get(e) {
+                            Some(
+                                ice::IceAspxElement::TwoCh(Some(t))
+                                | ice::IceAspxElement::OneCh(Some(t)),
+                            ) => Some((**t).clone()),
+                            _ => None,
+                        }
+                    });
+                    for (row, &(elem_idx, tr, is_secondary)) in mapping.iter().enumerate() {
+                        let trailer = match ice_el.aspx_elements.get(elem_idx) {
+                            Some(
+                                ice::IceAspxElement::TwoCh(Some(t))
+                                | ice::IceAspxElement::OneCh(Some(t)),
+                            ) => (**t).clone(),
+                            _ => continue,
+                        };
+                        (q_t[tr], _) = self.ice_extend_channel_qmf(
+                            &t[tr],
+                            &trailer,
+                            is_secondary,
+                            &cfg,
+                            tr,
+                            num_ts_in_ats,
+                            pre[row].as_ref(),
+                        );
+                    }
+                }
+                // §4.8.3.14: the A-CPL tool is not utilized in core
+                // decoding; apply g = 2 to every present channel
+                // instead (LFE excepted — handled by the caller).
+                let num_ts = n / qmf::NUM_QMF_SUBBANDS;
+                for (tr, q) in q_t.iter().enumerate() {
+                    let cols = Self::ice_qmf_cols(q, num_ts);
+                    chans[tr] = self.ice_core_synthesise_slot(tr, &cols, num_ts, 2.0);
+                }
+            }
+            ice::IceCodecMode::AspxAjcc => {
+                let cols = self.ice_ajcc_qmf_front_end(ice_el, sub_aspx_cfg, samples, n);
+                if let Some(ajcc_data) = ice_el.ajcc.as_deref() {
+                    let state_ok =
+                        matches!(&self.ice_ajcc_core, Some((f, _, _)) if *f == b_5fronts);
+                    if !state_ok {
+                        self.ice_ajcc_core = Some((
+                            b_5fronts,
+                            crate::ajcc::AjccState::new(b_5fronts),
+                            ajcc_synth::AjccCoreSynthState::new(),
+                        ));
+                    }
+                    let (_, param_state, synth_state) =
+                        self.ice_ajcc_core.as_mut().expect("ice ajcc core state");
+                    let decoded = crate::ajcc::decode_ajcc_parsed(ajcc_data.clone(), param_state)?;
+                    let owned = ajcc_synth::AjccOwnedParams::from_decoded(&decoded);
+                    let num_ts = n / qmf::NUM_QMF_SUBBANDS;
+                    let x: [&[ajcc_synth::QmfCol]; 5] =
+                        [&cols[0], &cols[1], &cols[2], &cols[3], &cols[4]];
+                    let z = ajcc_synth::ajcc_core_decode(&x, &owned.params(), synth_state)?;
+                    for (slot, zm) in z.iter().enumerate().take(7) {
+                        chans[slot] = self.ice_core_synthesise_slot(slot, zm, num_ts, 1.0);
+                    }
+                }
+            }
+        }
+        Ok(chans)
+    }
+
     /// Decode one immersive-channel-element frame (TS 103 190-2
     /// §6.2.4.1, channel modes 7.0.4 / 7.1.4 / 9.0.4 / 9.1.4) to PCM.
     ///
@@ -2338,7 +2724,14 @@ impl Ac4Decoder {
         )?;
         let samples = info.frame_length;
         let n = samples as usize;
-        let n_named = if b_5fronts { 13 } else { 11 };
+        let core_mode = self.decoding_mode == DecodingMode::Core;
+        let n_named = if core_mode {
+            7
+        } else if b_5fronts {
+            13
+        } else {
+            11
+        };
         let channels_out = n_named + usize::from(b_lfe);
         let mut chans: Vec<Vec<f32>> = vec![Vec::new(); n_named];
         let mut lfe_pcm: Option<Vec<f32>> = None;
@@ -2348,12 +2741,74 @@ impl Ac4Decoder {
         if let Some(ice_el) = sub.tools.ice.as_deref() {
             let tl_ok = ice_el.transform_length() == Some(samples);
             // LFE (Table 21 mono_data(1)) — IMDCT on a dedicated
-            // overlap slot past the 13 track slots.
+            // overlap slot past the 13 track slots. Decoded the same
+            // way in both §4.7 decoding modes (no core-mode gain —
+            // §4.8.3.14 excepts the LFE).
             if b_lfe {
                 if let Some(spec) = ice_el.lfe_spectrum().map(<[f32]>::to_vec) {
                     lfe_pcm = Some(self.imdct_channel_f32(13, &spec, n));
                 }
             }
+            if core_mode {
+                if tl_ok {
+                    chans = self.ice_decode_core(ice_el, sub_aspx_cfg, b_5fronts, samples)?;
+                }
+            } else {
+                self.receive_frame_ice_full(
+                    ice_el,
+                    &mut chans,
+                    sub_aspx_cfg,
+                    sub_acpl_partial,
+                    sub_acpl_full,
+                    b_5fronts,
+                    samples,
+                    tl_ok,
+                )?;
+            }
+        }
+        // Interleave to S16.
+        let mut buf = vec![0u8; n * channels_out * 2];
+        let lfe_slots = usize::from(b_lfe);
+        let write_channel = |buf: &mut [u8], c: usize, pcm: &[f32]| {
+            for (i, &v) in pcm.iter().take(n).enumerate() {
+                let s = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                let le = s.to_le_bytes();
+                let off = (i * channels_out + c) * 2;
+                buf[off] = le[0];
+                buf[off + 1] = le[1];
+            }
+        };
+        if let (true, Some(lfe)) = (b_lfe, lfe_pcm.as_ref()) {
+            write_channel(&mut buf, 0, lfe);
+        }
+        for (c, pcm) in chans.iter().enumerate() {
+            write_channel(&mut buf, c + lfe_slots, pcm);
+        }
+        self.last_substream = Some(sub);
+        self.last_info = Some(info);
+        Ok(Frame::Audio(AudioFrame {
+            samples,
+            pts,
+            data: vec![buf],
+        }))
+    }
+
+    /// Full-decoding-mode body of [`Self::receive_frame_ice`] — the
+    /// per-codec-mode synthesis into the 11 / 13 named output slots.
+    #[allow(clippy::too_many_arguments)]
+    fn receive_frame_ice_full(
+        &mut self,
+        ice_el: &ice::IceElement,
+        chans: &mut Vec<Vec<f32>>,
+        sub_aspx_cfg: Option<aspx::AspxConfig>,
+        sub_acpl_partial: Option<crate::acpl::AcplConfig1ch>,
+        sub_acpl_full: Option<crate::acpl::AcplConfig1ch>,
+        b_5fronts: bool,
+        samples: u32,
+        tl_ok: bool,
+    ) -> Result<()> {
+        let n = samples as usize;
+        {
             match ice_el.mode {
                 ice::IceCodecMode::Scpl if tl_ok => {
                     // §5.2.3.2 steps 3-6 (SAP mixing on the track
@@ -2365,7 +2820,7 @@ impl Ac4Decoder {
                     for (slot, spec) in specs.iter().enumerate() {
                         t.push(self.imdct_channel_f32(slot, spec, n));
                     }
-                    chans =
+                    *chans =
                         Self::ice_scpl_full_matrix(&t, b_5fronts, 2.0, std::f32::consts::SQRT_2, n);
                 }
                 ice::IceCodecMode::AspxScpl if tl_ok => {
@@ -2487,7 +2942,7 @@ impl Ac4Decoder {
                             }
                         }
                     }
-                    chans = ch_pcm;
+                    *chans = ch_pcm;
                 }
                 ice::IceCodecMode::AspxAcpl1 | ice::IceCodecMode::AspxAcpl2 if tl_ok => {
                     let is_acpl1 = matches!(ice_el.mode, ice::IceCodecMode::AspxAcpl1);
@@ -2723,87 +3178,9 @@ impl Ac4Decoder {
                     }
                 }
                 ice::IceCodecMode::AspxAjcc if tl_ok => {
-                    let specs: Vec<Option<Vec<f32>>> = ice_el
-                        .track_spectra()
-                        .into_iter()
-                        .take(5)
-                        .map(|s| s.map(<[f32]>::to_vec))
-                        .collect();
-                    let mut pcm_core: Vec<Vec<f32>> = Vec::with_capacity(5);
-                    for (slot, spec) in specs.iter().enumerate() {
-                        let coeffs: &[f32] = spec.as_deref().unwrap_or(&[]);
-                        pcm_core.push(self.imdct_channel_f32(slot, coeffs, n));
-                    }
-                    // A-SPX QMF extension per core channel. Payload
-                    // mapping per the V1.3.1 Table 8 ASPX_AJCC row:
-                    // first aspx_data_2ch → (A, B), second → (D, E),
-                    // the aspx_data_1ch → C.
-                    let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
-                    let mut q_ch: Vec<aspx::QmfMatrix> = Vec::with_capacity(5);
-                    let mut bands: Vec<Option<(u32, u32)>> = vec![None; 5];
-                    for (tr, pcm) in pcm_core.iter().take(5).enumerate() {
-                        let q = self.ice_plain_qmf_streaming(tr, pcm);
-                        q_ch.push(q);
-                    }
-                    if let Some(cfg) = sub_aspx_cfg {
-                        let mapping: [(usize, usize, bool); 5] = [
-                            (0, 0, false), // payload 0 primary   → A
-                            (0, 1, true),  // payload 0 secondary → B
-                            (1, 3, false), // payload 1 primary   → D
-                            (1, 4, true),  // payload 1 secondary → E
-                            (2, 2, false), // payload 2 (1ch)     → C
-                        ];
-                        // Pair-level aspx_balance == 1 joint decode
-                        // (Pseudocode 84) once per 2ch element.
-                        let pre = self.ice_mapping_balance_scf(&mapping, |e| {
-                            match ice_el.aspx_elements.get(e) {
-                                Some(
-                                    ice::IceAspxElement::TwoCh(Some(t))
-                                    | ice::IceAspxElement::OneCh(Some(t)),
-                                ) => Some((**t).clone()),
-                                _ => None,
-                            }
-                        });
-                        for (row, &(elem_idx, ch, is_secondary)) in mapping.iter().enumerate() {
-                            let trailer = match ice_el.aspx_elements.get(elem_idx) {
-                                Some(
-                                    ice::IceAspxElement::TwoCh(Some(t))
-                                    | ice::IceAspxElement::OneCh(Some(t)),
-                                ) => (**t).clone(),
-                                _ => continue,
-                            };
-                            (q_ch[ch], bands[ch]) = self.ice_extend_channel_qmf(
-                                &pcm_core[ch],
-                                &trailer,
-                                is_secondary,
-                                &cfg,
-                                ch,
-                                num_ts_in_ats,
-                                pre[row].as_ref(),
-                            );
-                        }
-                    }
-                    // §4.8.3.10.3: companding on the five input
-                    // channels L, R, C, Ls, Rs — the same order as
-                    // companding_control(5) — via the §5.7.5 tool.
-                    // Channel slot order here is the Table 19 track
-                    // order A..E = L, R, C, Ls, Rs.
-                    let cc = ice_el.companding.as_ref();
-                    if let Some(mode) = Self::five_x_synced_mode(cc) {
-                        let mut sync_view: Vec<aspx::SyncCompandingEntry<'_>> = Vec::new();
-                        for (q, band) in q_ch.iter_mut().zip(bands.iter()) {
-                            if let Some((sb0, sbz)) = band {
-                                sync_view.push((q, *sb0, *sbz));
-                            }
-                        }
-                        aspx::apply_synchronised_companding_across_channels(&mut sync_view, mode);
-                    } else {
-                        for (slot, (q, band)) in q_ch.iter_mut().zip(bands.iter()).enumerate() {
-                            let Some((sb0, sbz)) = band else { continue };
-                            let mode = Self::five_x_compand_mode_for_slot(cc, slot);
-                            aspx::apply_companding_on_qmf_with_mode(q, *sb0, *sbz, mode);
-                        }
-                    }
+                    // Shared §5.6.3.5.1 front end (IMDCT core + A-SPX
+                    // extension + §4.8.3.10.3 companding).
+                    let cols = self.ice_ajcc_qmf_front_end(ice_el, sub_aspx_cfg, samples, n);
                     // §5.6.3.2-5: differential decode + full-decode
                     // reconstruction with cross-frame state.
                     if let Some(ajcc_data) = ice_el.ajcc.as_deref() {
@@ -2821,8 +3198,6 @@ impl Ac4Decoder {
                             crate::ajcc::decode_ajcc_parsed(ajcc_data.clone(), param_state)?;
                         let owned = ajcc_synth::AjccOwnedParams::from_decoded(&decoded);
                         let num_ts = n / qmf::NUM_QMF_SUBBANDS;
-                        let cols: Vec<Vec<ajcc_synth::QmfCol>> =
-                            q_ch.iter().map(|q| Self::ice_qmf_cols(q, num_ts)).collect();
                         let x: [&[ajcc_synth::QmfCol]; 5] =
                             [&cols[0], &cols[1], &cols[2], &cols[3], &cols[4]];
                         let z = ajcc_synth::ajcc_full_decode(&x, &owned.params(), synth_state)?;
@@ -2851,31 +3226,7 @@ impl Ac4Decoder {
                 _ => {}
             }
         }
-        // Interleave to S16.
-        let mut buf = vec![0u8; n * channels_out * 2];
-        let lfe_slots = usize::from(b_lfe);
-        let write_channel = |buf: &mut [u8], c: usize, pcm: &[f32]| {
-            for (i, &v) in pcm.iter().take(n).enumerate() {
-                let s = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                let le = s.to_le_bytes();
-                let off = (i * channels_out + c) * 2;
-                buf[off] = le[0];
-                buf[off + 1] = le[1];
-            }
-        };
-        if let (true, Some(lfe)) = (b_lfe, lfe_pcm.as_ref()) {
-            write_channel(&mut buf, 0, lfe);
-        }
-        for (c, pcm) in chans.iter().enumerate() {
-            write_channel(&mut buf, c + lfe_slots, pcm);
-        }
-        self.last_substream = Some(sub);
-        self.last_info = Some(info);
-        Ok(Frame::Audio(AudioFrame {
-            samples,
-            pts,
-            data: vec![buf],
-        }))
+        Ok(())
     }
 
     /// Decode one `22_2_channel_element()` frame (TS 103 190-2
