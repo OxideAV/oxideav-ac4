@@ -198,6 +198,29 @@ an S16 `AudioFrame`:
   five codec modes (`write_ice_body_scpl[_with_sap]` /
   `write_ice_body_aspx_scpl` / `write_ice_body_acpl` /
   `write_ice_body_ajcc[_with_companding]` / `encode_ice_raw_frame`).
+- **Core decoding mode** (TS 103 190-2 §4.7.3, r443) —
+  `Ac4Decoder::set_decoding_mode(DecodingMode::Core)` decodes an
+  `immersive_channel_element` substream to the seven-channel core
+  operating point `[L, R, C, Ls, Rs, Tsl, Tsr]` (+ unity LFE) across
+  all five Table 95 codec modes: SCPL per §5.3.3.2 Table 24
+  (`c_gain × A''..G''`), ASPX_SCPL per §4.8.3.11.2 (the Table 8 core
+  payload roster with first-of-pair bracket channels, the §5.4 A-SPX
+  postprocessing tool at −1,5 dB above `sbx` on the Table 9 channels,
+  `g = 2` on every output), the ACPL modes per §4.8.3.14 (carriers
+  A-SPX-extended as in full decoding, no A-CPL, `g = 2` per present
+  channel), and ASPX_AJCC per §5.6.3.5.3 (Table 39
+  `ajcc_core_decode` on the shared §5.6.3.5.1 front end). The
+  `core_render` module implements the §5.10.2.6/§5.10.2.7
+  channel-based renderer for core decoding (Table 129 gain codes,
+  Table 130 defaults, Table 45 → 5.X.2 and Table 46 → 5.X.0 folds).
+  Validated by PCM-level core-vs-full relationships on the same
+  streams (L/R/C identical; each core surround/top = the ÷√2 fold of
+  its full-decode pair; `render_core_to_5_x_2(core)` reproduces the
+  full decode folded to 5.X.2 with the same customized gains). The
+  whole 7CH_STATIC track-role reading (Table 23 fold pairs
+  `(D, H)/(E, I)/(F, J)/(G, K)`, Table 8 payload associations) was
+  reconciled to the **V1.3.1** edition in the same round — the staged
+  errata notes record the superseded V1.2.1 rows.
 - **22.2 channel element** (TS 103 190-2 §6.2.4.3 + §5.2.4 — Table 78
   channel mode 15, 24 channels) — `22_2_channel_element()` parses and
   decodes in both Table 98 codec modes: the two LFE `mono_data(1)`
@@ -370,17 +393,12 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **Immersive remainders** — core decoding mode (the reduced
-  7-channel operating point of §5.3.3.2 / §5.6.3.5.3 / §4.8.3.11.2;
-  the A-JCC core-decode reconstruction itself is implemented, but no
-  decoder API selects the mode yet); the A-SPX / A-CPL codec modes of
+- **Immersive remainders** — the A-SPX / A-CPL codec modes of
   the A-JOC `b_static_dmx` core parse but their carrier synthesis
   into the object path is pending (needs the 5_X carrier pipeline
-  shared into the object decoder). Table 8's ASPX_ACPL_1 rows list
-  more A-SPX groups than the §6.2.4.1 syntax carries payloads for —
-  the extension covers the four transmitted payloads and the
-  S-CPL-section tracks pass through unextended (see the `ice` module
-  notes).
+  shared into the object decoder). Core-mode dialogue enhancement
+  (§5.8.2.1-2/4) is not applied (the DE walker parses the payloads;
+  no ICE-route DE application exists in either decoding mode yet).
 - Remaining TS 103 190-2 multi-stream / immersive / object-based (IFM)
   extensions beyond the parsed presentation / OAMD / object substream
   surfaces.

@@ -530,3 +530,212 @@ fn core_mode_7_1_4_lfe_and_channel_count() {
     let e = rel_rms_err(&full[0], &core[0]);
     assert!(e < 0.02, "LFE identical in both modes ({e})");
 }
+
+/// ASPX_SCPL 9.0.4 (`b_5fronts`) through the real encoder arm: the
+/// core fronts fold the screens ([L] extends from the first channel
+/// of the (L, Lscr) payload — Table 9 puts L / R in the §5.4
+/// postprocessing roster, `num_sig = 6`), and the surround / top
+/// channels track the full-decode pair folds.
+#[test]
+fn core_aspx_scpl_9_0_4_relations() {
+    let cycles = [12u32, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60];
+    let input: Vec<Vec<f32>> = cycles
+        .iter()
+        .enumerate()
+        .map(|(ch, &c)| {
+            (0..N)
+                .map(|i| {
+                    let t = i as f32 / N as f32;
+                    0.3 * (2.0 * std::f32::consts::PI * c as f32 * t + 0.3 * ch as f32).sin()
+                })
+                .collect()
+        })
+        .collect();
+    let refs: [&[f32]; 13] = std::array::from_fn(|i| input[i].as_slice());
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut enc = Ac4ImsEncoder::new();
+    let mut dec_full = Ac4Decoder::new(&params);
+    let mut dec_core = Ac4Decoder::new(&params);
+    dec_core.set_decoding_mode(DecodingMode::Core);
+    let (mut full, mut core) = (Vec::new(), Vec::new());
+    for _ in 0..4 {
+        let bytes = enc.encode_frame_pcm_9_0_4_ice_aspx_scpl(&refs);
+        full = decode_frame(&mut dec_full, bytes.clone(), 13);
+        core = decode_frame(&mut dec_core, bytes, 7);
+    }
+    // Full order: [L, R, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl, Tfr,
+    // Tbl, Tbr]; core order: [L, R, C, Ls, Rs, Tsl, Tsr].
+    // C: own 1ch payload, identical in both modes.
+    let e_c = rel_rms_err(&full[2], &core[2]);
+    assert!(e_c < 0.05, "C identical in both modes ({e_c})");
+    // Fronts: core L = full L + full Lscr (§5.4 PP touches only the
+    // regenerated band; the low band folds exactly).
+    for (c_slot, f_a, f_b) in [(0usize, 0usize, 3usize), (1, 1, 4)] {
+        let reference = fold(&full[f_a], &full[f_b], 1.0);
+        assert!(energy(&core[c_slot]) > 1e-4, "core slot {c_slot} live");
+        let e = rel_rms_err(&reference, &core[c_slot]);
+        assert!(
+            e < 0.2,
+            "core front slot {c_slot} folds the screens (err {e})"
+        );
+    }
+    // Surround / top folds.
+    for (c_slot, f_a, f_b) in [(3usize, 5usize, 7usize), (4, 6, 8), (5, 9, 11), (6, 10, 12)] {
+        let reference = fold(&full[f_a], &full[f_b], 1.0 / SQRT_2);
+        assert!(energy(&core[c_slot]) > 1e-4, "core slot {c_slot} live");
+        let e = rel_rms_err(&reference, &core[c_slot]);
+        assert!(
+            e < 0.2,
+            "core slot {c_slot} tracks the full-decode fold (err {e})"
+        );
+    }
+}
+
+/// ASPX_AJCC 9.0.4 (`b_5fronts`, Table 40 ajcc_module_3): the core
+/// decode reconstructs on the correct side, the centre passes
+/// through, and every core output is live.
+#[test]
+fn core_ajcc_9_0_4_reconstructs_and_separates() {
+    let sb_tone = |sb: u32, amp: f32, phase: f32| -> Vec<f32> {
+        let cycles = 15 * sb + 7;
+        (0..N)
+            .map(|i| {
+                let t = i as f32 / N as f32;
+                amp * (2.0 * std::f32::consts::PI * cycles as f32 * t + phase).sin()
+            })
+            .collect()
+    };
+    let tone_power = |pcm: &[f32], sb: u32| -> f64 {
+        let cycles = (15 * sb + 7) as f64;
+        let omega = 2.0 * std::f64::consts::PI * cycles / N as f64;
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, &s) in pcm.iter().enumerate() {
+            let ph = omega * i as f64;
+            re += s as f64 * ph.cos();
+            im -= s as f64 * ph.sin();
+        }
+        re * re + im * im
+    };
+    // Round-440 b_5fronts content (each module-group channel in its
+    // own parameter band).
+    let input: Vec<Vec<f32>> = vec![
+        sb_tone(1, 0.35, 0.0), // L
+        sb_tone(3, 0.35, 0.5), // R
+        sb_tone(5, 0.35, 1.0), // C
+        sb_tone(2, 0.32, 0.3), // Lscr
+        sb_tone(0, 0.32, 0.8), // Rscr
+        sb_tone(2, 0.35, 2.4), // Ls
+        sb_tone(1, 0.35, 2.9), // Rs
+        sb_tone(5, 0.30, 0.2), // Lb
+        sb_tone(8, 0.30, 0.7), // Rb
+        sb_tone(4, 0.30, 1.3), // Tfl
+        sb_tone(6, 0.30, 1.8), // Tfr
+        sb_tone(7, 0.28, 0.6), // Tbl
+        sb_tone(9, 0.28, 1.1), // Tbr
+    ];
+    let refs: [&[f32]; 13] = std::array::from_fn(|i| input[i].as_slice());
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut enc = Ac4ImsEncoder::new();
+    let mut dec = Ac4Decoder::new(&params);
+    dec.set_decoding_mode(DecodingMode::Core);
+    let mut core = Vec::new();
+    for _ in 0..4 {
+        let bytes = enc.encode_frame_pcm_9_0_4_ice_ajcc(&refs);
+        core = decode_frame(&mut dec, bytes, 7);
+    }
+    let settle = N / 2;
+    // Centre passthrough within 3 dB.
+    let ratio = energy(&core[2][settle..]) / energy(&input[2][settle..]);
+    assert!(
+        (0.5..=2.0).contains(&ratio),
+        "core C within 3 dB of the input C ({ratio})"
+    );
+    // The front-left tone (sb1) lands on core L; the front-right
+    // tone (sb3) stays off it.
+    let l_own = tone_power(&core[0][settle..], 1);
+    let l_leak = tone_power(&core[0][settle..], 3);
+    assert!(l_own > 1e-2, "core L carries the front-left tone");
+    assert!(
+        l_leak < l_own * 0.05,
+        "right-module content stays off core L ({l_leak} vs {l_own})"
+    );
+    for slot in [3usize, 4, 5, 6] {
+        assert!(
+            energy(&core[slot][settle..]) > 1e-4,
+            "core slot {slot} live"
+        );
+    }
+}
+
+/// ASPX_ACPL_2 9.0.4 (`b_5fronts`): core fronts fold the screens via
+/// the A / B carriers ((L + Lscr)/2 tracks ×2), surround / top
+/// channels are the module-pair folds.
+#[test]
+fn core_acpl2_9_0_4_carrier_relations() {
+    let lead = |c: u32, p: f32| -> Vec<f32> {
+        (0..N)
+            .map(|i| {
+                let t = i as f32 / N as f32;
+                0.28 * (2.0 * std::f32::consts::PI * c as f32 * t + p).sin()
+            })
+            .collect()
+    };
+    let scale = |x: &[f32], g: f32| -> Vec<f32> { x.iter().map(|&v| v * g).collect() };
+    let l = lead(9, 0.0);
+    let r = lead(22, 0.5);
+    let ls = lead(24, 0.4);
+    let rs = lead(28, 0.9);
+    let tfl = lead(36, 1.3);
+    let tfr = lead(40, 1.8);
+    let input: Vec<Vec<f32>> = vec![
+        l.clone(),         // L
+        r.clone(),         // R
+        lead(20, 1.0),     // C
+        scale(&l, 0.7),    // Lscr
+        scale(&r, 0.7),    // Rscr
+        ls.clone(),        // Ls
+        rs.clone(),        // Rs
+        scale(&ls, 0.8),   // Lb
+        scale(&rs, 0.8),   // Rb
+        tfl.clone(),       // Tfl
+        tfr.clone(),       // Tfr
+        scale(&tfl, 0.75), // Tbl
+        scale(&tfr, 0.75), // Tbr
+    ];
+    let refs: [&[f32]; 13] = std::array::from_fn(|i| input[i].as_slice());
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut enc = Ac4ImsEncoder::new();
+    let mut dec_full = Ac4Decoder::new(&params);
+    let mut dec_core = Ac4Decoder::new(&params);
+    dec_core.set_decoding_mode(DecodingMode::Core);
+    let (mut full, mut core) = (Vec::new(), Vec::new());
+    for _ in 0..4 {
+        let bytes = enc.encode_frame_pcm_9_0_4_ice_acpl2(&refs);
+        full = decode_frame(&mut dec_full, bytes.clone(), 13);
+        core = decode_frame(&mut dec_core, bytes, 7);
+    }
+    // Full order: [L, R, C, Lscr, Rscr, Ls, Rs, Lb, Rb, Tfl, Tfr,
+    // Tbl, Tbr]. Fronts: core L = 2·A = full-module pair fold
+    // (L, Lscr) at unity (the b_5fronts front modules ride A / B
+    // without the √2 output scale).
+    let e_c = rel_rms_err(&full[2], &core[2]);
+    assert!(e_c < 0.05, "C identical in both modes ({e_c})");
+    for (c_slot, f_a, f_b) in [(0usize, 0usize, 3usize), (1, 1, 4)] {
+        let reference = fold(&full[f_a], &full[f_b], 1.0);
+        assert!(energy(&core[c_slot]) > 1e-4, "core slot {c_slot} live");
+        let e = rel_rms_err(&reference, &core[c_slot]);
+        assert!(
+            e < 0.35,
+            "core front slot {c_slot} folds the screens (err {e})"
+        );
+    }
+    for (c_slot, f_a, f_b) in [(3usize, 5usize, 7usize), (4, 6, 8), (5, 9, 11), (6, 10, 12)] {
+        let reference = fold(&full[f_a], &full[f_b], 1.0 / SQRT_2);
+        assert!(energy(&core[c_slot]) > 1e-4, "core slot {c_slot} live");
+        let e = rel_rms_err(&reference, &core[c_slot]);
+        assert!(
+            e < 0.35,
+            "core slot {c_slot} tracks the full-decode module fold (err {e})"
+        );
+    }
+}

@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 443 — **immersive core decoding mode + V1.3.1 track-role
+  reconciliation** (ETSI TS 103 190-2 §4.7.3 / §5.3.3.2 /
+  §4.8.3.11.2 / §4.8.3.14 / §5.6.3.5.3 / §5.10.2.6-7). Two landings:
+  1. **7CH_STATIC track roles reconciled to the V1.3.1 edition**
+     (staged 2026-07-31; the in-repo errata notes A1/A2 record the
+     superseded V1.2.1 rows): the S-CPL full-decoding fold pairs are
+     `(D, H) / (E, I) / (F, J) / (G, K)` — tracks `A''..G''` are the
+     5.X.2 core (top-front mids on the additional pair `F`/`G`) and
+     the S-CPL-section tracks `H''..K''` carry the pair sides — the
+     ASPX_SCPL payload roster follows Table 8's bitstream order
+     (`(Ls, Lb), (Rs, Rb), C, (L, R | L, Lscr), (R, Rscr)?,
+     (Tfl, Tbl), (Tfr, Tbr)`), the ACPL/AJCC-family payloads extend
+     exactly the carrier tracks `(A, B), (D, E), (F, G), C` (the
+     ACPL_1 residual tracks are no longer A-SPX targets), and the
+     ASPX_ACPL_1 module residuals are the S-CPL-section tracks
+     (x7/x8/x11/x12 per Table 25). Encoder, decoder and the
+     routing-premise tests moved together; round-trip suites pass
+     unchanged. The previous reading followed V1.2.1's Table 23
+     column order, which contradicted that edition's own core-mode
+     Table 24.
+  2. **Core decoding mode** (`Ac4Decoder::set_decoding_mode` +
+     `DecodingMode::{Full, Core}`): an `immersive_channel_element`
+     substream decodes to the seven-channel core operating point
+     `[L, R, C, Ls, Rs, Tsl, Tsr]` (+ unity LFE) in all five
+     Table 95 codec modes — SCPL via §5.3.3.2 Table 24; ASPX_SCPL
+     via §4.8.3.11.2 (Table 8 core roster with NOTE-6 first-of-pair
+     bracket channels, §5.4 postprocessing at −1,5 dB above `sbx` on
+     the Table 9 channels, `g = 2`); ACPL modes via §4.8.3.14 (no
+     A-CPL, `g = 2` per present channel); ASPX_AJCC via §5.6.3.5.3
+     (Table 39 `ajcc_core_decode`, its §5.6.3.5.1 front end now
+     shared with the full-decode arm). New `core_render` module:
+     the §5.10.2.6/§5.10.2.7 core-decoding channel renderer
+     (Table 129 gain codes, Table 130 defaults, Table 45 → 5.X.2 /
+     Table 46 → 5.X.0). Validation (11 new decoder-level tests):
+     L/R/C decode identically in both modes, each core surround/top
+     channel equals the ÷√2 fold of its full-decode pair (b_5fronts
+     fronts fold the screens at unity), the LFE is bit-identical,
+     A-JCC core keeps module separation with centre passthrough, and
+     `render_core_to_5_x_2(core)` reproduces the full decode folded
+     to 5.X.2 with the same customized gains (the +3 dB static terms
+     cancel the core fold exactly).
+
 - ac4 round 440 — **b_5fronts ICE encode + A-JCC parameter extractor
   + SAP encode decisions** (ETSI TS 103 190-2 §5.2.3.2 / §5.5.2 /
   §5.6 / §6.2.4.1), closing the immersive encoder "lacks" tail. Five
