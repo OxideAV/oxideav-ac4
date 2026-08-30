@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `n_add_emdf_substreams`, `n_substreams`, substream sizes) and the
   DRC gain-set size now use checked arithmetic. The `ajoc_substream`
   target then ran its full 10-minute budget clean.
+  Fourth / fifth rounds: `dlg_obj` / the `de_main_dlg_flag[]` read are
+  bounded for descriptors with more than 32 upmix signals, the
+  `n_fullband_upmix_signals` escape is checked, and the immersive SAP
+  band loop clamps a band start past a short transform's length
+  (inverted-slice panic). `parse_toc` and `ajoc_substream` then ran
+  their full budgets clean.
 - ac4 round 453 — **multi-envelope P-frame TIME direction** on the
   live 5_X ASPX_ACPL_3 encoder path (§5.7.6.3.4 Pseudocodes 80/81).
   `build_aspx_multi_envelope_2ch_from_qmf` now also returns the frame's

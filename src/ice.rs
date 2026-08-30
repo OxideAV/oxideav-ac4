@@ -425,8 +425,11 @@ pub fn apply_sap_steps(specs: &mut [Vec<f32>], ice: &IceElement, transform_lengt
                 ensure_len(x_row, hi_bin);
                 ensure_len(y_row, hi_bin);
                 for (sfb, &(a, b, c, d)) in abcd.iter().enumerate().take(usable) {
-                    let lo = sfbo[sfb] as usize;
                     let hi = (sfbo[sfb + 1] as usize).min(n);
+                    // A short transform can leave sfbo[sfb] past `n`;
+                    // clamp so the band degenerates to empty instead
+                    // of an inverted slice.
+                    let lo = (sfbo[sfb] as usize).min(hi);
                     for (x, y) in x_row[lo..hi].iter_mut().zip(y_row[lo..hi].iter_mut()) {
                         let (xv, yv) = (*x, *y);
                         *x = a * xv + b * yv;
