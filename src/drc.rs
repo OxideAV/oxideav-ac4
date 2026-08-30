@@ -635,7 +635,10 @@ pub fn parse_drc_data(
             let mut drc_gainset_size = br.read_u32(6)?;
             let b_more_bits = br.read_bit()?;
             if b_more_bits {
-                drc_gainset_size += variable_bits(br, 2)? << 6;
+                drc_gainset_size = variable_bits(br, 2)?
+                    .checked_shl(6)
+                    .and_then(|v| v.checked_add(drc_gainset_size))
+                    .ok_or_else(|| Error::invalid("ac4: drc_gainset_size overflow"))?;
             }
             let drc_version = br.read_u32(2)?;
             let bit_pos_before = br.bit_position();

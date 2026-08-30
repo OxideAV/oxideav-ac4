@@ -452,7 +452,9 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     } else {
         let b_more = br.read_bit()?;
         if b_more {
-            variable_bits(&mut br, 2)? + 2
+            variable_bits(&mut br, 2)?
+                .checked_add(2)
+                .ok_or_else(|| Error::invalid("ac4: n_presentations overflow"))?
         } else {
             0
         }
@@ -463,7 +465,9 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     let payload_base = if b_payload_base {
         let base = br.read_u32(5)? + 1;
         if base == 0x20 {
-            base + variable_bits(&mut br, 3)?
+            variable_bits(&mut br, 3)?
+                .checked_add(base)
+                .ok_or_else(|| Error::invalid("ac4: payload_base overflow"))?
         } else {
             base
         }
@@ -763,7 +767,10 @@ fn parse_presentation_config_ext_info(br: &mut BitReader<'_>) -> Result<()> {
     let mut n_skip_bytes = br.read_u32(5)?;
     let b_more = br.read_bit()?;
     if b_more {
-        n_skip_bytes += variable_bits(br, 2)? << 5;
+        n_skip_bytes = variable_bits(br, 2)?
+            .checked_shl(5)
+            .and_then(|v| v.checked_add(n_skip_bytes))
+            .ok_or_else(|| Error::invalid("ac4: n_skip_bytes overflow"))?;
     }
     if n_skip_bytes > 1 << 20 {
         return Err(Error::invalid("ac4: presentation_config_ext_info too big"));
@@ -870,7 +877,9 @@ fn parse_presentation_info(
     if b_add_emdf_substreams {
         let mut n = br.read_u32(2)?;
         if n == 0 {
-            n = variable_bits(br, 2)? + 4;
+            n = variable_bits(br, 2)?
+                .checked_add(4)
+                .ok_or_else(|| Error::invalid("ac4: n_add_emdf_substreams overflow"))?;
         }
         for _ in 0..n {
             parse_emdf_info(br)?;
@@ -1000,7 +1009,9 @@ fn parse_presentation_v1_info(
     if b_add_emdf_substreams {
         let mut n = br.read_u32(2)?;
         if n == 0 {
-            n = variable_bits(br, 2)? + 4;
+            n = variable_bits(br, 2)?
+                .checked_add(4)
+                .ok_or_else(|| Error::invalid("ac4: n_add_emdf_substreams overflow"))?;
         }
         for _ in 0..n {
             parse_emdf_info(br)?;
@@ -1755,7 +1766,9 @@ fn parse_substream_index_table(br: &mut BitReader<'_>) -> Result<(u32, Vec<u32>)
     // §4.2.3.11 Syntax of substream_index_table().
     let mut n_substreams = br.read_u32(2)?;
     if n_substreams == 0 {
-        n_substreams = variable_bits(br, 2)? + 4;
+        n_substreams = variable_bits(br, 2)?
+            .checked_add(4)
+            .ok_or_else(|| Error::invalid("ac4: n_substreams overflow"))?;
     }
     let b_size_present = if n_substreams == 1 {
         br.read_bit()?
@@ -1768,7 +1781,10 @@ fn parse_substream_index_table(br: &mut BitReader<'_>) -> Result<(u32, Vec<u32>)
             let b_more_bits = br.read_bit()?;
             let mut size = br.read_u32(10)?;
             if b_more_bits {
-                size += variable_bits(br, 2)? << 10;
+                size = variable_bits(br, 2)?
+                    .checked_shl(10)
+                    .and_then(|v| v.checked_add(size))
+                    .ok_or_else(|| Error::invalid("ac4: size overflow"))?;
             }
             sizes.push(size);
         }
