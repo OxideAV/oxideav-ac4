@@ -13,8 +13,11 @@ framework but usable standalone.
 AC-4 is a complex, hierarchical codec — multiple presentations, nested
 substream descriptors, ASF / A-SPX / SSF coefficient streams, A-CPL
 channel-pair coupling, and an EMDF metadata sidecar. This crate parses
-the full framing and decodes channel-based streams to PCM; an encoder
-covers the channel-based layouts.
+the full framing and decodes channel-based, immersive (7.X.4 / 9.X.4 /
+22.2) and A-JOC object-based streams to PCM in both §4.7 decoding
+modes, with dialogue enhancement applied on the immersive and object
+routes; an encoder covers the channel-based and immersive layouts and
+the A-JOC object forms.
 
 ### Bitstream framing and TOC
 
@@ -158,14 +161,24 @@ an S16 `AudioFrame`:
   bandwidth-extended in the QMF domain from its captured
   `aspx_data_2ch()` / `aspx_data_1ch()` payload before the spatial
   reconstruction, with the I-frame `aspx_config` + xover sticky
-  across P-frames), and the **`b_static_dmx`** 5.X core (the
-  `audio_data_chan(5.0/5.1)` SIMPLE coding configs feed the
-  reconstruction in the Table 180 `[L, R, C, Ls, Rs]` order; the 5.1
-  core's LFE lands on the leading output slot). The write side gains
-  the matching `write_audio_data_ajoc_static` /
-  `write_audio_data_ajoc_aspx` bodies and
-  `encode_ajoc_raw_frame_static` / `encode_ajoc_raw_frame_aspx`
-  full-frame writers.
+  across P-frames), and the **`b_static_dmx`** 5.X core in **every**
+  part-1 codec mode — the SIMPLE coding configs feed the
+  reconstruction in the Table 180 `[L, R, C, Ls, Rs]` order, and the
+  ASPX / ASPX_ACPL_1..3 cores render through the shared 5_X carrier
+  pipeline (`Ac4Decoder::render_static_5x_tools`: A-SPX extension,
+  companding, A-CPL centre / surround synthesis) with Table 25's
+  I-frame configs sticky across P-frames; the 5.1 core's LFE lands on
+  the leading output slot. **Dialogue enhancement** (§5.8.2.3 /
+  §5.8.2.4) applies on the object route in both decoding modes from
+  `ajoc_dmx_de_data()` — Pseudocode 22 scaling of the main-dialogue
+  objects' matrices (full) and the `y = H_M·H_A·x + x` downmix form
+  (core) — under the user gain of
+  `Ac4Decoder::set_dialogue_enhancement_gain_db`, clamped to
+  `de_max_gain`. The write side has the matching
+  `write_audio_data_ajoc_static` / `_static_acpl3` /
+  `write_audio_data_ajoc_aspx` bodies, `write_ajoc_dmx_de_data`, and
+  the `encode_ajoc_raw_frame_static` / `_static_acpl3` / `_aspx` /
+  `_with_dmx_de` full-frame writers.
 - **Immersive channel element** (TS 103 190-2 §6.2.4.1-2 — channel
   modes 7.0.4 / 7.1.4 / 9.0.4 / 9.1.4, Table 78) — the `ice` module
   parses the full `immersive_channel_element()` family: the Table 95
@@ -281,7 +294,18 @@ an S16 `AudioFrame`:
   (`emdf_payloads_substream()` Table 18 + `emdf_payload_config()`
   Table 79, capturing each payload's bytes verbatim), DRC gain
   application (`drc_raw_to_linear` + dialnorm correction applied to
-  planar PCM), and the DE (dialogue enhancement) walker.
+  planar PCM), the DE (dialogue enhancement) walker, and the **DE
+  application tool** (`de_apply`, TS 103 190-1 §5.7.8: Table 209/210
+  dequantization, Table 172 rendering vector, Table 173 banding,
+  channel-independent incl. M/S, cross-channel, the parametric half
+  of the hybrid modes, `Gmax` clamp, keep-flag inheritance and the
+  §5.7.8.6 cross-frame interpolation). The immersive route parses its
+  post-audio `metadata(…, sus_ver = 1)` and applies the tool on the
+  Table 15 dialogue channels in both §4.7 decoding modes (7.X.4 fronts
+  and the 7-channel core roster; 9.X.4 screen channels on the
+  full-decoding roster) when `set_dialogue_enhancement_gain_db` is
+  non-zero, routing every output channel through streaming QMF pairs
+  so enhanced and pass-through channels stay time-aligned.
 - **Metadata write-side (encoder symmetry)** — every metadata parser now
   has a bit-exact inverse, so a decoded `Metadata` round-trips back to a
   parse-equivalent bitstream. `write_metadata` (Table 66) drives
@@ -397,100 +421,38 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **Immersive remainders** — the A-SPX / A-CPL codec modes of
-  the A-JOC `b_static_dmx` core parse but their carrier synthesis
-  into the object path is pending (needs the 5_X carrier pipeline
-  shared into the object decoder). Core-mode dialogue enhancement
-  (§5.8.2.1-2/4) is not applied (the DE walker parses the payloads;
-  no ICE-route DE application exists in either decoding mode yet).
-- Remaining TS 103 190-2 multi-stream / immersive / object-based (IFM)
-  extensions beyond the parsed presentation / OAMD / object substream
-  surfaces.
-- P-frame refinements: the sticky state carries **one** xover offset per
-  substream, so P-frames assume the I-frame used a single
-  `aspx_xover_subband_offset` across all A-SPX elements of the element
-  (always true for this encoder; per-element sticky xovers would need a
-  per-trailer table). Multi-envelope (`num_env > 1`) P-frame bodies emit
-  FREQ-direction envelopes only (the encoder clears its cross-frame rows
-  after a multi-envelope frame rather than tracking the last envelope).
-  Cross-frame TIME/DIFF_TIME emission is wired on the 5_X ACPL_3 path;
-  the other live paths emit correct P-frame bodies with FREQ rows.
-- Per-`emdf_payload_id` semantic interpretation of EMDF payload bodies
+- **Dialogue enhancement remainders** — the 9.X.4 core-decoding
+  refinements of §5.8.2.1 (A-JCC, `C_L`/`C_R` from the dry
+  coefficients) and §5.8.2.2 (A-CPL, from `acpl_alpha5/6`) — the
+  `Ĥ_DE,Core × M_interp` Pseudocode 20 form — fall back to the plain
+  part-1 §5.7.8 application on the folded core L/R/C; the waveform
+  half of the hybrid methods (an isolated dialogue substream) is not
+  consumed (parametric-only, as §5.7.8.1 permits low-complexity
+  decoders); `b_de_simulcast`'s second `de_data`; §5.8.2.5 gain on
+  direct-coded object audio (no `audio_data_objs` decode path).
+- **Remaining TS 103 190-2 surfaces** — direct-coded object substreams
+  (`audio_data_objs` + their inline OAMD), rendering of more than the
+  first substream of the first substream group, and per-
+  `emdf_payload_id` semantic interpretation of EMDF payload bodies
   (captured as raw bytes).
-- Some advanced A-CPL parameters (β3 / γ on certain encoder paths)
-  remain scaffolded at minimum-bit-cost defaults.
-- **A-SPX `aspx_hfgen_iwc` sub-fields:** the live 5_X ASPX_ACPL_3, the
-  5_X / 7_X ASPX_ACPL_2, the **7.0 pure-ASPX**, and the **7_X
-  ASPX_ACPL_1** paths now emit a real `aspx_tna_mode` (inverse filtering)
-  on every A-SPX carrier — each body derives an independent
-  `aspx_tna_mode` per carrier from that carrier's own QMF low band (front
-  pair from L, surround pair from Ls, centre from C, and the 7.0
-  pure-ASPX back pair from Lb). The 7_X ASPX_ACPL_1 path additionally now
-  emits **real** per-sbg SIGNAL/NOISE ASPX envelopes on all three carriers
-  (replacing the round-118 `write_aspx_data_*_minimal` scaffold). Every
-  live A-SPX path now also emits a **real `aspx_add_harmonic`** decision:
-  the `aspx_ah_select` module measures each carrier's per-high-res-signal-
-  subband-group HF QMF **spectral crest** (the group's loudest subband
-  energy ÷ its mean per-subband energy) and requests a restored missing
-  harmonic (§4.2.12.6) where a dominant tonal partial is present (the
-  decoder places the §5.7.6.4.2.1 Pseudocode 92 sinusoid at the group's
-  `sb_mid`). This is wired per-channel into the live 5_X ASPX_ACPL_3
-  (single- **and** multi-envelope), 5_X / 7_X ASPX_ACPL_2 (single- and
-  centre-multi-envelope), 7.0 pure-ASPX, and 7_X ASPX_ACPL_1 paths via new
-  `write_aspx_data_{1,2}ch_real_envelope_tna_ah` +
-  `write_aspx_data_{1,2}ch_multi_envelope_tna_ah` writers and an
-  `extract_aspx_add_harmonic` per-carrier analysis. The decoder fully
-  consumes `aspx_add_harmonic` (§5.7.6.4.4 tone generator → HF QMF
-  injection), so the decision changes the **decoded PCM**, not just the
-  wire bytes. Every live A-SPX path additionally emits a **real
-  `aspx_preflat`** decision (Table 121): the `aspx_preflat_select` module
-  reuses the decoder's own §5.7.6.4.1.2 Pseudocode 85 gain fit
-  (`compute_preflat_gains`) over the carrier's QMF low band — the
-  HF-generation source range — and signals spectral pre-flattening when the
-  fitted-slope dB dynamic range (`20·log10(max gain ÷ min gain)`, a
-  level-independent measure of the source range's overall tilt) clears a
-  threshold. A spectrally flat source range yields ~unity gains and is left
-  alone; a steeply tilted one flips the per-`aspx_config` flag so the
-  decoder applies the §5.7.6.4.1.4 Pseudocode 89 inverse pre-flatten gain to
-  the patched tile (re-shaping the spectrum within each subband group while
-  the SIGNAL envelope, restored *after* pre-flattening, pins each group's
-  energy). Wired into every live path (5_X ASPX_ACPL_3 single + multi-env,
-  5_X / 7_X ASPX_ACPL_2, 7.0 pure-ASPX, 7_X ASPX_ACPL_1) via an
-  `extract_aspx_preflat` per-carrier analysis. Still pending:
-  `fic_used_in_sfb` / `tic_used_in_slot` remain
-  at the all-zero scaffold on every live path — they are parsed but not yet
-  driven through the decoder's HF synthesis, so an encoder decision for
-  them would be informative-only (a docs gap on their §5.7.6.4 synthesis
-  semantics blocks a real round-trip). The 7.X ASPX_ACPL_3 path does not
-  yet exist. The `aspx_tna_mode` / `aspx_add_harmonic` threshold mappings
-  are encoder tuning choices (the spec leaves the selection informative);
-  they are calibrated to the live QMF pipeline but not yet tuned against a
-  perceptual reference.
-- The live 5_X ASPX_ACPL_3 real-ASPX frame path now selects between a
-  single FIXFIX envelope and a `num_env = 2` multi-envelope body per
-  frame (`encode_frame_pcm_5_{0,1}_acpl3_real_aspx_multi_env` — the
-  encoder probes the L/R HF QMF energy for a transient and emits the
-  multi-envelope `aspx_data_2ch()` with per-envelope FREQ/TIME DPCM when
-  one is present, else falls back to the single-envelope path). The
-  ASPX_ACPL_2 5.X live frame path now also emits a **real single-envelope
-  `aspx_data_1ch()`** for the centre carrier
-  (`encode_frame_pcm_5_{0,1}_acpl2_real_aspx`: QMF-analyses L/R **and** C,
-  emitting real SIGNAL/NOISE envelopes on all three carriers via
-  `write_aspx_data_1ch_real_envelope` + `write_aspx_data_2ch_real_envelope`).
-  The 7.X ASPX_ACPL_2 live frame path now also emits real single-envelope
-  ASPX on all three carriers — both carrier-pair `aspx_data_2ch()` elements
-  (L/R front, Ls/Rs surround) **and** the centre `aspx_data_1ch()`
-  (`encode_frame_pcm_7_{0,1}_acpl2_real_aspx` →
-  `build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx`). The
-  7.0 pure-ASPX path (`encode_frame_pcm_7_0_aspx_real_aspx` →
-  `build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna`) and the 7_X
-  ASPX_ACPL_1 path (`encode_frame_pcm_7_{0,1}_acpl1_real_alpha_beta` →
-  `build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna`)
-  now also emit real single-envelope ASPX + real `aspx_tna_mode` on every
-  carrier. The live `aspx_data_1ch()` path remains single-envelope
-  (`num_env = 1`), and multi-envelope (`num_env > 1`) is wired only on the
-  5.X ASPX_ACPL_3 live path; `num_env > 2` (requiring a wider
-  `num_env_bits_fixfix`) is not yet selected.
+- **P-frame encoder remainders** — cross-frame TIME / DIFF_TIME
+  emission is wired on the 5_X ASPX_ACPL_3 live path (single- and
+  multi-envelope; the multi-envelope frame's A-CPL rows stay
+  DIFF_FREQ); the other live paths emit correct P-frame bodies with
+  FREQ rows. `num_env > 2` (a wider `num_env_bits_fixfix`) is never
+  selected, and multi-envelope A-SPX is wired only on the 5.X
+  ASPX_ACPL_3 live path (the live `aspx_data_1ch()` stays
+  single-envelope).
+- **A-SPX `aspx_hfgen_iwc` sub-fields** — `fic_used_in_sfb` /
+  `tic_used_in_slot` stay at the all-zero scaffold on every live
+  encoder path (parsed but not driven through the decoder's HF
+  synthesis; a docs gap on their §5.7.6.4 synthesis semantics blocks a
+  real round-trip). The `aspx_tna_mode` / `aspx_add_harmonic` /
+  `aspx_preflat` thresholds are encoder tuning choices calibrated to
+  the live QMF pipeline, not against a perceptual reference.
+- **Encoder coverage gaps** — no 7.X ASPX_ACPL_3 path; some advanced
+  A-CPL parameters (β3 / γ on certain paths) remain scaffolded at
+  minimum-bit-cost defaults.
 
 ## Specs
 
