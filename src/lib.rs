@@ -532,6 +532,7 @@ pub mod aspx_tone;
 pub mod core_render;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de;
+pub mod de_apply;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de_huffman;
 pub mod decoder;
