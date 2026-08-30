@@ -571,14 +571,10 @@ impl InputSignalModifier {
     /// Reset the running history (e.g. on substream restart).
     pub fn reset(&mut self) {
         for h in &mut self.x_hist {
-            for v in h {
-                *v = (0.0, 0.0);
-            }
+            h.fill((0.0, 0.0));
         }
         for h in &mut self.y_hist {
-            for v in h {
-                *v = (0.0, 0.0);
-            }
+            h.fill((0.0, 0.0));
         }
     }
 

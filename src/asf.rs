@@ -2087,8 +2087,7 @@ pub(crate) fn parse_aspx_data_2ch_body(
     // channel 0's framing.
     let balance = br.read_bit()?;
     tools.aspx_balance = Some(balance);
-    let framing_ch1_ref;
-    if !balance {
+    let framing_ch1_ref = if !balance {
         let framing_ch1 = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
         // Per Table 52 the ch1 qmode is recomputed against the ch1
         // framing (and re-clamped on FIXFIX + num_env == 1).
@@ -2101,12 +2100,12 @@ pub(crate) fn parse_aspx_data_2ch_body(
         };
         tools.aspx_qmode_env_secondary = Some(qmode_ch1);
         tools.aspx_framing_secondary = Some(framing_ch1);
-        framing_ch1_ref = tools.aspx_framing_secondary.as_ref();
+        tools.aspx_framing_secondary.as_ref()
     } else {
         // Shared framing; copy the ch0 qmode across.
         tools.aspx_qmode_env_secondary = Some(qmode_ch0);
-        framing_ch1_ref = Some(&framing_ch0);
-    }
+        Some(&framing_ch0)
+    };
     // aspx_delta_dir(0) then aspx_delta_dir(1) per Table 52.
     let dd0 = aspx::parse_aspx_delta_dir(br, &framing_ch0)?;
     let f_ch1 = framing_ch1_ref.unwrap_or(&framing_ch0);

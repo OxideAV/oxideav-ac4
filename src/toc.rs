@@ -798,10 +798,9 @@ fn parse_presentation_info(
         }
     }
     info.version = ver;
-    let b_add_emdf_substreams;
-    if !b_single_substream && presentation_config == 6 {
+    let b_add_emdf_substreams = if !b_single_substream && presentation_config == 6 {
         // Special "add EMDF only" configuration.
-        b_add_emdf_substreams = true;
+        true
     } else {
         let _md_compat = br.read_u32(3)?;
         let b_belongs_to_presentation_id = br.read_bit()?;
@@ -866,8 +865,8 @@ fn parse_presentation_info(
             }
         }
         let _b_pre_virtualized = br.read_bit()?;
-        b_add_emdf_substreams = br.read_bit()?;
-    }
+        br.read_bit()?
+    };
     if b_add_emdf_substreams {
         let mut n = br.read_u32(2)?;
         if n == 0 {
@@ -915,9 +914,8 @@ fn parse_presentation_v1_info(
         info.version = ver;
     }
     let mut n_substream_groups: u32 = 0;
-    let b_add_emdf_substreams;
-    if !b_single_substream_group && presentation_config == 6 {
-        b_add_emdf_substreams = true;
+    let b_add_emdf_substreams = if !b_single_substream_group && presentation_config == 6 {
+        true
     } else {
         if bitstream_version != 1 {
             let _mdcompat = br.read_u32(3)?;
@@ -984,7 +982,7 @@ fn parse_presentation_v1_info(
             }
         }
         let _b_pre_virtualized = br.read_bit()?;
-        b_add_emdf_substreams = br.read_bit()?;
+        let b_add_emdf = br.read_bit()?;
         // ac4_presentation_substream_info() — per §6.2.1.12: b_alternative,
         // b_pres_ndot, substream_index (2 + optional variable_bits(2)).
         let _b_alternative = br.read_bit()?;
@@ -997,7 +995,8 @@ fn parse_presentation_v1_info(
         if si == 3 {
             let _ = variable_bits(br, 2)?;
         }
-    }
+        b_add_emdf
+    };
     if b_add_emdf_substreams {
         let mut n = br.read_u32(2)?;
         if n == 0 {
