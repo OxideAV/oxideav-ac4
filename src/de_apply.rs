@@ -41,7 +41,10 @@ pub const DE_PAR_DQ_CI: [f32; 32] = [
 ];
 
 /// Table 172 — dequantization vector for `de_mix_coef1_idx` /
-/// `de_mix_coef2_idx` (index 0..=31).
+/// `de_mix_coef2_idx` (index 0..=31). The values are the printed
+/// Table 172 entries verbatim (index 16 is the table's rounded
+/// "0,7071", not the exact 1/√2).
+#[allow(clippy::approx_constant)]
 pub const DE_MIX_COEF_DQ: [f32; 32] = [
     0.0, 6.32e-3, 1.0e-2, 1.79e-2, 3.16e-2, 5.65e-2, 7.87e-2, 0.111, 0.156, 0.218, 0.303, 0.37,
     0.448, 0.533, 0.577, 0.622, 0.7071, 0.783, 0.846, 0.894, 0.929, 0.953, 0.976, 0.9877, 0.9938,
@@ -353,7 +356,7 @@ mod tests {
         let mut st = DeApplyState::new();
         let h = build_frame_matrices(&mut st, &c, &d, 6.0);
         let g = 10f32.powf(6.0 / 20.0) - 1.0;
-        let c1 = 0.7071f32;
+        let c1 = DE_MIX_COEF_DQ[16];
         let c2 = (1.0 - c1 * c1).max(0.0).sqrt();
         let (p0, p1) = (1.0f32, -1.0f32);
         for hb in &h {
@@ -415,8 +418,8 @@ mod tests {
         let (mut l2, mut r2, mut c2) = (ones(), ones(), ones());
         let h2 = build_frame_matrices(&mut st, &c, &d, 6.0);
         apply_frame_to_qmf(&mut st, h2, &mut [&mut l2, &mut r2, &mut c2]);
-        for ts in 0..num_ts {
-            assert!((l2[ts][3].0 - (1.0 + g)).abs() < 1e-5);
+        for col in l2.iter().take(num_ts) {
+            assert!((col[3].0 - (1.0 + g)).abs() < 1e-5);
         }
     }
 }
