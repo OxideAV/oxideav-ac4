@@ -2632,16 +2632,16 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     )
 }
 
-/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna`]
-/// with **per-channel, per-data-type A-SPX envelope transmission
-/// directions** ([`AspxEncodedEnvelope`] rows instead of raw FREQ-DPCM
-/// slices) — the P-frame builder: TIME-direction rows delta-code
-/// against the previous frame's last envelope (§5.7.6.3.4 Pseudocodes
-/// 80 / 81 `qscf_*_prev`), which the decoder reconstructs from its
-/// per-channel [`crate::aspx::AspxEnvPrev`] state. All-FREQ rows
-/// reproduce the plain `_real_aspx_tna` builder byte-for-byte.
+/// `audio_data_chan(5.X)` body of
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna_directional`]
+/// written into the caller's `BitWriter` — from the 3-bit
+/// `5_X_codec_mode` through the trailing `acpl_data_2ch()`, without
+/// the `ac4_substream()` size header, alignment or padding. Lets the
+/// same ASPX_ACPL_3 core be embedded where Table 25 is nested, e.g.
+/// the TS 103 190-2 §6.2.3.4 A-JOC `b_static_dmx` downmix.
 #[allow(clippy::too_many_arguments)]
-pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna_directional(
+pub fn write_5_x_acpl3_audio_data_directional(
+    bw: &mut BitWriter,
     transform_length: u32,
     max_sfb: u32,
     max_sfb_lfe: Option<u32>,
@@ -2667,9 +2667,8 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     beta_scale: f32,
     gamma_scale: f32,
     beta3_scale: f32,
-    pad_target_bytes: usize,
     acpl_prev: Option<&mut Acpl3ParamPrevRows>,
-) -> Vec<u8> {
+) {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
 
     let alpha_q = extract_alpha_q_per_band_carrier_correlation(
@@ -2770,32 +2769,25 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
         vec![0i32; acpl_num_bands as usize]
     };
 
-    let mut bw = BitWriter::new();
-    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
-    let audio_size = pad_target_bytes as u32;
-    bw.write_u32(audio_size & 0x7FFF, 15);
-    bw.write_bit(false);
-    bw.align_to_byte();
-
     // 5_X_codec_mode = ASPX_ACPL_3 (4) — 3 bits.
     bw.write_u32(4, 3);
 
     // I-frame block: aspx_config() (15 b) + acpl_config_2ch() (4 b).
     if b_iframe {
-        write_aspx_config(&mut bw, aspx_cfg);
-        write_acpl_config_2ch(&mut bw, acpl_num_param_bands_id, acpl_qm0, acpl_qm1);
+        write_aspx_config(bw, aspx_cfg);
+        write_acpl_config_2ch(bw, acpl_num_param_bands_id, acpl_qm0, acpl_qm1);
     }
 
     // LFE: mono_data(b_lfe=1) when present.
     if let (Some(lfe), Some(m_lfe)) = (coeffs_lfe, max_sfb_lfe) {
-        write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
+        write_lfe_mono_data(bw, transform_length, m_lfe, lfe);
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_2ch_sync_on(bw);
 
     // stereo_data(): split-MDCT L/R carriers.
-    write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_stereo_split_data(bw, transform_length, max_sfb, coeffs_l, coeffs_r);
 
     // Real-envelope aspx_data_2ch() + acpl_data_2ch() with real
     // α / β / β₃ / γ₁..γ₆. Per Table 25 both data elements are present
@@ -2803,7 +2795,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     // inside aspx_data_2ch() are I-frame-gated.
     {
         write_aspx_data_2ch_directional_envelope_tna_ah_framed(
-            &mut bw,
+            bw,
             aspx_cfg,
             aspx_l_sig,
             aspx_l_noise,
@@ -2834,7 +2826,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
             };
             choose_acpl_direction(cur_rows[i], prev)
         });
-        write_acpl_data_2ch_directional(&mut bw, acpl_num_bands, acpl_qm0, acpl_qm1, &params);
+        write_acpl_data_2ch_directional(bw, acpl_num_bands, acpl_qm0, acpl_qm1, &params);
         // The transmitted absolute rows become the next frame's
         // Pseudocode 121 q_prev reference.
         if let Some(st) = acpl_prev {
@@ -2845,7 +2837,82 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
             st.primed = true;
         }
     }
+}
 
+/// [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna`]
+/// with **per-channel, per-data-type A-SPX envelope transmission
+/// directions** ([`AspxEncodedEnvelope`] rows instead of raw FREQ-DPCM
+/// slices) — the P-frame builder: TIME-direction rows delta-code
+/// against the previous frame's last envelope (§5.7.6.3.4 Pseudocodes
+/// 80 / 81 `qscf_*_prev`), which the decoder reconstructs from its
+/// per-channel [`crate::aspx::AspxEnvPrev`] state. All-FREQ rows
+/// reproduce the plain `_real_aspx_tna` builder byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna_directional(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    aspx_l_sig: &AspxEncodedEnvelope,
+    aspx_l_noise: &AspxEncodedEnvelope,
+    aspx_r_sig: &AspxEncodedEnvelope,
+    aspx_r_noise: &AspxEncodedEnvelope,
+    aspx_tna_mode: &[u8],
+    aspx_l_ah: &[bool],
+    aspx_r_ah: &[bool],
+    acpl_num_param_bands_id: u8,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    beta3_scale: f32,
+    pad_target_bytes: usize,
+    acpl_prev: Option<&mut Acpl3ParamPrevRows>,
+) -> Vec<u8> {
+    let mut bw = BitWriter::new();
+    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    write_5_x_acpl3_audio_data_directional(
+        &mut bw,
+        transform_length,
+        max_sfb,
+        max_sfb_lfe,
+        b_iframe,
+        coeffs_l,
+        coeffs_r,
+        coeffs_c,
+        coeffs_ls,
+        coeffs_rs,
+        coeffs_lfe,
+        aspx_cfg,
+        aspx_l_sig,
+        aspx_l_noise,
+        aspx_r_sig,
+        aspx_r_noise,
+        aspx_tna_mode,
+        aspx_l_ah,
+        aspx_r_ah,
+        acpl_num_param_bands_id,
+        acpl_qm0,
+        acpl_qm1,
+        alpha_scale,
+        beta_scale,
+        gamma_scale,
+        beta3_scale,
+        acpl_prev,
+    );
     bw.align_to_byte();
     while bw.byte_len() < pad_target_bytes {
         bw.write_u32(0, 8);

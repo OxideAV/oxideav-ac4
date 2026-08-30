@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 453 — **A-JOC `b_static_dmx` core A-SPX / A-CPL carrier
+  synthesis in the object path** (TS 103 190-2 §6.2.3.4 nesting part-1
+  §4.2.6.6 Table 25). The channel-based decoder's per-frame render is
+  factored into `Ac4Decoder::render_channel_substream` (IMDCT / A-SPX /
+  A-CPL / SSF / SAP / coding-config dispatch, byte-identical move) with
+  a `render_static_5x_tools` entry, and the A-JOC substream decoder
+  routes every non-SIMPLE static 5.X core through it — object-based
+  (IFM) presentations over an ASPX / ASPX_ACPL_1..3 static downmix now
+  decode to PCM in both §4.7 decoding modes instead of stopping at an
+  `unsupported` error. The Table 25 I-frame-gated configs are sticky
+  across P-frames via a per-substream `StickyConfig` (seed / harvest,
+  matching the channel route). Encoder side: the ASPX_ACPL_3 body
+  writer is split into a `write_5_x_acpl3_audio_data_directional`
+  BitWriter form plus `write_audio_data_ajoc_static_acpl3` /
+  `encode_ajoc_raw_frame_static_acpl3` (an `AjocStaticAcpl3Core`
+  parameter set nesting the 5.X core in the static A-JOC envelope).
+  New `round453_ajoc_static_core_modes` suite drives an I + P + P + P
+  GOP end-to-end in both decoding modes.
 - ac4 round 443 — **immersive core decoding mode + V1.3.1 track-role
   reconciliation** (ETSI TS 103 190-2 §4.7.3 / §5.3.3.2 /
   §4.8.3.11.2 / §4.8.3.14 / §5.6.3.5.3 / §5.10.2.6-7). Four landings:

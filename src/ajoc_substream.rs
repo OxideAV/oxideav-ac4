@@ -339,6 +339,35 @@ pub fn parse_audio_data_ajoc(
     ajoc_state: &mut AjocDiffState,
     sticky_aspx: Option<(&AspxConfig, u8)>,
 ) -> Result<AudioDataAjoc> {
+    parse_audio_data_ajoc_with_static_sticky(
+        br,
+        params,
+        b_iframe,
+        b_alternative,
+        frame_len_base,
+        ajoc_state,
+        sticky_aspx,
+        None,
+    )
+}
+
+/// [`parse_audio_data_ajoc`] with the `b_static_dmx` 5.X core's
+/// I-frame-sticky configuration (`aspx_config` / `acpl_config_*` /
+/// xover offset, part-1 §4.2.6.6 Table 25) threaded through
+/// `static_sticky`: seeded into the `audio_data_chan()` walk on
+/// `b_iframe == 0` frames and harvested from I-frames, exactly like
+/// the channel-based decoder's [`crate::asf::walk_ac4_substream_sticky`].
+#[allow(clippy::too_many_arguments)]
+pub fn parse_audio_data_ajoc_with_static_sticky(
+    br: &mut BitReader<'_>,
+    params: &AjocBodyParams,
+    b_iframe: bool,
+    b_alternative: bool,
+    frame_len_base: u32,
+    ajoc_state: &mut AjocDiffState,
+    sticky_aspx: Option<(&AspxConfig, u8)>,
+    static_sticky: Option<&mut crate::asf::StickyConfig>,
+) -> Result<AudioDataAjoc> {
     let mut static_chan_tools = None;
     let mut dmx_active_signals_mask = None;
     let mut var_element = None;
@@ -350,6 +379,11 @@ pub fn parse_audio_data_ajoc(
             channel_mode_channels: if params.b_lfe { 6 } else { 5 },
             ..Default::default()
         });
+        if !b_iframe {
+            if let Some(st) = static_sticky.as_ref() {
+                st.seed(&mut tools);
+            }
+        }
         crate::mch::parse_5x_audio_data_outer(
             br,
             &mut tools,
@@ -357,6 +391,11 @@ pub fn parse_audio_data_ajoc(
             b_iframe,
             frame_len_base,
         )?;
+        if b_iframe {
+            if let Some(st) = static_sticky {
+                st.harvest(&tools);
+            }
+        }
         static_chan_tools = Some(tools);
     } else {
         let n_dmx_signals = params.n_fullband_dmx_signals + u32::from(params.b_lfe);
@@ -488,13 +527,13 @@ pub type AjocSubstreamDecode = (
 /// canonical `[L, R, C, Ls, Rs]` order from the parsed
 /// `audio_data_chan(b_lfe ? 5.1 : 5.0)` tools (part-1 Table 180
 /// channel mappings, SIMPLE codec mode). The A-SPX / A-CPL 5.X codec
-/// modes are parsed upstream but their carrier synthesis is not wired
-/// into the object path.
+/// modes render through the shared 5_X carrier pipeline instead
+/// (`AjocSubstreamDecoder::decode_static_core_stage`).
 fn static_dmx_spectra(tools: &SubstreamTools) -> Result<[Option<&[f32]>; 5]> {
     use crate::mch::{FiveXCodecMode, FiveXCodingConfig};
     if !matches!(tools.five_x_mode, Some(FiveXCodecMode::Simple)) {
         return Err(Error::unsupported(
-            "ac4: static-dmx A-JOC core beyond the SIMPLE codec mode not wired yet",
+            "ac4: static-dmx A-JOC core beyond the SIMPLE codec mode renders via the 5_X pipeline",
         ));
     }
     fn pair_ch(p: &TwoChannelData, ch: usize) -> Option<&[f32]> {
@@ -605,6 +644,17 @@ pub struct AjocSubstreamDecoder {
     /// PCM instead of feeding the spatial reconstruction). Grown on
     /// demand on the first core-mode frame.
     core_synthesis: Vec<crate::qmf::QmfSynthesisBank>,
+    /// Shared 5_X carrier pipeline for the `b_static_dmx` core's
+    /// A-SPX / A-CPL codec modes: a channel-based decoder instance
+    /// whose walked-substream slot receives the parsed
+    /// `audio_data_chan(5.X)` tools each frame
+    /// ([`crate::decoder::Ac4Decoder::render_static_5x_tools`]). Owns
+    /// the A-SPX extension / A-CPL module / IMDCT overlap state of the
+    /// core, so P-frames carry their history like a channel substream.
+    static_core: Option<Box<crate::decoder::Ac4Decoder>>,
+    /// I-frame-sticky configuration of the `b_static_dmx` core
+    /// (Table 25 gates `aspx_config` / `acpl_config_*` on I-frames).
+    static_sticky: crate::asf::StickyConfig,
 }
 
 impl AjocSubstreamDecoder {
@@ -630,6 +680,8 @@ impl AjocSubstreamDecoder {
             sticky_aspx: None,
             aspx_ext_state: Vec::new(),
             core_synthesis: Vec::new(),
+            static_core: None,
+            static_sticky: crate::asf::StickyConfig::default(),
         }
     }
 
@@ -806,6 +858,53 @@ impl AjocSubstreamDecoder {
         Ok((out, lfe_pcm))
     }
 
+    /// `b_static_dmx` core in an A-SPX / A-CPL codec mode: render the
+    /// parsed `audio_data_chan(5.X)` tools through the shared 5_X
+    /// pipeline ([`crate::decoder::Ac4Decoder::render_static_5x_tools`])
+    /// and return the `[L, R, C, Ls, Rs]` PCM (plus the LFE) in the
+    /// `decode_dmx_stage` shape. Slots the pipeline could not render
+    /// (an undecodable carrier body) are an error, matching the
+    /// dynamic-form behaviour.
+    #[allow(clippy::type_complexity)]
+    fn decode_static_core_stage(
+        &mut self,
+        tools: &SubstreamTools,
+        frame_len_base: u32,
+    ) -> Result<(
+        Option<Vec<f32>>,
+        Vec<Vec<f32>>,
+        Vec<Option<(crate::aspx::QmfMatrix, u32, u32)>>,
+    )> {
+        if self.num_dmx != 5 {
+            return Err(Error::invalid(
+                "ac4: b_static_dmx A-JOC core must carry five fullband signals",
+            ));
+        }
+        let b_lfe = tools.five_x_b_has_lfe;
+        let core = self.static_core.get_or_insert_with(|| {
+            let params = oxideav_core::CodecParameters::audio(oxideav_core::CodecId::new("ac4"));
+            Box::new(crate::decoder::Ac4Decoder::new(&params))
+        });
+        let slots =
+            core.render_static_5x_tools(tools.clone(), b_lfe, frame_len_base, frame_len_base);
+        let to_f32 =
+            |pcm: &[i16]| -> Vec<f32> { pcm.iter().map(|&s| s as f32 / 32767.0).collect() };
+        let mut pcm_dmx = Vec::with_capacity(5);
+        for slot in slots.iter().take(5) {
+            let pcm = slot
+                .as_deref()
+                .ok_or_else(|| Error::unsupported("ac4: undecodable downmix channel body"))?;
+            pcm_dmx.push(to_f32(pcm));
+        }
+        let lfe_pcm = if b_lfe {
+            slots.get(5).and_then(|s| s.as_deref()).map(to_f32)
+        } else {
+            None
+        };
+        let ext = (0..self.num_dmx).map(|_| None).collect();
+        Ok((lfe_pcm, pcm_dmx, ext))
+    }
+
     /// Steps 0-2 of the downmix decode, shared by both §4.7 decoding
     /// modes: LFE IMDCT, per-channel IMDCT, the A-SPX QMF extension
     /// (dynamic A-SPX form) and the §4.8.3.10.4 companding gains.
@@ -823,6 +922,18 @@ impl AjocSubstreamDecoder {
         Vec<Option<(crate::aspx::QmfMatrix, u32, u32)>>,
     )> {
         let n = frame_len_base as usize;
+        // `b_static_dmx` core beyond the SIMPLE codec mode (ASPX,
+        // ASPX_ACPL_1..3): the part-1 5_X carrier pipeline renders the
+        // five core signals (+ LFE) — A-SPX extension, companding and
+        // the A-CPL surround / centre synthesis included — through a
+        // channel-based decoder instance sharing this substream's
+        // history. The reconstruction then sees plain PCM (no separate
+        // extension matrix).
+        if let Some(tools) = ajoc.static_chan_tools.as_deref() {
+            if !matches!(tools.five_x_mode, Some(crate::mch::FiveXCodecMode::Simple)) {
+                return self.decode_static_core_stage(tools, frame_len_base);
+            }
+        }
         // Downmix spectra in channel order + the LFE body, from either
         // the static 5.X core or the dynamic var_channel_element.
         let (spectra, lfe_data): (Vec<Option<&[f32]>>, Option<&MonoLfeData>) =
@@ -1063,7 +1174,7 @@ impl AjocSubstreamDecoder {
         br.align_to_byte();
         let audio_start = br.byte_position();
         let sticky = self.sticky_aspx;
-        let ajoc = parse_audio_data_ajoc(
+        let ajoc = parse_audio_data_ajoc_with_static_sticky(
             &mut br,
             params,
             b_iframe,
@@ -1071,6 +1182,7 @@ impl AjocSubstreamDecoder {
             frame_len_base,
             &mut self.diff_state,
             sticky.as_ref().map(|(c, x)| (c, *x)),
+            Some(&mut self.static_sticky),
         )?;
         // Harvest the I-frame-sticky A-SPX config + xover for the
         // P-frames that follow (single-xover convention — the first
@@ -1508,6 +1620,142 @@ pub fn write_audio_data_ajoc_static(
     bw.write_u32(3, 2);
     crate::ice::write_five_channel_data_simple(bw, chan_spectra, transform_length, max_sfb)?;
     write_ajoc_tail(bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state)
+}
+
+/// The ASPX_ACPL_3 5.X core of a `b_static_dmx` A-JOC substream — the
+/// inputs of
+/// [`crate::encoder_acpl3::write_5_x_acpl3_audio_data_directional`]
+/// (part-1 §4.2.6.6 Table 25: L / R carriers, optional C / Ls / Rs
+/// references for the A-CPL parameter extraction, optional LFE, the
+/// A-SPX config + per-channel envelope rows and the A-CPL scales).
+pub struct AjocStaticAcpl3Core<'a> {
+    /// Transform length (long frame) of the carriers.
+    pub transform_length: u32,
+    /// `max_sfb` of the split-MDCT carriers.
+    pub max_sfb: u32,
+    /// L / R carrier spectra.
+    pub coeffs_l: &'a [f32],
+    pub coeffs_r: &'a [f32],
+    /// Centre / surround reference spectra for the γ / β₃ extraction.
+    pub coeffs_c: Option<&'a [f32]>,
+    pub coeffs_ls: Option<&'a [f32]>,
+    pub coeffs_rs: Option<&'a [f32]>,
+    /// LFE spectrum + its `max_sfb` (present iff the descriptor's
+    /// `b_lfe`).
+    pub lfe: Option<(&'a [f32], u32)>,
+    /// `aspx_config()` (I-frame only on the wire; sticky afterwards).
+    pub aspx_cfg: &'a AspxConfig,
+    /// Per-channel SIGNAL / NOISE envelope rows.
+    pub aspx_l_sig: &'a crate::encoder_acpl3::AspxEncodedEnvelope,
+    pub aspx_l_noise: &'a crate::encoder_acpl3::AspxEncodedEnvelope,
+    pub aspx_r_sig: &'a crate::encoder_acpl3::AspxEncodedEnvelope,
+    pub aspx_r_noise: &'a crate::encoder_acpl3::AspxEncodedEnvelope,
+    /// `aspx_tna_mode` / `aspx_add_harmonic` decisions (empty = off).
+    pub aspx_tna_mode: &'a [u8],
+    pub aspx_l_ah: &'a [bool],
+    pub aspx_r_ah: &'a [bool],
+    /// `acpl_config_2ch()` fields.
+    pub acpl_num_param_bands_id: u8,
+    pub acpl_qm0: crate::acpl::AcplQuantMode,
+    pub acpl_qm1: crate::acpl::AcplQuantMode,
+    /// A-CPL parameter extraction scales (α / β / γ / β₃).
+    pub alpha_scale: f32,
+    pub beta_scale: f32,
+    pub gamma_scale: f32,
+    pub beta3_scale: f32,
+}
+
+/// Write a complete `audio_data_ajoc()` in the **static-downmix**
+/// form (`b_static_dmx == 1`) whose 5.X core is coded in the part-1
+/// **ASPX_ACPL_3** codec mode: `audio_data_chan(b_lfe ? 5.1 : 5.0)`
+/// from [`crate::encoder_acpl3::write_5_x_acpl3_audio_data_directional`]
+/// (L / R split-MDCT carriers + `aspx_data_2ch()` + `acpl_data_2ch()`),
+/// then the `ajoc()` / `ajoc_dmx_de_data()` / OAMD tail of
+/// [`write_audio_data_ajoc_static`]. The decoder renders the core
+/// through the shared 5_X carrier pipeline (A-SPX extension,
+/// companding, A-CPL centre / surround synthesis) before the §5.7.3.6
+/// object reconstruction. `acpl_prev` carries the encoder's A-CPL
+/// DIFF_TIME reference rows across frames (P-frames).
+#[allow(clippy::too_many_arguments)]
+pub fn write_audio_data_ajoc_static_acpl3(
+    bw: &mut BitWriter,
+    params: &AjocBodyParams,
+    core: &AjocStaticAcpl3Core<'_>,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+    acpl_prev: Option<&mut crate::encoder_acpl3::Acpl3ParamPrevRows>,
+) -> Result<()> {
+    if !params.b_static_dmx || params.n_fullband_dmx_signals != 5 {
+        return Err(Error::invalid(
+            "ac4: static audio_data_ajoc writer needs b_static_dmx with 5 core signals",
+        ));
+    }
+    if params.b_lfe != core.lfe.is_some() {
+        return Err(Error::invalid(
+            "ac4: LFE spectrum presence must match the descriptor's b_lfe",
+        ));
+    }
+    let (coeffs_lfe, max_sfb_lfe) = match core.lfe {
+        Some((c, m)) => (Some(c), Some(m)),
+        None => (None, None),
+    };
+    crate::encoder_acpl3::write_5_x_acpl3_audio_data_directional(
+        bw,
+        core.transform_length,
+        core.max_sfb,
+        max_sfb_lfe,
+        b_iframe,
+        core.coeffs_l,
+        core.coeffs_r,
+        core.coeffs_c,
+        core.coeffs_ls,
+        core.coeffs_rs,
+        coeffs_lfe,
+        core.aspx_cfg,
+        core.aspx_l_sig,
+        core.aspx_l_noise,
+        core.aspx_r_sig,
+        core.aspx_r_noise,
+        core.aspx_tna_mode,
+        core.aspx_l_ah,
+        core.aspx_r_ah,
+        core.acpl_num_param_bands_id,
+        core.acpl_qm0,
+        core.acpl_qm1,
+        core.alpha_scale,
+        core.beta_scale,
+        core.gamma_scale,
+        core.beta3_scale,
+        acpl_prev,
+    );
+    write_ajoc_tail(bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state)
+}
+
+/// Emit a complete v2 `raw_ac4_frame()` carrying one static-downmix
+/// A-JOC object substream whose 5.X core is ASPX_ACPL_3 coded (see
+/// [`write_audio_data_ajoc_static_acpl3`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ajoc_raw_frame_static_acpl3(
+    sequence_counter: u32,
+    params: &AjocBodyParams,
+    core: &AjocStaticAcpl3Core<'_>,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+    acpl_prev: Option<&mut crate::encoder_acpl3::Acpl3ParamPrevRows>,
+) -> Result<Vec<u8>> {
+    let mut frame = write_ajoc_toc(sequence_counter, params, b_iframe)?;
+    let mut body = BitWriter::new();
+    write_audio_data_ajoc_static_acpl3(
+        &mut body, params, core, num_decorr, ctrl, qmats, b_iframe, enc_state, acpl_prev,
+    )?;
+    frame.extend_from_slice(&wrap_ajoc_substream(body)?);
+    Ok(frame)
 }
 
 /// Write a complete dynamic-form `audio_data_ajoc()` whose downmix is
