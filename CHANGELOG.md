@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 453 — **multi-envelope P-frame TIME direction** on the
+  live 5_X ASPX_ACPL_3 encoder path (§5.7.6.3.4 Pseudocodes 80/81).
+  `build_aspx_multi_envelope_2ch_from_qmf` now also returns the frame's
+  last SIGNAL / NOISE envelope rows (sum / pan wire-step domain — the
+  decoder's post-frame `qscf_*_prev`), and the IMS encoder keeps them
+  as the cross-frame reference instead of clearing it after a
+  multi-envelope frame: the next frame (multi- or single-envelope)
+  may TIME-code its leading envelope against them, and multi-envelope
+  P-frames receive the previous frame's reference rather than an
+  empty I-frame history. New `round453_aspx_multi_env_pframe` suite
+  pins a mirrored-transient I/P pair (leading envelope TIME-coded,
+  Pseudocode 80 reconstruction mirrors the I-frame rows) and a
+  single-envelope P-frame after a multi-envelope frame.
 - ac4 round 453 — **per-trailer sticky `aspx_xover_subband_offset`**
   (TS 103 190-1 §4.2.12.3/.4 Tables 51/52). Multi-payload elements
   (5_X / 7_X ASPX trailers, the immersive A-SPX roster, the A-JOC

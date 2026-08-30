@@ -3258,6 +3258,7 @@ impl Ac4ImsEncoder {
         frame_len: u32,
         pcm_l: &[f32],
         pcm_r: &[f32],
+        prev: Option<&crate::encoder_acpl3::Acpl3EnvPrevRows>,
     ) -> (u32, crate::encoder_acpl3::AspxMultiEnvelope2chRows) {
         let fallback = || {
             (
@@ -3328,9 +3329,19 @@ impl Ac4ImsEncoder {
             num_ts_in_ats,
             aspx_frame_ts_count,
             sbx,
-            // I-frame: no inter-frame TIME-direction history.
-            crate::encoder_acpl3::AspxMultiEnvelopePrevLast::default(),
-            crate::encoder_acpl3::AspxMultiEnvelopePrevLast::default(),
+            // P-frames carry the previous frame's last-envelope rows
+            // (sum / pan wire-step domain) as the leading-envelope TIME
+            // reference; I-frames / first frames have no history.
+            prev.map(|p| crate::encoder_acpl3::AspxMultiEnvelopePrevLast {
+                sig: &p.l_sig,
+                noise: &p.l_noise,
+            })
+            .unwrap_or_default(),
+            prev.map(|p| crate::encoder_acpl3::AspxMultiEnvelopePrevLast {
+                sig: &p.r_sig,
+                noise: &p.r_noise,
+            })
+            .unwrap_or_default(),
             1,
             false,
         );
@@ -3403,8 +3414,18 @@ impl Ac4ImsEncoder {
         // stationary frame returns num_env = 1, in which case we delegate
         // to the single-envelope path (which carries the FIXFIX num_env==1
         // Fine clamp the multi-envelope writer does not apply).
-        let (num_env, rows) =
-            self.extract_aspx_lr_multi_env(&aspx_cfg, frame_len, frames[0], frames[1]);
+        let env_prev = if self.b_iframe_global {
+            None
+        } else {
+            self.acpl3_env_prev.clone()
+        };
+        let (num_env, rows) = self.extract_aspx_lr_multi_env(
+            &aspx_cfg,
+            frame_len,
+            frames[0],
+            frames[1],
+            env_prev.as_ref(),
+        );
         // Per-channel real aspx_add_harmonic (§4.2.12.6) for the L / R
         // carriers — carried on the multi-envelope aspx_data_2ch() too.
         let aspx_l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
@@ -3504,14 +3525,21 @@ impl Ac4ImsEncoder {
             );
         }
 
-        // A multi-envelope body was emitted: its last-envelope rows are
-        // not tracked here, so clear the single-envelope P-frame
-        // reference — the next frame emits FREQ (always decodable)
-        // rather than TIME against a stale row. The A-CPL parameter
-        // rows the multi-envelope body transmitted DO advance the
-        // decoder's Pseudocode-121 q_prev, so the encoder-side rows are
-        // reset (unprimed) for the same reason.
-        self.acpl3_env_prev = None;
+        // A multi-envelope body was emitted: its LAST envelope's rows
+        // become the decoder's Pseudocode 80/81 `qscf_*_prev` (the same
+        // sum / pan wire-step domain the single-envelope path tracks),
+        // so the next frame — single- or multi-envelope — may pick
+        // TIME direction against them. The A-CPL parameter rows the
+        // multi-envelope body transmitted DO advance the decoder's
+        // Pseudocode-121 q_prev, but this builder emits them as
+        // DIFF_FREQ without threading the encoder-side reference, so
+        // those rows stay unprimed (next frame emits DIFF_FREQ).
+        self.acpl3_env_prev = Some(crate::encoder_acpl3::Acpl3EnvPrevRows {
+            l_sig: rows.ch0_last_sig.clone(),
+            l_noise: rows.ch0_last_noise.clone(),
+            r_sig: rows.ch1_last_sig.clone(),
+            r_noise: rows.ch1_last_noise.clone(),
+        });
         self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
 
         let mut bw = BitWriter::new();

@@ -6088,6 +6088,17 @@ pub struct AspxMultiEnvelope2chRows {
     pub ch1_sig: Vec<AspxEncodedEnvelope>,
     /// Channel-1 (BALANCE) NOISE envelope rows.
     pub ch1_noise: Vec<AspxEncodedEnvelope>,
+    /// Absolute `qscf` row of the frame's **last** SIGNAL envelope on
+    /// channel 0 (sum domain) — what the decoder's §5.7.6.3.4
+    /// `qscf_sig_prev` holds after this frame, i.e. the next frame's
+    /// leading-envelope TIME reference.
+    pub ch0_last_sig: Vec<i32>,
+    /// Last NOISE envelope row, channel 0 (sum domain).
+    pub ch0_last_noise: Vec<i32>,
+    /// Last SIGNAL envelope row, channel 1 (pan wire-step domain).
+    pub ch1_last_sig: Vec<i32>,
+    /// Last NOISE envelope row, channel 1 (pan wire-step domain).
+    pub ch1_last_noise: Vec<i32>,
 }
 
 /// Build both channels' multi-envelope SIGNAL + NOISE
@@ -6174,7 +6185,18 @@ pub fn build_aspx_multi_envelope_2ch_from_qmf(
     let ch0_noise = dpcm_encode_qscf_envelopes(&sum_noise_q, prev0.noise, delta, force_freq);
     let ch1_sig = dpcm_encode_qscf_envelopes(&pan_sig_q, prev1.sig, delta, force_freq);
     let ch1_noise = dpcm_encode_qscf_envelopes(&pan_noise_q, prev1.noise, delta, force_freq);
+    // The last atsg column of each transmitted matrix is the decoder's
+    // post-frame `qscf_*_prev` reference (Pseudocodes 80 / 81).
+    let last_col = |m: &[Vec<i32>]| -> Vec<i32> {
+        m.iter()
+            .map(|row| row.last().copied().unwrap_or(0))
+            .collect()
+    };
     AspxMultiEnvelope2chRows {
+        ch0_last_sig: last_col(&sum_sig_q),
+        ch0_last_noise: last_col(&sum_noise_q),
+        ch1_last_sig: last_col(&pan_sig_q),
+        ch1_last_noise: last_col(&pan_noise_q),
         ch0_sig,
         ch0_noise,
         ch1_sig,
