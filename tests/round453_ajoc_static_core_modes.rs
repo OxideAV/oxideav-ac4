@@ -221,10 +221,11 @@ fn static_acpl3_core_full_decoding_reconstructs_all_five_objects() {
 fn static_acpl3_core_core_decoding_emits_rendered_downmix() {
     let (energies, channels_out) = gop_energies(DecodingMode::Core, true);
     assert_eq!(channels_out, 6);
-    // Frame 0 is filterbank / interpolation warm-up (the smooth A-CPL
-    // parameter ramp starts from the zero reference); the settled
-    // frames must carry signal on every slot.
-    for (f, e) in energies.iter().enumerate().skip(1) {
+    // Frames 0-1 are warm-up (the smooth A-CPL parameter ramp starts
+    // from the zero reference, and the QMF / decorrelator / IMDCT
+    // overlap chains take another frame to fill); the settled frames
+    // must carry signal on every slot.
+    for (f, e) in energies.iter().enumerate().skip(2) {
         for (c, &v) in e.iter().enumerate() {
             assert!(v > 1e4, "frame {f} slot {c} silent: {e:?}");
         }
