@@ -2020,9 +2020,13 @@ pub fn parse_oamd_common_data(br: &mut BitReader<'_>, bed_has_lfe: bool) -> Resu
     let add_data = if br.read_bit()? {
         let mut add_data_bytes = br.read_u32(1)? + 1;
         if add_data_bytes == 2 {
-            add_data_bytes += variable_bits(br, 2)?;
+            add_data_bytes = add_data_bytes
+                .checked_add(variable_bits(br, 2)?)
+                .ok_or_else(|| Error::invalid("ac4: oamd add_data size overflow"))?;
         }
-        let total = add_data_bytes * 8;
+        let total = add_data_bytes
+            .checked_mul(8)
+            .ok_or_else(|| Error::invalid("ac4: oamd add_data size overflow"))?;
         let start = br.bit_position();
         let trim = parse_trim(br)?;
         let bed_render_info = parse_bed_render_info(br, bed_has_lfe)?;

@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `variable_bits`-derived `oamd extension` / `audio_size` sizes in
   `audio_data_ajoc`, `oamd` and the channel-substream walker now use
   checked arithmetic instead of overflowing.
+  Second-round findings: the ASF Huffman `ext_decode` escape run is
+  bounded (a hostile unary prefix drove the reader past 32 bits and
+  overflowed the `(1 << bits) + ext_val` sum), and the OAMD
+  `add_data` byte count uses checked arithmetic.
 - ac4 round 453 — **multi-envelope P-frame TIME direction** on the
   live 5_X ASPX_ACPL_3 encoder path (§5.7.6.3.4 Pseudocodes 80/81).
   `build_aspx_multi_envelope_2ch_from_qmf` now also returns the frame's

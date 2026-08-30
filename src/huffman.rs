@@ -120,9 +120,16 @@ pub fn ext_decode(br: &mut BitReader<'_>) -> Result<u32> {
         }
         n_ext += 1;
     }
+    // The escape prefix is a unary run; a hostile stream can run it
+    // past the 32-bit reader (and past any representable spectral
+    // value). Bound it so `bits` stays a valid read width and the
+    // `(1 << bits) + ext_val` sum cannot overflow.
+    if n_ext > 20 {
+        return Err(Error::invalid("ac4: ext_decode escape run too long"));
+    }
     let bits = n_ext + 4;
     let ext_val = br.read_u32(bits)?;
-    Ok((1u32 << (n_ext + 4)) + ext_val)
+    Ok((1u32 << bits) + ext_val)
 }
 
 #[cfg(test)]
