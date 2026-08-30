@@ -144,6 +144,22 @@ pub struct Ac4Decoder {
     /// / ducker state, keyed by `b_5fronts`. Allocated on the first
     /// core-mode ASPX_AJCC immersive frame.
     ice_ajcc_core: Option<(bool, crate::ajcc::AjccState, ajcc_synth::AjccCoreSynthState)>,
+    /// User-selected dialogue-enhancement gain G_DE in dB (§5.7.8;
+    /// 0 dB = tool inactive). Set via
+    /// [`Self::set_dialogue_enhancement_gain_db`].
+    de_gain_db: f32,
+    /// §5.7.8.6 dialogue-enhancement application state for the
+    /// immersive route (previous-frame matrices + keep-flag
+    /// inheritance).
+    ice_de_state: crate::de_apply::DeApplyState,
+    /// Sticky `de_config()` for P-frame `dialog_enhancement()` parses
+    /// on the immersive route.
+    ice_prev_de: Option<crate::de::DeConfig>,
+    /// Streaming per-output-slot QMF (analysis, synthesis) pairs for
+    /// the dialogue-enhancement stage — every output channel routes
+    /// through the same filterbank when the tool is active so the
+    /// processed and pass-through channels stay time-aligned.
+    ice_de_qmf: Vec<(qmf::QmfAnalysisBank, qmf::QmfSynthesisBank)>,
 }
 
 /// Per-decoder immersive A-CPL state — see [`Ac4Decoder::ice_acpl`].
@@ -265,6 +281,10 @@ impl Ac4Decoder {
             ice_out_syn: Vec::new(),
             decoding_mode: DecodingMode::Full,
             ice_ajcc_core: None,
+            de_gain_db: 0.0,
+            ice_de_state: crate::de_apply::DeApplyState::new(),
+            ice_prev_de: None,
+            ice_de_qmf: Vec::new(),
         }
     }
 
@@ -279,6 +299,17 @@ impl Ac4Decoder {
     /// The currently selected §4.7 decoding mode.
     pub fn decoding_mode(&self) -> DecodingMode {
         self.decoding_mode
+    }
+
+    /// Select the user dialogue-enhancement gain G_DE in dB
+    /// (ETSI TS 103 190-1 §5.7.8 / TS 103 190-2 §4.8.3.15). The
+    /// decoder clamps it to the bitstream's `Gmax`
+    /// (§4.3.14.3.2) per frame; `0.0` (the default) leaves the tool
+    /// inactive. Applied on the immersive-channel-element route in
+    /// both §4.7 decoding modes when the substream carries a
+    /// `dialog_enhancement()` payload.
+    pub fn set_dialogue_enhancement_gain_db(&mut self, gain_db: f32) {
+        self.de_gain_db = gain_db;
     }
 
     /// Streaming counterpart of [`Self::ice_plain_qmf`] — analyse one
@@ -4087,6 +4118,88 @@ impl Ac4Decoder {
                     samples,
                     tl_ok,
                 )?;
+            }
+        }
+        // §4.8.3.15 dialogue enhancement: the substream continues past
+        // audio_size with metadata(…, sus_ver = 1); parse its
+        // dialog_enhancement() (sticky de_config across P-frames) and
+        // — when the user enabled a gain — apply the part-1 §5.7.8
+        // tool on the Table 15 dialogue channels.
+        let meta_off = (sub.audio_data_offset + sub.audio_size) as usize;
+        let ice_meta = if meta_off < substream.len() {
+            let mut mbr = oxideav_core::bits::BitReader::new(&substream[meta_off..]);
+            crate::metadata::parse_metadata_v2(
+                &mut mbr,
+                mode_desc.ch_mode,
+                b_iframe,
+                false,
+                self.ice_prev_de,
+            )
+            .ok()
+        } else {
+            None
+        };
+        if let Some(cfg) = ice_meta.as_ref().and_then(|m| m.dialog_enhancement.config) {
+            self.ice_prev_de = Some(cfg);
+        }
+        let de_payload = ice_meta
+            .as_ref()
+            .map(|m| &m.dialog_enhancement)
+            .filter(|de| de.data_present && self.de_gain_db > 0.0);
+        if let Some((cfg, data)) =
+            de_payload.and_then(|de| de.config.as_ref().zip(de.data.as_ref()))
+        {
+            let h = crate::de_apply::build_frame_matrices(
+                &mut self.ice_de_state,
+                cfg,
+                data,
+                self.de_gain_db,
+            );
+            // Table 15: the dialogue channels are (L, R, C) — for the
+            // 9.X.4 full-decoding roster the screen channels
+            // (Lscr, Rscr, C) at slots (3, 4, 2); everywhere else
+            // (7.X.4 full, and the 7-channel core roster where the
+            // screen channels fold into the fronts) slots (0, 1, 2).
+            let de_slots: [usize; 3] = if !core_mode && b_5fronts {
+                [3, 4, 2]
+            } else {
+                [0, 1, 2]
+            };
+            // Route EVERY output channel (LFE included) through its
+            // streaming QMF pair so the enhanced and pass-through
+            // channels share the filterbank latency.
+            let total = chans.len() + 1;
+            while self.ice_de_qmf.len() < total {
+                self.ice_de_qmf
+                    .push((qmf::QmfAnalysisBank::new(), qmf::QmfSynthesisBank::new()));
+            }
+            let mut qmats: Vec<Vec<[(f32, f32); qmf::NUM_QMF_SUBBANDS]>> =
+                Vec::with_capacity(chans.len());
+            for (i, ch) in chans.iter().enumerate() {
+                let mut pcm = ch.clone();
+                pcm.resize(n, 0.0);
+                qmats.push(self.ice_de_qmf[i].0.process_block(&pcm));
+            }
+            let mut qa = std::mem::take(&mut qmats[de_slots[0]]);
+            let mut qb = std::mem::take(&mut qmats[de_slots[1]]);
+            let mut qc = std::mem::take(&mut qmats[de_slots[2]]);
+            crate::de_apply::apply_frame_to_qmf(
+                &mut self.ice_de_state,
+                h,
+                &mut [&mut qa, &mut qb, &mut qc],
+            );
+            qmats[de_slots[0]] = qa;
+            qmats[de_slots[1]] = qb;
+            qmats[de_slots[2]] = qc;
+            for (i, q) in qmats.into_iter().enumerate() {
+                chans[i] = self.ice_de_qmf[i].1.process_block(&q);
+            }
+            if let Some(lfe) = lfe_pcm.as_mut() {
+                let slot = chans.len();
+                let mut pcm = lfe.clone();
+                pcm.resize(n, 0.0);
+                let q = self.ice_de_qmf[slot].0.process_block(&pcm);
+                *lfe = self.ice_de_qmf[slot].1.process_block(&q);
             }
         }
         // Interleave to S16.

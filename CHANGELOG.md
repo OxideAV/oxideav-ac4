@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 453 — **dialogue-enhancement application on the immersive
+  route** (TS 103 190-2 §4.8.3.15 Tables 13/15 + TS 103 190-1
+  §5.7.8). New `de_apply` module implements the part-1 application
+  tool — Table 209/210 dequantization, Table 172 mixing coefficients
+  with the energy-preserving rendering vector, the Table 173 QMF →
+  DE-band mapping, channel-independent (incl. the M/S form),
+  cross-channel (`I + g·r·pᵀ`) and the parametric half of the
+  waveform-parametric hybrid, `Gmax` clamping, keep-flag inheritance
+  and the §5.7.8.6 cross-frame matrix interpolation. The decoder
+  gains `set_dialogue_enhancement_gain_db`; the immersive route now
+  parses the substream's post-audio `metadata(…, sus_ver = 1)`
+  (sticky `de_config` across P-frames) and, with a non-zero user
+  gain, applies the tool on the Table 15 dialogue channels in both
+  §4.7 decoding modes (7.X.4 fronts; 9.X.4 screen channels on the
+  full-decoding roster), routing every output channel through
+  streaming QMF pairs so enhanced and pass-through channels stay
+  time-aligned. `encode_ice_raw_frame_with_metadata` writes
+  metadata-carrying immersive frames. New
+  `round453_ice_dialogue_enhancement` suite pins the (1+g)² boost on
+  L/R/C, pass-through elsewhere, and the Gmax clamp.
 - ac4 round 453 — **A-JOC `b_static_dmx` core A-SPX / A-CPL carrier
   synthesis in the object path** (TS 103 190-2 §6.2.3.4 nesting part-1
   §4.2.6.6 Table 25). The channel-based decoder's per-frame render is

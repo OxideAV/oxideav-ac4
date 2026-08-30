@@ -1973,7 +1973,41 @@ pub fn encode_ice_raw_frame(
     body: BitWriter,
 ) -> Result<Vec<u8>> {
     let (code, code_bits) = ice_channel_mode_code(b_lfe, b_5fronts);
-    encode_chan_raw_frame(sequence_counter, code, code_bits, true, b_iframe, body)
+    encode_chan_raw_frame(
+        sequence_counter,
+        code,
+        code_bits,
+        true,
+        b_iframe,
+        body,
+        None,
+    )
+}
+
+/// [`encode_ice_raw_frame`] with trailing substream `metadata(…)`
+/// bytes (TS 103 190-2 §6.2.2.2: the `ac4_substream()` continues past
+/// the announced `audio_size` with `metadata(b_alternative, b_ajoc,
+/// b_audio_ndot, sus_ver = 1)` — e.g. a `dialog_enhancement()`
+/// payload for the §4.8.3.15 tool). The caller provides the
+/// byte-aligned metadata element.
+pub fn encode_ice_raw_frame_with_metadata(
+    sequence_counter: u32,
+    b_lfe: bool,
+    b_5fronts: bool,
+    b_iframe: bool,
+    body: BitWriter,
+    metadata: &[u8],
+) -> Result<Vec<u8>> {
+    let (code, code_bits) = ice_channel_mode_code(b_lfe, b_5fronts);
+    encode_chan_raw_frame(
+        sequence_counter,
+        code,
+        code_bits,
+        true,
+        b_iframe,
+        body,
+        Some(metadata),
+    )
 }
 
 /// [`encode_ice_raw_frame`] for the 22.2 channel mode (Table 78 code
@@ -1983,7 +2017,15 @@ pub fn encode_22_2_raw_frame(
     b_iframe: bool,
     body: BitWriter,
 ) -> Result<Vec<u8>> {
-    encode_chan_raw_frame(sequence_counter, 0b111111110, 9, false, b_iframe, body)
+    encode_chan_raw_frame(
+        sequence_counter,
+        0b111111110,
+        9,
+        false,
+        b_iframe,
+        body,
+        None,
+    )
 }
 
 fn encode_chan_raw_frame(
@@ -1993,6 +2035,7 @@ fn encode_chan_raw_frame(
     presence_fields: bool,
     b_iframe: bool,
     body: BitWriter,
+    metadata: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut bw = BitWriter::new();
     // ---- ac4_toc() (§6.2.1.1) ----
@@ -2063,6 +2106,11 @@ fn encode_chan_raw_frame(
     sw.align_to_byte();
     frame.extend_from_slice(&sw.into_bytes());
     frame.extend_from_slice(&body_bytes);
+    // Post-audio metadata(…) — starts right at audio_data_offset +
+    // audio_size (the substream spans to the frame end).
+    if let Some(meta) = metadata {
+        frame.extend_from_slice(meta);
+    }
     Ok(frame)
 }
 
