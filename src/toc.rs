@@ -475,7 +475,10 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     // bitstream_version: <= 1 takes the TS 103 190-1 `ac4_presentation_info()`
     // path; >= 2 runs `ac4_presentation_v1_info()` per presentation followed
     // by `ac4_substream_group_info()` × `total_n_substream_groups`.
-    let mut presentations = Vec::with_capacity(n_presentations as usize);
+    // n_presentations comes from variable_bits — never pre-size on it
+    // (a hostile count is a multi-gigabyte allocation before the walk
+    // fails on the first missing bit).
+    let mut presentations = Vec::new();
     let mut ajoc_substreams = Vec::new();
     let mut obj_substreams = Vec::new();
     let mut oamd_substreams = Vec::new();
@@ -1383,7 +1386,7 @@ pub fn parse_bed_dyn_obj_assignment(
         } else {
             1
         };
-        let mut assignments = Vec::with_capacity(n_bed_signals as usize);
+        let mut assignments = Vec::with_capacity((n_bed_signals as usize).min(64));
         for _ in 0..n_bed_signals {
             assignments.push(br.read_u32(4)? as u8);
         }
@@ -1443,7 +1446,7 @@ impl AjocSubstreamInfo {
     /// bed).
     pub fn obj_type_dmx(&self) -> Vec<crate::oamd::ObjType> {
         use crate::oamd::ObjType;
-        let mut v = Vec::with_capacity(self.n_dmx_signals() as usize);
+        let mut v = Vec::with_capacity((self.n_dmx_signals() as usize).min(64));
         if self.b_lfe {
             v.push(ObjType::Dyn);
         }
@@ -1458,7 +1461,7 @@ impl AjocSubstreamInfo {
     /// present).
     pub fn obj_type_umx(&self) -> Vec<crate::oamd::ObjType> {
         use crate::oamd::ObjType;
-        let mut v = Vec::with_capacity(self.n_umx_signals() as usize);
+        let mut v = Vec::with_capacity((self.n_umx_signals() as usize).min(64));
         if self.b_lfe {
             v.push(ObjType::Dyn);
         }
@@ -1539,7 +1542,7 @@ pub fn parse_substream_info_ajoc(
         None
     };
     let factor = frame_rate_factor(frame_rate_index, false, 0).max(1);
-    let mut b_audio_ndot = Vec::with_capacity(factor as usize);
+    let mut b_audio_ndot = Vec::with_capacity((factor as usize).min(64));
     for _ in 0..factor {
         b_audio_ndot.push(br.read_bit()?);
     }
@@ -1692,7 +1695,7 @@ pub fn parse_substream_info_obj(
         None
     };
     let factor = frame_rate_factor(frame_rate_index, false, 0).max(1);
-    let mut b_audio_ndot = Vec::with_capacity(factor as usize);
+    let mut b_audio_ndot = Vec::with_capacity((factor as usize).min(64));
     for _ in 0..factor {
         b_audio_ndot.push(br.read_bit()?);
     }

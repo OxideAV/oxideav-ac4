@@ -1,0 +1,39 @@
+[package]
+name = "oxideav-ac4-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-ac4]
+path = ".."
+
+[[bin]]
+name = "decode_packet"
+path = "fuzz_targets/decode_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_toc"
+path = "fuzz_targets/parse_toc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ajoc_substream"
+path = "fuzz_targets/ajoc_substream.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone package: keep the fuzz crate out of the umbrella workspace.
+[workspace]

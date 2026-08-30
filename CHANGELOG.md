@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 453 — **dialogue enhancement on A-JOC object substreams**
+  (TS 103 190-2 §4.8.3.15 Table 14, §5.8.2.3 / §5.8.2.4). Full
+  decoding: Pseudocode 22 `ajoc_de_process` scales the main-dialogue
+  objects' dry / wet rows by `de_gain = 10^(G/20)` inside the
+  Pseudocode 18 reconstruction (`ajoc_reconstruct_de`; the decorrelator
+  pre-matrix follows the unscaled rows). Core decoding:
+  `ajoc_core_de_apply` forms `y = H_M·H_A·x + x` on the downmix QMF
+  signals — `H_A` from the dialogue objects' interpolated dry rows
+  scaled by `10^(G/20) − 1` (Pseudocode 23), `H_M` from the sticky
+  `de_dlg_dmx_coeff` grid interpolated across the frame (Pseudocode
+  24). `ajoc_dmx_de_data()` configuration and coefficients are sticky
+  per §6.3.6.6.1-2 (`b_dmx_de_cfg` / `b_keep_dmx_de_coeffs`), `Gmax`
+  from `de_max_gain`; the object decoder gains
+  `set_dialogue_enhancement_gain_db` (fed from the frame decoder's
+  gain). Writers: `write_ajoc_dmx_de_data` / `write_de_dlg_dmx_coeff_idx`
+  (Table 106) and `encode_ajoc_raw_frame_with_dmx_de` /
+  `write_audio_data_ajoc_simple_with_dmx_de`. New
+  `round453_ajoc_dialogue_enhancement` suite pins the (10^(G/20))²
+  boost on the dialogue object / its downmix channel in both modes,
+  pass-through elsewhere, the Gmax clamp and the P-frame stickiness.
+- ac4 round 453 — **cargo-fuzz sub-crate** (`fuzz/`: `decode_packet`,
+  `parse_toc`, `ajoc_substream` targets + a bounded `Fuzz` workflow)
+  and its first findings fixed: `parse_ac4_toc` pre-sized the
+  presentation vector from the `variable_bits` presentation count (a
+  hostile count → multi-gigabyte allocation before the walk failed;
+  now grown on demand, the other TOC pre-allocations capped), and the
+  `variable_bits`-derived `oamd extension` / `audio_size` sizes in
+  `audio_data_ajoc`, `oamd` and the channel-substream walker now use
+  checked arithmetic instead of overflowing.
 - ac4 round 453 — **multi-envelope P-frame TIME direction** on the
   live 5_X ASPX_ACPL_3 encoder path (§5.7.6.3.4 Pseudocodes 80/81).
   `build_aspx_multi_envelope_2ch_from_qmf` now also returns the frame's

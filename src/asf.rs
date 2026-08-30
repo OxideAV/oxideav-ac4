@@ -3628,7 +3628,10 @@ pub fn walk_ac4_substream_sticky(
     let audio_size_short = br.read_u32(15)?;
     let b_more_bits = br.read_bit()?;
     let audio_size = if b_more_bits {
-        audio_size_short + (variable_bits(&mut br, 7)? << 15)
+        variable_bits(&mut br, 7)?
+            .checked_shl(15)
+            .and_then(|hi| hi.checked_add(audio_size_short))
+            .ok_or_else(|| Error::invalid("ac4: audio_size overflow"))?
     } else {
         audio_size_short
     };

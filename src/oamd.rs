@@ -1179,7 +1179,10 @@ pub fn parse_oamd_dyndata_single(
                 }
             }
             let additional = if br.read_bit()? {
-                let total = (variable_bits(br, 2)? + 1) * 8;
+                let total = variable_bits(br, 2)?
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(8))
+                    .ok_or_else(|| Error::invalid("ac4: oamd extension size overflow"))?;
                 let start = br.bit_position();
                 // ext_prec_alt_pos(n_objs, b_keep, obj_type, b_lfe).
                 let mut per_obj = Vec::with_capacity(n_objs);

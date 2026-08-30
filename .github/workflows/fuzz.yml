@@ -1,0 +1,32 @@
+name: Fuzz
+
+# Bounded libFuzzer smoke over the crate's fuzz/ sub-crate: every
+# target builds and runs for a short budget on each push / PR so a
+# core-API drift in fuzz/ (which resolves oxideav-core independently)
+# or a fresh crash surfaces on CI rather than at the next long run.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        run: cargo fuzz build --fuzz-dir fuzz
+      - name: Run each target (bounded)
+        run: |
+          for t in $(cargo fuzz list --fuzz-dir fuzz); do
+            cargo fuzz run --fuzz-dir fuzz "$t" -- -max_total_time=120 -max_len=16384 -rss_limit_mb=2048
+          done
