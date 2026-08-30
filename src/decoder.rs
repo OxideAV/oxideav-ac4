@@ -3421,7 +3421,11 @@ impl Ac4Decoder {
             ));
         }
         let core_mode = self.decoding_mode == DecodingMode::Core;
+        let de_gain_db = self.de_gain_db;
         let dec = &mut self.ajoc_dec.as_mut().expect("ajoc decoder ensured").2;
+        // §4.8.3.15 Table 14 (b_ajoc = true): §5.8.2.3 / §5.8.2.4
+        // dialogue enhancement on the object substream.
+        dec.set_dialogue_enhancement_gain_db(de_gain_db);
         // §4.8.2 step 4: the A-JOC tool applies to full decoding only
         // — in core decoding mode the substream renders its downmix
         // signal set (described by the first OAMD portion, §4.8.3.4)

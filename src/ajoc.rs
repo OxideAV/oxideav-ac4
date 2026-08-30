@@ -678,6 +678,153 @@ fn pre_matrix_param(
     pre
 }
 
+/// TS 103 190-2 §5.8.2.4 — dialogue enhancement for **core decoding**
+/// of A-JOC content, applied in place on the downmix QMF signals
+/// `x[ts][sb][ch]`:
+///
+/// ```text
+///   y_ch(ts, sb) = Σ_dlg H_M(ts, sb)[ch][dlg] · (H_A(ts, sb)[dlg] · x(ts, sb)) + x_ch(ts, sb)
+/// ```
+///
+/// `H_A` (Pseudocode 23) is the interpolated dry matrix of the
+/// main-dialogue objects (`dlg_idx`) — the same §5.7.3.4 interpolators
+/// the full path steps, on `state` — with the rows scaled by the
+/// core-decoding `de_gain = 10^(G/20) − 1` (Pseudocode 22 applied to
+/// mtx_dry); `H_M` (Pseudocode 24) is the per-subband
+/// `de_dlg_dmx_coeff[dlg][ch]` grid, interpolated over the frame
+/// between the previous frame's `H'_M` (`h_m_prev`) and this frame's
+/// (`h_m_cur`) with weight `(ts+1) / num_qmf_timeslots`. Missing
+/// coefficient rows read as zero (no contribution).
+#[allow(clippy::too_many_arguments)]
+pub fn ajoc_core_de_apply(
+    x: &mut [Vec<Vec<Cplx>>],
+    matrices: &AjocDequantMatrices,
+    data_point_info: &AjocDataPointInfo,
+    geom: &AjocGeometry,
+    state: &mut AjocReconState,
+    dlg_idx: &[u32],
+    de_gain: f64,
+    h_m_prev: &[Vec<f64>],
+    h_m_cur: &[Vec<f64>],
+) {
+    if dlg_idx.is_empty() || de_gain <= 0.0 {
+        return;
+    }
+    let num_dp = data_point_info.num_dpoints.max(1) as usize;
+    let start_pos = &data_point_info.start_pos;
+    let ramp_len = &data_point_info.ramp_len;
+    let num_ts = geom.num_timeslots.min(x.len());
+    let coef = |grid: &[Vec<f64>], d: usize, ch: usize| -> f64 {
+        grid.get(d).and_then(|r| r.get(ch)).copied().unwrap_or(0.0)
+    };
+    for (ts, x_ts) in x.iter_mut().enumerate().take(num_ts) {
+        let w = (ts as f64 + 1.0) / geom.num_timeslots.max(1) as f64;
+        for (sb, x_col) in x_ts.iter_mut().enumerate().take(geom.num_subbands) {
+            // a[d] = de_gain · Σ_ch mtx_dry[dlg][ch] · x[ch]
+            let mut a: Vec<Cplx> = Vec::with_capacity(dlg_idx.len());
+            for &o in dlg_idx {
+                let o = o as usize;
+                let nb = matrices.num_bands.get(o).copied().unwrap_or(0);
+                let mut acc = (0.0f64, 0.0f64);
+                for ch in 0..geom.num_dmx {
+                    let targets: Vec<f64> = (0..num_dp)
+                        .map(|dp| {
+                            matrices
+                                .dry_dq
+                                .get(o)
+                                .and_then(|d| d.get(dp))
+                                .and_then(|d| d.get(ch))
+                                .map(|row| band_value(row, sb, nb))
+                                .unwrap_or(0.0)
+                        })
+                        .collect();
+                    let m = match state.dry.get_mut(o).and_then(|r| r.get_mut(ch)) {
+                        Some(row) if sb < row.len() => {
+                            row[sb].step(ts as u32, &targets, start_pos, ramp_len)
+                        }
+                        _ => 0.0,
+                    };
+                    let xc = x_col.get(ch).copied().unwrap_or((0.0, 0.0));
+                    acc.0 += m * xc.0;
+                    acc.1 += m * xc.1;
+                }
+                a.push((acc.0 * de_gain, acc.1 * de_gain));
+            }
+            for (ch, xc) in x_col.iter_mut().enumerate().take(geom.num_dmx) {
+                let mut add = (0.0f64, 0.0f64);
+                for (d, ad) in a.iter().enumerate() {
+                    let h = (1.0 - w) * coef(h_m_prev, d, ch) + w * coef(h_m_cur, d, ch);
+                    add.0 += h * ad.0;
+                    add.1 += h * ad.1;
+                }
+                xc.0 += add.0;
+                xc.1 += add.1;
+            }
+        }
+        // Table 49 end-of-time-slot ramp re-arm on the interpolators
+        // this pass stepped (the dialogue objects' dry rows).
+        for &o in dlg_idx {
+            if let Some(rows) = state.dry.get_mut(o as usize) {
+                for row in rows.iter_mut() {
+                    for interp in row.iter_mut() {
+                        interp.end_of_slot(ts as u32, start_pos, ramp_len);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Write one `de_dlg_dmx_coeff_idx` (§6.3.6.6.4 Table 106) from its
+/// index `k` in `0..=15` (`k/15` is the coefficient): `0` → `0`,
+/// `15` → `1111`, otherwise `1` + 4 bits of `k − 1`. The exact inverse
+/// of [`read_de_dlg_dmx_coeff`].
+pub fn write_de_dlg_dmx_coeff_idx(bw: &mut oxideav_core::bits::BitWriter, k: u32) {
+    match k {
+        0 => bw.write_bit(false),
+        15.. => bw.write_u32(0b1111, 4),
+        k => {
+            bw.write_bit(true);
+            bw.write_u32(k - 1, 4);
+        }
+    }
+}
+
+/// Write `ajoc_dmx_de_data(num_dmx_signals, num_umx_signals)`
+/// (§6.2.3.5) — the inverse of [`parse_ajoc_dmx_de_data`]. The
+/// coefficient grid is emitted from `de_dlg_dmx_coeff` (values on the
+/// `k/15` grid, rounded to the nearest index) when
+/// `keep_dmx_de_coeffs == false`, one row per main-dialogue object of
+/// `de_main_dlg_mask`.
+pub fn write_ajoc_dmx_de_data(
+    bw: &mut oxideav_core::bits::BitWriter,
+    de: &AjocDmxDeData,
+    num_dmx_signals: u32,
+    num_umx_signals: u32,
+) {
+    bw.write_bit(de.dmx_de_cfg);
+    bw.write_bit(de.keep_dmx_de_coeffs);
+    if de.dmx_de_cfg {
+        bw.write_u32(de.de_max_gain & 3, 2);
+        bw.write_u32(de.de_main_dlg_mask, num_umx_signals);
+    }
+    if !de.keep_dmx_de_coeffs {
+        let (num_dlg_obj, _) = dlg_obj(de.de_main_dlg_mask, num_umx_signals);
+        for dio in 0..num_dlg_obj as usize {
+            for dmxo in 0..num_dmx_signals as usize {
+                let v = de
+                    .de_dlg_dmx_coeff
+                    .get(dio)
+                    .and_then(|r| r.get(dmxo))
+                    .copied()
+                    .unwrap_or(0.0);
+                let k = (v.clamp(0.0, 1.0) * 15.0).round() as u32;
+                write_de_dlg_dmx_coeff_idx(bw, k);
+            }
+        }
+    }
+}
+
 /// Per-track target value for a given parameter band, ungrouped to a QMF
 /// subband via [`sb_to_pb`]. Returns 0 when the band is out of range.
 fn band_value(row: &[f64], sb: usize, num_bands: u32) -> f64 {
@@ -710,6 +857,55 @@ pub fn ajoc_reconstruct(
     geom: &AjocGeometry,
     state: &mut AjocReconState,
 ) -> Vec<Vec<Vec<Cplx>>> {
+    ajoc_reconstruct_de(
+        x,
+        matrices,
+        data_point_info,
+        object_present,
+        geom,
+        state,
+        None,
+    )
+}
+
+/// TS 103 190-2 §5.8.2.3 Pseudocode 22 `ajoc_de_process()`: scale the
+/// dry and wet matrix rows of the main-dialogue objects (`dlg_idx`,
+/// from [`dlg_obj`]) by `de_gain` — the full-decoding dialogue
+/// enhancement. Per the pseudocode's guard the scaling applies only
+/// when `de_gain > 1`.
+pub fn ajoc_de_process(matrices: &mut AjocDequantMatrices, dlg_idx: &[u32], de_gain: f64) {
+    if de_gain <= 1.0 {
+        return;
+    }
+    for &o in dlg_idx {
+        let o = o as usize;
+        if let Some(dry) = matrices.dry_dq.get_mut(o) {
+            for v in dry.iter_mut().flatten().flatten() {
+                *v *= de_gain;
+            }
+        }
+        if let Some(wet) = matrices.wet_dq.get_mut(o) {
+            for v in wet.iter_mut().flatten().flatten() {
+                *v *= de_gain;
+            }
+        }
+    }
+}
+
+/// [`ajoc_reconstruct`] with the §5.8.2.3 dialogue-enhancement hook
+/// of Pseudocode 18: `de = Some((dlg_idx, de_gain))` runs
+/// [`ajoc_de_process`] on the dequantized matrices **after** the
+/// decorrelator pre-matrix parameters are formed (they follow the
+/// unscaled matrices) and before the interpolation / reconstruction.
+pub fn ajoc_reconstruct_de(
+    x: &[Vec<Vec<Cplx>>],
+    matrices: &AjocDequantMatrices,
+    data_point_info: &AjocDataPointInfo,
+    object_present: &[bool],
+    geom: &AjocGeometry,
+    state: &mut AjocReconState,
+    de: Option<(&[u32], f64)>,
+) -> Vec<Vec<Vec<Cplx>>> {
     let num_dp = data_point_info.num_dpoints.max(1) as usize;
     let start_pos = &data_point_info.start_pos;
     let ramp_len = &data_point_info.ramp_len;
@@ -721,6 +917,20 @@ pub fn ajoc_reconstruct(
     let pre_param: Vec<Vec<Vec<Vec<f64>>>> = (0..num_dp)
         .map(|dp| pre_matrix_param(matrices, dp, geom, max_bands))
         .collect();
+
+    // §5.8.2.3: b_ajoc_de_process → ajoc_de_process() on the matrices
+    // feeding the interpolation (the pre-matrix parameters above stay
+    // on the unscaled matrices, as in Pseudocode 18).
+    let de_scaled: AjocDequantMatrices;
+    let matrices: &AjocDequantMatrices = match de {
+        Some((dlg_idx, de_gain)) if de_gain > 1.0 && !dlg_idx.is_empty() => {
+            let mut m = matrices.clone();
+            ajoc_de_process(&mut m, dlg_idx, de_gain);
+            de_scaled = m;
+            &de_scaled
+        }
+        _ => matrices,
+    };
 
     // Build per-track target arrays (target per data point) addressed by
     // QMF subband. For each `(o, ch, sb)` the dry target at data point dp

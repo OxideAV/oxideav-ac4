@@ -434,7 +434,10 @@ pub fn parse_audio_data_ajoc_with_static_sticky(
     }
     // b_oamd_extension_present — the envelope embeds ajoc_bed_info().
     let oamd_extension = if !params.b_static_dmx && br.read_bit()? {
-        let total = (variable_bits(br, 3)? + 1) * 8;
+        let total = variable_bits(br, 3)?
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(8))
+            .ok_or_else(|| Error::invalid("ac4: oamd extension size overflow"))?;
         let start = br.bit_position();
         let bed_info = parse_ajoc_bed_info(br)?;
         let used = (br.bit_position() - start) as u32;
@@ -655,6 +658,16 @@ pub struct AjocSubstreamDecoder {
     /// I-frame-sticky configuration of the `b_static_dmx` core
     /// (Table 25 gates `aspx_config` / `acpl_config_*` on I-frames).
     static_sticky: crate::asf::StickyConfig,
+    /// User dialogue-enhancement gain G_DE in dB (0 = inactive) —
+    /// §5.8.2.3 (full) / §5.8.2.4 (core) on this object substream.
+    de_gain_db: f32,
+    /// Sticky `ajoc_dmx_de_data()` configuration `(de_max_gain,
+    /// de_main_dlg_mask)` — carried while `b_dmx_de_cfg == 0`.
+    dmx_de_cfg: Option<(u32, u32)>,
+    /// Sticky `de_dlg_dmx_coeff[dlg][ch]` grid (`b_keep_dmx_de_coeffs`).
+    dmx_de_coeff: Vec<Vec<f64>>,
+    /// Previous frame's `H'_M` for the §5.8.2.4 interpolation.
+    h_m_prev: Vec<Vec<f64>>,
 }
 
 impl AjocSubstreamDecoder {
@@ -682,6 +695,10 @@ impl AjocSubstreamDecoder {
             core_synthesis: Vec::new(),
             static_core: None,
             static_sticky: crate::asf::StickyConfig::default(),
+            de_gain_db: 0.0,
+            dmx_de_cfg: None,
+            dmx_de_coeff: Vec::new(),
+            h_m_prev: Vec::new(),
         }
     }
 
@@ -689,6 +706,39 @@ impl AjocSubstreamDecoder {
     /// [`parse_audio_data_ajoc`] directly).
     pub fn diff_state_mut(&mut self) -> &mut AjocDiffState {
         &mut self.diff_state
+    }
+
+    /// Select the user dialogue-enhancement gain G_DE in dB (TS 103
+    /// 190-2 §5.8.2.3 / §5.8.2.4): clamped per frame to the
+    /// substream's `de_max_gain` (`ajoc_dmx_de_data()`), applied to the
+    /// main-dialogue objects of `de_main_dlg_flag[]`. `0.0` leaves the
+    /// tool inactive.
+    pub fn set_dialogue_enhancement_gain_db(&mut self, gain_db: f32) {
+        self.de_gain_db = gain_db;
+    }
+
+    /// Fold this frame's `ajoc_dmx_de_data()` into the sticky
+    /// configuration / coefficient grid (§6.3.6.6.1-2) and resolve the
+    /// active dialogue set: `(dlg_idx, Gmax_dB)`, or `None` when no
+    /// configuration is known or the user gain is off.
+    fn resolve_dmx_de(&mut self, ajoc: &AudioDataAjoc) -> Option<(Vec<u32>, f32)> {
+        let de = &ajoc.dmx_de;
+        if de.dmx_de_cfg {
+            self.dmx_de_cfg = Some((de.de_max_gain, de.de_main_dlg_mask));
+        }
+        if (!de.keep_dmx_de_coeffs || de.dmx_de_cfg) && !de.de_dlg_dmx_coeff.is_empty() {
+            self.dmx_de_coeff = de.de_dlg_dmx_coeff.clone();
+        }
+        if self.de_gain_db <= 0.0 {
+            return None;
+        }
+        let (max_gain, mask) = self.dmx_de_cfg?;
+        let (_, dlg_idx) = crate::ajoc::dlg_obj(mask, self.num_umx as u32);
+        if dlg_idx.is_empty() {
+            return None;
+        }
+        // Gmax from de_max_gain (§4.3.14.3.2 form: (v + 1) · 3 dB).
+        Some((dlg_idx, (max_gain as f32 + 1.0) * 3.0))
     }
 
     fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
@@ -779,14 +829,22 @@ impl AjocSubstreamDecoder {
         if !state_matches {
             self.recon = Some((geom, crate::ajoc::AjocReconState::new(&geom)));
         }
+        // §5.8.2.3: full-decoding dialogue enhancement scales the
+        // main-dialogue objects' matrices by de_gain = 10^(G/20)
+        // (G clamped to Gmax).
+        let de = self.resolve_dmx_de(ajoc).map(|(idx, gmax)| {
+            let g = self.de_gain_db.min(gmax);
+            (idx, 10f64.powf(g as f64 / 20.0))
+        });
         let recon = &mut self.recon.as_mut().expect("recon state just ensured").1;
-        let z = crate::ajoc::ajoc_reconstruct(
+        let z = crate::ajoc::ajoc_reconstruct_de(
             &x,
             &frame.matrices,
             &frame.ctrl.data_point_info,
             &frame.ctrl.object_present,
             &geom,
             recon,
+            de.as_ref().map(|(idx, g)| (idx.as_slice(), *g)),
         );
         // 4. QMF-synthesise each object.
         let mut out = Vec::with_capacity(self.num_umx);
@@ -829,6 +887,79 @@ impl AjocSubstreamDecoder {
                 .push(crate::qmf::QmfSynthesisBank::new());
         }
         let inv_scale = 1.0 / crate::aspx::ASPX_QMF_PCM_SCALE;
+        // §5.8.2.4: core-decoding dialogue enhancement — every downmix
+        // channel enters the QMF domain, the main-dialogue objects'
+        // (de_gain-scaled, interpolated) dry rows form H_A, the sticky
+        // de_dlg_dmx_coeff grid forms the interpolated H_M, and
+        // y = H_M·H_A·x + x is synthesised back per channel.
+        if let Some((dlg_idx, gmax)) = self.resolve_dmx_de(ajoc) {
+            let de_gain = 10f64.powf(self.de_gain_db.min(gmax) as f64 / 20.0) - 1.0;
+            let mut x = vec![vec![vec![(0.0f64, 0.0f64); self.num_dmx]; num_sb]; num_ts];
+            let inv64 = inv_scale as f64;
+            for (ch, slot) in ext.iter().enumerate() {
+                if let Some((q, _, _)) = slot {
+                    for (ts, x_ts) in x.iter_mut().enumerate().take(num_ts) {
+                        for (sb, row) in q.iter().enumerate().take(num_sb) {
+                            let (re, im) = row.get(ts).copied().unwrap_or((0.0, 0.0));
+                            x_ts[sb][ch] = (re as f64 * inv64, im as f64 * inv64);
+                        }
+                    }
+                } else {
+                    let slots = self.analysis[ch].process_block(&pcm_dmx[ch]);
+                    for (ts, slot) in slots.iter().take(num_ts).enumerate() {
+                        for (sb, &(re, im)) in slot.iter().enumerate() {
+                            x[ts][sb][ch] = (re as f64, im as f64);
+                        }
+                    }
+                }
+            }
+            let frame = &ajoc.ajoc_frame;
+            let geom = crate::ajoc::AjocGeometry {
+                num_dmx: self.num_dmx,
+                num_umx: self.num_umx,
+                num_decorr: frame.num_decorr as usize,
+                num_timeslots: num_ts,
+                num_subbands: num_sb,
+            };
+            let state_matches = matches!(
+                &self.recon,
+                Some((g, _)) if g.num_dmx == geom.num_dmx
+                    && g.num_umx == geom.num_umx
+                    && g.num_decorr == geom.num_decorr
+                    && g.num_subbands == geom.num_subbands
+            );
+            if !state_matches {
+                self.recon = Some((geom, crate::ajoc::AjocReconState::new(&geom)));
+            }
+            let recon = &mut self.recon.as_mut().expect("recon state just ensured").1;
+            let h_m_cur = self.dmx_de_coeff.clone();
+            crate::ajoc::ajoc_core_de_apply(
+                &mut x,
+                &frame.matrices,
+                &frame.ctrl.data_point_info,
+                &geom,
+                recon,
+                &dlg_idx,
+                de_gain,
+                &self.h_m_prev,
+                &h_m_cur,
+            );
+            self.h_m_prev = h_m_cur;
+            let mut out = Vec::with_capacity(self.num_dmx);
+            for ch in 0..self.num_dmx {
+                let mut pcm = Vec::with_capacity(num_ts * num_sb);
+                for x_ts in x.iter().take(num_ts) {
+                    let mut col = [(0.0f32, 0.0f32); crate::qmf::NUM_QMF_SUBBANDS];
+                    for (sb, s) in col.iter_mut().enumerate() {
+                        let (re, im) = x_ts[sb][ch];
+                        *s = (re as f32, im as f32);
+                    }
+                    pcm.extend_from_slice(&self.core_synthesis[ch].process_slot(&col));
+                }
+                out.push(pcm);
+            }
+            return Ok((out, lfe_pcm));
+        }
         let mut out = Vec::with_capacity(self.num_dmx);
         for (ch, slot) in ext.into_iter().enumerate() {
             match slot {
@@ -1169,7 +1300,10 @@ impl AjocSubstreamDecoder {
         // §6.2.2.2: audio_size_value (15) + b_more_bits escape.
         let mut audio_size = br.read_u32(15)?;
         if br.read_bit()? {
-            audio_size += variable_bits(&mut br, 7)? << 15;
+            audio_size = variable_bits(&mut br, 7)?
+                .checked_shl(15)
+                .and_then(|hi| hi.checked_add(audio_size))
+                .ok_or_else(|| Error::invalid("ac4: audio_size overflow"))?;
         }
         br.align_to_byte();
         let audio_start = br.byte_position();
@@ -1503,6 +1637,41 @@ pub fn write_audio_data_ajoc_simple(
     b_iframe: bool,
     enc_state: &mut AjocDiffState,
 ) -> Result<()> {
+    write_audio_data_ajoc_simple_with_dmx_de(
+        bw,
+        params,
+        dmx_spectra,
+        lfe,
+        transform_length,
+        max_sfb,
+        num_decorr,
+        ctrl,
+        qmats,
+        b_iframe,
+        enc_state,
+        None,
+    )
+}
+
+/// [`write_audio_data_ajoc_simple`] with an explicit
+/// `ajoc_dmx_de_data()` payload (§6.2.3.5) — the main-dialogue object
+/// flags, `de_max_gain` and the dialogue downmix coefficient grid the
+/// §5.8.2.3 / §5.8.2.4 dialogue-enhancement tools consume.
+#[allow(clippy::too_many_arguments)]
+pub fn write_audio_data_ajoc_simple_with_dmx_de(
+    bw: &mut BitWriter,
+    params: &AjocBodyParams,
+    dmx_spectra: &[&[f32]],
+    lfe: Option<(&[f32], u32)>,
+    transform_length: u32,
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+    dmx_de: Option<&crate::ajoc::AjocDmxDeData>,
+) -> Result<()> {
     if params.b_static_dmx {
         return Err(Error::invalid(
             "ac4: SIMPLE audio_data_ajoc writer covers the dynamic form",
@@ -1520,7 +1689,9 @@ pub fn write_audio_data_ajoc_simple(
     bw.write_bit(false);
     write_var_channel_element_simple_lfe(bw, lfe, dmx_spectra, transform_length, max_sfb)?;
     write_ajoc_dyn_oamd_mid(bw, params, b_iframe)?;
-    write_ajoc_tail(bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state)
+    write_ajoc_tail_de(
+        bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state, dmx_de,
+    )
 }
 
 /// Dynamic-form middle section of `audio_data_ajoc()`: `b_dmx_timing`
@@ -1560,11 +1731,41 @@ fn write_ajoc_tail(
     b_iframe: bool,
     enc_state: &mut AjocDiffState,
 ) -> Result<()> {
+    write_ajoc_tail_de(
+        bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state, None,
+    )
+}
+
+/// [`write_ajoc_tail`] with an explicit `ajoc_dmx_de_data()` payload
+/// (`None` → the inactive `b_dmx_de_cfg = 0, b_keep_dmx_de_coeffs = 1`
+/// form).
+#[allow(clippy::too_many_arguments)]
+fn write_ajoc_tail_de(
+    bw: &mut BitWriter,
+    params: &AjocBodyParams,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+    dmx_de: Option<&crate::ajoc::AjocDmxDeData>,
+) -> Result<()> {
     // ajoc().
     crate::encoder_ajoc::encode_ajoc(bw, num_decorr, ctrl, qmats, b_iframe, enc_state)?;
-    // ajoc_dmx_de_data(): b_dmx_de_cfg = 0, b_keep_dmx_de_coeffs = 1.
-    bw.write_bit(false);
-    bw.write_bit(true);
+    // ajoc_dmx_de_data().
+    match dmx_de {
+        Some(de) => crate::ajoc::write_ajoc_dmx_de_data(
+            bw,
+            de,
+            params.n_fullband_dmx_signals,
+            params.n_fullband_upmix_signals,
+        ),
+        None => {
+            // b_dmx_de_cfg = 0, b_keep_dmx_de_coeffs = 1.
+            bw.write_bit(false);
+            bw.write_bit(true);
+        }
+    }
     // b_umx_timing = 0, b_derive_timing_from_dmx = 1.
     bw.write_bit(false);
     bw.write_bit(true);
@@ -2012,6 +2213,47 @@ pub fn encode_ajoc_raw_frame(
         enc_state,
     )?;
     frame.extend_from_slice(&substream);
+    Ok(frame)
+}
+
+/// [`encode_ajoc_raw_frame`] with an explicit `ajoc_dmx_de_data()`
+/// payload (see [`write_audio_data_ajoc_simple_with_dmx_de`]).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ajoc_raw_frame_with_dmx_de(
+    sequence_counter: u32,
+    params: &AjocBodyParams,
+    dmx_spectra: &[&[f32]],
+    lfe: Option<(&[f32], u32)>,
+    max_sfb: u32,
+    num_decorr: u32,
+    ctrl: &crate::ajoc::AjocCtrlInfo,
+    qmats: &crate::encoder_ajoc::AjocQuantMatrices,
+    b_iframe: bool,
+    enc_state: &mut AjocDiffState,
+    dmx_de: Option<&crate::ajoc::AjocDmxDeData>,
+) -> Result<Vec<u8>> {
+    if params.b_static_dmx {
+        return Err(Error::invalid(
+            "ac4: frame writer covers the dynamic A-JOC form",
+        ));
+    }
+    let mut frame = write_ajoc_toc(sequence_counter, params, b_iframe)?;
+    let mut body = BitWriter::new();
+    write_audio_data_ajoc_simple_with_dmx_de(
+        &mut body,
+        params,
+        dmx_spectra,
+        lfe,
+        1920,
+        max_sfb,
+        num_decorr,
+        ctrl,
+        qmats,
+        b_iframe,
+        enc_state,
+        dmx_de,
+    )?;
+    frame.extend_from_slice(&wrap_ajoc_substream(body)?);
     Ok(frame)
 }
 
