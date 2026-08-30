@@ -2049,6 +2049,1309 @@ impl Ac4Decoder {
         }
     }
 
+    /// Render the walked channel-based substream (`self.last_substream`)
+    /// to per-channel PCM: IMDCT + overlap-add, the A-SPX / A-CPL /
+    /// SSF / SAP tool chains and the 5_X / 7_X coding-config
+    /// dispatch. `channels` is the output slot count, `samples` the
+    /// rendered frame length and `frame_len_base` the TOC
+    /// `frame_length` at the base sample rate. Shared by the
+    /// channel-based frame path and the A-JOC `b_static_dmx` core (the
+    /// 5.X core of an object substream renders through the same
+    /// pipeline; see [`Self::render_static_5x_tools`]).
+    pub(crate) fn render_channel_substream(
+        &mut self,
+        channels: u16,
+        samples: u32,
+        frame_len_base: u32,
+    ) -> Vec<Option<Vec<i16>>> {
+        // If we have scaled spectra for the substream, run IMDCT + OLA
+        // and produce real PCM. Per-channel PCM buffers live in
+        // `pcm_per_channel`; the interleaver below lays them out to the
+        // frame's channel count. Any channel without decoded spectra
+        // stays silent. We detach the per-channel inputs from
+        // `last_substream` up front so the IMDCT step can mutate
+        // `self.overlap` without a borrow conflict.
+        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
+        // Detach the inputs + the ASPX tables once so we can run IMDCT
+        // (which mutates overlap state) and the ASPX extension without
+        // a borrow conflict on self.
+        // Detach A-CPL config + parsed data so the synth call below
+        // doesn't conflict with the immutable borrow of `last_substream`
+        // when we later mutate decoder state.
+        let acpl_active_cfg = self.last_substream.as_ref().and_then(|sub| {
+            sub.tools
+                .acpl_config_1ch_full
+                .or(sub.tools.acpl_config_1ch_partial)
+        });
+        let acpl_active_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_1ch.clone());
+        // Detach SSF data so we can run §5.2.3-5.2.7 synthesis without
+        // a borrow conflict on `self`. SSF substreams are mutually
+        // exclusive with ASF on a per-channel basis (per
+        // `spec_frontend`), so when these are populated the IMDCT input
+        // for that channel comes from `synthesize_ssf_data` instead of
+        // the ASF Huffman path.
+        let ssf_primary = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.ssf_data_primary.clone());
+        let ssf_secondary = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.ssf_data_secondary.clone());
+        // Detach 5_X ASPX_ACPL_3 synthesis inputs: two carrier spectra
+        // land on scaled_spec_primary / scaled_spec_secondary (via the
+        // stereo body walker), centre from cfg0_centre_mono, and the
+        // A-CPL parameter pair from acpl_config_2ch / acpl_data_2ch.
+        // Only populated when five_x_mode == AspxAcpl3.
+        let five_x_acpl3_active = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                matches!(
+                    sub.tools.five_x_mode,
+                    Some(crate::mch::FiveXCodecMode::AspxAcpl3)
+                ) && sub.tools.acpl_config_2ch.is_some()
+                    && sub.tools.acpl_data_2ch.is_some()
+                    && sub.tools.scaled_spec_primary.is_some()
+                    && sub.tools.scaled_spec_secondary.is_some()
+            })
+            .unwrap_or(false);
+        let five_x_acpl3_cfg = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_config_2ch);
+        let five_x_acpl3_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_2ch.clone());
+        // Detach 5_X ASPX_ACPL_1 / ASPX_ACPL_2 synthesis inputs
+        // (Pseudocode 117). The active acpl_config_1ch is one of:
+        //   - acpl_config_1ch_partial (ASPX_ACPL_1 — surround Ls/Rs
+        //     carriers come from extra mono carriers; here we silence
+        //     them as placeholders since the standalone Ls/Rs decode
+        //     path isn't fleshed out yet).
+        //   - acpl_config_1ch_full   (ASPX_ACPL_2 — no surround carriers).
+        // The two `acpl_data_1ch_pair[]` entries drive the L-side
+        // (alpha_1/beta_1) and R-side (alpha_2/beta_2) ACplModule's.
+        let five_x_pair_mode: Option<acpl_synth::Acpl5xPairMode> = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| match sub.tools.five_x_mode {
+                Some(crate::mch::FiveXCodecMode::AspxAcpl1) => {
+                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl1)
+                }
+                Some(crate::mch::FiveXCodecMode::AspxAcpl2) => {
+                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl2)
+                }
+                _ => None,
+            });
+        let five_x_pair_cfg =
+            self.last_substream
+                .as_ref()
+                .and_then(|sub| match sub.tools.five_x_mode {
+                    Some(crate::mch::FiveXCodecMode::AspxAcpl1) => {
+                        sub.tools.acpl_config_1ch_partial
+                    }
+                    Some(crate::mch::FiveXCodecMode::AspxAcpl2) => sub.tools.acpl_config_1ch_full,
+                    _ => None,
+                });
+        let five_x_pair_data_1 = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_1ch_pair[0].clone());
+        let five_x_pair_data_2 = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_1ch_pair[1].clone());
+        let five_x_pair_active = five_x_pair_mode.is_some()
+            && five_x_pair_cfg.is_some()
+            && five_x_pair_data_1.is_some()
+            && five_x_pair_data_2.is_some();
+        // Round 37: detach the parsed `cfg0_centre_mono` payload (Cfg0
+        // trailing `mono_data(0)`) for the 5_X pair / 7_X pair paths so
+        // we can IMDCT its `scaled_spec` into a real centre carrier
+        // (replacing the silence-placeholder used in round 36). For
+        // ACPL_3 the centre is also pulled from the same source. The
+        // detach is a clone so the substream tools borrow can be
+        // released before we mutate decoder IMDCT state.
+        let cfg0_centre_mono = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg0_centre_mono.clone());
+        // Round 38 / 39: detach the 5_X SIMPLE/ASPX `coding_config`
+        // payloads so we can drive end-to-end multichannel decode.
+        // Round 38 wired Cfg2 (four_channel_data + cfg2_back_mono);
+        // round 39 adds Cfg0 (b_2ch_mode + 2x two_channel_data +
+        // cfg0_centre_mono), Cfg1 (three_channel_data + two_channel_data),
+        // and Cfg3 (five_channel_data). Each helper computes its own
+        // gating; we just detach the inputs once.
+        let five_x_simple_aspx_active = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                matches!(
+                    sub.tools.five_x_mode,
+                    Some(crate::mch::FiveXCodecMode::Simple)
+                        | Some(crate::mch::FiveXCodecMode::Aspx)
+                )
+            })
+            .unwrap_or(false);
+        let five_x_coding_cfg = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.five_x_coding_config);
+        let cfg2_four_channel_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.four_channel_data.clone());
+        let cfg2_back_mono = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg2_back_mono.clone());
+        // Round 41: 5_X SIMPLE/ASPX cfg2 ASPX trailer detach. The
+        // outer walker populates these when `5_X_codec_mode == ASPX`
+        // (the SIMPLE path leaves them None and the dispatch falls
+        // back to low-band only PCM).
+        let cfg2_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg2_aspx_lr.clone());
+        let cfg2_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg2_aspx_ls_rs.clone());
+        let cfg2_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg2_aspx_centre.clone());
+        // Round 42: cfg0 / cfg1 / cfg3 ASPX trailer detach.
+        let cfg0_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg0_aspx_lr.clone());
+        let cfg0_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg0_aspx_ls_rs.clone());
+        let cfg0_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg0_aspx_centre.clone());
+        let cfg1_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg1_aspx_lr.clone());
+        let cfg1_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg1_aspx_ls_rs.clone());
+        let cfg1_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg1_aspx_centre.clone());
+        let cfg3_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg3_aspx_lr.clone());
+        let cfg3_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg3_aspx_ls_rs.clone());
+        let cfg3_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.cfg3_aspx_centre.clone());
+        let five_x_aspx_config = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.aspx_config);
+        // Round 42: companding_control() per-channel flags. The 5_X
+        // ASPX path captures companding(3) (L/R, Ls/Rs, C) into
+        // `tools.companding`; we lift the parsed flags here so the
+        // dispatch can hand a per-channel companding-on bool to the
+        // `aspx_extend_with_trailer` wrapper.
+        let five_x_companding = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.companding.clone());
+        // Cfg0 / Cfg1 / Cfg3 5_X SIMPLE/ASPX detach. Round 39: the walker
+        // already populates the same `tools.three_channel_data` /
+        // `four_channel_data` / `five_channel_data` / `two_channel_data`
+        // slots; here we detach clones for the dispatch helpers.
+        let cfg_two_channel_data: Vec<crate::mch::TwoChannelData> = self
+            .last_substream
+            .as_ref()
+            .map(|sub| sub.tools.two_channel_data.clone())
+            .unwrap_or_default();
+        let cfg_b_2ch_mode = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.b_2ch_mode);
+        let cfg_three_channel_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.three_channel_data.clone());
+        let cfg_five_channel_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.five_channel_data.clone());
+        // Round 39: 7_X SIMPLE/ASPX additional-channel pair (Table 182).
+        // The walker populates `seven_x_additional_channel_data` with two
+        // `sf_data(ASF)` bodies for the F / G preliminary outputs (slots
+        // 5 / 6 in the bitstream order). Render with identity SAP for now.
+        let seven_x_additional_channel_data = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.seven_x_additional_channel_data.clone());
+        let seven_x_simple_aspx_active = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                matches!(
+                    sub.tools.seven_x_mode,
+                    Some(crate::mch::SevenXCodecMode::Simple)
+                        | Some(crate::mch::SevenXCodecMode::Aspx)
+                )
+            })
+            .unwrap_or(false);
+        // Round 37: 7_X ASPX_ACPL_1 / ASPX_ACPL_2 pair dispatch state
+        // (mirrors the 5_X detach above). Both modes carry the same
+        // shape of `acpl_config_1ch_*` + `acpl_data_1ch_pair`. The 7_X
+        // walker also fires for 7.0 and 7.1 (b_has_lfe). Channel
+        // mapping per Table 202 — for ACPL_1/_2 (no SIMPLE/ASPX
+        // additional-channel block in scope), z6/z7 stay silent and
+        // we populate slots 0..4 (L/R/C/Ls/Rs) only.
+        let seven_x_pair_mode: Option<acpl_synth::Acpl5xPairMode> = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| match sub.tools.seven_x_mode {
+                Some(crate::mch::SevenXCodecMode::AspxAcpl1) => {
+                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl1)
+                }
+                Some(crate::mch::SevenXCodecMode::AspxAcpl2) => {
+                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl2)
+                }
+                _ => None,
+            });
+        let seven_x_pair_cfg =
+            self.last_substream
+                .as_ref()
+                .and_then(|sub| match sub.tools.seven_x_mode {
+                    Some(crate::mch::SevenXCodecMode::AspxAcpl1) => {
+                        sub.tools.acpl_config_1ch_partial
+                    }
+                    Some(crate::mch::SevenXCodecMode::AspxAcpl2) => sub.tools.acpl_config_1ch_full,
+                    _ => None,
+                });
+        let seven_x_pair_data_1 = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_1ch_pair[0].clone());
+        let seven_x_pair_data_2 = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.acpl_data_1ch_pair[1].clone());
+        let seven_x_pair_active = seven_x_pair_mode.is_some()
+            && seven_x_pair_cfg.is_some()
+            && seven_x_pair_data_1.is_some()
+            && seven_x_pair_data_2.is_some();
+        // Centre channel for ASPX_ACPL_3: round 38 wires the parsed
+        // `cfg0_centre_mono.scaled_spec` (when present) through IMDCT +
+        // overlap-add for slot 2 (centre). This replaces the round-37
+        // silence placeholder used while the body decoder was deferred.
+        // Falls back to a zero-filled placeholder when the centre body
+        // isn't decoded (LFE / SSF / Huffman miss / ACPL_3 walker
+        // doesn't populate cfg0_centre_mono on every frame) so the
+        // length-checked run_acpl_5x_mch_pcm still fires and emits
+        // shaped Ls/Rs from the L/R carriers.
+        let five_x_centre_spec: Option<Vec<f32>> = if five_x_acpl3_active {
+            let centre_pcm = cfg0_centre_mono
+                .as_ref()
+                .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
+            Some(centre_pcm.unwrap_or_else(|| vec![0.0_f32; samples as usize]))
+        } else {
+            None
+        };
+        // ASPX_ACPL_1 (joint-MDCT residual layer): M spectrum lives on
+        // `scaled_spec_primary`, S on `scaled_spec_secondary`; both
+        // share the same transform_info. Detect it via the parsed
+        // stereo_codec_mode + acpl_config_1ch_partial (`partial` is the
+        // ACPL_1 flavour).
+        let acpl1_active = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                matches!(sub.tools.stereo_mode, Some(asf::StereoCodecMode::AspxAcpl1))
+                    && sub.tools.acpl_config_1ch_partial.is_some()
+                    && sub.tools.scaled_spec_primary.is_some()
+                    && sub.tools.scaled_spec_secondary.is_some()
+            })
+            .unwrap_or(false);
+        let (
+            primary_in,
+            secondary_in,
+            aspx_tables,
+            aspx_cfg,
+            framing_pri,
+            framing_sec,
+            sig_pri,
+            sig_sec,
+            noise_pri,
+            noise_sec,
+            qmode_pri,
+            qmode_sec,
+            delta_dir_pri,
+            delta_dir_sec,
+            ah_pri,
+            ah_sec,
+            tna_pri,
+            tna_sec,
+        ) = if let Some(sub) = self.last_substream.as_ref() {
+            let pri = sub
+                .tools
+                .scaled_spec_primary
+                .as_ref()
+                .zip(sub.tools.transform_info_primary.as_ref())
+                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+            let sec = sub
+                .tools
+                .scaled_spec_secondary
+                .as_ref()
+                .zip(sub.tools.transform_info_secondary.as_ref())
+                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+            let tables = sub.tools.aspx_frequency_tables.clone();
+            let cfg = sub.tools.aspx_config;
+            // add_harmonic flags per channel: prefer the 2-channel
+            // hfgen payload when present, else fall back to the 1-ch
+            // one for the primary channel (secondary inherits nothing
+            // in that case — the 1-ch hfgen only covers one channel).
+            let (ah_p, ah_s) = if let Some(h2) = sub.tools.aspx_hfgen_iwc_2ch.as_ref() {
+                (
+                    Some(h2.add_harmonic[0].clone()),
+                    Some(h2.add_harmonic[1].clone()),
+                )
+            } else if let Some(h1) = sub.tools.aspx_hfgen_iwc_1ch.as_ref() {
+                (Some(h1.add_harmonic.clone()), None)
+            } else {
+                (None, None)
+            };
+            // §5.7.6.4.1.3 Pseudocode 88 input — `aspx_tna_mode[ch][sbg]`.
+            // 2-ch hfgen carries per-channel modes; 1-ch hfgen carries
+            // a single channel's modes that we apply to the primary.
+            let (tna_p, tna_s) = if let Some(h2) = sub.tools.aspx_hfgen_iwc_2ch.as_ref() {
+                (Some(h2.tna_mode[0].clone()), Some(h2.tna_mode[1].clone()))
+            } else if let Some(h1) = sub.tools.aspx_hfgen_iwc_1ch.as_ref() {
+                (Some(h1.tna_mode.clone()), None)
+            } else {
+                (None, None)
+            };
+            (
+                pri,
+                sec,
+                tables,
+                cfg,
+                sub.tools.aspx_framing_primary.clone(),
+                sub.tools.aspx_framing_secondary.clone(),
+                sub.tools.aspx_data_sig_primary.clone(),
+                sub.tools.aspx_data_sig_secondary.clone(),
+                sub.tools.aspx_data_noise_primary.clone(),
+                sub.tools.aspx_data_noise_secondary.clone(),
+                sub.tools.aspx_qmode_env_primary,
+                sub.tools.aspx_qmode_env_secondary,
+                sub.tools.aspx_delta_dir_primary.clone(),
+                sub.tools.aspx_delta_dir_secondary.clone(),
+                ah_p,
+                ah_s,
+                tna_p,
+                tna_s,
+            )
+        } else {
+            (
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None,
+            )
+        };
+        // If the ASPX I-frame pipeline populated derived frequency
+        // tables + config, run the A-SPX bandwidth-extension on top of
+        // the IMDCT low-band PCM.
+        let use_aspx_ext = aspx_tables.is_some() && aspx_cfg.is_some();
+        let num_ts_in_ats = aspx::num_ts_in_ats(frame_len_base.max(1));
+        // Round 43: per-channel companding mode from the parsed
+        // `companding_control()`. For mono / stereo CPE paths the
+        // grouping is `companding_control(1)` / `companding_control(2)`
+        // — i.e. compand_on[0] is the primary channel, compand_on[1]
+        // is the secondary (or the sole entry mirrors via sync_flag).
+        let (compand_mode_pri, compand_mode_sec) = self
+            .last_substream
+            .as_ref()
+            .map(|sub| {
+                let cc = sub.tools.companding.as_ref();
+                (
+                    Self::five_x_compand_mode_for_slot(cc, 0),
+                    Self::five_x_compand_mode_for_slot(cc, 1),
+                )
+            })
+            .unwrap_or((aspx::CompandingMode::Off, aspx::CompandingMode::Off));
+        // Round 43: §5.7.5.2 sb0 selection — for the ASPX_ACPL_1 codec
+        // mode the companding tool starts at `acpl_qmf_band` instead of
+        // `aspx_xover_band`. Both the stereo CPE ASPX_ACPL_1 path and
+        // the 5_X ASPX_ACPL_1 path read this from
+        // `acpl_config_1ch_partial.qmf_band`. `None` for any other
+        // codec mode → falls back to `tables.sbx`.
+        let compand_sb0_override: Option<u32> = self.last_substream.as_ref().and_then(|sub| {
+            let stereo_acpl1 =
+                matches!(sub.tools.stereo_mode, Some(asf::StereoCodecMode::AspxAcpl1));
+            let five_x_acpl1 = matches!(
+                sub.tools.five_x_mode,
+                Some(crate::mch::FiveXCodecMode::AspxAcpl1)
+            );
+            if stereo_acpl1 || five_x_acpl1 {
+                sub.tools
+                    .acpl_config_1ch_partial
+                    .as_ref()
+                    .map(|c| c.qmf_band as u32)
+            } else {
+                None
+            }
+        });
+        // Make sure the per-channel A-SPX state vector is large enough.
+        while self.aspx_ext_state.len() < channels as usize {
+            self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
+        }
+        // Same for the SSF synth state.
+        while self.ssf_synth_state.len() < channels as usize {
+            self.ssf_synth_state.push(ssf_synth::SsfSynthState::new());
+        }
+        // §5.7.7 A-CPL: when the substream parsed `acpl_config_1ch` +
+        // `acpl_data_1ch` we run the channel-pair synthesis on the
+        // ASPX-extended primary PCM and emit two channels. The path
+        // owns the primary IMDCT + ASPX path so `pcm_per_channel[1]`
+        // ends up populated by the synth's `z1` output instead of by a
+        // duplicate-of-primary fallback.
+        let use_acpl =
+            channels as usize >= 2 && acpl_active_cfg.is_some() && acpl_active_data.is_some();
+        // Round 45: stereo-CPE M=2 synced companding. When
+        // `companding_control(2)` carried `sync_flag == 1` and the
+        // primary / secondary cohort both feed the standalone ASPX
+        // path (i.e. `!use_acpl` — ACPL_1 stereo only ASPX-extends
+        // the M-channel via the `acpl1_active` branch and so falls
+        // outside the synced cohort), the two channels share one
+        // geometric-mean gain `g_synch(ts) = √(g_0 · g_1)` per
+        // Pseudocode 121's `sync_flag == 1` branch instead of two
+        // independent per-channel gains. For 5_X ASPX_ACPL_3 the
+        // primary / secondary are the L / R carriers feeding
+        // Pseudocode 118's `run_acpl_5x_mch_pcm`, so this puts the
+        // ACPL_3 surround-pair driver on the same synced footing as
+        // r44's 5_X SIMPLE/ASPX dispatch. Resolves to `None` for
+        // `sync_flag == 0`, missing companding, or any non-sync
+        // sub-branch — falling back to the per-channel
+        // `aspx_extend_pcm` path below.
+        let stereo_cpe_synced_mode: Option<aspx::CompandingMode> = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.companding.as_ref())
+            .and_then(|cc| Self::five_x_synced_mode(Some(cc)));
+        let use_stereo_cpe_synced = use_aspx_ext
+            && !use_acpl
+            && channels as usize >= 2
+            && stereo_cpe_synced_mode.is_some()
+            && primary_in.is_some()
+            && secondary_in.is_some()
+            && primary_in.as_ref().map(|(_, n)| *n) == secondary_in.as_ref().map(|(_, n)| *n);
+        // Pair-level §5.7.6.3.4-5 joint decode for a stereo-CPE
+        // aspx_balance == 1 pair (Table 52): the balance channel's
+        // envelopes accumulate with delta = 2 and both channels
+        // dequantize jointly through Pseudocode 84. Runs once per
+        // frame, updating both channels' cross-interval envelope
+        // state; the per-channel phase-1 then consumes the
+        // precomputed scale factors instead of re-running the
+        // per-channel Pseudocode 80-83 path.
+        let (pre_scf_pri, pre_scf_sec): (
+            Option<aspx::AspxDecodedScf>,
+            Option<aspx::AspxDecodedScf>,
+        ) = {
+            let is_balance = self
+                .last_substream
+                .as_ref()
+                .and_then(|sub| sub.tools.aspx_balance)
+                .unwrap_or(false);
+            let pair = if is_balance && use_aspx_ext && channels as usize >= 2 {
+                if let (
+                    Some(tables),
+                    Some(frm),
+                    Some(sig_p),
+                    Some(noise_p),
+                    Some(sig_s),
+                    Some(noise_s),
+                    Some(qm),
+                ) = (
+                    aspx_tables.as_ref(),
+                    framing_pri.as_ref(),
+                    sig_pri.as_ref(),
+                    noise_pri.as_ref(),
+                    sig_sec.as_ref(),
+                    noise_sec.as_ref(),
+                    qmode_pri,
+                ) {
+                    if sig_p.is_empty() {
+                        None
+                    } else {
+                        let (st0, st1) = self.two_ext_states(0, 1);
+                        Some(aspx::decode_scf_balance_pair(
+                            tables,
+                            sig_p,
+                            noise_p,
+                            sig_s,
+                            noise_s,
+                            qm,
+                            &frm.freq_res,
+                            &mut st0.env_prev,
+                            &mut st1.env_prev,
+                        ))
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match pair {
+                Some((a, b)) => (Some(a), Some(b)),
+                None => (None, None),
+            }
+        };
+        if use_stereo_cpe_synced {
+            // Synced stereo-CPE pipeline. IMDCT each channel, then
+            // run the M=2 phase-1 / sync-apply / phase-2 helper.
+            // SAFETY of the unwraps: guarded by `use_stereo_cpe_synced`
+            // (use_aspx_ext, primary_in.is_some(), secondary_in.is_some(),
+            // stereo_cpe_synced_mode.is_some()).
+            let (p_scaled, p_n) = primary_in.as_ref().unwrap();
+            let (s_scaled, s_n) = secondary_in.as_ref().unwrap();
+            let n = *p_n;
+            if n > 0 && n == samples as usize && *s_n == n && !pcm_per_channel.is_empty() {
+                let pcm_pri_f = self.imdct_channel_f32(0, p_scaled, n);
+                let pcm_sec_f = self.imdct_channel_f32(1, s_scaled, n);
+                let pri_input = StereoCpeChannelInput {
+                    ch_index: 0,
+                    pcm_in: &pcm_pri_f,
+                    framing: framing_pri.as_ref(),
+                    sig: sig_pri.as_deref(),
+                    noise: noise_pri.as_deref(),
+                    qmode: qmode_pri,
+                    delta_dir: delta_dir_pri.as_ref(),
+                    add_harmonic: ah_pri.as_deref(),
+                    tna_mode: tna_pri.as_deref(),
+                    precomputed_scf: pre_scf_pri.clone(),
+                };
+                let sec_input = StereoCpeChannelInput {
+                    ch_index: 1,
+                    pcm_in: &pcm_sec_f,
+                    framing: framing_sec.as_ref().or(framing_pri.as_ref()),
+                    sig: sig_sec.as_deref(),
+                    noise: noise_sec.as_deref(),
+                    qmode: qmode_sec.or(qmode_pri),
+                    delta_dir: delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
+                    add_harmonic: ah_sec.as_deref().or(ah_pri.as_deref()),
+                    tna_mode: tna_sec.as_deref().or(tna_pri.as_deref()),
+                    precomputed_scf: pre_scf_sec.clone(),
+                };
+                let (ext_pri, ext_sec) = self.extend_stereo_cpe_pair_with_sync_companding(
+                    &pri_input,
+                    &sec_input,
+                    aspx_tables.as_ref().unwrap(),
+                    aspx_cfg.as_ref().unwrap(),
+                    num_ts_in_ats,
+                    stereo_cpe_synced_mode.unwrap(),
+                    compand_sb0_override,
+                );
+                if pcm_per_channel.len() < 2 {
+                    while pcm_per_channel.len() < 2 {
+                        pcm_per_channel.push(None);
+                    }
+                }
+                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&ext_pri));
+                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&ext_sec));
+            }
+        }
+        if !use_stereo_cpe_synced {
+            if let Some((scaled, n)) = primary_in {
+                if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
+                    if use_aspx_ext {
+                        let pcm_f = self.imdct_channel_f32(0, &scaled, n);
+                        let state = &mut self.aspx_ext_state[0];
+                        let extended = Self::aspx_extend_pcm(
+                            &pcm_f,
+                            aspx_tables.as_ref().unwrap(),
+                            aspx_cfg.as_ref().unwrap(),
+                            framing_pri.as_ref(),
+                            sig_pri.as_deref(),
+                            noise_pri.as_deref(),
+                            qmode_pri,
+                            delta_dir_pri.as_ref(),
+                            ah_pri.as_deref(),
+                            tna_pri.as_deref(),
+                            pre_scf_pri.as_ref(),
+                            state,
+                            num_ts_in_ats,
+                            compand_mode_pri,
+                            compand_sb0_override,
+                        );
+                        if use_acpl {
+                            if let (Some(cfg), Some(data)) =
+                                (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
+                            {
+                                // ASPX_ACPL_1: feed both M (extended) and S
+                                // PCM into the stereo A-CPL. The S spectrum
+                                // is already in `secondary_in`; we IMDCT it
+                                // here without ASPX (the `aspx_data_1ch` in
+                                // ACPL_1 covers the M channel only).
+                                let acpl1_result = if acpl1_active {
+                                    if let Some((s_scaled, s_n)) = secondary_in.as_ref() {
+                                        if *s_n == n {
+                                            let s_pcm = self.imdct_channel_f32(1, s_scaled, *s_n);
+                                            acpl_synth::run_acpl_1ch_pcm_stereo(
+                                                &extended,
+                                                &s_pcm,
+                                                cfg,
+                                                data,
+                                                &mut self.acpl_state,
+                                            )
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    acpl_synth::run_acpl_1ch_pcm(
+                                        &extended,
+                                        cfg,
+                                        data,
+                                        &mut self.acpl_state,
+                                    )
+                                };
+                                if let Some((left, right)) = acpl1_result {
+                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
+                                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
+                                } else {
+                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                                }
+                            } else {
+                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                            }
+                        } else {
+                            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                        }
+                    } else {
+                        pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
+                    }
+                }
+            }
+            if channels as usize >= 2 && !use_acpl {
+                if let Some((scaled, n)) = secondary_in {
+                    if n > 0 && n == samples as usize {
+                        if use_aspx_ext {
+                            let pcm_f = self.imdct_channel_f32(1, &scaled, n);
+                            let state = &mut self.aspx_ext_state[1];
+                            let extended = Self::aspx_extend_pcm(
+                                &pcm_f,
+                                aspx_tables.as_ref().unwrap(),
+                                aspx_cfg.as_ref().unwrap(),
+                                framing_sec.as_ref().or(framing_pri.as_ref()),
+                                sig_sec.as_deref(),
+                                noise_sec.as_deref(),
+                                qmode_sec.or(qmode_pri),
+                                delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
+                                ah_sec.as_deref().or(ah_pri.as_deref()),
+                                tna_sec.as_deref().or(tna_pri.as_deref()),
+                                pre_scf_sec.as_ref(),
+                                state,
+                                num_ts_in_ats,
+                                compand_mode_sec,
+                                compand_sb0_override,
+                            );
+                            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
+                        } else {
+                            pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                        }
+                    }
+                }
+            }
+        } // end `if !use_stereo_cpe_synced`
+          // SSF synthesis path — if either ssf_data_* is populated and
+          // the corresponding `pcm_per_channel[ch]` slot is still empty
+          // (the ASF Huffman pipeline didn't fire because spec_frontend
+          // was SSF), drive §5.2.3-5.2.7 → IMDCT to produce real PCM.
+          // Synthesize each granule into a `num_blocks * n_mdct`-long
+          // spectrum vector, then IMDCT each `n_mdct` block independently
+          // and concat the resulting overlap-added PCM.
+        if let Some(data) = ssf_primary.as_ref() {
+            if !pcm_per_channel.is_empty() && pcm_per_channel[0].is_none() {
+                let pcm = self.run_ssf_channel(0, data, samples as usize);
+                if !pcm.is_empty() {
+                    pcm_per_channel[0] = Some(pcm);
+                }
+            }
+        }
+        if channels as usize >= 2 {
+            if let Some(data) = ssf_secondary.as_ref() {
+                if pcm_per_channel.len() >= 2 && pcm_per_channel[1].is_none() {
+                    let pcm = self.run_ssf_channel(1, data, samples as usize);
+                    if !pcm.is_empty() {
+                        pcm_per_channel[1] = Some(pcm);
+                    }
+                }
+            }
+        }
+        // §5.7.7.6.2 ASPX_ACPL_3 5_X synthesis (Pseudocode 118) —
+        // When the substream parsed acpl_config_2ch + acpl_data_2ch and
+        // the stereo-body path decoded the L/R carrier spectra, run the
+        // full 5-channel A-CPL synthesis and populate channels 0..4.
+        // Only fires when all five pcm_per_channel slots are still empty
+        // (i.e. the standard stereo path didn't already claim them), or
+        // when the frame is explicitly a 5_X ASPX_ACPL_3 substream.
+        if five_x_acpl3_active {
+            if let (Some(cfg), Some(data), Some(centre)) = (
+                five_x_acpl3_cfg.as_ref(),
+                five_x_acpl3_data.as_ref(),
+                five_x_centre_spec.as_deref(),
+            ) {
+                // Carrier L and R come from pcm_per_channel[0] / [1] (already
+                // filled by the stereo ASF / ASPX decode path above). If they
+                // are present use them; otherwise zero-fill as placeholders so
+                // the A-CPL synthesis still produces shaped Ls/Rs.
+                let n = samples as usize;
+                let pcm_l_f32: Vec<f32> = pcm_per_channel
+                    .first()
+                    .and_then(|p| p.as_ref())
+                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
+                    .unwrap_or_else(|| vec![0.0_f32; n]);
+                let pcm_r_f32: Vec<f32> = pcm_per_channel
+                    .get(1)
+                    .and_then(|p| p.as_ref())
+                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
+                    .unwrap_or_else(|| vec![0.0_f32; n]);
+                if let Some(out) = acpl_synth::run_acpl_5x_mch_pcm(
+                    &pcm_l_f32,
+                    &pcm_r_f32,
+                    centre,
+                    cfg,
+                    data,
+                    &mut self.acpl_5x_mch_state,
+                ) {
+                    // Output channel mapping for 5.0/5.1:
+                    //   ch0 = L, ch1 = R, ch2 = C, ch3 = Ls, ch4 = Rs.
+                    // Resize pcm_per_channel to 5 slots if needed.
+                    while pcm_per_channel.len() < 5 {
+                        pcm_per_channel.push(None);
+                    }
+                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
+                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
+                    pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
+                    pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
+                    pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
+                }
+            }
+        }
+        // §5.7.7.6.1 ASPX_ACPL_1 / ASPX_ACPL_2 5_X synthesis (Pseudocode 117) —
+        // When the 5_X walker resolved `five_x_mode` to AspxAcpl1 / AspxAcpl2
+        // and parsed the matching `acpl_config_1ch_*` + `acpl_data_1ch_pair`,
+        // run the channel-pair synthesis on the L/R carrier PCM and emit
+        // L / R / C / Ls / Rs.
+        //
+        // L/R carriers come from `pcm_per_channel[0]/[1]` (already filled
+        // by the stereo ASF/ASPX decode path above when present, else
+        // zero-filled placeholders). The centre carrier mirrors the
+        // ACPL_3 path — `cfg0_centre_mono` exists in the tools struct
+        // but lacks an end-to-end decode path; we use silence so the
+        // QMF lengths line up. ACPL_1's Ls/Rs surround carriers are
+        // similarly silence-placeholders for the same reason: A-CPL
+        // synthesis still produces shaped Ls/Rs from the L/R carriers
+        // and the pair parameters; the contribution from the surround
+        // carriers (when those gain a real decode path) just adds in
+        // on top.
+        if five_x_pair_active && !five_x_acpl3_active {
+            if let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
+                five_x_pair_mode,
+                five_x_pair_cfg.as_ref(),
+                five_x_pair_data_1.as_ref(),
+                five_x_pair_data_2.as_ref(),
+            ) {
+                // Round 37: IMDCT the parsed centre `mono_data(0)`
+                // spectrum (Cfg0 trailing) into a real PCM carrier;
+                // falls back to silence when `scaled_spec` is None
+                // (LFE / SSF / Huffman miss) — see `imdct_mono_lfe_data_f32`.
+                let centre_pcm = cfg0_centre_mono
+                    .as_ref()
+                    .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
+                // Round 40: standalone Ls/Rs surround mono walker for
+                // ACPL_1's Mode 1 surround-driven path. The 5_X
+                // ASPX_ACPL_1 inner walker now persists the joint-MDCT
+                // residual pair (sSMP,3 / sSMP,4 per Table 181) on
+                // `tools.acpl_1_residual_pair`; we IMDCT them here into
+                // Ls/Rs PCM carriers and feed them as the `x3` / `x4`
+                // inputs of Pseudocode 117. ACPL_2 mode never emits a
+                // residual pair (no max_sfb_master in the walker), so
+                // the detach is `None` for that path → silence — same
+                // as the round-37 placeholder.
+                //
+                // Round 46 — ACPL_1 surround Ls/Rs ASPX extension:
+                // SPEC-CONFIRMS-NOT-ASPX. Per ETSI TS 103 190-1 §4.2.6.6
+                // Table 25 row `case ASPX_ACPL_1:` (the `5_X_codec_mode
+                // == ASPX_ACPL_1` body parsed by
+                // `parse_aspx_acpl_1_2_inner_body` in `mch.rs`) the
+                // trailer order is `aspx_data_2ch()` (L/R primary
+                // carriers) + `aspx_data_1ch()` (centre mono) + two
+                // `acpl_data_1ch()` parameter sets — there is NO third
+                // ASPX trailer for the surround Ls/Rs pair. The Ls/Rs
+                // carriers are the joint-MDCT residual sSMP,3 / sSMP,4
+                // straight out of the inner sf_data×2 walker; per
+                // §5.7.5.2 / §5.7.6 ASPX BWE applies to the
+                // M-channel-side carriers only (acpl_qmf_band-rooted
+                // sb0 on the L/R primary pair + centre mono, never on
+                // the residual surround pair). Feeding them raw into
+                // Pseudocode 117 as `x3` / `x4` matches the spec — the
+                // post-Pseudocode-117 surround output gets its
+                // synthesis-bandwidth shape from the L/R carriers via
+                // alpha/beta/decorrelator, not from independent
+                // surround-pair extension. Same finding for the
+                // matching M=2 surround-pair synced companding cohort:
+                // no carriers means no companding to sync. Round-46
+                // therefore wires no new surround-pair ASPX/companding
+                // path here; the existing raw-PCM path is correct.
+                let acpl_1_residual_pair = self
+                    .last_substream
+                    .as_ref()
+                    .map(|sub| sub.tools.acpl_1_residual_pair.clone())
+                    .unwrap_or([None, None]);
+                // Round 41: §5.3.4.3.2 / Table 181 first-stage matrix —
+                // when the 5_X ACPL_1 walker captured the two
+                // `chparam_info()` payloads + the joint-MDCT residual
+                // pair AND the inner `two_channel_data` carries
+                // sSMP_A / sSMP_B spectra, mix per-sfb to produce
+                // preliminary (L, R, Ls, Rs) spectra, IMDCT each, and
+                // feed those PCMs into Pseudocode 117.
+                //
+                // When the SAP inputs aren't all available (ACPL_2 path,
+                // or non-AspxAcpl1 mode, or any of the inputs missing)
+                // fall through to the round-40 path: raw sSMP_3/sSMP_4
+                // PCM as ls/rs, slots 0/1 untouched.
+                let chparam_pair = self
+                    .last_substream
+                    .as_ref()
+                    .map(|sub| sub.tools.acpl_1_residual_chparam.clone())
+                    .unwrap_or([None, None]);
+                let max_sfb_master_opt: Option<u32> = self
+                    .last_substream
+                    .as_ref()
+                    .and_then(|sub| sub.tools.acpl_1_residual_max_sfb_master);
+                let inner_tcd_specs: Option<(Vec<f32>, Vec<f32>)> =
+                    self.last_substream.as_ref().and_then(|sub| {
+                        let tcd = sub.tools.two_channel_data.first()?;
+                        let a = tcd.scaled_spec_per_channel.first().cloned().flatten()?;
+                        let b = tcd.scaled_spec_per_channel.get(1).cloned().flatten()?;
+                        Some((a, b))
+                    });
+                let sap_outputs: Option<asf::SapTable181Output> = match (
+                    mode,
+                    inner_tcd_specs.as_ref(),
+                    &chparam_pair,
+                    &acpl_1_residual_pair,
+                    max_sfb_master_opt,
+                ) {
+                    (
+                        acpl_synth::Acpl5xPairMode::AspxAcpl1,
+                        Some((a_spec, b_spec)),
+                        [Some(cp0), Some(cp1)],
+                        [Some((tl3, s3)), Some((tl4, s4))],
+                        Some(max_sfb_master),
+                    ) if *tl3 == *tl4
+                        && *tl3 as usize == samples as usize
+                        && max_sfb_master > 0 =>
+                    {
+                        asf::apply_sap_table_181(
+                            a_spec,
+                            b_spec,
+                            s3,
+                            s4,
+                            &[cp0.clone(), cp1.clone()],
+                            max_sfb_master,
+                            *tl3,
+                        )
+                    }
+                    _ => None,
+                };
+                let (ls_pcm, rs_pcm) =
+                    if let Some((l_spec, r_spec, ls_spec, rs_spec)) = sap_outputs.as_ref() {
+                        // SAP path: replace pcm_per_channel[0]/[1] with the
+                        // mixed L/R PCM and pass mixed Ls/Rs PCM into the
+                        // pair dispatcher.
+                        let n = samples as usize;
+                        let l_pcm = self.imdct_channel_f32(0, l_spec, n);
+                        let r_pcm = self.imdct_channel_f32(1, r_spec, n);
+                        while pcm_per_channel.len() < 2 {
+                            pcm_per_channel.push(None);
+                        }
+                        pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&l_pcm));
+                        pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&r_pcm));
+                        let ls_pcm = self.imdct_channel_f32(3, ls_spec, n);
+                        let rs_pcm = self.imdct_channel_f32(4, rs_spec, n);
+                        (Some(ls_pcm), Some(rs_pcm))
+                    } else {
+                        let ls_pcm = acpl_1_residual_pair[0].as_ref().and_then(|(tl, scaled)| {
+                            if *tl as usize == samples as usize {
+                                Some(self.imdct_channel_f32(3, scaled, samples as usize))
+                            } else {
+                                None
+                            }
+                        });
+                        let rs_pcm = acpl_1_residual_pair[1].as_ref().and_then(|(tl, scaled)| {
+                            if *tl as usize == samples as usize {
+                                Some(self.imdct_channel_f32(4, scaled, samples as usize))
+                            } else {
+                                None
+                            }
+                        });
+                        (ls_pcm, rs_pcm)
+                    };
+                self.dispatch_acpl_5x_pair(
+                    mode,
+                    cfg,
+                    data_1,
+                    data_2,
+                    samples as usize,
+                    centre_pcm.as_deref(),
+                    ls_pcm.as_deref(),
+                    rs_pcm.as_deref(),
+                    &mut pcm_per_channel,
+                );
+            }
+        }
+        // §5.7.7.6.3 Pseudocode 120 — 7_X ASPX_ACPL_1 / ASPX_ACPL_2
+        // dispatch (mirrors the 5_X path above). Channel mapping is
+        // Table 202 (channel_mode, add_ch_base) — for ACPL_1/_2 the
+        // additional 2 channels (z6/z7 in Pseudocode 120) live outside
+        // the A-CPL pair so they aren't generated here; we populate
+        // slots 0..4 (L/R/C/Ls/Rs) and leave 5..7 for the per-channel
+        // fallback path. The pair core itself is bit-equivalent to
+        // Pseudocode 117 — same `(z0, z1) = ACplModule(...)` shape +
+        // `z1 *= sqrt(2)` / `z3 *= sqrt(2)` scaling — modulo the extra
+        // `add_ch_base == 0` z0/z2 sqrt(2) tweak which only fires when
+        // the additional channels carry the L/R pair. Since we treat
+        // the additional pair as silence here, that conditional scale
+        // does not affect the produced 5-channel core.
+        if seven_x_pair_active {
+            if let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
+                seven_x_pair_mode,
+                seven_x_pair_cfg.as_ref(),
+                seven_x_pair_data_1.as_ref(),
+                seven_x_pair_data_2.as_ref(),
+            ) {
+                let centre_pcm = cfg0_centre_mono
+                    .as_ref()
+                    .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
+                // Round 40: same standalone Ls/Rs surround mono walker
+                // as the 5_X path — the 7_X ASPX_ACPL_1 walker writes
+                // to the same `acpl_1_residual_pair` slot. ACPL_2 path
+                // detaches `None` (no residual pair).
+                let acpl_1_residual_pair = self
+                    .last_substream
+                    .as_ref()
+                    .map(|sub| sub.tools.acpl_1_residual_pair.clone())
+                    .unwrap_or([None, None]);
+                let ls_pcm = acpl_1_residual_pair[0].as_ref().and_then(|(tl, scaled)| {
+                    if *tl as usize == samples as usize {
+                        Some(self.imdct_channel_f32(3, scaled, samples as usize))
+                    } else {
+                        None
+                    }
+                });
+                let rs_pcm = acpl_1_residual_pair[1].as_ref().and_then(|(tl, scaled)| {
+                    if *tl as usize == samples as usize {
+                        Some(self.imdct_channel_f32(4, scaled, samples as usize))
+                    } else {
+                        None
+                    }
+                });
+                self.dispatch_acpl_5x_pair(
+                    mode,
+                    cfg,
+                    data_1,
+                    data_2,
+                    samples as usize,
+                    centre_pcm.as_deref(),
+                    ls_pcm.as_deref(),
+                    rs_pcm.as_deref(),
+                    &mut pcm_per_channel,
+                );
+            }
+        }
+        // Round 38 / 39: §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX
+        // end-to-end decode. Round 38 wired Cfg2; round 39 wires Cfg0,
+        // Cfg1, Cfg3. Mutually exclusive with the ACPL_3 / pair paths
+        // above (they own different `five_x_mode` enums), so each cfg
+        // fires only when the SIMPLE/ASPX pure-MDCT path is in scope.
+        if five_x_simple_aspx_active && !five_x_acpl3_active && !five_x_pair_active {
+            match five_x_coding_cfg {
+                Some(crate::mch::FiveXCodingConfig::Cfg0Stereo2plusMono)
+                    if cfg_two_channel_data.len() >= 2 =>
+                {
+                    let b_2ch = cfg_b_2ch_mode.unwrap_or(false);
+                    self.dispatch_5x_cfg0_simple_aspx(
+                        &cfg_two_channel_data[0],
+                        &cfg_two_channel_data[1],
+                        b_2ch,
+                        cfg0_centre_mono.as_ref(),
+                        cfg0_aspx_lr.as_ref(),
+                        cfg0_aspx_ls_rs.as_ref(),
+                        cfg0_aspx_centre.as_ref(),
+                        five_x_aspx_config,
+                        five_x_companding.as_ref(),
+                        num_ts_in_ats,
+                        samples as usize,
+                        &mut pcm_per_channel,
+                    );
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
+                    if let (Some(three), Some(tcd)) = (
+                        cfg_three_channel_data.as_ref(),
+                        cfg_two_channel_data.first(),
+                    ) {
+                        self.dispatch_5x_cfg1_simple_aspx(
+                            three,
+                            tcd,
+                            cfg1_aspx_lr.as_ref(),
+                            cfg1_aspx_ls_rs.as_ref(),
+                            cfg1_aspx_centre.as_ref(),
+                            five_x_aspx_config,
+                            five_x_companding.as_ref(),
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
+                    if let Some(four) = cfg2_four_channel_data.as_ref() {
+                        self.dispatch_5x_cfg2_simple_aspx(
+                            four,
+                            cfg2_back_mono.as_ref(),
+                            cfg2_aspx_lr.as_ref(),
+                            cfg2_aspx_ls_rs.as_ref(),
+                            cfg2_aspx_centre.as_ref(),
+                            five_x_aspx_config,
+                            five_x_companding.as_ref(),
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
+                    if let Some(five) = cfg_five_channel_data.as_ref() {
+                        self.dispatch_5x_cfg3_simple_aspx(
+                            five,
+                            cfg3_aspx_lr.as_ref(),
+                            cfg3_aspx_ls_rs.as_ref(),
+                            cfg3_aspx_centre.as_ref(),
+                            five_x_aspx_config,
+                            five_x_companding.as_ref(),
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Round 91: 7_X SIMPLE/ASPX inner 5-channel core render (slots
+        // 0..4). The 7_X SIMPLE/Cfg3Five path inherits the inner
+        // `five_channel_data()` from the 5_X Table 29 layout (5 SCEs in
+        // L/R/C/Ls/Rs order, identity SAP via 5x `chparam_info(sap_mode
+        // = 0)`); the only difference from the 5_X dispatch is which
+        // walker populated `tools.five_channel_data` (7_X here, vs 5_X
+        // for the 5.0/5.1 paths). The 5_X dispatch fires the same
+        // IMDCT/KBD/overlap-add chain regardless of which walker
+        // populated the slot, so we route the 7_X-walker-produced
+        // five_channel_data through it. With identity SAP no joint-MDCT
+        // mixing happens at decode time so each output slot 0..4 reflects
+        // only its own input SCE. ASPX trailers for the 7_X path land in
+        // different `tools.*_aspx_*` slots (the 7_X walker has its own
+        // ASPX trailer plumbing — out of scope here); pass `None` for
+        // the trailer slots so the round-91 SIMPLE path reduces to
+        // low-band only. Cfg0/Cfg1/Cfg2 7_X variants need their own
+        // wiring (queued for follow-up rounds — they share the same
+        // 5_X core dispatchers, just with the 7_X-specific trailing
+        // `mono_data(0)` gate and ASPX trailer plumbing).
+        if seven_x_simple_aspx_active
+            && matches!(
+                self.last_substream
+                    .as_ref()
+                    .and_then(|sub| sub.tools.seven_x_coding_config),
+                Some(crate::mch::FiveXCodingConfig::Cfg3Five)
+            )
+        {
+            if let Some(five) = self
+                .last_substream
+                .as_ref()
+                .and_then(|sub| sub.tools.five_channel_data.clone())
+            {
+                self.dispatch_5x_cfg3_simple_aspx(
+                    &five,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    num_ts_in_ats,
+                    samples as usize,
+                    &mut pcm_per_channel,
+                );
+            }
+        }
+        // Round 39 / 40: §5.3.4.4.1 / Table 182 + Table 183 — 7_X
+        // SIMPLE/ASPX additional-channel pair render. The walker populates
+        // `seven_x_additional_channel_data` (two sf_data(ASF) bodies)
+        // when `7_X_codec_mode in {SIMPLE, ASPX}`. Slots 5 / 6 (the F/G
+        // preliminary outputs in Table 182) get the IMDCT'd low-band PCM.
+        //
+        // Round 40 wires the SAP a/b/c/d coefficient extraction
+        // (`extract_sap_abcd` per Pseudocode 59) through Table 183's
+        // 2-pair joint-stereo matrix when `b_use_sap_add_ch == true` AND
+        // partner spectra (D, E for `coding_config in {0, 2, 3}` —
+        // 3/4/0.x channel_mode) are present. The dispatch walks
+        // (P, F) → (slot_high, slot_low) and (Q, G) → (slot_high+1,
+        // slot_low+1) per-sfb in the spectral domain. With identity SAP
+        // (`b_use_sap_add_ch == false`), the partner spectra are left
+        // untouched at their 5.X-core slots and only F/G land at slots
+        // 5/6 — matching the round-39 behaviour.
+        //
+        // The 7_X ACPL_1/_2 walker has its own additional-channel
+        // handling per §5.3.4.4.2/.3 (z6/z7 in Pseudocode 120) — this
+        // branch is gated on the SIMPLE/ASPX active-flag.
+        if seven_x_simple_aspx_active {
+            if let Some(add) = seven_x_additional_channel_data.as_ref() {
+                // Resolve partner spectra + slots based on the active
+                // 7_X coding_config. Per Table 183 row "3/4/0.x" (the
+                // standard 7.0/7.1 layout that our 7_X walker handles)
+                // the partner pair is (Ls, Rs) — slot 3 / slot 4 in our
+                // 5.X-core dispatch; F/G lift to (Lb, Rb) on slot 5/6.
+                let partner_slots: [usize; 2] = [3, 4];
+                let (partner_d, partner_e): (Option<Vec<f32>>, Option<Vec<f32>>) =
+                    match five_x_coding_cfg {
+                        Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
+                            // 5_X cfg2 four_channel_data carries [L, R, Ls, Rs]
+                            // in indices [0, 1, 2, 3] per Table 180. The
+                            // surround pair lives at four[2]/four[3].
+                            let (d, e) = match cfg2_four_channel_data.as_ref() {
+                                Some(four) => (
+                                    four.scaled_spec_per_channel.get(2).cloned().flatten(),
+                                    four.scaled_spec_per_channel.get(3).cloned().flatten(),
+                                ),
+                                None => (None, None),
+                            };
+                            (d, e)
+                        }
+                        Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
+                            // 5_X cfg3 five_channel_data lays out [L, R, C,
+                            // Ls, Rs] per Table 180. Surround pair lives at
+                            // five[3]/five[4].
+                            let (d, e) = match cfg_five_channel_data.as_ref() {
+                                Some(five) => (
+                                    five.scaled_spec_per_channel.get(3).cloned().flatten(),
+                                    five.scaled_spec_per_channel.get(4).cloned().flatten(),
+                                ),
+                                None => (None, None),
+                            };
+                            (d, e)
+                        }
+                        Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
+                            // 5_X cfg1 three_channel_data + two_channel_data:
+                            // surround pair lives at the trailing
+                            // two_channel_data[0]/[1] (slots 3/4 in our
+                            // dispatch). Use the parsed scaled_spec.
+                            let (d, e) = match cfg_two_channel_data.first() {
+                                Some(tcd) => (
+                                    tcd.scaled_spec_per_channel.first().cloned().flatten(),
+                                    tcd.scaled_spec_per_channel.get(1).cloned().flatten(),
+                                ),
+                                None => (None, None),
+                            };
+                            (d, e)
+                        }
+                        _ => (None, None),
+                    };
+                let chparam_pair = self
+                    .last_substream
+                    .as_ref()
+                    .and_then(|sub| sub.tools.seven_x_add_chparam_info.as_ref().cloned());
+                let partner_pair: Option<[&[f32]; 2]> =
+                    match (partner_d.as_ref(), partner_e.as_ref()) {
+                        (Some(d), Some(e)) => Some([d.as_slice(), e.as_slice()]),
+                        _ => None,
+                    };
+                self.dispatch_7x_additional_channel_pair(
+                    add,
+                    partner_pair,
+                    partner_slots,
+                    chparam_pair.as_ref(),
+                    samples as usize,
+                    &mut pcm_per_channel,
+                );
+            }
+        }
+        // Round 80: 5.1 / 7.1 LFE channel render. When the 5_X / 7_X
+        // walker parsed a `mono_data(b_lfe = 1)` payload (per §4.2.6.6
+        // Table 25 `if (b_has_lfe) mono_data(1);` / §4.2.6.14 Table 33
+        // equivalent) the LFE scaled spectrum lives on
+        // `tools.lfe_mono_data.scaled_spec`. IMDCT it into the trailing
+        // LFE PCM slot — slot 5 for 5.1 (after L/R/C/Ls/Rs) and slot 7
+        // for 7.1 (after L/R/C/Ls/Rs/Lb/Rb).
+        if channels == 6 || channels == 8 {
+            let lfe_slot = (channels as usize) - 1;
+            let lfe_mono = self
+                .last_substream
+                .as_ref()
+                .and_then(|sub| sub.tools.lfe_mono_data.clone());
+            if let Some(lfe) = lfe_mono.as_ref() {
+                if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(lfe, lfe_slot, samples as usize) {
+                    while pcm_per_channel.len() <= lfe_slot {
+                        pcm_per_channel.push(None);
+                    }
+                    pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
+                }
+            }
+        }
+        pcm_per_channel
+    }
+
+    /// Render an A-JOC `b_static_dmx` 5.X core (TS 103 190-2 §6.2.3.4
+    /// `audio_data_chan(b_lfe ? 5.1 : 5.0)`) through the channel-based
+    /// 5_X pipeline: the parsed [`asf::SubstreamTools`] become this
+    /// decoder's walked substream and [`Self::render_channel_substream`]
+    /// runs the SIMPLE / ASPX / ASPX_ACPL_1..3 carrier synthesis. The
+    /// returned slots are `[L, R, C, Ls, Rs(, LFE)]`.
+    pub(crate) fn render_static_5x_tools(
+        &mut self,
+        tools: asf::SubstreamTools,
+        b_lfe: bool,
+        samples: u32,
+        frame_len_base: u32,
+    ) -> Vec<Option<Vec<i16>>> {
+        let channels: u16 = if b_lfe { 6 } else { 5 };
+        self.last_substream = Some(asf::Ac4SubstreamInfo {
+            audio_size: 0,
+            audio_data_offset: 0,
+            tools,
+        });
+        self.render_channel_substream(channels, samples, frame_len_base)
+    }
+
     /// Decode a v2 frame whose first substream group carries an A-JOC
     /// object substream (TS 103 190-2 §6.2.3.4): run the
     /// [`crate::ajoc_substream::AjocSubstreamDecoder`] chain and emit
@@ -3553,1269 +4856,7 @@ impl Decoder for Ac4Decoder {
             )
             .ok()
         });
-        // If we have scaled spectra for the substream, run IMDCT + OLA
-        // and produce real PCM. Per-channel PCM buffers live in
-        // `pcm_per_channel`; the interleaver below lays them out to the
-        // frame's channel count. Any channel without decoded spectra
-        // stays silent. We detach the per-channel inputs from
-        // `last_substream` up front so the IMDCT step can mutate
-        // `self.overlap` without a borrow conflict.
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
-        // Detach the inputs + the ASPX tables once so we can run IMDCT
-        // (which mutates overlap state) and the ASPX extension without
-        // a borrow conflict on self.
-        // Detach A-CPL config + parsed data so the synth call below
-        // doesn't conflict with the immutable borrow of `last_substream`
-        // when we later mutate decoder state.
-        let acpl_active_cfg = self.last_substream.as_ref().and_then(|sub| {
-            sub.tools
-                .acpl_config_1ch_full
-                .or(sub.tools.acpl_config_1ch_partial)
-        });
-        let acpl_active_data = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.acpl_data_1ch.clone());
-        // Detach SSF data so we can run §5.2.3-5.2.7 synthesis without
-        // a borrow conflict on `self`. SSF substreams are mutually
-        // exclusive with ASF on a per-channel basis (per
-        // `spec_frontend`), so when these are populated the IMDCT input
-        // for that channel comes from `synthesize_ssf_data` instead of
-        // the ASF Huffman path.
-        let ssf_primary = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.ssf_data_primary.clone());
-        let ssf_secondary = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.ssf_data_secondary.clone());
-        // Detach 5_X ASPX_ACPL_3 synthesis inputs: two carrier spectra
-        // land on scaled_spec_primary / scaled_spec_secondary (via the
-        // stereo body walker), centre from cfg0_centre_mono, and the
-        // A-CPL parameter pair from acpl_config_2ch / acpl_data_2ch.
-        // Only populated when five_x_mode == AspxAcpl3.
-        let five_x_acpl3_active = self
-            .last_substream
-            .as_ref()
-            .map(|sub| {
-                matches!(
-                    sub.tools.five_x_mode,
-                    Some(crate::mch::FiveXCodecMode::AspxAcpl3)
-                ) && sub.tools.acpl_config_2ch.is_some()
-                    && sub.tools.acpl_data_2ch.is_some()
-                    && sub.tools.scaled_spec_primary.is_some()
-                    && sub.tools.scaled_spec_secondary.is_some()
-            })
-            .unwrap_or(false);
-        let five_x_acpl3_cfg = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.acpl_config_2ch);
-        let five_x_acpl3_data = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.acpl_data_2ch.clone());
-        // Detach 5_X ASPX_ACPL_1 / ASPX_ACPL_2 synthesis inputs
-        // (Pseudocode 117). The active acpl_config_1ch is one of:
-        //   - acpl_config_1ch_partial (ASPX_ACPL_1 — surround Ls/Rs
-        //     carriers come from extra mono carriers; here we silence
-        //     them as placeholders since the standalone Ls/Rs decode
-        //     path isn't fleshed out yet).
-        //   - acpl_config_1ch_full   (ASPX_ACPL_2 — no surround carriers).
-        // The two `acpl_data_1ch_pair[]` entries drive the L-side
-        // (alpha_1/beta_1) and R-side (alpha_2/beta_2) ACplModule's.
-        let five_x_pair_mode: Option<acpl_synth::Acpl5xPairMode> = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| match sub.tools.five_x_mode {
-                Some(crate::mch::FiveXCodecMode::AspxAcpl1) => {
-                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl1)
-                }
-                Some(crate::mch::FiveXCodecMode::AspxAcpl2) => {
-                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl2)
-                }
-                _ => None,
-            });
-        let five_x_pair_cfg =
-            self.last_substream
-                .as_ref()
-                .and_then(|sub| match sub.tools.five_x_mode {
-                    Some(crate::mch::FiveXCodecMode::AspxAcpl1) => {
-                        sub.tools.acpl_config_1ch_partial
-                    }
-                    Some(crate::mch::FiveXCodecMode::AspxAcpl2) => sub.tools.acpl_config_1ch_full,
-                    _ => None,
-                });
-        let five_x_pair_data_1 = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.acpl_data_1ch_pair[0].clone());
-        let five_x_pair_data_2 = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.acpl_data_1ch_pair[1].clone());
-        let five_x_pair_active = five_x_pair_mode.is_some()
-            && five_x_pair_cfg.is_some()
-            && five_x_pair_data_1.is_some()
-            && five_x_pair_data_2.is_some();
-        // Round 37: detach the parsed `cfg0_centre_mono` payload (Cfg0
-        // trailing `mono_data(0)`) for the 5_X pair / 7_X pair paths so
-        // we can IMDCT its `scaled_spec` into a real centre carrier
-        // (replacing the silence-placeholder used in round 36). For
-        // ACPL_3 the centre is also pulled from the same source. The
-        // detach is a clone so the substream tools borrow can be
-        // released before we mutate decoder IMDCT state.
-        let cfg0_centre_mono = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg0_centre_mono.clone());
-        // Round 38 / 39: detach the 5_X SIMPLE/ASPX `coding_config`
-        // payloads so we can drive end-to-end multichannel decode.
-        // Round 38 wired Cfg2 (four_channel_data + cfg2_back_mono);
-        // round 39 adds Cfg0 (b_2ch_mode + 2x two_channel_data +
-        // cfg0_centre_mono), Cfg1 (three_channel_data + two_channel_data),
-        // and Cfg3 (five_channel_data). Each helper computes its own
-        // gating; we just detach the inputs once.
-        let five_x_simple_aspx_active = self
-            .last_substream
-            .as_ref()
-            .map(|sub| {
-                matches!(
-                    sub.tools.five_x_mode,
-                    Some(crate::mch::FiveXCodecMode::Simple)
-                        | Some(crate::mch::FiveXCodecMode::Aspx)
-                )
-            })
-            .unwrap_or(false);
-        let five_x_coding_cfg = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.five_x_coding_config);
-        let cfg2_four_channel_data = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.four_channel_data.clone());
-        let cfg2_back_mono = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg2_back_mono.clone());
-        // Round 41: 5_X SIMPLE/ASPX cfg2 ASPX trailer detach. The
-        // outer walker populates these when `5_X_codec_mode == ASPX`
-        // (the SIMPLE path leaves them None and the dispatch falls
-        // back to low-band only PCM).
-        let cfg2_aspx_lr = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg2_aspx_lr.clone());
-        let cfg2_aspx_ls_rs = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg2_aspx_ls_rs.clone());
-        let cfg2_aspx_centre = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg2_aspx_centre.clone());
-        // Round 42: cfg0 / cfg1 / cfg3 ASPX trailer detach.
-        let cfg0_aspx_lr = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg0_aspx_lr.clone());
-        let cfg0_aspx_ls_rs = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg0_aspx_ls_rs.clone());
-        let cfg0_aspx_centre = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg0_aspx_centre.clone());
-        let cfg1_aspx_lr = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg1_aspx_lr.clone());
-        let cfg1_aspx_ls_rs = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg1_aspx_ls_rs.clone());
-        let cfg1_aspx_centre = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg1_aspx_centre.clone());
-        let cfg3_aspx_lr = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg3_aspx_lr.clone());
-        let cfg3_aspx_ls_rs = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg3_aspx_ls_rs.clone());
-        let cfg3_aspx_centre = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.cfg3_aspx_centre.clone());
-        let five_x_aspx_config = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.aspx_config);
-        // Round 42: companding_control() per-channel flags. The 5_X
-        // ASPX path captures companding(3) (L/R, Ls/Rs, C) into
-        // `tools.companding`; we lift the parsed flags here so the
-        // dispatch can hand a per-channel companding-on bool to the
-        // `aspx_extend_with_trailer` wrapper.
-        let five_x_companding = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.companding.clone());
-        // Cfg0 / Cfg1 / Cfg3 5_X SIMPLE/ASPX detach. Round 39: the walker
-        // already populates the same `tools.three_channel_data` /
-        // `four_channel_data` / `five_channel_data` / `two_channel_data`
-        // slots; here we detach clones for the dispatch helpers.
-        let cfg_two_channel_data: Vec<crate::mch::TwoChannelData> = self
-            .last_substream
-            .as_ref()
-            .map(|sub| sub.tools.two_channel_data.clone())
-            .unwrap_or_default();
-        let cfg_b_2ch_mode = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.b_2ch_mode);
-        let cfg_three_channel_data = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.three_channel_data.clone());
-        let cfg_five_channel_data = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.five_channel_data.clone());
-        // Round 39: 7_X SIMPLE/ASPX additional-channel pair (Table 182).
-        // The walker populates `seven_x_additional_channel_data` with two
-        // `sf_data(ASF)` bodies for the F / G preliminary outputs (slots
-        // 5 / 6 in the bitstream order). Render with identity SAP for now.
-        let seven_x_additional_channel_data = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.seven_x_additional_channel_data.clone());
-        let seven_x_simple_aspx_active = self
-            .last_substream
-            .as_ref()
-            .map(|sub| {
-                matches!(
-                    sub.tools.seven_x_mode,
-                    Some(crate::mch::SevenXCodecMode::Simple)
-                        | Some(crate::mch::SevenXCodecMode::Aspx)
-                )
-            })
-            .unwrap_or(false);
-        // Round 37: 7_X ASPX_ACPL_1 / ASPX_ACPL_2 pair dispatch state
-        // (mirrors the 5_X detach above). Both modes carry the same
-        // shape of `acpl_config_1ch_*` + `acpl_data_1ch_pair`. The 7_X
-        // walker also fires for 7.0 and 7.1 (b_has_lfe). Channel
-        // mapping per Table 202 — for ACPL_1/_2 (no SIMPLE/ASPX
-        // additional-channel block in scope), z6/z7 stay silent and
-        // we populate slots 0..4 (L/R/C/Ls/Rs) only.
-        let seven_x_pair_mode: Option<acpl_synth::Acpl5xPairMode> = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| match sub.tools.seven_x_mode {
-                Some(crate::mch::SevenXCodecMode::AspxAcpl1) => {
-                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl1)
-                }
-                Some(crate::mch::SevenXCodecMode::AspxAcpl2) => {
-                    Some(acpl_synth::Acpl5xPairMode::AspxAcpl2)
-                }
-                _ => None,
-            });
-        let seven_x_pair_cfg =
-            self.last_substream
-                .as_ref()
-                .and_then(|sub| match sub.tools.seven_x_mode {
-                    Some(crate::mch::SevenXCodecMode::AspxAcpl1) => {
-                        sub.tools.acpl_config_1ch_partial
-                    }
-                    Some(crate::mch::SevenXCodecMode::AspxAcpl2) => sub.tools.acpl_config_1ch_full,
-                    _ => None,
-                });
-        let seven_x_pair_data_1 = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.acpl_data_1ch_pair[0].clone());
-        let seven_x_pair_data_2 = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.acpl_data_1ch_pair[1].clone());
-        let seven_x_pair_active = seven_x_pair_mode.is_some()
-            && seven_x_pair_cfg.is_some()
-            && seven_x_pair_data_1.is_some()
-            && seven_x_pair_data_2.is_some();
-        // Centre channel for ASPX_ACPL_3: round 38 wires the parsed
-        // `cfg0_centre_mono.scaled_spec` (when present) through IMDCT +
-        // overlap-add for slot 2 (centre). This replaces the round-37
-        // silence placeholder used while the body decoder was deferred.
-        // Falls back to a zero-filled placeholder when the centre body
-        // isn't decoded (LFE / SSF / Huffman miss / ACPL_3 walker
-        // doesn't populate cfg0_centre_mono on every frame) so the
-        // length-checked run_acpl_5x_mch_pcm still fires and emits
-        // shaped Ls/Rs from the L/R carriers.
-        let five_x_centre_spec: Option<Vec<f32>> = if five_x_acpl3_active {
-            let centre_pcm = cfg0_centre_mono
-                .as_ref()
-                .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
-            Some(centre_pcm.unwrap_or_else(|| vec![0.0_f32; samples as usize]))
-        } else {
-            None
-        };
-        // ASPX_ACPL_1 (joint-MDCT residual layer): M spectrum lives on
-        // `scaled_spec_primary`, S on `scaled_spec_secondary`; both
-        // share the same transform_info. Detect it via the parsed
-        // stereo_codec_mode + acpl_config_1ch_partial (`partial` is the
-        // ACPL_1 flavour).
-        let acpl1_active = self
-            .last_substream
-            .as_ref()
-            .map(|sub| {
-                matches!(sub.tools.stereo_mode, Some(asf::StereoCodecMode::AspxAcpl1))
-                    && sub.tools.acpl_config_1ch_partial.is_some()
-                    && sub.tools.scaled_spec_primary.is_some()
-                    && sub.tools.scaled_spec_secondary.is_some()
-            })
-            .unwrap_or(false);
-        let (
-            primary_in,
-            secondary_in,
-            aspx_tables,
-            aspx_cfg,
-            framing_pri,
-            framing_sec,
-            sig_pri,
-            sig_sec,
-            noise_pri,
-            noise_sec,
-            qmode_pri,
-            qmode_sec,
-            delta_dir_pri,
-            delta_dir_sec,
-            ah_pri,
-            ah_sec,
-            tna_pri,
-            tna_sec,
-        ) = if let Some(sub) = self.last_substream.as_ref() {
-            let pri = sub
-                .tools
-                .scaled_spec_primary
-                .as_ref()
-                .zip(sub.tools.transform_info_primary.as_ref())
-                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
-            let sec = sub
-                .tools
-                .scaled_spec_secondary
-                .as_ref()
-                .zip(sub.tools.transform_info_secondary.as_ref())
-                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
-            let tables = sub.tools.aspx_frequency_tables.clone();
-            let cfg = sub.tools.aspx_config;
-            // add_harmonic flags per channel: prefer the 2-channel
-            // hfgen payload when present, else fall back to the 1-ch
-            // one for the primary channel (secondary inherits nothing
-            // in that case — the 1-ch hfgen only covers one channel).
-            let (ah_p, ah_s) = if let Some(h2) = sub.tools.aspx_hfgen_iwc_2ch.as_ref() {
-                (
-                    Some(h2.add_harmonic[0].clone()),
-                    Some(h2.add_harmonic[1].clone()),
-                )
-            } else if let Some(h1) = sub.tools.aspx_hfgen_iwc_1ch.as_ref() {
-                (Some(h1.add_harmonic.clone()), None)
-            } else {
-                (None, None)
-            };
-            // §5.7.6.4.1.3 Pseudocode 88 input — `aspx_tna_mode[ch][sbg]`.
-            // 2-ch hfgen carries per-channel modes; 1-ch hfgen carries
-            // a single channel's modes that we apply to the primary.
-            let (tna_p, tna_s) = if let Some(h2) = sub.tools.aspx_hfgen_iwc_2ch.as_ref() {
-                (Some(h2.tna_mode[0].clone()), Some(h2.tna_mode[1].clone()))
-            } else if let Some(h1) = sub.tools.aspx_hfgen_iwc_1ch.as_ref() {
-                (Some(h1.tna_mode.clone()), None)
-            } else {
-                (None, None)
-            };
-            (
-                pri,
-                sec,
-                tables,
-                cfg,
-                sub.tools.aspx_framing_primary.clone(),
-                sub.tools.aspx_framing_secondary.clone(),
-                sub.tools.aspx_data_sig_primary.clone(),
-                sub.tools.aspx_data_sig_secondary.clone(),
-                sub.tools.aspx_data_noise_primary.clone(),
-                sub.tools.aspx_data_noise_secondary.clone(),
-                sub.tools.aspx_qmode_env_primary,
-                sub.tools.aspx_qmode_env_secondary,
-                sub.tools.aspx_delta_dir_primary.clone(),
-                sub.tools.aspx_delta_dir_secondary.clone(),
-                ah_p,
-                ah_s,
-                tna_p,
-                tna_s,
-            )
-        } else {
-            (
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None, None, None,
-            )
-        };
-        // If the ASPX I-frame pipeline populated derived frequency
-        // tables + config, run the A-SPX bandwidth-extension on top of
-        // the IMDCT low-band PCM.
-        let use_aspx_ext = aspx_tables.is_some() && aspx_cfg.is_some();
-        let num_ts_in_ats = aspx::num_ts_in_ats(info.frame_length.max(1));
-        // Round 43: per-channel companding mode from the parsed
-        // `companding_control()`. For mono / stereo CPE paths the
-        // grouping is `companding_control(1)` / `companding_control(2)`
-        // — i.e. compand_on[0] is the primary channel, compand_on[1]
-        // is the secondary (or the sole entry mirrors via sync_flag).
-        let (compand_mode_pri, compand_mode_sec) = self
-            .last_substream
-            .as_ref()
-            .map(|sub| {
-                let cc = sub.tools.companding.as_ref();
-                (
-                    Self::five_x_compand_mode_for_slot(cc, 0),
-                    Self::five_x_compand_mode_for_slot(cc, 1),
-                )
-            })
-            .unwrap_or((aspx::CompandingMode::Off, aspx::CompandingMode::Off));
-        // Round 43: §5.7.5.2 sb0 selection — for the ASPX_ACPL_1 codec
-        // mode the companding tool starts at `acpl_qmf_band` instead of
-        // `aspx_xover_band`. Both the stereo CPE ASPX_ACPL_1 path and
-        // the 5_X ASPX_ACPL_1 path read this from
-        // `acpl_config_1ch_partial.qmf_band`. `None` for any other
-        // codec mode → falls back to `tables.sbx`.
-        let compand_sb0_override: Option<u32> = self.last_substream.as_ref().and_then(|sub| {
-            let stereo_acpl1 =
-                matches!(sub.tools.stereo_mode, Some(asf::StereoCodecMode::AspxAcpl1));
-            let five_x_acpl1 = matches!(
-                sub.tools.five_x_mode,
-                Some(crate::mch::FiveXCodecMode::AspxAcpl1)
-            );
-            if stereo_acpl1 || five_x_acpl1 {
-                sub.tools
-                    .acpl_config_1ch_partial
-                    .as_ref()
-                    .map(|c| c.qmf_band as u32)
-            } else {
-                None
-            }
-        });
-        // Make sure the per-channel A-SPX state vector is large enough.
-        while self.aspx_ext_state.len() < channels as usize {
-            self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
-        }
-        // Same for the SSF synth state.
-        while self.ssf_synth_state.len() < channels as usize {
-            self.ssf_synth_state.push(ssf_synth::SsfSynthState::new());
-        }
-        // §5.7.7 A-CPL: when the substream parsed `acpl_config_1ch` +
-        // `acpl_data_1ch` we run the channel-pair synthesis on the
-        // ASPX-extended primary PCM and emit two channels. The path
-        // owns the primary IMDCT + ASPX path so `pcm_per_channel[1]`
-        // ends up populated by the synth's `z1` output instead of by a
-        // duplicate-of-primary fallback.
-        let use_acpl =
-            channels as usize >= 2 && acpl_active_cfg.is_some() && acpl_active_data.is_some();
-        // Round 45: stereo-CPE M=2 synced companding. When
-        // `companding_control(2)` carried `sync_flag == 1` and the
-        // primary / secondary cohort both feed the standalone ASPX
-        // path (i.e. `!use_acpl` — ACPL_1 stereo only ASPX-extends
-        // the M-channel via the `acpl1_active` branch and so falls
-        // outside the synced cohort), the two channels share one
-        // geometric-mean gain `g_synch(ts) = √(g_0 · g_1)` per
-        // Pseudocode 121's `sync_flag == 1` branch instead of two
-        // independent per-channel gains. For 5_X ASPX_ACPL_3 the
-        // primary / secondary are the L / R carriers feeding
-        // Pseudocode 118's `run_acpl_5x_mch_pcm`, so this puts the
-        // ACPL_3 surround-pair driver on the same synced footing as
-        // r44's 5_X SIMPLE/ASPX dispatch. Resolves to `None` for
-        // `sync_flag == 0`, missing companding, or any non-sync
-        // sub-branch — falling back to the per-channel
-        // `aspx_extend_pcm` path below.
-        let stereo_cpe_synced_mode: Option<aspx::CompandingMode> = self
-            .last_substream
-            .as_ref()
-            .and_then(|sub| sub.tools.companding.as_ref())
-            .and_then(|cc| Self::five_x_synced_mode(Some(cc)));
-        let use_stereo_cpe_synced = use_aspx_ext
-            && !use_acpl
-            && channels as usize >= 2
-            && stereo_cpe_synced_mode.is_some()
-            && primary_in.is_some()
-            && secondary_in.is_some()
-            && primary_in.as_ref().map(|(_, n)| *n) == secondary_in.as_ref().map(|(_, n)| *n);
-        // Pair-level §5.7.6.3.4-5 joint decode for a stereo-CPE
-        // aspx_balance == 1 pair (Table 52): the balance channel's
-        // envelopes accumulate with delta = 2 and both channels
-        // dequantize jointly through Pseudocode 84. Runs once per
-        // frame, updating both channels' cross-interval envelope
-        // state; the per-channel phase-1 then consumes the
-        // precomputed scale factors instead of re-running the
-        // per-channel Pseudocode 80-83 path.
-        let (pre_scf_pri, pre_scf_sec): (
-            Option<aspx::AspxDecodedScf>,
-            Option<aspx::AspxDecodedScf>,
-        ) = {
-            let is_balance = self
-                .last_substream
-                .as_ref()
-                .and_then(|sub| sub.tools.aspx_balance)
-                .unwrap_or(false);
-            let pair = if is_balance && use_aspx_ext && channels as usize >= 2 {
-                if let (
-                    Some(tables),
-                    Some(frm),
-                    Some(sig_p),
-                    Some(noise_p),
-                    Some(sig_s),
-                    Some(noise_s),
-                    Some(qm),
-                ) = (
-                    aspx_tables.as_ref(),
-                    framing_pri.as_ref(),
-                    sig_pri.as_ref(),
-                    noise_pri.as_ref(),
-                    sig_sec.as_ref(),
-                    noise_sec.as_ref(),
-                    qmode_pri,
-                ) {
-                    if sig_p.is_empty() {
-                        None
-                    } else {
-                        let (st0, st1) = self.two_ext_states(0, 1);
-                        Some(aspx::decode_scf_balance_pair(
-                            tables,
-                            sig_p,
-                            noise_p,
-                            sig_s,
-                            noise_s,
-                            qm,
-                            &frm.freq_res,
-                            &mut st0.env_prev,
-                            &mut st1.env_prev,
-                        ))
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            match pair {
-                Some((a, b)) => (Some(a), Some(b)),
-                None => (None, None),
-            }
-        };
-        if use_stereo_cpe_synced {
-            // Synced stereo-CPE pipeline. IMDCT each channel, then
-            // run the M=2 phase-1 / sync-apply / phase-2 helper.
-            // SAFETY of the unwraps: guarded by `use_stereo_cpe_synced`
-            // (use_aspx_ext, primary_in.is_some(), secondary_in.is_some(),
-            // stereo_cpe_synced_mode.is_some()).
-            let (p_scaled, p_n) = primary_in.as_ref().unwrap();
-            let (s_scaled, s_n) = secondary_in.as_ref().unwrap();
-            let n = *p_n;
-            if n > 0 && n == samples as usize && *s_n == n && !pcm_per_channel.is_empty() {
-                let pcm_pri_f = self.imdct_channel_f32(0, p_scaled, n);
-                let pcm_sec_f = self.imdct_channel_f32(1, s_scaled, n);
-                let pri_input = StereoCpeChannelInput {
-                    ch_index: 0,
-                    pcm_in: &pcm_pri_f,
-                    framing: framing_pri.as_ref(),
-                    sig: sig_pri.as_deref(),
-                    noise: noise_pri.as_deref(),
-                    qmode: qmode_pri,
-                    delta_dir: delta_dir_pri.as_ref(),
-                    add_harmonic: ah_pri.as_deref(),
-                    tna_mode: tna_pri.as_deref(),
-                    precomputed_scf: pre_scf_pri.clone(),
-                };
-                let sec_input = StereoCpeChannelInput {
-                    ch_index: 1,
-                    pcm_in: &pcm_sec_f,
-                    framing: framing_sec.as_ref().or(framing_pri.as_ref()),
-                    sig: sig_sec.as_deref(),
-                    noise: noise_sec.as_deref(),
-                    qmode: qmode_sec.or(qmode_pri),
-                    delta_dir: delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
-                    add_harmonic: ah_sec.as_deref().or(ah_pri.as_deref()),
-                    tna_mode: tna_sec.as_deref().or(tna_pri.as_deref()),
-                    precomputed_scf: pre_scf_sec.clone(),
-                };
-                let (ext_pri, ext_sec) = self.extend_stereo_cpe_pair_with_sync_companding(
-                    &pri_input,
-                    &sec_input,
-                    aspx_tables.as_ref().unwrap(),
-                    aspx_cfg.as_ref().unwrap(),
-                    num_ts_in_ats,
-                    stereo_cpe_synced_mode.unwrap(),
-                    compand_sb0_override,
-                );
-                if pcm_per_channel.len() < 2 {
-                    while pcm_per_channel.len() < 2 {
-                        pcm_per_channel.push(None);
-                    }
-                }
-                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&ext_pri));
-                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&ext_sec));
-            }
-        }
-        if !use_stereo_cpe_synced {
-            if let Some((scaled, n)) = primary_in {
-                if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
-                    if use_aspx_ext {
-                        let pcm_f = self.imdct_channel_f32(0, &scaled, n);
-                        let state = &mut self.aspx_ext_state[0];
-                        let extended = Self::aspx_extend_pcm(
-                            &pcm_f,
-                            aspx_tables.as_ref().unwrap(),
-                            aspx_cfg.as_ref().unwrap(),
-                            framing_pri.as_ref(),
-                            sig_pri.as_deref(),
-                            noise_pri.as_deref(),
-                            qmode_pri,
-                            delta_dir_pri.as_ref(),
-                            ah_pri.as_deref(),
-                            tna_pri.as_deref(),
-                            pre_scf_pri.as_ref(),
-                            state,
-                            num_ts_in_ats,
-                            compand_mode_pri,
-                            compand_sb0_override,
-                        );
-                        if use_acpl {
-                            if let (Some(cfg), Some(data)) =
-                                (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
-                            {
-                                // ASPX_ACPL_1: feed both M (extended) and S
-                                // PCM into the stereo A-CPL. The S spectrum
-                                // is already in `secondary_in`; we IMDCT it
-                                // here without ASPX (the `aspx_data_1ch` in
-                                // ACPL_1 covers the M channel only).
-                                let acpl1_result = if acpl1_active {
-                                    if let Some((s_scaled, s_n)) = secondary_in.as_ref() {
-                                        if *s_n == n {
-                                            let s_pcm = self.imdct_channel_f32(1, s_scaled, *s_n);
-                                            acpl_synth::run_acpl_1ch_pcm_stereo(
-                                                &extended,
-                                                &s_pcm,
-                                                cfg,
-                                                data,
-                                                &mut self.acpl_state,
-                                            )
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    acpl_synth::run_acpl_1ch_pcm(
-                                        &extended,
-                                        cfg,
-                                        data,
-                                        &mut self.acpl_state,
-                                    )
-                                };
-                                if let Some((left, right)) = acpl1_result {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
-                                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
-                                } else {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
-                                }
-                            } else {
-                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
-                            }
-                        } else {
-                            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
-                        }
-                    } else {
-                        pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
-                    }
-                }
-            }
-            if channels as usize >= 2 && !use_acpl {
-                if let Some((scaled, n)) = secondary_in {
-                    if n > 0 && n == samples as usize {
-                        if use_aspx_ext {
-                            let pcm_f = self.imdct_channel_f32(1, &scaled, n);
-                            let state = &mut self.aspx_ext_state[1];
-                            let extended = Self::aspx_extend_pcm(
-                                &pcm_f,
-                                aspx_tables.as_ref().unwrap(),
-                                aspx_cfg.as_ref().unwrap(),
-                                framing_sec.as_ref().or(framing_pri.as_ref()),
-                                sig_sec.as_deref(),
-                                noise_sec.as_deref(),
-                                qmode_sec.or(qmode_pri),
-                                delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
-                                ah_sec.as_deref().or(ah_pri.as_deref()),
-                                tna_sec.as_deref().or(tna_pri.as_deref()),
-                                pre_scf_sec.as_ref(),
-                                state,
-                                num_ts_in_ats,
-                                compand_mode_sec,
-                                compand_sb0_override,
-                            );
-                            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
-                        } else {
-                            pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
-                        }
-                    }
-                }
-            }
-        } // end `if !use_stereo_cpe_synced`
-          // SSF synthesis path — if either ssf_data_* is populated and
-          // the corresponding `pcm_per_channel[ch]` slot is still empty
-          // (the ASF Huffman pipeline didn't fire because spec_frontend
-          // was SSF), drive §5.2.3-5.2.7 → IMDCT to produce real PCM.
-          // Synthesize each granule into a `num_blocks * n_mdct`-long
-          // spectrum vector, then IMDCT each `n_mdct` block independently
-          // and concat the resulting overlap-added PCM.
-        if let Some(data) = ssf_primary.as_ref() {
-            if !pcm_per_channel.is_empty() && pcm_per_channel[0].is_none() {
-                let pcm = self.run_ssf_channel(0, data, samples as usize);
-                if !pcm.is_empty() {
-                    pcm_per_channel[0] = Some(pcm);
-                }
-            }
-        }
-        if channels as usize >= 2 {
-            if let Some(data) = ssf_secondary.as_ref() {
-                if pcm_per_channel.len() >= 2 && pcm_per_channel[1].is_none() {
-                    let pcm = self.run_ssf_channel(1, data, samples as usize);
-                    if !pcm.is_empty() {
-                        pcm_per_channel[1] = Some(pcm);
-                    }
-                }
-            }
-        }
-        // §5.7.7.6.2 ASPX_ACPL_3 5_X synthesis (Pseudocode 118) —
-        // When the substream parsed acpl_config_2ch + acpl_data_2ch and
-        // the stereo-body path decoded the L/R carrier spectra, run the
-        // full 5-channel A-CPL synthesis and populate channels 0..4.
-        // Only fires when all five pcm_per_channel slots are still empty
-        // (i.e. the standard stereo path didn't already claim them), or
-        // when the frame is explicitly a 5_X ASPX_ACPL_3 substream.
-        if five_x_acpl3_active {
-            if let (Some(cfg), Some(data), Some(centre)) = (
-                five_x_acpl3_cfg.as_ref(),
-                five_x_acpl3_data.as_ref(),
-                five_x_centre_spec.as_deref(),
-            ) {
-                // Carrier L and R come from pcm_per_channel[0] / [1] (already
-                // filled by the stereo ASF / ASPX decode path above). If they
-                // are present use them; otherwise zero-fill as placeholders so
-                // the A-CPL synthesis still produces shaped Ls/Rs.
-                let n = samples as usize;
-                let pcm_l_f32: Vec<f32> = pcm_per_channel
-                    .first()
-                    .and_then(|p| p.as_ref())
-                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
-                    .unwrap_or_else(|| vec![0.0_f32; n]);
-                let pcm_r_f32: Vec<f32> = pcm_per_channel
-                    .get(1)
-                    .and_then(|p| p.as_ref())
-                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
-                    .unwrap_or_else(|| vec![0.0_f32; n]);
-                if let Some(out) = acpl_synth::run_acpl_5x_mch_pcm(
-                    &pcm_l_f32,
-                    &pcm_r_f32,
-                    centre,
-                    cfg,
-                    data,
-                    &mut self.acpl_5x_mch_state,
-                ) {
-                    // Output channel mapping for 5.0/5.1:
-                    //   ch0 = L, ch1 = R, ch2 = C, ch3 = Ls, ch4 = Rs.
-                    // Resize pcm_per_channel to 5 slots if needed.
-                    while pcm_per_channel.len() < 5 {
-                        pcm_per_channel.push(None);
-                    }
-                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
-                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
-                    pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
-                    pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
-                    pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
-                }
-            }
-        }
-        // §5.7.7.6.1 ASPX_ACPL_1 / ASPX_ACPL_2 5_X synthesis (Pseudocode 117) —
-        // When the 5_X walker resolved `five_x_mode` to AspxAcpl1 / AspxAcpl2
-        // and parsed the matching `acpl_config_1ch_*` + `acpl_data_1ch_pair`,
-        // run the channel-pair synthesis on the L/R carrier PCM and emit
-        // L / R / C / Ls / Rs.
-        //
-        // L/R carriers come from `pcm_per_channel[0]/[1]` (already filled
-        // by the stereo ASF/ASPX decode path above when present, else
-        // zero-filled placeholders). The centre carrier mirrors the
-        // ACPL_3 path — `cfg0_centre_mono` exists in the tools struct
-        // but lacks an end-to-end decode path; we use silence so the
-        // QMF lengths line up. ACPL_1's Ls/Rs surround carriers are
-        // similarly silence-placeholders for the same reason: A-CPL
-        // synthesis still produces shaped Ls/Rs from the L/R carriers
-        // and the pair parameters; the contribution from the surround
-        // carriers (when those gain a real decode path) just adds in
-        // on top.
-        if five_x_pair_active && !five_x_acpl3_active {
-            if let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
-                five_x_pair_mode,
-                five_x_pair_cfg.as_ref(),
-                five_x_pair_data_1.as_ref(),
-                five_x_pair_data_2.as_ref(),
-            ) {
-                // Round 37: IMDCT the parsed centre `mono_data(0)`
-                // spectrum (Cfg0 trailing) into a real PCM carrier;
-                // falls back to silence when `scaled_spec` is None
-                // (LFE / SSF / Huffman miss) — see `imdct_mono_lfe_data_f32`.
-                let centre_pcm = cfg0_centre_mono
-                    .as_ref()
-                    .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
-                // Round 40: standalone Ls/Rs surround mono walker for
-                // ACPL_1's Mode 1 surround-driven path. The 5_X
-                // ASPX_ACPL_1 inner walker now persists the joint-MDCT
-                // residual pair (sSMP,3 / sSMP,4 per Table 181) on
-                // `tools.acpl_1_residual_pair`; we IMDCT them here into
-                // Ls/Rs PCM carriers and feed them as the `x3` / `x4`
-                // inputs of Pseudocode 117. ACPL_2 mode never emits a
-                // residual pair (no max_sfb_master in the walker), so
-                // the detach is `None` for that path → silence — same
-                // as the round-37 placeholder.
-                //
-                // Round 46 — ACPL_1 surround Ls/Rs ASPX extension:
-                // SPEC-CONFIRMS-NOT-ASPX. Per ETSI TS 103 190-1 §4.2.6.6
-                // Table 25 row `case ASPX_ACPL_1:` (the `5_X_codec_mode
-                // == ASPX_ACPL_1` body parsed by
-                // `parse_aspx_acpl_1_2_inner_body` in `mch.rs`) the
-                // trailer order is `aspx_data_2ch()` (L/R primary
-                // carriers) + `aspx_data_1ch()` (centre mono) + two
-                // `acpl_data_1ch()` parameter sets — there is NO third
-                // ASPX trailer for the surround Ls/Rs pair. The Ls/Rs
-                // carriers are the joint-MDCT residual sSMP,3 / sSMP,4
-                // straight out of the inner sf_data×2 walker; per
-                // §5.7.5.2 / §5.7.6 ASPX BWE applies to the
-                // M-channel-side carriers only (acpl_qmf_band-rooted
-                // sb0 on the L/R primary pair + centre mono, never on
-                // the residual surround pair). Feeding them raw into
-                // Pseudocode 117 as `x3` / `x4` matches the spec — the
-                // post-Pseudocode-117 surround output gets its
-                // synthesis-bandwidth shape from the L/R carriers via
-                // alpha/beta/decorrelator, not from independent
-                // surround-pair extension. Same finding for the
-                // matching M=2 surround-pair synced companding cohort:
-                // no carriers means no companding to sync. Round-46
-                // therefore wires no new surround-pair ASPX/companding
-                // path here; the existing raw-PCM path is correct.
-                let acpl_1_residual_pair = self
-                    .last_substream
-                    .as_ref()
-                    .map(|sub| sub.tools.acpl_1_residual_pair.clone())
-                    .unwrap_or([None, None]);
-                // Round 41: §5.3.4.3.2 / Table 181 first-stage matrix —
-                // when the 5_X ACPL_1 walker captured the two
-                // `chparam_info()` payloads + the joint-MDCT residual
-                // pair AND the inner `two_channel_data` carries
-                // sSMP_A / sSMP_B spectra, mix per-sfb to produce
-                // preliminary (L, R, Ls, Rs) spectra, IMDCT each, and
-                // feed those PCMs into Pseudocode 117.
-                //
-                // When the SAP inputs aren't all available (ACPL_2 path,
-                // or non-AspxAcpl1 mode, or any of the inputs missing)
-                // fall through to the round-40 path: raw sSMP_3/sSMP_4
-                // PCM as ls/rs, slots 0/1 untouched.
-                let chparam_pair = self
-                    .last_substream
-                    .as_ref()
-                    .map(|sub| sub.tools.acpl_1_residual_chparam.clone())
-                    .unwrap_or([None, None]);
-                let max_sfb_master_opt: Option<u32> = self
-                    .last_substream
-                    .as_ref()
-                    .and_then(|sub| sub.tools.acpl_1_residual_max_sfb_master);
-                let inner_tcd_specs: Option<(Vec<f32>, Vec<f32>)> =
-                    self.last_substream.as_ref().and_then(|sub| {
-                        let tcd = sub.tools.two_channel_data.first()?;
-                        let a = tcd.scaled_spec_per_channel.first().cloned().flatten()?;
-                        let b = tcd.scaled_spec_per_channel.get(1).cloned().flatten()?;
-                        Some((a, b))
-                    });
-                let sap_outputs: Option<asf::SapTable181Output> = match (
-                    mode,
-                    inner_tcd_specs.as_ref(),
-                    &chparam_pair,
-                    &acpl_1_residual_pair,
-                    max_sfb_master_opt,
-                ) {
-                    (
-                        acpl_synth::Acpl5xPairMode::AspxAcpl1,
-                        Some((a_spec, b_spec)),
-                        [Some(cp0), Some(cp1)],
-                        [Some((tl3, s3)), Some((tl4, s4))],
-                        Some(max_sfb_master),
-                    ) if *tl3 == *tl4
-                        && *tl3 as usize == samples as usize
-                        && max_sfb_master > 0 =>
-                    {
-                        asf::apply_sap_table_181(
-                            a_spec,
-                            b_spec,
-                            s3,
-                            s4,
-                            &[cp0.clone(), cp1.clone()],
-                            max_sfb_master,
-                            *tl3,
-                        )
-                    }
-                    _ => None,
-                };
-                let (ls_pcm, rs_pcm) =
-                    if let Some((l_spec, r_spec, ls_spec, rs_spec)) = sap_outputs.as_ref() {
-                        // SAP path: replace pcm_per_channel[0]/[1] with the
-                        // mixed L/R PCM and pass mixed Ls/Rs PCM into the
-                        // pair dispatcher.
-                        let n = samples as usize;
-                        let l_pcm = self.imdct_channel_f32(0, l_spec, n);
-                        let r_pcm = self.imdct_channel_f32(1, r_spec, n);
-                        while pcm_per_channel.len() < 2 {
-                            pcm_per_channel.push(None);
-                        }
-                        pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&l_pcm));
-                        pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&r_pcm));
-                        let ls_pcm = self.imdct_channel_f32(3, ls_spec, n);
-                        let rs_pcm = self.imdct_channel_f32(4, rs_spec, n);
-                        (Some(ls_pcm), Some(rs_pcm))
-                    } else {
-                        let ls_pcm = acpl_1_residual_pair[0].as_ref().and_then(|(tl, scaled)| {
-                            if *tl as usize == samples as usize {
-                                Some(self.imdct_channel_f32(3, scaled, samples as usize))
-                            } else {
-                                None
-                            }
-                        });
-                        let rs_pcm = acpl_1_residual_pair[1].as_ref().and_then(|(tl, scaled)| {
-                            if *tl as usize == samples as usize {
-                                Some(self.imdct_channel_f32(4, scaled, samples as usize))
-                            } else {
-                                None
-                            }
-                        });
-                        (ls_pcm, rs_pcm)
-                    };
-                self.dispatch_acpl_5x_pair(
-                    mode,
-                    cfg,
-                    data_1,
-                    data_2,
-                    samples as usize,
-                    centre_pcm.as_deref(),
-                    ls_pcm.as_deref(),
-                    rs_pcm.as_deref(),
-                    &mut pcm_per_channel,
-                );
-            }
-        }
-        // §5.7.7.6.3 Pseudocode 120 — 7_X ASPX_ACPL_1 / ASPX_ACPL_2
-        // dispatch (mirrors the 5_X path above). Channel mapping is
-        // Table 202 (channel_mode, add_ch_base) — for ACPL_1/_2 the
-        // additional 2 channels (z6/z7 in Pseudocode 120) live outside
-        // the A-CPL pair so they aren't generated here; we populate
-        // slots 0..4 (L/R/C/Ls/Rs) and leave 5..7 for the per-channel
-        // fallback path. The pair core itself is bit-equivalent to
-        // Pseudocode 117 — same `(z0, z1) = ACplModule(...)` shape +
-        // `z1 *= sqrt(2)` / `z3 *= sqrt(2)` scaling — modulo the extra
-        // `add_ch_base == 0` z0/z2 sqrt(2) tweak which only fires when
-        // the additional channels carry the L/R pair. Since we treat
-        // the additional pair as silence here, that conditional scale
-        // does not affect the produced 5-channel core.
-        if seven_x_pair_active {
-            if let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
-                seven_x_pair_mode,
-                seven_x_pair_cfg.as_ref(),
-                seven_x_pair_data_1.as_ref(),
-                seven_x_pair_data_2.as_ref(),
-            ) {
-                let centre_pcm = cfg0_centre_mono
-                    .as_ref()
-                    .and_then(|m| self.imdct_mono_lfe_data_f32(m, 2, samples as usize));
-                // Round 40: same standalone Ls/Rs surround mono walker
-                // as the 5_X path — the 7_X ASPX_ACPL_1 walker writes
-                // to the same `acpl_1_residual_pair` slot. ACPL_2 path
-                // detaches `None` (no residual pair).
-                let acpl_1_residual_pair = self
-                    .last_substream
-                    .as_ref()
-                    .map(|sub| sub.tools.acpl_1_residual_pair.clone())
-                    .unwrap_or([None, None]);
-                let ls_pcm = acpl_1_residual_pair[0].as_ref().and_then(|(tl, scaled)| {
-                    if *tl as usize == samples as usize {
-                        Some(self.imdct_channel_f32(3, scaled, samples as usize))
-                    } else {
-                        None
-                    }
-                });
-                let rs_pcm = acpl_1_residual_pair[1].as_ref().and_then(|(tl, scaled)| {
-                    if *tl as usize == samples as usize {
-                        Some(self.imdct_channel_f32(4, scaled, samples as usize))
-                    } else {
-                        None
-                    }
-                });
-                self.dispatch_acpl_5x_pair(
-                    mode,
-                    cfg,
-                    data_1,
-                    data_2,
-                    samples as usize,
-                    centre_pcm.as_deref(),
-                    ls_pcm.as_deref(),
-                    rs_pcm.as_deref(),
-                    &mut pcm_per_channel,
-                );
-            }
-        }
-        // Round 38 / 39: §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX
-        // end-to-end decode. Round 38 wired Cfg2; round 39 wires Cfg0,
-        // Cfg1, Cfg3. Mutually exclusive with the ACPL_3 / pair paths
-        // above (they own different `five_x_mode` enums), so each cfg
-        // fires only when the SIMPLE/ASPX pure-MDCT path is in scope.
-        if five_x_simple_aspx_active && !five_x_acpl3_active && !five_x_pair_active {
-            match five_x_coding_cfg {
-                Some(crate::mch::FiveXCodingConfig::Cfg0Stereo2plusMono)
-                    if cfg_two_channel_data.len() >= 2 =>
-                {
-                    let b_2ch = cfg_b_2ch_mode.unwrap_or(false);
-                    self.dispatch_5x_cfg0_simple_aspx(
-                        &cfg_two_channel_data[0],
-                        &cfg_two_channel_data[1],
-                        b_2ch,
-                        cfg0_centre_mono.as_ref(),
-                        cfg0_aspx_lr.as_ref(),
-                        cfg0_aspx_ls_rs.as_ref(),
-                        cfg0_aspx_centre.as_ref(),
-                        five_x_aspx_config,
-                        five_x_companding.as_ref(),
-                        num_ts_in_ats,
-                        samples as usize,
-                        &mut pcm_per_channel,
-                    );
-                }
-                Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
-                    if let (Some(three), Some(tcd)) = (
-                        cfg_three_channel_data.as_ref(),
-                        cfg_two_channel_data.first(),
-                    ) {
-                        self.dispatch_5x_cfg1_simple_aspx(
-                            three,
-                            tcd,
-                            cfg1_aspx_lr.as_ref(),
-                            cfg1_aspx_ls_rs.as_ref(),
-                            cfg1_aspx_centre.as_ref(),
-                            five_x_aspx_config,
-                            five_x_companding.as_ref(),
-                            num_ts_in_ats,
-                            samples as usize,
-                            &mut pcm_per_channel,
-                        );
-                    }
-                }
-                Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
-                    if let Some(four) = cfg2_four_channel_data.as_ref() {
-                        self.dispatch_5x_cfg2_simple_aspx(
-                            four,
-                            cfg2_back_mono.as_ref(),
-                            cfg2_aspx_lr.as_ref(),
-                            cfg2_aspx_ls_rs.as_ref(),
-                            cfg2_aspx_centre.as_ref(),
-                            five_x_aspx_config,
-                            five_x_companding.as_ref(),
-                            num_ts_in_ats,
-                            samples as usize,
-                            &mut pcm_per_channel,
-                        );
-                    }
-                }
-                Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
-                    if let Some(five) = cfg_five_channel_data.as_ref() {
-                        self.dispatch_5x_cfg3_simple_aspx(
-                            five,
-                            cfg3_aspx_lr.as_ref(),
-                            cfg3_aspx_ls_rs.as_ref(),
-                            cfg3_aspx_centre.as_ref(),
-                            five_x_aspx_config,
-                            five_x_companding.as_ref(),
-                            num_ts_in_ats,
-                            samples as usize,
-                            &mut pcm_per_channel,
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Round 91: 7_X SIMPLE/ASPX inner 5-channel core render (slots
-        // 0..4). The 7_X SIMPLE/Cfg3Five path inherits the inner
-        // `five_channel_data()` from the 5_X Table 29 layout (5 SCEs in
-        // L/R/C/Ls/Rs order, identity SAP via 5x `chparam_info(sap_mode
-        // = 0)`); the only difference from the 5_X dispatch is which
-        // walker populated `tools.five_channel_data` (7_X here, vs 5_X
-        // for the 5.0/5.1 paths). The 5_X dispatch fires the same
-        // IMDCT/KBD/overlap-add chain regardless of which walker
-        // populated the slot, so we route the 7_X-walker-produced
-        // five_channel_data through it. With identity SAP no joint-MDCT
-        // mixing happens at decode time so each output slot 0..4 reflects
-        // only its own input SCE. ASPX trailers for the 7_X path land in
-        // different `tools.*_aspx_*` slots (the 7_X walker has its own
-        // ASPX trailer plumbing — out of scope here); pass `None` for
-        // the trailer slots so the round-91 SIMPLE path reduces to
-        // low-band only. Cfg0/Cfg1/Cfg2 7_X variants need their own
-        // wiring (queued for follow-up rounds — they share the same
-        // 5_X core dispatchers, just with the 7_X-specific trailing
-        // `mono_data(0)` gate and ASPX trailer plumbing).
-        if seven_x_simple_aspx_active
-            && matches!(
-                self.last_substream
-                    .as_ref()
-                    .and_then(|sub| sub.tools.seven_x_coding_config),
-                Some(crate::mch::FiveXCodingConfig::Cfg3Five)
-            )
-        {
-            if let Some(five) = self
-                .last_substream
-                .as_ref()
-                .and_then(|sub| sub.tools.five_channel_data.clone())
-            {
-                self.dispatch_5x_cfg3_simple_aspx(
-                    &five,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    num_ts_in_ats,
-                    samples as usize,
-                    &mut pcm_per_channel,
-                );
-            }
-        }
-        // Round 39 / 40: §5.3.4.4.1 / Table 182 + Table 183 — 7_X
-        // SIMPLE/ASPX additional-channel pair render. The walker populates
-        // `seven_x_additional_channel_data` (two sf_data(ASF) bodies)
-        // when `7_X_codec_mode in {SIMPLE, ASPX}`. Slots 5 / 6 (the F/G
-        // preliminary outputs in Table 182) get the IMDCT'd low-band PCM.
-        //
-        // Round 40 wires the SAP a/b/c/d coefficient extraction
-        // (`extract_sap_abcd` per Pseudocode 59) through Table 183's
-        // 2-pair joint-stereo matrix when `b_use_sap_add_ch == true` AND
-        // partner spectra (D, E for `coding_config in {0, 2, 3}` —
-        // 3/4/0.x channel_mode) are present. The dispatch walks
-        // (P, F) → (slot_high, slot_low) and (Q, G) → (slot_high+1,
-        // slot_low+1) per-sfb in the spectral domain. With identity SAP
-        // (`b_use_sap_add_ch == false`), the partner spectra are left
-        // untouched at their 5.X-core slots and only F/G land at slots
-        // 5/6 — matching the round-39 behaviour.
-        //
-        // The 7_X ACPL_1/_2 walker has its own additional-channel
-        // handling per §5.3.4.4.2/.3 (z6/z7 in Pseudocode 120) — this
-        // branch is gated on the SIMPLE/ASPX active-flag.
-        if seven_x_simple_aspx_active {
-            if let Some(add) = seven_x_additional_channel_data.as_ref() {
-                // Resolve partner spectra + slots based on the active
-                // 7_X coding_config. Per Table 183 row "3/4/0.x" (the
-                // standard 7.0/7.1 layout that our 7_X walker handles)
-                // the partner pair is (Ls, Rs) — slot 3 / slot 4 in our
-                // 5.X-core dispatch; F/G lift to (Lb, Rb) on slot 5/6.
-                let partner_slots: [usize; 2] = [3, 4];
-                let (partner_d, partner_e): (Option<Vec<f32>>, Option<Vec<f32>>) =
-                    match five_x_coding_cfg {
-                        Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
-                            // 5_X cfg2 four_channel_data carries [L, R, Ls, Rs]
-                            // in indices [0, 1, 2, 3] per Table 180. The
-                            // surround pair lives at four[2]/four[3].
-                            let (d, e) = match cfg2_four_channel_data.as_ref() {
-                                Some(four) => (
-                                    four.scaled_spec_per_channel.get(2).cloned().flatten(),
-                                    four.scaled_spec_per_channel.get(3).cloned().flatten(),
-                                ),
-                                None => (None, None),
-                            };
-                            (d, e)
-                        }
-                        Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
-                            // 5_X cfg3 five_channel_data lays out [L, R, C,
-                            // Ls, Rs] per Table 180. Surround pair lives at
-                            // five[3]/five[4].
-                            let (d, e) = match cfg_five_channel_data.as_ref() {
-                                Some(five) => (
-                                    five.scaled_spec_per_channel.get(3).cloned().flatten(),
-                                    five.scaled_spec_per_channel.get(4).cloned().flatten(),
-                                ),
-                                None => (None, None),
-                            };
-                            (d, e)
-                        }
-                        Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
-                            // 5_X cfg1 three_channel_data + two_channel_data:
-                            // surround pair lives at the trailing
-                            // two_channel_data[0]/[1] (slots 3/4 in our
-                            // dispatch). Use the parsed scaled_spec.
-                            let (d, e) = match cfg_two_channel_data.first() {
-                                Some(tcd) => (
-                                    tcd.scaled_spec_per_channel.first().cloned().flatten(),
-                                    tcd.scaled_spec_per_channel.get(1).cloned().flatten(),
-                                ),
-                                None => (None, None),
-                            };
-                            (d, e)
-                        }
-                        _ => (None, None),
-                    };
-                let chparam_pair = self
-                    .last_substream
-                    .as_ref()
-                    .and_then(|sub| sub.tools.seven_x_add_chparam_info.as_ref().cloned());
-                let partner_pair: Option<[&[f32]; 2]> =
-                    match (partner_d.as_ref(), partner_e.as_ref()) {
-                        (Some(d), Some(e)) => Some([d.as_slice(), e.as_slice()]),
-                        _ => None,
-                    };
-                self.dispatch_7x_additional_channel_pair(
-                    add,
-                    partner_pair,
-                    partner_slots,
-                    chparam_pair.as_ref(),
-                    samples as usize,
-                    &mut pcm_per_channel,
-                );
-            }
-        }
-        // Round 80: 5.1 / 7.1 LFE channel render. When the 5_X / 7_X
-        // walker parsed a `mono_data(b_lfe = 1)` payload (per §4.2.6.6
-        // Table 25 `if (b_has_lfe) mono_data(1);` / §4.2.6.14 Table 33
-        // equivalent) the LFE scaled spectrum lives on
-        // `tools.lfe_mono_data.scaled_spec`. IMDCT it into the trailing
-        // LFE PCM slot — slot 5 for 5.1 (after L/R/C/Ls/Rs) and slot 7
-        // for 7.1 (after L/R/C/Ls/Rs/Lb/Rb).
-        if channels == 6 || channels == 8 {
-            let lfe_slot = (channels as usize) - 1;
-            let lfe_mono = self
-                .last_substream
-                .as_ref()
-                .and_then(|sub| sub.tools.lfe_mono_data.clone());
-            if let Some(lfe) = lfe_mono.as_ref() {
-                if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(lfe, lfe_slot, samples as usize) {
-                    while pcm_per_channel.len() <= lfe_slot {
-                        pcm_per_channel.push(None);
-                    }
-                    pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
-                }
-            }
-        }
+        let pcm_per_channel = self.render_channel_substream(channels, samples, info.frame_length);
         self.last_info = Some(info);
         let byte_count = (samples as usize) * (channels as usize) * 2; // S16 interleaved.
         let any_decoded = pcm_per_channel.iter().any(|p| p.is_some());
