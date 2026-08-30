@@ -736,7 +736,18 @@ pub(crate) fn write_aspx_data_2ch_minimal_framed(
     cfg: &aspx::AspxConfig,
     b_iframe: bool,
 ) -> Result<(), &'static str> {
-    let xover: u32 = 0;
+    write_aspx_data_2ch_minimal_framed_xover(bw, cfg, b_iframe, 0)
+}
+
+/// [`write_aspx_data_2ch_minimal_framed`] with an explicit
+/// `aspx_xover_subband_offset` (3 bits on I-frames; the frequency
+/// tables — and so the envelope band counts — follow it).
+pub(crate) fn write_aspx_data_2ch_minimal_framed_xover(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+    xover: u32,
+) -> Result<(), &'static str> {
     if b_iframe {
         bw.write_u32(xover, 3);
     }
@@ -3595,7 +3606,17 @@ pub(crate) fn write_aspx_data_1ch_minimal_framed(
     cfg: &aspx::AspxConfig,
     b_iframe: bool,
 ) -> Result<(), &'static str> {
-    let xover: u32 = 0;
+    write_aspx_data_1ch_minimal_framed_xover(bw, cfg, b_iframe, 0)
+}
+
+/// [`write_aspx_data_1ch_minimal_framed`] with an explicit
+/// `aspx_xover_subband_offset`.
+pub(crate) fn write_aspx_data_1ch_minimal_framed_xover(
+    bw: &mut BitWriter,
+    cfg: &aspx::AspxConfig,
+    b_iframe: bool,
+    xover: u32,
+) -> Result<(), &'static str> {
     if b_iframe {
         bw.write_u32(xover, 3);
     }

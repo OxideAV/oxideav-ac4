@@ -3324,4 +3324,89 @@ mod tests {
         assert!(tools.five_channel_data.is_none());
         assert!(tools.seven_x_additional_channel_data.is_none());
     }
+
+    /// Per-trailer sticky `aspx_xover_subband_offset` (round 453): a
+    /// 5_X ASPX I-frame whose three `aspx_data_*()` payloads carry
+    /// DIFFERENT xover offsets (1 / 2 / 3) must re-seed each payload's
+    /// own offset on the following P-frame — Tables 51 / 52 omit the
+    /// field on non-I-frames and every payload derives its own
+    /// frequency tables from its own offset.
+    #[test]
+    fn five_x_aspx_p_frame_reseeds_per_trailer_xover() {
+        use crate::asf::StickyConfig;
+        use crate::encoder_acpl3::{
+            write_aspx_config, write_aspx_data_1ch_minimal_framed_xover,
+            write_aspx_data_2ch_minimal_framed_xover,
+        };
+        use oxideav_core::bits::BitWriter;
+        let cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::Signalled,
+        };
+        let tl = 1920u32;
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let end = sfbo[20] as usize;
+        let spec = vec![0.0f32; end];
+        let spectra: [&[f32]; 5] = [&spec, &spec, &spec, &spec, &spec];
+        let xovers = [1u32, 2, 3];
+        let body = |b_iframe: bool| -> Vec<u8> {
+            let mut bw = BitWriter::new();
+            bw.write_u32(1, 3); // 5_X_codec_mode = ASPX
+            if b_iframe {
+                write_aspx_config(&mut bw, &cfg);
+            }
+            // companding_control(5): sync_flag = 1, b_compand_on = 1.
+            bw.write_bit(true);
+            bw.write_bit(true);
+            bw.write_u32(3, 2); // coding_config = 3 (five_channel_data)
+            crate::ice::write_five_channel_data_simple(&mut bw, &spectra, tl, 20).unwrap();
+            write_aspx_data_2ch_minimal_framed_xover(&mut bw, &cfg, b_iframe, xovers[0]).unwrap();
+            write_aspx_data_2ch_minimal_framed_xover(&mut bw, &cfg, b_iframe, xovers[1]).unwrap();
+            write_aspx_data_1ch_minimal_framed_xover(&mut bw, &cfg, b_iframe, xovers[2]).unwrap();
+            bw.align_to_byte();
+            bw.into_bytes()
+        };
+        let mut sticky = StickyConfig::default();
+        // I-frame.
+        let i_bytes = body(true);
+        let mut br = BitReader::new(&i_bytes);
+        let mut tools = SubstreamTools {
+            channel_mode_channels: 5,
+            ..Default::default()
+        };
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, true, tl).expect("I-frame parse");
+        let i_bits = br.bit_position();
+        let got = |t: &SubstreamTools| -> [u8; 3] {
+            [
+                t.cfg3_aspx_lr.as_ref().expect("lr").xover,
+                t.cfg3_aspx_ls_rs.as_ref().expect("ls_rs").xover,
+                t.cfg3_aspx_centre.as_ref().expect("centre").xover,
+            ]
+        };
+        assert_eq!(got(&tools), [1, 2, 3], "I-frame trailer xovers");
+        assert_eq!(tools.aspx_xover_sticky, vec![1, 2, 3], "per-trailer table");
+        sticky.harvest(&tools);
+        // P-frame: no xover on the wire; each payload re-seeds its own.
+        let p_bytes = body(false);
+        let mut br = BitReader::new(&p_bytes);
+        let mut tools = SubstreamTools {
+            channel_mode_channels: 5,
+            ..Default::default()
+        };
+        sticky.seed(&mut tools);
+        parse_5x_audio_data_outer(&mut br, &mut tools, false, false, tl).expect("P-frame parse");
+        assert_eq!(got(&tools), [1, 2, 3], "P-frame trailer xovers");
+        // The P-frame walk consumes exactly the I-frame walk minus the
+        // I-frame-only fields (15-bit aspx_config + 3 × 3-bit xover) —
+        // every payload's envelope band count followed its own offset.
+        assert_eq!(i_bits - br.bit_position(), 15 + 9, "P-frame bit budget");
+    }
 }

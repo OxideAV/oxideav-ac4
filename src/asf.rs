@@ -1346,7 +1346,7 @@ pub fn select_alpha_q_for_pair(
 /// The decoder harvests this struct from the parsed
 /// [`SubstreamTools`] after each I-frame and seeds the next frame's
 /// tools from it when `b_iframe == 0`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StickyConfig {
     /// `aspx_config()` from the last I-frame.
     pub aspx_config: Option<aspx::AspxConfig>,
@@ -1361,6 +1361,9 @@ pub struct StickyConfig {
     pub acpl_config_1ch_full: Option<crate::acpl::AcplConfig1ch>,
     /// `acpl_config_2ch()` from the last I-frame (5_X ASPX_ACPL_3).
     pub acpl_config_2ch: Option<crate::acpl::AcplConfig2ch>,
+    /// Per-trailer `aspx_xover_subband_offset` table from the last
+    /// I-frame (see [`SubstreamTools::aspx_xover_sticky`]).
+    pub aspx_xover_table: Vec<u8>,
 }
 
 impl StickyConfig {
@@ -1372,6 +1375,7 @@ impl StickyConfig {
         tools.acpl_config_1ch_partial = self.acpl_config_1ch_partial;
         tools.acpl_config_1ch_full = self.acpl_config_1ch_full;
         tools.acpl_config_2ch = self.acpl_config_2ch;
+        tools.aspx_xover_sticky = self.aspx_xover_table.clone();
     }
 
     /// Harvest the sticky configs from a parsed I-frame's tools.
@@ -1381,6 +1385,7 @@ impl StickyConfig {
         self.acpl_config_1ch_partial = tools.acpl_config_1ch_partial;
         self.acpl_config_1ch_full = tools.acpl_config_1ch_full;
         self.acpl_config_2ch = tools.acpl_config_2ch;
+        self.aspx_xover_table = tools.aspx_xover_sticky.clone();
     }
 }
 
@@ -1457,6 +1462,19 @@ pub struct SubstreamTools {
     /// populated for I-frames; carries the crossover-subband offset
     /// used to seed `sbx` in §5.7.6.3.1.2.
     pub aspx_xover_subband_offset: Option<u8>,
+    /// Per-trailer I-frame-sticky `aspx_xover_subband_offset` table
+    /// for multi-payload elements (5_X / 7_X ASPX trailers, the
+    /// immersive A-SPX payload roster): entry `i` is the offset the
+    /// last I-frame carried on its `i`-th captured `aspx_data_*()`
+    /// payload. Tables 51 / 52 omit the field on non-I-frames, and
+    /// each payload derives its own frequency tables from its own
+    /// offset — so P-frames re-seed per trailer rather than assuming
+    /// one offset across the element. Seeded from
+    /// [`StickyConfig::aspx_xover_table`]; harvested from I-frames.
+    pub aspx_xover_sticky: Vec<u8>,
+    /// Index of the next `aspx_data_*()` payload to capture within the
+    /// current frame's element (fresh `SubstreamTools` per frame → 0).
+    pub aspx_trailer_cursor: usize,
     /// `aspx_delta_dir(0)` — per-envelope delta-direction bits for the
     /// primary channel (Table 54). Populated when the walker reaches
     /// `aspx_data_1ch() / aspx_data_2ch()` and the framing decoded
@@ -2232,6 +2250,18 @@ impl AspxTrailerSnapshot {
     }
 }
 
+/// Record the I-frame `aspx_xover_subband_offset` just parsed for the
+/// `idx`-th `aspx_data_*()` payload of the element into the
+/// per-trailer sticky table (grown on demand).
+fn record_sticky_xover(tools: &mut SubstreamTools, idx: usize) {
+    if let Some(x) = tools.aspx_xover_subband_offset {
+        if tools.aspx_xover_sticky.len() <= idx {
+            tools.aspx_xover_sticky.resize(idx + 1, x);
+        }
+        tools.aspx_xover_sticky[idx] = x;
+    }
+}
+
 /// Walk a trailing `aspx_data_2ch()` body and capture the result as a
 /// [`aspx::FiveXAspxTrailer`]. The per-substream ASPX-trailer slots
 /// in `tools` are saved before the parse and restored afterwards, so
@@ -2249,13 +2279,24 @@ pub(crate) fn capture_aspx_data_2ch_trailer(
     frame_len_base: u32,
 ) -> Option<aspx::FiveXAspxTrailer> {
     let snap = AspxTrailerSnapshot::capture(tools);
+    let trailer_idx = tools.aspx_trailer_cursor;
+    tools.aspx_trailer_cursor += 1;
     // Tables 51 / 52: non-I-frames carry no xover offset on the wire —
     // the parse below needs the I-frame-sticky value the snapshot just
-    // detached, so re-seed it for the walk (restored either way).
+    // detached, so re-seed it for the walk (restored either way): this
+    // payload's own entry of the per-trailer table, else the element's
+    // single sticky slot.
     if !b_iframe {
-        tools.aspx_xover_subband_offset = snap.xover;
+        tools.aspx_xover_subband_offset = tools
+            .aspx_xover_sticky
+            .get(trailer_idx)
+            .copied()
+            .or(snap.xover);
     }
     let parse_ok = parse_aspx_data_2ch_body(br, tools, cfg, b_iframe, frame_len_base).is_ok();
+    if parse_ok && b_iframe {
+        record_sticky_xover(tools, trailer_idx);
+    }
     let trailer = if parse_ok {
         let xover = tools.aspx_xover_subband_offset?;
         let frequency_tables = tools.aspx_frequency_tables.clone()?;
@@ -2340,12 +2381,22 @@ pub(crate) fn capture_aspx_data_1ch_trailer(
     frame_len_base: u32,
 ) -> Option<aspx::FiveXAspxTrailer> {
     let snap = AspxTrailerSnapshot::capture(tools);
+    let trailer_idx = tools.aspx_trailer_cursor;
+    tools.aspx_trailer_cursor += 1;
     // See capture_aspx_data_2ch_trailer — re-seed the sticky xover the
-    // snapshot detached so the Table 51 non-I-frame walk can run.
+    // snapshot detached (per-trailer entry first) so the Table 51
+    // non-I-frame walk can run.
     if !b_iframe {
-        tools.aspx_xover_subband_offset = snap.xover;
+        tools.aspx_xover_subband_offset = tools
+            .aspx_xover_sticky
+            .get(trailer_idx)
+            .copied()
+            .or(snap.xover);
     }
     let parse_ok = parse_aspx_data_1ch_body(br, tools, cfg, b_iframe, frame_len_base).is_ok();
+    if parse_ok && b_iframe {
+        record_sticky_xover(tools, trailer_idx);
+    }
     let trailer = if parse_ok {
         let xover = tools.aspx_xover_subband_offset?;
         let frequency_tables = tools.aspx_frequency_tables.clone()?;

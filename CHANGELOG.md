@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 453 — **per-trailer sticky `aspx_xover_subband_offset`**
+  (TS 103 190-1 §4.2.12.3/.4 Tables 51/52). Multi-payload elements
+  (5_X / 7_X ASPX trailers, the immersive A-SPX roster, the A-JOC
+  static core) now keep an I-frame-sticky offset **per captured
+  `aspx_data_*()` payload** (`SubstreamTools::aspx_xover_sticky` /
+  `StickyConfig::aspx_xover_table`), so a P-frame re-seeds each
+  payload's own offset — and its own frequency tables — instead of
+  assuming one offset across the element. The element-wide slot stays
+  as the fallback. New `five_x_aspx_p_frame_reseeds_per_trailer_xover`
+  pins an I/P pair whose three trailers carry offsets 1/2/3.
 - ac4 round 453 — **dialogue-enhancement application on the immersive
   route** (TS 103 190-2 §4.8.3.15 Tables 13/15 + TS 103 190-1
   §5.7.8). New `de_apply` module implements the part-1 application
