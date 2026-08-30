@@ -1284,7 +1284,10 @@ pub fn dlg_obj(de_main_dlg_mask: u32, num_umx_signals: u32) -> (u32, Vec<u32>) {
     let mut num_dlg_obj = 0;
     let mut dlg_idx = Vec::new();
     for obj in 0..num_umx_signals {
-        if de_main_dlg_mask & (1 << (num_umx_signals - obj - 1)) != 0 {
+        // The mask carries at most the lowest 32 flag bits (objects
+        // whose flag position falls outside a u32 read as 0).
+        let bit = num_umx_signals - obj - 1;
+        if bit < 32 && de_main_dlg_mask & (1u32 << bit) != 0 {
             dlg_idx.push(obj);
             num_dlg_obj += 1;
         }
@@ -1304,7 +1307,17 @@ pub fn parse_ajoc_dmx_de_data(
     let mut de_main_dlg_mask = 0;
     if dmx_de_cfg {
         de_max_gain = br.read_u32(2)?;
-        de_main_dlg_mask = br.read_u32(num_umx_signals)?;
+        // de_main_dlg_flag[] is one bit per upmix signal; the count
+        // may exceed a u32 read (up to 256 objects), so consume the
+        // flags bit-by-bit and keep the lowest 32 mask positions
+        // (matching `dlg_obj`).
+        for i in 0..num_umx_signals {
+            let flag = br.read_bit()?;
+            let bit = num_umx_signals - i - 1;
+            if flag && bit < 32 {
+                de_main_dlg_mask |= 1u32 << bit;
+            }
+        }
     }
     let mut de_dlg_dmx_coeff = Vec::new();
     if !keep_dmx_de_coeffs {

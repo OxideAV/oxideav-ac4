@@ -1536,7 +1536,9 @@ pub fn parse_substream_info_ajoc(
     };
     let mut n_fullband_upmix_signals = br.read_u32(4)? + 1;
     if n_fullband_upmix_signals == 16 {
-        n_fullband_upmix_signals += variable_bits(br, 3)?;
+        n_fullband_upmix_signals = variable_bits(br, 3)?
+            .checked_add(n_fullband_upmix_signals)
+            .ok_or_else(|| Error::invalid("ac4: n_fullband_upmix_signals overflow"))?;
     }
     if n_fullband_upmix_signals > 256 {
         return Err(Error::invalid("ac4: n_fullband_upmix_signals too big"));
