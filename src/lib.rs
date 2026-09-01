@@ -529,9 +529,11 @@ pub mod aspx_tna_select;
 pub mod aspx_tns;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx_tone;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod core_render;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de_apply;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de_huffman;
