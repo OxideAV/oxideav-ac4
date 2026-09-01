@@ -7,6 +7,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.7...v0.0.8) - 2026-08-30
+
+### Other
+
+- fuzz round 5: clamp the immersive SAP band start on short transforms
+- fuzz round 4: dlg_obj / de_main_dlg_flag shift bounds; upmix-count escape checked
+- fuzz round 3: checked arithmetic on every variable_bits-derived TOC / DRC size
+- clippy 1.98: manual_slice_fill + needless_late_init (toolchain drift)
+- fuzz round 2: bound the ASF ext_decode escape run; checked OAMD add_data size
+- round 453 — static-core modes, dialogue enhancement, Not-yet-supported rewrite
+- cargo-fuzz sub-crate + bounded workflow; first findings fixed
+- dialogue enhancement in both decoding modes (§5.8.2.3 / §5.8.2.4)
+- multi-envelope P-frames keep the last-envelope TIME reference
+- per-trailer sticky aspx_xover_subband_offset
+- static-core GOP settle window is two frames
+- dialogue enhancement applied on the immersive route
+- clippy — Table-172 verbatim-constant allow + test lints
+- §5.7.8 dialogue-enhancement application tool
+- b_static_dmx core A-SPX / A-CPL synthesis into the object path
+- factor the channel-substream render out of receive_frame
+- core decoding mode outputs the downmix; A-SPX-route domain-scale fix
+- b_5fronts core-mode coverage; README/CHANGELOG for r443
+- immersive core decoding mode + §5.10.2.6 core renderer
+- reconcile 7CH_STATIC track roles to TS 103 190-2 V1.3.1
+- SAP encode decisions — SCPL arms with automatic step-3/4 + step-5/6 prediction
+- ASPX_AJCC encode from PCM for both layouts, driven by the A-JCC extractor
+- A-JCC parameter extractor — quantisers, per-band analysis, GOP-aware ajcc_data() assembly
+- 9.0.4 / 9.1.4 ASPX_ACPL_1 / ASPX_ACPL_2 encode from PCM (b_5fronts, six modules)
+- 9.0.4 / 9.1.4 ASPX_SCPL encode from PCM (b_5fronts Table 23 inverse)
+- Acpl3EnvPrevRows rows live in the (sum, pan) wire domain
+- tie the balance-encoder clamps to the Annex A.2 codebook ranges
+- README + aspx module doc — balance stereo joint decode landed
+- clippy repeat_vec_with_capacity fix in round-435 suite
+- round-435 A-SPX balance joint-decode pinning
+- wire the §5.7.6.3.5 joint balance stereo decode end-to-end
+- §5.7.6.3.5 Pseudocode 84 joint (sum, balance) stereo dequantization
+- ac4 r419: README — encoder ICE synthesis routes + A-SPX stack notes
+- ac4 r419: 22.2 encode from PCM + encoder companding decision
+- ac4 r419: ASPX_ACPL_1 / ASPX_ACPL_2 encode from PCM
+- ac4 r419: ASPX_SCPL encode from PCM + A-SPX integer-scale anchors
+- ac4 r419: streaming QMF filterbanks on the A-SPX extension chain
+- ac4 r419: real-A-SPX payload row plumbing for the ICE / 22.2 body writers
+- ac4 r417: README + CHANGELOG — round 417 rollup
+- ac4 r417: 22_2_channel_element to PCM (§6.2.4.3 + §5.2.4 Table 21)
+- ac4 r417: companding on the A-JOC A-SPX-downmix route (§4.8.3.10.4)
+- ac4 r417: companding on the immersive ASPX_AJCC route (§4.8.3.10.3)
+- ac4 r417: ASPX_ACPL_1 / ASPX_ACPL_2 full decoding to PCM (§5.5.2 Table 27)
+- ac4 r417: ASPX_SCPL full decoding to PCM (§5.3.3.1 + §4.8.3.11.3)
+- ac4 r417: immersive SMP SAP mixing — §5.2.3.2 steps 3-6 to PCM
+- sap_mode 2 is M/S-in-all-bands (TS 103 190-1 Table 114), not reserved
+- doc(hidden) the internal public surface for semver-checks
+- ac4 r414: README + CHANGELOG — round 414 rollup
+- ac4 r414: A-JOC static-dmx 5.X core + A-SPX var_channel_element to object PCM
+- ac4 r414: immersive_channel_element decode routing — SCPL + ASPX_AJCC to PCM
+- ac4 r414: immersive_channel_element() parse layer + writers (TS 103 190-2 §6.2.4.1-2)
+- ac4 r414: TS 103 190-2 Table 78 channel_mode codes + immersive descriptor surfaces
+- reword a pre-existing provenance note to drop an external-implementation name (disclaimer hygiene)
+- ac4 r411: README + CHANGELOG — round 411 rollup
+- ac4 r411: verify the 0xAC41 sync-frame CRC (Annex G.4.2)
+- ac4 r411: wire sus_ver=1 metadata() into the A-JOC substream decode route
+- ac4 r411: A-JOC LFE decode path — mono_data(1) to the LFE output slot
+- ac4 r411: standalone oamd_substream() ($6.2.2.4) + oamd_substream_info surfaced on the TOC
+- ac4 r411: ac4_presentation_substream() (TS 103 190-2 $6.2.2.3)
+- ac4 r411: fix v2 ndot flag polarity — ndot IS the I-frame flag
+- ac4 r411: presentation data elements — loud_corr + custom_dmx_data (TS 103 190-2 $6.2.9)
+- ac4 r411: stereo_dmx_coeff() element + Tables 149/149a/150 gain maps
+- ac4 r406: sus_ver=1 metadata element layer (TS 103 190-2 §6.2.7)
+- ac4 r406: README + CHANGELOG — A-JOC object-substream end-to-end rollup
+- ac4 r406: Ac4Decoder A-JOC object-frame route + full-frame encoder
+- ac4 r406: A-JOC bitstream-to-object-PCM decode chain + end-to-end proof
+- ac4 r406: audio_data_ajoc + var_channel_element substream body (§6.2.3.4 / §6.2.4.4)
+- ac4 r406: v2 TOC A-JOC + direct-object substream descriptors (§6.2.1.9-11)
+- ac4 r406: OAMD element layer — §6.2.8 parsers + exact writer inverses
+- ac4 r392: README + CHANGELOG — A-JOC Huffman closure + A-JCC subsystem rollup
+- ac4 r392: A-JCC decoded-parameters → synthesis bridge + bitstream-to-QMF end-to-end GOP test
+- ac4 r392: A-JCC §5.6.3.5.3 core decoding mode — ajcc_module_3/4 + Table 39 driver
+- ac4 r392: A-JCC synthesis — §5.6.3.3 interpolation + §5.6.3.5.2 full-decoding reconstruction
+- ac4 r392: A-JCC parameter path — Annex A.1.2 codebooks + §6.2.6 syntax + §5.6.3.2 decode
+- ac4 r392: A-JOC parameter ENCODER — quantizers + bit-cost direction selection + GOP chaining
+- ac4 r392: §6.2.5.1/§6.2.5.3 ajoc()/ajoc_data() decode chain + exact encoder inverses
+- ac4 r392: A-JOC Huffman codeword layer — Annex A.1.1 codebooks + §6.2.5.5 ajoc_huff_data
+- add CI / crates.io / docs.rs / MIT-license badges
+- ac4 r389: README + CHANGELOG — P-frame (b_iframe=0) end-to-end rollup
+- ac4 r389: GOP-depth P-frame chain-consistency + measured element savings
+- ac4 r389: P-frame bodies for ALL remaining live A-SPX paths (5_X/7_X ACPL_2, 7_X/5_X ACPL_1, 7.0 pure-ASPX)
+- ac4 r389: encoder A-CPL DIFF_TIME parameter coding on P-frames (live 5_X ACPL_3)
+- ac4 r389: encoder cross-frame TIME-direction A-SPX envelope DPCM on P-frames (live 5_X ACPL_3)
+- ac4 r389: 5_X/7_X P-frame decode + live ACPL_3 P-frame encode (Table 25 element presence fix)
+- ac4 r389: I-frame-sticky substream configs — P-frame (b_iframe=0) parse for mono/stereo elements
+- ac4 r389: full Pseudocode 80/81 A-SPX envelope delta decode with cross-interval state
+- ac4 r381: README + CHANGELOG — real aspx_preflat selection rollup
+- ac4 r381: extend real aspx_preflat to all remaining live A-SPX paths
+- ac4 r381: wire real aspx_preflat into the live single-env 5_X ASPX_ACPL_3 path
+- ac4 r381: encoder-side aspx_preflat selector (aspx_preflat_select module)
+- ac4 r377: extend real aspx_add_harmonic to the multi-envelope A-SPX paths
+- ac4 r377: end-to-end audibility test for aspx_add_harmonic
+- ac4 r377: extend real aspx_add_harmonic to all live A-SPX paths
+- ac4 r377: wire real aspx_add_harmonic into live 5_X ASPX_ACPL_3 path
+- ac4 r377: encoder aspx_add_harmonic selection (aspx_ah_select module)
+- ac4 r370: README + CHANGELOG — metadata write-side (encoder symmetry) rollup
+- ac4 r370: drc_frame write-side + outer metadata() write-side (Table 66/70/74/75)
+- ac4 r370: dialogue-enhancement write-side (Table 76/77/78 + Annex A.4)
+- ac4 r370: drc_config + drc_compression_curve write-side (Table 71/72/73)
+- ac4 r370: extended_metadata write-side (Table 69) + explicit b_channels_classifier
+- ac4 r370: basic_metadata + further_loudness_info write-side (Table 67/68)
+- ac4 r370: canonical write_variable_bits + EMDF payloads write-side (Table 18/79)
+- ac4 r363: README + CHANGELOG — 7.0 pure-ASPX + 7_X ASPX_ACPL_1 real ASPX/tna_mode
+- ac4 r363: real ASPX envelopes + aspx_tna_mode on the live 7_X ASPX_ACPL_1 path
+- ac4 r363: real aspx_tna_mode on the live 7.0 pure-ASPX frame path
+- ac4 r358: real aspx_tna_mode on the live 7_X ASPX_ACPL_2 path + README/CHANGELOG
+- ac4 r358: real aspx_tna_mode on the live 5_X ASPX_ACPL_2 path (all 3 carriers)
+- ac4 r351: wire real aspx_tna_mode into the live 5_X ASPX_ACPL_3 path
+- ac4 r351: tna-carrying aspx_data_{1,2}ch real-envelope writers
+- ac4 r351: encoder-side aspx_tna_mode selector (A-SPX inverse-filtering mode)
+- ac4 r347: A-JOC spatial reconstruction (§5.7.3.5/§5.7.3.6 Table 49)
+- A-JOC decode parameter-processing core (TS 103 190-2 §5.7 + §6.2.5)
+- ac4 round 340 (part 3) — 7_X Table-202 back-pair (Lb/Rb) channel ASPX envelopes
+- ac4 round 340 (part 2) — mono multi-envelope live A-SPX centre for the 7_X ACPL_2 path
+- ac4 round 340 — mono multi-envelope live A-SPX path for the 5_X ACPL_2 centre carrier
+- ac4 round 337 — real ASPX envelopes on the live 7_X ASPX_ACPL_2 frame path
+- ac4 r331: wire real aspx_data_1ch() into live 5_X ASPX_ACPL_2 frame path
+- ac4 round 327 — wire num_env > 1 multi-envelope real ASPX into the live 5_X ASPX_ACPL_3 frame path
+- ac4 round 322 — wire real ASPX SIGNAL/NOISE envelope into the live 5_X ASPX_ACPL_3 frame path
+- ac4 round 316 — stereo QMF → multi-envelope ASPX encoder builder
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - ac4 round 453 — **dialogue enhancement on A-JOC object substreams**
