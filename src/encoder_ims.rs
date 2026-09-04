@@ -167,6 +167,13 @@ pub struct Ac4ImsEncoder {
     /// [`crate::encoder_asf::with_asf_quant`] on the SIMPLE / ASF,
     /// SCPL and 22.2 bodies.
     pub asf_dynamic_range_db: Option<f32>,
+    /// Dialogue-enhancement metadata to carry in the closing
+    /// `metadata()` element of every frame: the `de_config()` and the
+    /// frame's `de_data()` (author the latter per frame with
+    /// [`crate::de_author::DeAuthor`]). `None` emits
+    /// `b_de_data_present = 0`. The payload is written with the
+    /// keep-flags clear on every frame, so P-frames stay self-contained.
+    pub dialogue_enhancement: Option<(crate::de::DeConfig, crate::de::DeData)>,
 }
 
 impl Ac4ImsEncoder {
@@ -191,6 +198,7 @@ impl Ac4ImsEncoder {
             ice_env_ana: Vec::new(),
             ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState::new(),
             asf_dynamic_range_db: None,
+            dialogue_enhancement: None,
         }
     }
 
@@ -528,41 +536,67 @@ impl Ac4ImsEncoder {
     pub fn trailing_metadata(&self) -> Vec<u8> {
         let mut bw = BitWriter::new();
         let b_iframe = self.b_iframe_global;
+        // The `dialog_enhancement(b_iframe)` element: the configured
+        // payload (config on every frame — I-frames carry it by
+        // definition, P-frames through `de_config_flag = 1`) or the
+        // 1-bit `b_de_data_present = 0`.
+        let de = match &self.dialogue_enhancement {
+            Some((cfg, data)) => crate::de::DialogEnhancement {
+                data_present: true,
+                config_flag: true,
+                config: Some(*cfg),
+                data: Some(data.clone()),
+            },
+            None => crate::de::DialogEnhancement {
+                data_present: false,
+                config_flag: false,
+                config: None,
+                data: None,
+            },
+        };
+        // `tools_metadata_size` announces the DE element's exact bit
+        // length (§4.3.12.1.1) — measure it on a scratch writer.
+        let de_bits = {
+            let mut probe = BitWriter::new();
+            crate::de::write_dialog_enhancement(&mut probe, &de, b_iframe)
+                .expect("dialog_enhancement payload writes");
+            probe.bit_position() as u32
+        };
         if self.bitstream_version >= 2 {
             let meta = crate::metadata::MetadataV2 {
                 basic: crate::metadata::BasicMetadataV2::default(),
                 b_dialog: false,
                 extended: crate::metadata::ExtendedMetadata::default(),
-                // The tools envelope holds exactly the 1-bit
-                // `dialog_enhancement()` (`b_de_data_present = 0`).
-                tools_metadata_size: 1,
-                dialog_enhancement: crate::de::DialogEnhancement {
-                    data_present: false,
-                    config_flag: false,
-                    config: None,
-                    data: None,
-                },
+                tools_metadata_size: de_bits,
+                dialog_enhancement: de,
                 tools_metadata_trailing_bits: 0,
                 emdf_payloads_substream: None,
             };
             crate::metadata::write_metadata_v2(&mut bw, &meta, self.ch_mode(), b_iframe)
-                .expect("minimal metadata(sus_ver = 1) always writes");
+                .expect("metadata(sus_ver = 1) always writes");
         } else {
             // Table 66 (sus_ver = 0): basic_metadata = dialnorm_bits +
             // b_more_basic_metadata = 0; extended_metadata(ch, 0, 0) =
             // b_channels_classifier = 0 + b_event_probability = 0;
-            // tools envelope of two bits (drc_frame: b_drc_present = 0;
-            // dialog_enhancement: b_de_data_present = 0);
-            // b_emdf_payloads_substream = 0.
+            // tools envelope = drc_frame (b_drc_present = 0, 1 bit) +
+            // dialog_enhancement; b_emdf_payloads_substream = 0.
             bw.write_u32(Self::DIALNORM_DEFAULT as u32, 7);
             bw.write_bit(false);
             bw.write_bit(false);
             bw.write_bit(false);
-            bw.write_u32(2, 7);
-            bw.write_bit(false);
-            bw.write_bit(false);
-            bw.write_bit(false);
-            bw.write_bit(false);
+            let tools_bits = 1 + de_bits;
+            if tools_bits < (1 << 7) {
+                bw.write_u32(tools_bits, 7);
+                bw.write_bit(false);
+            } else {
+                bw.write_u32(tools_bits & 0x7F, 7);
+                bw.write_bit(true);
+                crate::toc::write_variable_bits(&mut bw, 3, tools_bits >> 7);
+            }
+            bw.write_bit(false); // drc_frame: b_drc_present = 0
+            crate::de::write_dialog_enhancement(&mut bw, &de, b_iframe)
+                .expect("dialog_enhancement payload writes");
+            bw.write_bit(false); // b_emdf_payloads_substream
         }
         bw.align_to_byte();
         bw.finish()

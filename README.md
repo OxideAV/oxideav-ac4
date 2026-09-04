@@ -385,6 +385,19 @@ emit only the `b_long_frame` form of `asf_transform_info()`, not the
 Table 103 `transf_length` code + grouped psy layout those frame lengths
 require (§4.3.6.1).
 
+**Dialogue-enhancement authoring** (`de_author::DeAuthor`, §4.3.14 /
+§5.7.8.7 channel-independent method): from a dialogue stem and the
+final mix of each processed channel the encoder estimates the per-band
+parameter `p_i = sqrt(E_dialogue / E_mix)` over the Table 173 bands of
+a streaming QMF analysis, quantises it to Table 209 and carries the
+`de_config()` + `de_data()` in every frame's closing `metadata()`
+(`Ac4ImsEncoder::dialogue_enhancement`, exact `tools_metadata_size`).
+Validated through the decoder's own §5.7.8 tool on the immersive
+route: an all-dialogue centre gains +6,04 dB under `G_DE = 6 dB` with
+L / R untouched, a half-amplitude stem +3,54 dB (theory +3,51), a 30 dB
+request clamps to the authored `Gmax` (12,04 dB), and the payload
+parses back to the authored rows.
+
 `Ac4ImsEncoder` emits IMS v2 frames for the channel-based layouts:
 
 - Mono / stereo (SIMPLE/ASF split-MDCT and joint M/S CPE).
@@ -486,6 +499,10 @@ require (§4.3.6.1).
   `transf_length` code and the grouped `asf_psy_info()` / spectral
   layout in place of `b_long_frame`; no body writer emits them, so the
   framework encoder rejects those indices.
+- **Dialogue-enhancement authoring remainders** — only the parametric
+  channel-independent method is authored; the cross-channel methods
+  (`de_mix_coef` rendering vectors), the M/S form, the hybrid
+  waveform contribution and the keep-flag (delta) coding are not.
 - **Dialogue enhancement remainders** — the 9.X.4 core-decoding
   refinements of §5.8.2.1 (A-JCC, `C_L`/`C_R` from the dry
   coefficients) and §5.8.2.2 (A-CPL, from `acpl_alpha5/6`) — the

@@ -536,6 +536,8 @@ pub mod de;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de_apply;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod de_author;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod de_huffman;
 pub mod decoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

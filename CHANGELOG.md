@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_sfb`; every long-frame index (48 kHz 0..=4, 13; 44,1 kHz 13)
   round-trips on every layout. Short-frame indices 5..=12 are rejected
   by the framework encoder with an explanatory error.
+- Dialogue-enhancement authoring (`de_author::DeAuthor`, channel-
+  independent method from dialogue stem + mix energies), carried in the
+  closing `metadata()` via `Ac4ImsEncoder::dialogue_enhancement` with an
+  exact `tools_metadata_size`; validated through the decoder's DE tool
+  (+6,04 dB on an all-dialogue centre at `G_DE = 6 dB`, Gmax clamp).
 
 ### Changed
 
