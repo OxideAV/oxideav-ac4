@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.8...v0.0.9) - 2026-09-04
+
+### Other
+
+- checked variable_bits escape accumulation everywhere (CI parse_toc fuzz finding)
+- encode_stream — framework-encoder round-trip target
+- dialogue-enhancement authoring — de_author + DE payload in the closing metadata()
+- frame-rate matrix — per-index TOC frame-rate info, RawFrameHeader on the immersive/22.2 writers, LFE max_sfb cap
+- ASF band gate — dynamic_range quantiser policy on every waveform body
+- tight audio_size on every substream body + the closing metadata() element
+- framework Encoder — make_encoder + registry entry, layout dispatch, FIFO framing, sync/raw packets, options schema
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - Framework encoder (`encoder::Ac4Encoder`, `make_encoder`, registered
