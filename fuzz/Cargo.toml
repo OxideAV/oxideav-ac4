@@ -35,5 +35,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "encode_stream"
+path = "fuzz_targets/encode_stream.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone package: keep the fuzz crate out of the umbrella workspace.
 [workspace]

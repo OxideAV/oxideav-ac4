@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact `tools_metadata_size`; validated through the decoder's DE tool
   (+6,04 dB on an all-dialogue centre at `G_DE = 6 dB`, Gmax clamp).
 
+- Fuzz target `encode_stream`: framework-encoder round trip (layout /
+  tool family / framing / frame-rate index / bandwidth / band gate / GOP
+  from the leading bytes, S16 PCM through `Ac4Encoder` and back through
+  `Ac4Decoder`); 540 s of bounded runs clean.
+
 ### Changed
 
 - `audio_size` announces the exact `audio_data()` byte length on every
