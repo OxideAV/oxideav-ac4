@@ -689,7 +689,9 @@ impl PresSubstreamParams {
 fn parse_alt_data_set_index(br: &mut BitReader<'_>) -> Result<u32> {
     let mut idx = br.read_u32(1)?;
     if idx == 1 {
-        idx += crate::toc::variable_bits(br, 2)?;
+        idx = idx
+            .checked_add(crate::toc::variable_bits(br, 2)?)
+            .ok_or_else(|| oxideav_core::Error::invalid("ac4: variable_bits escape overflow"))?;
     }
     Ok(idx)
 }
@@ -727,7 +729,11 @@ pub fn parse_presentation_substream(
         }
         let mut n_targets = br.read_u32(2)? + 1;
         if n_targets == 4 {
-            n_targets += crate::toc::variable_bits(br, 2)?;
+            n_targets = n_targets
+                .checked_add(crate::toc::variable_bits(br, 2)?)
+                .ok_or_else(|| {
+                    oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                })?;
         }
         for _ in 0..n_targets {
             let target_level = br.read_u32(3)? as u8;
@@ -770,7 +776,11 @@ pub fn parse_presentation_substream(
         // b_additional_data.
         let mut add_data_bytes = br.read_u32(4)? + 1;
         if add_data_bytes == 16 {
-            add_data_bytes += crate::toc::variable_bits(br, 2)?;
+            add_data_bytes = add_data_bytes
+                .checked_add(crate::toc::variable_bits(br, 2)?)
+                .ok_or_else(|| {
+                    oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                })?;
         }
         br.align_to_byte();
         let mut bytes = Vec::with_capacity(add_data_bytes as usize);

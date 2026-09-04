@@ -1128,11 +1128,19 @@ pub fn parse_oamd_dyndata_single(
         let b_ducking_disabled = br.read_bit()?;
         let mut object_sound_category = br.read_u32(2)?;
         if object_sound_category == 3 {
-            object_sound_category += variable_bits(br, 2)?;
+            object_sound_category = object_sound_category
+                .checked_add(variable_bits(br, 2)?)
+                .ok_or_else(|| {
+                    oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                })?;
         }
         let mut n_alt_data_sets = br.read_u32(2)?;
         if n_alt_data_sets == 3 {
-            n_alt_data_sets += variable_bits(br, 2)?;
+            n_alt_data_sets = n_alt_data_sets
+                .checked_add(variable_bits(br, 2)?)
+                .ok_or_else(|| {
+                    oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                })?;
         }
         let mut sets = Vec::with_capacity(n_alt_data_sets as usize);
         for _ in 0..n_alt_data_sets {

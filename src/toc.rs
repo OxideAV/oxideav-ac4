@@ -433,7 +433,9 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     // 4.2.3.1 Syntax of ac4_toc().
     let mut bitstream_version = br.read_u32(2)?;
     if bitstream_version == 3 {
-        bitstream_version += variable_bits(&mut br, 2)?;
+        bitstream_version = bitstream_version
+            .checked_add(variable_bits(&mut br, 2)?)
+            .ok_or_else(|| oxideav_core::Error::invalid("ac4: variable_bits escape overflow"))?;
     }
     let sequence_counter = br.read_u32(10)?;
     let b_wait_frames = br.read_bit()?;
@@ -818,7 +820,11 @@ fn parse_presentation_info(
     if !b_single_substream {
         presentation_config = br.read_u32(3)?;
         if presentation_config == 7 {
-            presentation_config += variable_bits(br, 2)?;
+            presentation_config = presentation_config
+                .checked_add(variable_bits(br, 2)?)
+                .ok_or_else(|| {
+                    oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                })?;
         }
     }
     info.presentation_config = presentation_config;
@@ -934,7 +940,11 @@ fn parse_presentation_v1_info(
     if !b_single_substream_group {
         presentation_config = br.read_u32(3)?;
         if presentation_config == 7 {
-            presentation_config += variable_bits(br, 2)?;
+            presentation_config = presentation_config
+                .checked_add(variable_bits(br, 2)?)
+                .ok_or_else(|| {
+                    oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                })?;
         }
     }
     info.presentation_config = presentation_config;
@@ -1001,7 +1011,9 @@ fn parse_presentation_v1_info(
                     let n_minus2 = br.read_u32(2)?;
                     let mut n = n_minus2 + 2;
                     if n == 5 {
-                        n += variable_bits(br, 2)?;
+                        n = n.checked_add(variable_bits(br, 2)?).ok_or_else(|| {
+                            oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                        })?;
                     }
                     if n > 64 {
                         return Err(Error::invalid("ac4: presentation_config=5 n too big"));
@@ -1064,7 +1076,11 @@ fn parse_sgi_specifier(
     } else {
         let mut group_index = br.read_u32(3)?;
         if group_index == 7 {
-            group_index += variable_bits(br, 2)?;
+            group_index = group_index
+                .checked_add(variable_bits(br, 2)?)
+                .ok_or_else(|| {
+                    oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                })?;
         }
         Ok(group_index)
     }
@@ -1093,7 +1109,9 @@ fn parse_substream_group_info(
         let n_minus2 = br.read_u32(2)?;
         let mut n = n_minus2 + 2;
         if n == 5 {
-            n += variable_bits(br, 2)?;
+            n = n.checked_add(variable_bits(br, 2)?).ok_or_else(|| {
+                oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+            })?;
         }
         n
     };
@@ -1129,7 +1147,9 @@ fn parse_substream_group_info(
             let substream_index = if b_substreams_present {
                 let mut si = br.read_u32(2)?;
                 if si == 3 {
-                    si += variable_bits(br, 2)?;
+                    si = si.checked_add(variable_bits(br, 2)?).ok_or_else(|| {
+                        oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+                    })?;
                 }
                 Some(si)
             } else {
@@ -1587,7 +1607,9 @@ pub fn parse_substream_info_ajoc(
     let substream_index = if b_substreams_present {
         let mut si = br.read_u32(2)?;
         if si == 3 {
-            si += variable_bits(br, 2)?;
+            si = si.checked_add(variable_bits(br, 2)?).ok_or_else(|| {
+                oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+            })?;
         }
         Some(si)
     } else {
@@ -1740,7 +1762,9 @@ pub fn parse_substream_info_obj(
     let substream_index = if b_substreams_present {
         let mut si = br.read_u32(2)?;
         if si == 3 {
-            si += variable_bits(br, 2)?;
+            si = si.checked_add(variable_bits(br, 2)?).ok_or_else(|| {
+                oxideav_core::Error::invalid("ac4: variable_bits escape overflow")
+            })?;
         }
         Some(si)
     } else {
@@ -1823,6 +1847,18 @@ fn parse_substream_index_table(br: &mut BitReader<'_>) -> Result<(u32, Vec<u32>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CI fuzz finding (parse_toc, r456): `bitstream_version = 3` plus a
+    /// runaway `variable_bits(2)` escape overflowed the `+=`. Every
+    /// escape accumulation is checked now — the frame is rejected, not
+    /// a panic.
+    #[test]
+    fn bitstream_version_escape_overflow_is_rejected() {
+        // '11' then 2-bit chunks all '11' with continuation '1' → the
+        // escape value climbs past u32::MAX.
+        let bytes = vec![0xFFu8; 64];
+        assert!(parse_ac4_toc(&bytes).is_err());
+    }
 
     #[test]
     fn variable_bits_single_chunk() {
