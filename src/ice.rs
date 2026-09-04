@@ -2031,6 +2031,25 @@ pub fn encode_22_2_raw_frame(
     )
 }
 
+/// [`encode_22_2_raw_frame`] with trailing substream `metadata(…)`
+/// bytes (see [`encode_ice_raw_frame_with_metadata`]).
+pub fn encode_22_2_raw_frame_with_metadata(
+    sequence_counter: u32,
+    b_iframe: bool,
+    body: BitWriter,
+    metadata: &[u8],
+) -> Result<Vec<u8>> {
+    encode_chan_raw_frame(
+        sequence_counter,
+        0b111111110,
+        9,
+        false,
+        b_iframe,
+        body,
+        Some(metadata),
+    )
+}
+
 fn encode_chan_raw_frame(
     sequence_counter: u32,
     mode_code: u32,

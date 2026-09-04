@@ -135,11 +135,9 @@ fn encode_5_0_acpl2_real_alpha_beta_loud_surround_produces_different_bytes_than_
     let frame_loud =
         enc_b.encode_frame_pcm_5_0_acpl2_real_alpha_beta(&[&l, &r, &c, &ls_loud, &rs_loud]);
 
-    assert_eq!(
-        frame_silence.len(),
-        frame_loud.len(),
-        "padding-equalised output sizes"
-    );
+    // Substream bodies are tightly sized (audio_size = exact body
+    // length), so the two frames need not share a length; the byte-stream
+    // inequality below is the real check.
     assert_ne!(
         frame_silence, frame_loud,
         "real-α+β encoder must produce different bytes when surround content differs (the round-100 scaffold emits identical α/β codewords regardless of surround input)"
@@ -299,7 +297,9 @@ fn build_body_real_alpha_beta_diverges_from_scaffold_for_nonzero_surround() {
         AcplQuantMode::Fine,
         8192,
     );
-    assert_eq!(scaffold.len(), real.len(), "padding-equalised body sizes");
+    // Substream bodies are tightly sized (audio_size = exact body
+    // length), so the two frames need not share a length; the byte-stream
+    // inequality below is the real check.
     assert_ne!(
         scaffold, real,
         "real-α+β builder must produce a different byte stream than the round-100 scaffold when the caller's Ls/Rs spectra are non-trivial"

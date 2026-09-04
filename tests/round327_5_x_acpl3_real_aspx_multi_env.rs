@@ -234,7 +234,9 @@ fn multi_env_frame_differs_from_single_env_for_transient() {
         1.0,
         1.0,
     );
-    assert_eq!(multi.len(), single.len(), "same padded substream length");
+    // Substream bodies are tightly sized (audio_size = exact body
+    // length), so the two frames need not share a length; the byte-stream
+    // inequality below is the real check.
     assert_ne!(
         multi, single,
         "the 2-envelope FIXFIX body must reach the wire distinct from the \

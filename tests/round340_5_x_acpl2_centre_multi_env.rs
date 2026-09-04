@@ -185,7 +185,9 @@ fn centre_multi_env_frame_differs_from_single_env_for_transient() {
         enc_multi.encode_frame_pcm_5_0_acpl2_real_aspx_centre_multi_env(&[&l, &r, &c, &ls, &rs]);
     let mut enc_single = Ac4ImsEncoder::new();
     let single = enc_single.encode_frame_pcm_5_0_acpl2_real_aspx(&[&l, &r, &c, &ls, &rs]);
-    assert_eq!(multi.len(), single.len(), "same padded substream length");
+    // Substream bodies are tightly sized (audio_size = exact body
+    // length), so the two frames need not share a length; the byte-stream
+    // inequality below is the real check.
     assert_ne!(
         multi, single,
         "the 2-envelope FIXFIX centre body must reach the wire distinct from \

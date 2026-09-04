@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoder pinned on every layout in both tool families.
 - `max_sfb`-parameterised forms of the 7.1.4 / 9.1.4 SCPL-SAP and the
   22.2 encode entry points.
+- Every channel-coded substream closes with the mandatory `metadata()`
+  element (minimal `sus_ver = 1` form on the IMS v2 path, Table 66 form
+  with dialnorm −31 dBFS on the v0 path); `Ac4ImsEncoder::
+  trailing_metadata`, `ice::encode_22_2_raw_frame_with_metadata`.
+
+### Changed
+
+- `audio_size` announces the exact `audio_data()` byte length on every
+  body builder (`encoder_asf::finish_substream_body`, with the
+  `variable_bits(7)` escape) — no more fixed 2–32 KiB pad budgets, zero
+  fill or truncation. Frames shrink to their content (mono 2 048 → ≈1 100
+  bytes on the test content; 5.0 8 192 → ≈5 700) and P-frames are now
+  smaller than their I-frame anchors on the wire.
 
 ## [0.0.8](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.7...v0.0.8) - 2026-08-30
 

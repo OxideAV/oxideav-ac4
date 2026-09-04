@@ -46,8 +46,8 @@ use crate::aspx;
 use crate::aspx_huffman;
 use crate::encoder_asf::{
     build_band_codebook_cost_table, build_sections_from_dp, compute_snf_dpcm_for_zero_quant_bands,
-    dp_optimise_sections, pick_best_codebook_for_band, write_scalefac_data, write_section_data,
-    write_snf_data, write_spectral_data_sections,
+    dp_optimise_sections, finish_substream_body, pick_best_codebook_for_band, write_scalefac_data,
+    write_section_data, write_snf_data, write_spectral_data_sections,
 };
 
 // ====================================================================
@@ -1630,15 +1630,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra(
         write_acpl_data_2ch_minimal(&mut bw, acpl_num_bands, acpl_qm0, acpl_qm1);
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
@@ -1747,15 +1739,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_beta(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
@@ -1893,15 +1877,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
@@ -2050,15 +2026,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_gamma(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
@@ -2252,15 +2220,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Like [`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma`]
@@ -2463,15 +2423,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
@@ -2924,15 +2876,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
         beta3_scale,
         acpl_prev,
     );
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5_X SIMPLE/ASPX_ACPL_3 substream body identical to
@@ -3168,15 +3112,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Transpose a `[ts][sb]` QMF analysis matrix (the row-per-time-slot
@@ -6418,15 +6354,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra(
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, 0, acpl_quant_mode);
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5_X SIMPLE/ASPX_ACPL_2 substream body identical on the wire
@@ -6582,15 +6510,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// 5_X SIMPLE/ASPX_ACPL_2 body with **real** ASPX SIGNAL / NOISE
@@ -6761,15 +6681,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// `aspx_tna_mode`-carrying variant of
@@ -6955,15 +6867,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Multi-envelope **centre-carrier** variant of
@@ -7156,15 +7060,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================
@@ -7482,15 +7378,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra(
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// SAP-aware variant of [`build_5_x_acpl1_body_from_pcm_spectra`] —
@@ -7588,15 +7476,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_sap(
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Decision-driven `chparam_info()` pair selector for the ASPX_ACPL_1
@@ -7849,15 +7729,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_sap_auto(
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================
@@ -9289,15 +9161,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================
@@ -9460,15 +9324,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================
@@ -9620,15 +9476,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra(
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, 0, acpl_quant_mode);
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================
@@ -9797,15 +9645,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 7.0 / 7.1 SIMPLE/ASPX_ACPL_2 substream body identical in
@@ -10003,15 +9843,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// `aspx_tna_mode`-carrying variant of
@@ -10206,15 +10038,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Multi-envelope **centre-carrier** variant of
@@ -10410,15 +10234,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================
@@ -10587,15 +10403,7 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra(
         write_acpl_data_1ch_minimal(&mut bw, acpl_num_bands, start_band, acpl_quant_mode);
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================
@@ -10766,15 +10574,7 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Real-ASPX + `aspx_tna_mode` variant of
@@ -10976,15 +10776,7 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 // ====================================================================

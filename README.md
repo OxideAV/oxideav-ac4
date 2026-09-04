@@ -345,6 +345,17 @@ synthesis, 4–7 %; `gop` selects the I-frame interval and the P-frames
 re-use the sticky `aspx_config`). Parametric 5.X / 7.X (the A-CPL
 routes) is rejected at construction — see *Not yet supported*.
 
+Every `ac4_substream()` the encoder emits is **tightly sized**: the
+`audio_size` header announces the exact byte length of `audio_data()`
+(§4.3.4.1, with the `variable_bits(7)` escape past 32 767 bytes) and
+the substream closes with the mandatory `metadata()` element in the
+form the TOC's `sus_ver` demands — the minimal part-2
+`metadata(0, 0, b_iframe, channel_mode, 1)` on the IMS v2 path, the
+part-1 Table 66 form (dialnorm −31 dBFS, no DRC / DE / EMDF) on the v0
+path. The previous fixed pad budgets (2–32 KiB per frame, zero-filled
+and silently truncated) are gone, so packet sizes now track content
+and P-frame savings are visible at the packet level.
+
 `Ac4ImsEncoder` emits IMS v2 frames for the channel-based layouts:
 
 - Mono / stereo (SIMPLE/ASF split-MDCT and joint M/S CPE).

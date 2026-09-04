@@ -239,9 +239,7 @@ fn encode_5_0_acpl3_real_beta_with_tonal_inputs_diverges_from_scaffold() {
     );
     // Padded substream so byte length stays equal (both paths use the
     // same `pad_target_bytes`); only the body-bit content changes.
-    assert_eq!(
-        bytes_real_beta.len(),
-        bytes_minimal.len(),
-        "padded substream length must match the scaffold's"
-    );
+    // Substream bodies are tightly sized (audio_size = exact body
+    // length), so the two frames need not share a length; the byte-stream
+    // inequality below is the real check.
 }

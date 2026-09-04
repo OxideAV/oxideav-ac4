@@ -291,7 +291,9 @@ fn encode_5_0_acpl3_beta3_layer_is_live_for_uncaptured_centre() {
         1.0,
         1.0,
     );
-    assert_eq!(bytes_off.len(), bytes_on.len(), "padding-equalised sizes");
+    // Substream bodies are tightly sized (audio_size = exact body
+    // length), so the two frames need not share a length; the byte-stream
+    // inequality below is the real check.
     assert_ne!(
         bytes_off, bytes_on,
         "β₃ = real must change the on-wire acpl_data_2ch() payload"

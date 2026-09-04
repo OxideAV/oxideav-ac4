@@ -74,7 +74,7 @@ use crate::encoder_asf::{
     build_5_1_simple_asf_body_from_pcm_spectra, build_7_0_simple_asf_body_from_pcm_spectra,
     build_7_1_simple_asf_body_from_pcm_spectra, build_mono_simple_asf_body_from_pcm_spectrum,
     build_stereo_simple_asf_joint_body_from_pcm_spectra,
-    build_stereo_simple_asf_split_body_from_pcm_spectra,
+    build_stereo_simple_asf_split_body_from_pcm_spectra, finish_substream_body,
 };
 use crate::encoder_mdct::EncoderMdctState;
 
@@ -437,6 +437,87 @@ impl Ac4ImsEncoder {
     }
 }
 
+impl Ac4ImsEncoder {
+    /// `ch_mode` (TS 103 190-1 Table 88 index) for the configured
+    /// `channel_mode` prefix; the part-2 immersive / 22.2 codes map to
+    /// the reserved tail (`> 10`), which every `channel_mode_contains_*`
+    /// predicate treats as "no such channel".
+    fn ch_mode(&self) -> u32 {
+        match (self.channel_mode_value, self.channel_mode_bits) {
+            (0b0, 1) => 0,
+            (0b10, 2) => 1,
+            (0b1100, 4) => 2,
+            (0b1101, 4) => 3,
+            (0b1110, 4) => 4,
+            (0b1111000, 7) => 5,
+            (0b1111001, 7) => 6,
+            (0b1111010, 7) => 7,
+            (0b1111011, 7) => 8,
+            (0b1111100, 7) => 9,
+            (0b1111101, 7) => 10,
+            _ => 11,
+        }
+    }
+
+    /// The `metadata()` element that closes every `ac4_substream()`
+    /// (TS 103 190-1 §4.2.4.2 Table 16 / TS 103 190-2 §6.2.2.2), in its
+    /// minimal form: no loudness / downmix / classifier payload, no DRC,
+    /// no dialogue enhancement, no EMDF. `bitstream_version >= 2`
+    /// forces `sus_ver = 1` (§6.2.1.6), so the part-2 form (`metadata(0,
+    /// 0, b_iframe, channel_mode, 1)` — no `dialnorm_bits`, no
+    /// `drc_frame()`) is emitted; the v0 / v1 path writes the part-1
+    /// Table 66 form with `dialnorm_bits = DIALNORM_DEFAULT`. Byte
+    /// aligned per Table 16's closing `byte_align`.
+    pub fn trailing_metadata(&self) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        let b_iframe = self.b_iframe_global;
+        if self.bitstream_version >= 2 {
+            let meta = crate::metadata::MetadataV2 {
+                basic: crate::metadata::BasicMetadataV2::default(),
+                b_dialog: false,
+                extended: crate::metadata::ExtendedMetadata::default(),
+                // The tools envelope holds exactly the 1-bit
+                // `dialog_enhancement()` (`b_de_data_present = 0`).
+                tools_metadata_size: 1,
+                dialog_enhancement: crate::de::DialogEnhancement {
+                    data_present: false,
+                    config_flag: false,
+                    config: None,
+                    data: None,
+                },
+                tools_metadata_trailing_bits: 0,
+                emdf_payloads_substream: None,
+            };
+            crate::metadata::write_metadata_v2(&mut bw, &meta, self.ch_mode(), b_iframe)
+                .expect("minimal metadata(sus_ver = 1) always writes");
+        } else {
+            // Table 66 (sus_ver = 0): basic_metadata = dialnorm_bits +
+            // b_more_basic_metadata = 0; extended_metadata(ch, 0, 0) =
+            // b_channels_classifier = 0 + b_event_probability = 0;
+            // tools envelope of two bits (drc_frame: b_drc_present = 0;
+            // dialog_enhancement: b_de_data_present = 0);
+            // b_emdf_payloads_substream = 0.
+            bw.write_u32(Self::DIALNORM_DEFAULT as u32, 7);
+            bw.write_bit(false);
+            bw.write_bit(false);
+            bw.write_bit(false);
+            bw.write_u32(2, 7);
+            bw.write_bit(false);
+            bw.write_bit(false);
+            bw.write_bit(false);
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        bw.finish()
+    }
+
+    /// `dialnorm_bits` announced on the v0 / v1 path: §4.3.12.2.1
+    /// codes the input reference level in ¼ dBFS steps
+    /// (`dialnorm = −¼ · dialnorm_bits dBFS`); 124 announces −31 dBFS,
+    /// the conventional dialogue level.
+    pub const DIALNORM_DEFAULT: u8 = 124;
+}
+
 /// Scale a PCM slice into the A-SPX QMF integer-PCM domain
 /// ([`crate::aspx::ASPX_QMF_PCM_SCALE`]) before feeding an analysis
 /// bank — the encoder-side mirror of the decoder's scaled analysis,
@@ -525,11 +606,7 @@ pub fn build_mono_simple_asf_tone_body(
     bw.write_u32(120, 8);
     // asf_snf_data: b_snf_data_exists = 0.
     bw.write_u32(0, 1);
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    bw.finish()
+    finish_substream_body(bw)
 }
 
 /// Write a section-length increment sequence per §4.3.5.4
@@ -667,6 +744,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // sequence_counter wraps at 1024.
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         // Restore caller's channel_mode setting.
@@ -868,6 +946,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // sequence_counter wraps at 1024.
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         // Restore caller's channel_mode setting.
@@ -997,6 +1076,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // sequence_counter wraps at 1024.
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         // Restore caller's channel_mode setting.
@@ -1121,6 +1201,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // sequence_counter wraps at 1024.
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         // Restore caller's channel_mode setting.
@@ -1255,6 +1336,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // sequence_counter wraps at 1024.
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         // Restore caller's channel_mode setting.
@@ -1431,6 +1513,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -1576,6 +1659,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // sequence_counter wraps at 1024.
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         // Restore caller's channel_mode setting.
@@ -1751,6 +1835,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // sequence_counter wraps at 1024.
         // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
         // envelope + ACPL q_prev references without tracking the rows, so
@@ -1912,6 +1997,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
         // envelope + ACPL q_prev references without tracking the rows, so
         // reset the encoder-side P-frame reference states (next non-I
@@ -2090,6 +2176,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
         // envelope + ACPL q_prev references without tracking the rows, so
         // reset the encoder-side P-frame reference states (next non-I
@@ -2276,6 +2363,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
         // envelope + ACPL q_prev references without tracking the rows, so
         // reset the encoder-side P-frame reference states (next non-I
@@ -2488,6 +2576,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
         // envelope + ACPL q_prev references without tracking the rows, so
         // reset the encoder-side P-frame reference states (next non-I
@@ -2680,6 +2769,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
         // envelope + ACPL q_prev references without tracking the rows, so
         // reset the encoder-side P-frame reference states (next non-I
@@ -3029,6 +3119,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -3547,6 +3638,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -3675,6 +3767,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -3824,6 +3917,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -3979,6 +4073,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -4135,6 +4230,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -4417,6 +4513,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -4545,6 +4642,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -4665,6 +4763,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -4781,6 +4880,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -4918,6 +5018,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -5066,6 +5167,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -5204,6 +5306,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -5338,6 +5441,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -5506,6 +5610,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -5719,6 +5824,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -5925,6 +6031,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -6071,6 +6178,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -6255,6 +6363,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -6400,6 +6509,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -6603,6 +6713,7 @@ impl Ac4ImsEncoder {
         bw.align_to_byte();
         let mut out = bw.finish();
         out.extend(body);
+        out.extend(self.trailing_metadata());
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -7054,12 +7165,14 @@ impl Ac4ImsEncoder {
             },
         )
         .expect("encoder: ice aspx_scpl body");
-        let out = crate::ice::encode_ice_raw_frame(
+        let meta = self.trailing_metadata();
+        let out = crate::ice::encode_ice_raw_frame_with_metadata(
             self.sequence_counter as u32,
             lfe.is_some(),
             false,
             b_iframe,
             body,
+            &meta,
         )
         .expect("encoder: ice frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
@@ -7289,12 +7402,14 @@ impl Ac4ImsEncoder {
             },
         )
         .expect("encoder: ice aspx_scpl 5fronts body");
-        let out = crate::ice::encode_ice_raw_frame(
+        let meta = self.trailing_metadata();
+        let out = crate::ice::encode_ice_raw_frame_with_metadata(
             self.sequence_counter as u32,
             lfe.is_some(),
             true,
             b_iframe,
             body,
+            &meta,
         )
         .expect("encoder: ice frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
@@ -7555,12 +7670,14 @@ impl Ac4ImsEncoder {
             },
         )
         .expect("encoder: ice acpl body");
-        let out = crate::ice::encode_ice_raw_frame(
+        let meta = self.trailing_metadata();
+        let out = crate::ice::encode_ice_raw_frame_with_metadata(
             self.sequence_counter as u32,
             lfe.is_some(),
             false,
             b_iframe,
             body,
+            &meta,
         )
         .expect("encoder: ice frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
@@ -7852,12 +7969,14 @@ impl Ac4ImsEncoder {
             },
         )
         .expect("encoder: ice acpl 5fronts body");
-        let out = crate::ice::encode_ice_raw_frame(
+        let meta = self.trailing_metadata();
+        let out = crate::ice::encode_ice_raw_frame_with_metadata(
             self.sequence_counter as u32,
             lfe.is_some(),
             true,
             b_iframe,
             body,
+            &meta,
         )
         .expect("encoder: ice frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
@@ -8093,12 +8212,14 @@ impl Ac4ImsEncoder {
             &scpl_chparam,
         )
         .expect("encoder: ice scpl sap body");
-        let out = crate::ice::encode_ice_raw_frame(
+        let meta = self.trailing_metadata();
+        let out = crate::ice::encode_ice_raw_frame_with_metadata(
             self.sequence_counter as u32,
             lfe.is_some(),
             b_5fronts,
             b_iframe,
             body,
+            &meta,
         )
         .expect("encoder: ice frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
@@ -8335,12 +8456,14 @@ impl Ac4ImsEncoder {
             },
         )
         .expect("encoder: ice ajcc body");
-        let out = crate::ice::encode_ice_raw_frame(
+        let meta = self.trailing_metadata();
+        let out = crate::ice::encode_ice_raw_frame_with_metadata(
             self.sequence_counter as u32,
             lfe.is_some(),
             b_5fronts,
             b_iframe,
             body,
+            &meta,
         )
         .expect("encoder: ice frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
@@ -8471,8 +8594,14 @@ impl Ac4ImsEncoder {
             )
             .expect("encoder: 22_2 body");
         }
-        let out = crate::ice::encode_22_2_raw_frame(self.sequence_counter as u32, b_iframe, body)
-            .expect("encoder: 22_2 frame assembly");
+        let meta = self.trailing_metadata();
+        let out = crate::ice::encode_22_2_raw_frame_with_metadata(
+            self.sequence_counter as u32,
+            b_iframe,
+            body,
+            &meta,
+        )
+        .expect("encoder: 22_2 frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         out
     }

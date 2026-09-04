@@ -281,7 +281,9 @@ fn acpl2_real_aspx_7x_body_differs_from_scaffold_for_hf_input() {
     let real = enc_real.encode_frame_pcm_7_0_acpl2_real_aspx(&[&l, &r, &c, &ls, &rs, &lb, &rb]);
     let scaffold =
         enc_scaffold.encode_frame_pcm_7_0_acpl2_real_alpha_beta(&[&l, &r, &c, &ls, &rs, &lb, &rb]);
-    assert_eq!(real.len(), scaffold.len(), "padding-equalised output sizes");
+    // Substream bodies are tightly sized (audio_size = exact body
+    // length), so the two frames need not share a length; the byte-stream
+    // inequality below is the real check.
     assert_ne!(
         real, scaffold,
         "real L/R + Ls/Rs + centre ASPX envelopes must differ from the all-zero scaffold body"

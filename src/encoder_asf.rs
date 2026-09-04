@@ -1045,6 +1045,40 @@ pub fn write_spectral_data_sections(
 /// max_sfb. `coeffs` is the windowed forward-MDCT spectrum (length ≥
 /// `sfb_offset[max_sfb]`).
 ///
+/// Finish an `ac4_substream()` body: byte-align, then patch the
+/// 15-bit `audio_size_value` + `b_more_bits` header that every body
+/// builder opens with a placeholder so it announces the **exact**
+/// byte length of `audio_data()` (TS 103 190-1 §4.3.4.1: the size of
+/// `audio_data` including its `fill_bits` / `byte_align`, excluding the
+/// trailing `metadata()`). Bodies of 32 768 bytes and more re-open the
+/// header with the `variable_bits(7)` extension. No zero padding and no
+/// truncation — the announced size is what was written, so the decoder
+/// finds `metadata()` right after the audio data and nothing is lost.
+pub fn finish_substream_body(mut bw: BitWriter) -> Vec<u8> {
+    bw.align_to_byte();
+    let mut bytes = bw.finish();
+    debug_assert!(
+        bytes.len() >= 2,
+        "substream body lacks its audio_size header"
+    );
+    let body_len = bytes.len().saturating_sub(2) as u32;
+    if body_len < (1 << 15) {
+        let hdr = body_len << 1; // b_more_bits = 0
+        bytes[0] = (hdr >> 8) as u8;
+        bytes[1] = (hdr & 0xFF) as u8;
+        bytes
+    } else {
+        let mut h = BitWriter::new();
+        h.write_u32(body_len & 0x7FFF, 15);
+        h.write_bit(true);
+        crate::toc::write_variable_bits(&mut h, 7, body_len >> 15);
+        h.align_to_byte();
+        let mut out = h.finish();
+        out.extend_from_slice(&bytes[2..]);
+        out
+    }
+}
+
 /// Returns the substream bytes (audio_size header + audio_data + zero-
 /// padding) sized to `pad_target_bytes`.
 pub fn build_mono_simple_asf_body_from_pcm_spectrum(
@@ -1134,15 +1168,7 @@ pub fn build_mono_simple_asf_body_from_pcm_spectrum(
         max_sfb,
     );
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build the full stereo SIMPLE/ASF substream body for the long-frame
@@ -1278,15 +1304,7 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
         max_sfb,
     );
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Round-52: energy-weighted average per-SFB Pearson correlation between
@@ -1670,15 +1688,7 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
         max_sfb,
     );
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build the full 5.0 SIMPLE/ASF substream body for the long-frame
@@ -1840,15 +1850,7 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 5.1 SIMPLE/Cfg3Five substream body — same as
@@ -2022,15 +2024,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
         );
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 7.0 (3/4/0) SIMPLE/Cfg3Five substream body per ETSI TS 103
@@ -2224,15 +2218,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     // No trailing `mono_data(0)` for Cfg3 (the 7.X trailing-mono gate is
     // `coding_config in {0, 2}` only). No ASPX trailers for SIMPLE.
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 7.0 (3/4/0) **pure-ASPX** (`7_X_codec_mode = ASPX`) substream
@@ -2476,15 +2462,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
         .expect("encoder: aspx config invalid");
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// `aspx_tna_mode`-carrying variant of
@@ -2748,15 +2726,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
         .expect("encoder: aspx config invalid");
     }
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Build a 7.1 (3/4/0.1) SIMPLE/Cfg3Five substream body — extends
@@ -2977,15 +2947,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // No trailing `mono_data(0)` for Cfg3 (the 7.X trailing-mono gate is
     // `coding_config in {0, 2}` only). No ASPX trailers for SIMPLE.
 
-    bw.align_to_byte();
-    while bw.byte_len() < pad_target_bytes {
-        bw.write_u32(0, 8);
-    }
-    let mut bytes = bw.finish();
-    if bytes.len() > pad_target_bytes {
-        bytes.truncate(pad_target_bytes);
-    }
-    bytes
+    finish_substream_body(bw)
 }
 
 /// Round-50 helper: count total bits the body would emit if we used the
@@ -3125,16 +3087,19 @@ mod tests {
         let mut coeffs = vec![0.0_f32; end_bin];
         coeffs[4] = 32.0; // ends up in band 1 (sfbo[1]=4)
         coeffs[5] = -32.0;
-        // Build the body.
+        // Build the body. The (legacy) pad budget is ignored: the
+        // announced audio_size is the exact body length.
         let body = build_mono_simple_asf_body_from_pcm_spectrum(tl, max_sfb, &coeffs, 80);
-        assert_eq!(body.len(), 80);
+        assert!(body.len() < 80, "tight body, no padding: {}", body.len());
 
         // Parse: skip header (audio_size_value + b_more_bits + align +
         // mono_codec_mode + spec_frontend + b_long_frame + max_sfb).
         let mut br = BitReader::new(&body);
         // audio_size_value (15) + b_more_bits (1) = 16 bits = 2 bytes.
-        let _audio_size = br.read_u32(15).unwrap();
-        let _more = br.read_bit().unwrap();
+        let audio_size = br.read_u32(15).unwrap();
+        let more = br.read_bit().unwrap();
+        assert!(!more);
+        assert_eq!(audio_size as usize, body.len() - 2, "audio_size is tight");
         br.align_to_byte();
         let mono_mode = br.read_u32(1).unwrap();
         assert_eq!(mono_mode, 0);
