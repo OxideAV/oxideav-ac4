@@ -325,6 +325,26 @@ an S16 `AudioFrame`:
 
 ### Encoder
 
+The **framework encoder** (`encoder::Ac4Encoder`, registered next to
+the decoder and reachable through `oxideav_core::CodecRegistry::
+first_encoder` / `make_encoder`) turns the per-layout `Ac4ImsEncoder`
+entry points into a stream encoder: `CodecParameters::channels`
+selects the layout (mono / stereo / 5.0 / 5.1 / 7.0 / 7.1 / 7.0.4 /
+7.1.4 / 9.0.4 / 9.1.4 / 22.2), input frames of any sample format are
+FIFO-framed into `frame_len`-sample AC-4 frames (`frame_rate_index`
+option, TS 103 190-1 Tables 83 / 84), and every frame becomes one
+packet — an Annex G `0xAC40` / `0xAC41` sync frame or a bare
+`raw_ac4_frame()` (`framing` option) — with `pts` / `duration` in
+`1 / sample_rate` and the keyframe flag mirroring `b_iframe_global`.
+The `mode` option picks the tool family: `waveform` (SIMPLE / ASF on
+every channel, SCPL + automatic SAP decisions on the immersive
+element, 22.2 Simple; measured 3–7 % settled relative RMS error on
+every channel of every layout at the 20 kHz default `bandwidth`) or
+`parametric` (immersive ASPX_SCPL and 22.2 A-SPX with real envelope
+synthesis, 4–7 %; `gop` selects the I-frame interval and the P-frames
+re-use the sticky `aspx_config`). Parametric 5.X / 7.X (the A-CPL
+routes) is rejected at construction — see *Not yet supported*.
+
 `Ac4ImsEncoder` emits IMS v2 frames for the channel-based layouts:
 
 - Mono / stereo (SIMPLE/ASF split-MDCT and joint M/S CPE).
@@ -453,6 +473,14 @@ an S16 `AudioFrame`:
 - **Encoder coverage gaps** — no 7.X ASPX_ACPL_3 path; some advanced
   A-CPL parameters (β3 / γ on certain paths) remain scaffolded at
   minimum-bit-cost defaults.
+- **5.X / 7.X A-CPL PCM parity** — the ASPX_ACPL_1 / _2 / _3 encode
+  paths were pinned on structure (parse-back, envelope recovery,
+  determinism) but never on decoded PCM; measured through the
+  decoder, the 5_X / 7_X ASPX_ACPL_1 / _2 routes never render the
+  `two_channel_data()` L / R carrier pair (the pair synthesis runs
+  on silence) and the ASPX_ACPL_3 route lands 3–13× the input energy
+  on L / R / Ls / Rs. The framework encoder therefore rejects
+  `mode=parametric` on 5.X / 7.X until both sides are reconciled.
 
 ## Specs
 

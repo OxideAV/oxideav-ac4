@@ -7906,7 +7906,17 @@ impl Ac4ImsEncoder {
     /// (LFE **last**; the decoder emits it on the leading output
     /// slot).
     pub fn encode_frame_pcm_7_1_4_ice_scpl_sap(&mut self, frames: &[&[f32]; 12]) -> Vec<u8> {
-        self.encode_ice_scpl_sap_inner(&frames[..11], Some(frames[11]), 40)
+        self.encode_frame_pcm_7_1_4_ice_scpl_sap_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_7_1_4_ice_scpl_sap`].
+    pub fn encode_frame_pcm_7_1_4_ice_scpl_sap_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 12],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_scpl_sap_inner(&frames[..11], Some(frames[11]), max_sfb)
     }
 
     /// 9.0.4 form of [`Self::encode_frame_pcm_7_0_4_ice_scpl_sap`]
@@ -7930,7 +7940,17 @@ impl Ac4ImsEncoder {
     /// 9.1.4 form of [`Self::encode_frame_pcm_9_0_4_ice_scpl_sap`]
     /// (LFE **last**).
     pub fn encode_frame_pcm_9_1_4_ice_scpl_sap(&mut self, frames: &[&[f32]; 14]) -> Vec<u8> {
-        self.encode_ice_scpl_sap_inner(&frames[..13], Some(frames[13]), 40)
+        self.encode_frame_pcm_9_1_4_ice_scpl_sap_with_max_sfb(frames, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_9_1_4_ice_scpl_sap`].
+    pub fn encode_frame_pcm_9_1_4_ice_scpl_sap_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 14],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_ice_scpl_sap_inner(&frames[..13], Some(frames[13]), max_sfb)
     }
 
     /// Shared SCPL + SAP body + frame assembly for both layouts
@@ -8339,12 +8359,32 @@ impl Ac4ImsEncoder {
         self.encode_frame_pcm_22_2_inner(frames, false, 40)
     }
 
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_22_2_simple`].
+    pub fn encode_frame_pcm_22_2_simple_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 24],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_22_2_inner(frames, false, max_sfb)
+    }
+
     /// [`Self::encode_frame_pcm_22_2_simple`] with the A-SPX codec
     /// mode (Table 98): each of the eleven `two_channel_data()` pairs
     /// carries a real-synthesis `aspx_data_2ch()` payload extracted
     /// from its own channels.
     pub fn encode_frame_pcm_22_2_aspx(&mut self, frames: &[&[f32]; 24]) -> Vec<u8> {
         self.encode_frame_pcm_22_2_inner(frames, true, 40)
+    }
+
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_22_2_aspx`].
+    pub fn encode_frame_pcm_22_2_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 24],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_22_2_inner(frames, true, max_sfb)
     }
 
     /// Shared 22.2 body + frame assembly.

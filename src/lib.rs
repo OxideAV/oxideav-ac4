@@ -546,6 +546,7 @@ pub mod drc;
 pub mod drc_huffman;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod emdf;
+pub mod encoder;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_acpl3;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
@@ -591,12 +592,12 @@ pub mod tables;
 pub mod toc;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
-use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 /// Canonical codec id.
 pub const CODEC_ID_STR: &str = "ac4";
 
-/// Register the AC-4 decoder in a codec registry.
+/// Register the AC-4 decoder and encoder in a codec registry.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::audio("ac4_sw")
         .with_lossy(true)
@@ -609,6 +610,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(make_decoder)
+            .encoder(make_encoder)
+            .encoder_options::<encoder::Ac4EncoderOptions>()
             // ISO BMFF sample entry fourcc per ETSI TS 103 190-2 Annex E.
             .tag(CodecTag::fourcc(b"ac-4")),
     );
@@ -626,6 +629,10 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
 }
 
+fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    encoder::make_encoder(params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +642,10 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         assert!(reg.has_decoder(&CodecId::new(CODEC_ID_STR)));
+        assert!(reg.has_encoder(&CodecId::new(CODEC_ID_STR)));
+        assert!(reg
+            .encoder_options_schema(&CodecId::new(CODEC_ID_STR))
+            .is_some_and(|s| s.iter().any(|f| f.name == "framing")));
     }
 
     #[test]

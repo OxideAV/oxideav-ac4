@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Framework encoder (`encoder::Ac4Encoder`, `make_encoder`, registered
+  with an options schema): layout dispatch by channel count, any-format
+  input FIFO framing, `frame_rate_index` / `framing` / `mode` /
+  `bandwidth` / `gop` options, sync-frame or raw packetisation with
+  pts / duration / keyframe metadata. PCM parity through the registry
+  decoder pinned on every layout in both tool families.
+- `max_sfb`-parameterised forms of the 7.1.4 / 9.1.4 SCPL-SAP and the
+  22.2 encode entry points.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.7...v0.0.8) - 2026-08-30
 
 ### Other
