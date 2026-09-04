@@ -331,7 +331,63 @@ fn quantise_band_for_cb(coeffs: &[f32], sf: i32, cb_id: u8) -> Vec<i32> {
 /// Empty bands return `(0, 100, [], 0)` — codebook 0 = "all-zero", no
 /// emission, scalefactor doesn't matter.
 pub fn pick_best_codebook_for_band(coeffs: &[f32]) -> (u8, i32, Vec<i32>, u32) {
-    pick_best_codebook_for_band_with_q_target(coeffs, 12.0)
+    pick_best_codebook_for_band_with(coeffs, active_asf_quant())
+}
+
+/// Frame-level ASF quantiser policy consulted by every band quantiser
+/// call ([`pick_best_codebook_for_band`] and the `_with_q_target`
+/// form) through [`with_asf_quant`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AsfQuant {
+    /// Per-band peak-quant target: the band's anchor scalefactor is
+    /// chosen so its largest coefficient lands at about this quant
+    /// index (legacy 12 → ≈ 26 dB per-band SNR).
+    pub q_target: f32,
+    /// Band gate in the MDCT coefficient domain: a band whose peak
+    /// magnitude is below this is coded silent (codebook 0 + spectral
+    /// noise fill from its real energy) instead of at `q_target`
+    /// resolution. `0.0` disables the gate (legacy — every band with
+    /// any energy is coded at full resolution).
+    pub gate: f32,
+}
+
+impl AsfQuant {
+    /// The historical policy: `q_target = 12`, no gate.
+    pub const LEGACY: AsfQuant = AsfQuant {
+        q_target: 12.0,
+        gate: 0.0,
+    };
+}
+
+impl Default for AsfQuant {
+    fn default() -> Self {
+        Self::LEGACY
+    }
+}
+
+thread_local! {
+    static ASF_QUANT: std::cell::Cell<AsfQuant> = const { std::cell::Cell::new(AsfQuant::LEGACY) };
+}
+
+/// The [`AsfQuant`] policy in force on this thread (`LEGACY` outside
+/// any [`with_asf_quant`] scope).
+pub fn active_asf_quant() -> AsfQuant {
+    ASF_QUANT.with(|c| c.get())
+}
+
+/// Run `f` with `quant` as the active band-quantiser policy — the
+/// encoder's frame-level knob for the (deeply nested) body builders,
+/// all of which quantise through [`pick_best_codebook_for_band`]. The
+/// previous policy is restored when `f` returns (or unwinds).
+pub fn with_asf_quant<R>(quant: AsfQuant, f: impl FnOnce() -> R) -> R {
+    struct Restore(AsfQuant);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ASF_QUANT.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(ASF_QUANT.with(|c| c.replace(quant)));
+    f()
 }
 
 /// Variant of [`pick_best_codebook_for_band`] that lets the caller bump
@@ -345,11 +401,26 @@ pub fn pick_best_codebook_for_band_with_q_target(
     coeffs: &[f32],
     q_target: f32,
 ) -> (u8, i32, Vec<i32>, u32) {
+    let quant = AsfQuant {
+        q_target,
+        ..active_asf_quant()
+    };
+    pick_best_codebook_for_band_with(coeffs, quant)
+}
+
+/// [`pick_best_codebook_for_band`] under an explicit [`AsfQuant`]
+/// policy: the band is coded silent when its peak sits below
+/// `quant.gate`, else its anchor scalefactor targets `quant.q_target`.
+pub fn pick_best_codebook_for_band_with(
+    coeffs: &[f32],
+    quant: AsfQuant,
+) -> (u8, i32, Vec<i32>, u32) {
+    let q_target = quant.q_target;
     if coeffs.is_empty() {
         return (0, 100, Vec::new(), 0);
     }
     let max_abs = coeffs.iter().fold(0.0_f32, |a, &c| a.max(c.abs()));
-    if max_abs <= 1e-12 {
+    if max_abs <= 1e-12 || max_abs < quant.gate {
         return (0, 100, vec![0i32; coeffs.len()], 0);
     }
     // Anchor scalefactor: target peak quant ≈ q_target (default 12 for

@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with dialnorm −31 dBFS on the v0 path); `Ac4ImsEncoder::
   trailing_metadata`, `ice::encode_22_2_raw_frame_with_metadata`.
 
+- ASF band gate (`encoder_asf::AsfQuant` / `with_asf_quant`,
+  `Ac4ImsEncoder::asf_dynamic_range_db`, framework option
+  `dynamic_range`, default 60 dB below the frame peak): bands at the
+  leakage floor are coded silent + noise-filled instead of at full
+  resolution — mono ≈1 140 → ≈80 bytes/frame, 5.0 ≈5 700 → ≈340, 22.2
+  ≈22 500 → ≈1 450 on the round-456 tones at unchanged decoded parity.
+
 ### Changed
 
 - `audio_size` announces the exact `audio_data()` byte length on every

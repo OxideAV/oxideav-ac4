@@ -74,7 +74,8 @@ use crate::encoder_asf::{
     build_5_1_simple_asf_body_from_pcm_spectra, build_7_0_simple_asf_body_from_pcm_spectra,
     build_7_1_simple_asf_body_from_pcm_spectra, build_mono_simple_asf_body_from_pcm_spectrum,
     build_stereo_simple_asf_joint_body_from_pcm_spectra,
-    build_stereo_simple_asf_split_body_from_pcm_spectra, finish_substream_body,
+    build_stereo_simple_asf_split_body_from_pcm_spectra, finish_substream_body, with_asf_quant,
+    AsfQuant,
 };
 use crate::encoder_mdct::EncoderMdctState;
 
@@ -155,6 +156,17 @@ pub struct Ac4ImsEncoder {
     /// drives the P-frame FREQ-vs-TIME row selection.
     #[doc(hidden)] // internal cross-frame state; not part of the stable API
     pub ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState,
+    /// ASF band gate for the waveform-coded spectra, in dB below the
+    /// frame's peak MDCT coefficient (across all channels): a
+    /// scale-factor band whose peak sits further down than this is
+    /// coded silent with spectral noise fill instead of at the full
+    /// per-band quantiser resolution. `None` (the historical default)
+    /// codes every band that carries any energy — even the MDCT
+    /// leakage floor — at ≈ 26 dB SNR, which is what made frames cost
+    /// several kilobytes for a handful of tones. Applied through
+    /// [`crate::encoder_asf::with_asf_quant`] on the SIMPLE / ASF,
+    /// SCPL and 22.2 bodies.
+    pub asf_dynamic_range_db: Option<f32>,
 }
 
 impl Ac4ImsEncoder {
@@ -178,6 +190,24 @@ impl Ac4ImsEncoder {
             acpl3_param_prev: crate::encoder_acpl3::Acpl3ParamPrevRows::default(),
             ice_env_ana: Vec::new(),
             ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState::new(),
+            asf_dynamic_range_db: None,
+        }
+    }
+
+    /// The [`AsfQuant`] policy for one frame: the band gate sits
+    /// `asf_dynamic_range_db` below the peak coefficient of `spectra`
+    /// (`gate = 0`, i.e. no gate, when the knob is `None`).
+    fn frame_quant<'a>(&self, spectra: impl IntoIterator<Item = &'a [f32]>) -> AsfQuant {
+        let Some(db) = self.asf_dynamic_range_db else {
+            return AsfQuant::LEGACY;
+        };
+        let peak = spectra
+            .into_iter()
+            .flat_map(|s| s.iter())
+            .fold(0.0_f32, |a, &c| a.max(c.abs()));
+        AsfQuant {
+            gate: peak * 10f32.powf(-db.max(0.0) / 20.0),
+            ..AsfQuant::LEGACY
         }
     }
 
@@ -731,12 +761,15 @@ impl Ac4ImsEncoder {
             41..=50 => 4096,
             _ => 8192,
         };
-        let body = build_mono_simple_asf_body_from_pcm_spectrum(
-            frame_len,
-            max_sfb,
-            &coeffs,
-            pad_target_bytes,
-        );
+        let quant = self.frame_quant([coeffs.as_slice()]);
+        let body = with_asf_quant(quant, || {
+            build_mono_simple_asf_body_from_pcm_spectrum(
+                frame_len,
+                max_sfb,
+                &coeffs,
+                pad_target_bytes,
+            )
+        });
 
         // 5. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
@@ -922,23 +955,26 @@ impl Ac4ImsEncoder {
             41..=50 => 8192,
             _ => 16384,
         };
-        let body = if use_joint {
-            build_stereo_simple_asf_joint_body_from_pcm_spectra(
-                frame_len,
-                max_sfb,
-                &coeffs_l,
-                &coeffs_r,
-                pad_target_bytes,
-            )
-        } else {
-            build_stereo_simple_asf_split_body_from_pcm_spectra(
-                frame_len,
-                max_sfb,
-                &coeffs_l,
-                &coeffs_r,
-                pad_target_bytes,
-            )
-        };
+        let quant = self.frame_quant([coeffs_l.as_slice(), coeffs_r.as_slice()]);
+        let body = with_asf_quant(quant, || {
+            if use_joint {
+                build_stereo_simple_asf_joint_body_from_pcm_spectra(
+                    frame_len,
+                    max_sfb,
+                    &coeffs_l,
+                    &coeffs_r,
+                    pad_target_bytes,
+                )
+            } else {
+                build_stereo_simple_asf_split_body_from_pcm_spectra(
+                    frame_len,
+                    max_sfb,
+                    &coeffs_l,
+                    &coeffs_r,
+                    pad_target_bytes,
+                )
+            }
+        });
 
         // 6. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
@@ -1057,18 +1093,21 @@ impl Ac4ImsEncoder {
             41..=50 => 16384,
             _ => 32768,
         };
-        let body = build_5_0_simple_asf_body_from_pcm_spectra(
-            frame_len,
-            max_sfb,
-            &[
-                &coeffs_per_channel[0],
-                &coeffs_per_channel[1],
-                &coeffs_per_channel[2],
-                &coeffs_per_channel[3],
-                &coeffs_per_channel[4],
-            ],
-            pad_target_bytes,
-        );
+        let quant = self.frame_quant(coeffs_per_channel.iter().map(|c| c.as_slice()));
+        let body = with_asf_quant(quant, || {
+            build_5_0_simple_asf_body_from_pcm_spectra(
+                frame_len,
+                max_sfb,
+                &[
+                    &coeffs_per_channel[0],
+                    &coeffs_per_channel[1],
+                    &coeffs_per_channel[2],
+                    &coeffs_per_channel[3],
+                    &coeffs_per_channel[4],
+                ],
+                pad_target_bytes,
+            )
+        });
 
         // 5. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
@@ -1180,20 +1219,23 @@ impl Ac4ImsEncoder {
             41..=50 => 16384,
             _ => 32768,
         };
-        let body = build_5_1_simple_asf_body_from_pcm_spectra(
-            frame_len,
-            max_sfb,
-            max_sfb_lfe,
-            &[
-                &coeffs_per_channel[0],
-                &coeffs_per_channel[1],
-                &coeffs_per_channel[2],
-                &coeffs_per_channel[3],
-                &coeffs_per_channel[4],
-                &coeffs_per_channel[5],
-            ],
-            pad_target_bytes,
-        );
+        let quant = self.frame_quant(coeffs_per_channel.iter().map(|c| c.as_slice()));
+        let body = with_asf_quant(quant, || {
+            build_5_1_simple_asf_body_from_pcm_spectra(
+                frame_len,
+                max_sfb,
+                max_sfb_lfe,
+                &[
+                    &coeffs_per_channel[0],
+                    &coeffs_per_channel[1],
+                    &coeffs_per_channel[2],
+                    &coeffs_per_channel[3],
+                    &coeffs_per_channel[4],
+                    &coeffs_per_channel[5],
+                ],
+                pad_target_bytes,
+            )
+        });
 
         // 5. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
@@ -1314,21 +1356,24 @@ impl Ac4ImsEncoder {
             41..=50 => 24576,
             _ => 32767,
         };
-        let body = build_7_0_simple_asf_body_from_pcm_spectra(
-            frame_len,
-            max_sfb,
-            max_sfb_add,
-            &[
-                &coeffs_per_channel[0],
-                &coeffs_per_channel[1],
-                &coeffs_per_channel[2],
-                &coeffs_per_channel[3],
-                &coeffs_per_channel[4],
-                &coeffs_per_channel[5],
-                &coeffs_per_channel[6],
-            ],
-            pad_target_bytes,
-        );
+        let quant = self.frame_quant(coeffs_per_channel.iter().map(|c| c.as_slice()));
+        let body = with_asf_quant(quant, || {
+            build_7_0_simple_asf_body_from_pcm_spectra(
+                frame_len,
+                max_sfb,
+                max_sfb_add,
+                &[
+                    &coeffs_per_channel[0],
+                    &coeffs_per_channel[1],
+                    &coeffs_per_channel[2],
+                    &coeffs_per_channel[3],
+                    &coeffs_per_channel[4],
+                    &coeffs_per_channel[5],
+                    &coeffs_per_channel[6],
+                ],
+                pad_target_bytes,
+            )
+        });
 
         // 5. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
@@ -1635,23 +1680,26 @@ impl Ac4ImsEncoder {
             41..=50 => 24576,
             _ => 32767,
         };
-        let body = build_7_1_simple_asf_body_from_pcm_spectra(
-            frame_len,
-            max_sfb,
-            max_sfb_add,
-            max_sfb_lfe,
-            &[
-                &coeffs_per_channel[0],
-                &coeffs_per_channel[1],
-                &coeffs_per_channel[2],
-                &coeffs_per_channel[3],
-                &coeffs_per_channel[4],
-                &coeffs_per_channel[5],
-                &coeffs_per_channel[6],
-                &coeffs_per_channel[7],
-            ],
-            pad_target_bytes,
-        );
+        let quant = self.frame_quant(coeffs_per_channel.iter().map(|c| c.as_slice()));
+        let body = with_asf_quant(quant, || {
+            build_7_1_simple_asf_body_from_pcm_spectra(
+                frame_len,
+                max_sfb,
+                max_sfb_add,
+                max_sfb_lfe,
+                &[
+                    &coeffs_per_channel[0],
+                    &coeffs_per_channel[1],
+                    &coeffs_per_channel[2],
+                    &coeffs_per_channel[3],
+                    &coeffs_per_channel[4],
+                    &coeffs_per_channel[5],
+                    &coeffs_per_channel[6],
+                    &coeffs_per_channel[7],
+                ],
+                pad_target_bytes,
+            )
+        });
 
         // 5. Wrap in v2 IMS TOC.
         let mut bw = BitWriter::new();
@@ -7150,20 +7198,28 @@ impl Ac4ImsEncoder {
         };
         let b_iframe = self.b_iframe_global;
         let mut body = BitWriter::new();
-        crate::ice::write_ice_body_aspx_scpl_real(
-            &mut body,
-            &spectra,
-            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
-            false,
-            &aspx_cfg,
-            b_iframe,
-            frame_len,
-            max_sfb,
-            &crate::ice::IceAspxRows {
-                two_ch: &two_ch,
-                one_ch: &one_ch,
-            },
-        )
+        let quant = self.frame_quant(
+            coeffs
+                .iter()
+                .map(|c| c.as_slice())
+                .chain(lfe_coeffs.as_deref()),
+        );
+        with_asf_quant(quant, || {
+            crate::ice::write_ice_body_aspx_scpl_real(
+                &mut body,
+                &spectra,
+                lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+                false,
+                &aspx_cfg,
+                b_iframe,
+                frame_len,
+                max_sfb,
+                &crate::ice::IceAspxRows {
+                    two_ch: &two_ch,
+                    one_ch: &one_ch,
+                },
+            )
+        })
         .expect("encoder: ice aspx_scpl body");
         let meta = self.trailing_metadata();
         let out = crate::ice::encode_ice_raw_frame_with_metadata(
@@ -7387,20 +7443,28 @@ impl Ac4ImsEncoder {
         };
         let b_iframe = self.b_iframe_global;
         let mut body = BitWriter::new();
-        crate::ice::write_ice_body_aspx_scpl_real(
-            &mut body,
-            &spectra,
-            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
-            true,
-            &aspx_cfg,
-            b_iframe,
-            frame_len,
-            max_sfb,
-            &crate::ice::IceAspxRows {
-                two_ch: &two_ch,
-                one_ch: &one_ch,
-            },
-        )
+        let quant = self.frame_quant(
+            coeffs
+                .iter()
+                .map(|c| c.as_slice())
+                .chain(lfe_coeffs.as_deref()),
+        );
+        with_asf_quant(quant, || {
+            crate::ice::write_ice_body_aspx_scpl_real(
+                &mut body,
+                &spectra,
+                lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+                true,
+                &aspx_cfg,
+                b_iframe,
+                frame_len,
+                max_sfb,
+                &crate::ice::IceAspxRows {
+                    two_ch: &two_ch,
+                    one_ch: &one_ch,
+                },
+            )
+        })
         .expect("encoder: ice aspx_scpl 5fronts body");
         let meta = self.trailing_metadata();
         let out = crate::ice::encode_ice_raw_frame_with_metadata(
@@ -8201,16 +8265,23 @@ impl Ac4ImsEncoder {
         };
         let b_iframe = self.b_iframe_global;
         let mut body = BitWriter::new();
-        crate::ice::write_ice_body_scpl_with_sap(
-            &mut body,
-            &spectra,
-            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
-            b_5fronts,
-            frame_len,
-            max_sfb,
-            sap_add.as_ref(),
-            &scpl_chparam,
-        )
+        let quant = self.frame_quant(
+            wire.iter()
+                .map(|w| w.as_slice())
+                .chain(lfe_coeffs.as_deref()),
+        );
+        with_asf_quant(quant, || {
+            crate::ice::write_ice_body_scpl_with_sap(
+                &mut body,
+                &spectra,
+                lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+                b_5fronts,
+                frame_len,
+                max_sfb,
+                sap_add.as_ref(),
+                &scpl_chparam,
+            )
+        })
         .expect("encoder: ice scpl sap body");
         let meta = self.trailing_metadata();
         let out = crate::ice::encode_ice_raw_frame_with_metadata(
@@ -8554,6 +8625,7 @@ impl Ac4ImsEncoder {
         let pairs: [[&[f32]; 2]; 11] =
             std::array::from_fn(|p| [coeffs[2 * p].as_slice(), coeffs[2 * p + 1].as_slice()]);
         let lfe = [(coeffs[22].as_slice(), 7u32), (coeffs[23].as_slice(), 7u32)];
+        let quant_22 = self.frame_quant(coeffs.iter().map(|c| c.as_slice()));
         if aspx {
             let mut aspx_cfg = Self::ice_live_aspx_cfg();
             let q_ch: Vec<Vec<Vec<(f32, f32)>>> = (0..22)
@@ -8570,28 +8642,32 @@ impl Ac4ImsEncoder {
                     )
                 })
                 .collect();
-            crate::ice::write_22_2_body_real(
-                &mut body,
-                lfe,
-                &pairs,
-                Some(&aspx_cfg),
-                b_iframe,
-                frame_len,
-                max_sfb,
-                &rows,
-            )
+            with_asf_quant(quant_22, || {
+                crate::ice::write_22_2_body_real(
+                    &mut body,
+                    lfe,
+                    &pairs,
+                    Some(&aspx_cfg),
+                    b_iframe,
+                    frame_len,
+                    max_sfb,
+                    &rows,
+                )
+            })
             .expect("encoder: 22_2 body");
         } else {
-            crate::ice::write_22_2_body_real(
-                &mut body,
-                lfe,
-                &pairs,
-                None,
-                b_iframe,
-                frame_len,
-                max_sfb,
-                &[],
-            )
+            with_asf_quant(quant_22, || {
+                crate::ice::write_22_2_body_real(
+                    &mut body,
+                    lfe,
+                    &pairs,
+                    None,
+                    b_iframe,
+                    frame_len,
+                    max_sfb,
+                    &[],
+                )
+            })
             .expect("encoder: 22_2 body");
         }
         let meta = self.trailing_metadata();

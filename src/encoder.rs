@@ -92,6 +92,11 @@ pub struct Ac4EncoderOptions {
     /// Coded audio bandwidth in Hz — the encoder picks the widest
     /// `max_sfb` whose scale-factor-band edge stays at or below this.
     pub bandwidth_hz: u32,
+    /// ASF band gate in dB below the frame's peak MDCT coefficient:
+    /// scale-factor bands further down are coded silent (with spectral
+    /// noise fill) instead of at full quantiser resolution. `0`
+    /// disables the gate and codes every band that carries any energy.
+    pub dynamic_range_db: u32,
     /// I-frame interval: frame `k` is an I-frame when `k % gop == 0`.
     /// `1` (the default) makes every frame independently decodable.
     /// Only the parametric immersive / 22.2 routes emit P-frames; the
@@ -107,6 +112,7 @@ impl Default for Ac4EncoderOptions {
             framing: Framing::Sync,
             mode: EncodeMode::Waveform,
             bandwidth_hz: 20_000,
+            dynamic_range_db: 60,
             gop: 1,
         }
     }
@@ -139,6 +145,12 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
             help: "coded audio bandwidth in Hz (selects max_sfb)",
         },
         OptionField {
+            name: "dynamic_range",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(60),
+            help: "ASF band gate in dB below the frame peak (0 = code every band)",
+        },
+        OptionField {
             name: "gop",
             kind: OptionKind::U32,
             default: OptionValue::U32(1),
@@ -165,6 +177,7 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
                 }
             }
             "bandwidth" => self.bandwidth_hz = value.as_u32()?,
+            "dynamic_range" => self.dynamic_range_db = value.as_u32()?,
             "gop" => self.gop = value.as_u32()?,
             _ => return Err(Error::invalid(format!("ac4: unknown option '{key}'"))),
         }
@@ -340,6 +353,8 @@ impl Ac4Encoder {
         let mut inner = Ac4ImsEncoder::new();
         inner.fs_index = fs_index;
         inner.frame_rate_index = opts.frame_rate_index as u8;
+        inner.asf_dynamic_range_db =
+            (opts.dynamic_range_db > 0).then_some(opts.dynamic_range_db as f32);
 
         let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
         out_params.sample_rate = Some(sample_rate);
@@ -747,11 +762,13 @@ mod tests {
             .set("framing", "raw")
             .set("mode", "parametric")
             .set("bandwidth", "12000")
+            .set("dynamic_range", "45")
             .set("gop", "4");
         let o: Ac4EncoderOptions = parse_options(&bag).unwrap();
         assert_eq!(o.framing, Framing::Raw);
         assert_eq!(o.mode, EncodeMode::Parametric);
         assert_eq!(o.bandwidth_hz, 12_000);
+        assert_eq!(o.dynamic_range_db, 45);
         assert_eq!(o.gop, 4);
         let bad = oxideav_core::CodecOptions::new().set("framing", "mp4");
         assert!(parse_options::<Ac4EncoderOptions>(&bad).is_err());

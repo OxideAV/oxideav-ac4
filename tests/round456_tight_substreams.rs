@@ -49,6 +49,16 @@ fn lfe_slots(channels: usize) -> &'static [usize] {
 /// Encode `frames` AC-4 frames of test content through the framework
 /// encoder (raw framing) and return the raw frames.
 fn raw_frames(channels: usize, mode: EncodeMode, gop: u32, frames: usize) -> Vec<Vec<u8>> {
+    raw_frames_with_range(channels, mode, gop, frames, 60)
+}
+
+fn raw_frames_with_range(
+    channels: usize,
+    mode: EncodeMode,
+    gop: u32,
+    frames: usize,
+    dynamic_range_db: u32,
+) -> Vec<Vec<u8>> {
     let mut p = CodecParameters::audio(CodecId::new("ac4"));
     p.sample_rate = Some(48_000);
     p.channels = Some(channels as u16);
@@ -59,6 +69,7 @@ fn raw_frames(channels: usize, mode: EncodeMode, gop: u32, frames: usize) -> Vec
             framing: Framing::Raw,
             mode,
             gop,
+            dynamic_range_db,
             ..Ac4EncoderOptions::default()
         },
     )
@@ -155,12 +166,70 @@ fn every_layout_announces_the_exact_audio_size_and_closes_with_metadata() {
         );
     }
     // The old fixed pad budgets: mono 2 048, stereo 4 096, 5.X / 7.X
-    // 8 192+ bytes. Every layout now sits well under its old budget.
+    // 8 192+ bytes. With the 60 dB band gate the test tones code an
+    // order of magnitude under those budgets.
     let by = |ch: usize, m: EncodeMode| report.iter().find(|r| r.0 == ch && r.1 == m).unwrap().2;
-    assert!(by(1, EncodeMode::Waveform) < 2_048);
-    assert!(by(2, EncodeMode::Waveform) < 4_096);
-    assert!(by(5, EncodeMode::Waveform) < 8_192);
-    assert!(by(8, EncodeMode::Waveform) < 8_192);
+    assert!(by(1, EncodeMode::Waveform) < 256);
+    assert!(by(2, EncodeMode::Waveform) < 512);
+    assert!(by(5, EncodeMode::Waveform) < 1_024);
+    assert!(by(8, EncodeMode::Waveform) < 1_536);
+    assert!(by(24, EncodeMode::Waveform) < 4_096);
+}
+
+#[test]
+fn band_gate_ladder_trades_bytes_for_floor_bands() {
+    // dynamic_range 0 = legacy (every band with energy coded at full
+    // resolution), 80 / 60 / 40 dB progressively gate the leakage
+    // floor. Bytes must fall monotonically; the decoded tones must
+    // survive every setting (the gated bands hold only MDCT leakage).
+    let params = CodecParameters::audio(CodecId::new("ac4"));
+    let mut sizes = Vec::new();
+    for range in [0u32, 80, 60, 40] {
+        let frames = raw_frames_with_range(2, EncodeMode::Waveform, 1, 4, range);
+        let mut dec = Ac4Decoder::new(&params);
+        let mut out = vec![Vec::new(); 2];
+        for f in &frames {
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 48_000), f.clone()))
+                .unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                panic!()
+            };
+            for i in 0..af.samples as usize {
+                for (c, ch) in out.iter_mut().enumerate() {
+                    let off = (i * 2 + c) * 2;
+                    ch.push(
+                        i16::from_le_bytes([af.data[0][off], af.data[0][off + 1]]) as f32 / 32768.0,
+                    );
+                }
+            }
+        }
+        // Settled frame 2 of the input lands on output frame 3 (one
+        // frame of MDCT latency).
+        for (c, ch) in out.iter().enumerate() {
+            let x = signal(c, N * 4, false);
+            let reference = &x[2 * N..3 * N];
+            let got = &ch[3 * N..4 * N];
+            let num: f64 = reference
+                .iter()
+                .zip(got)
+                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                .sum();
+            let den: f64 = reference.iter().map(|a| (*a as f64).powi(2)).sum();
+            let e = (num / den).sqrt();
+            eprintln!("ROUND-456 gate {range} dB: stereo ch{c} settled rel err {e:.4}");
+            assert!(e < 0.10, "range {range} ch{c}: {e:.4}");
+        }
+        sizes.push(frames[2].len());
+    }
+    eprintln!("ROUND-456 gate ladder (0 / 80 / 60 / 40 dB): {sizes:?} bytes/frame");
+    assert!(
+        sizes[0] > sizes[1] && sizes[1] > sizes[2] && sizes[2] >= sizes[3],
+        "{sizes:?}"
+    );
+    assert!(
+        sizes[0] > 4 * sizes[2],
+        "the gate must shed the leakage floor: {sizes:?}"
+    );
 }
 
 #[test]
@@ -198,15 +267,23 @@ fn v0_path_closes_with_the_part_1_metadata_form() {
 fn pframes_are_smaller_than_their_iframe_anchor() {
     // With real (unpadded) sizes the P-frame saving is finally visible
     // at the packet level: the sticky aspx_config / xover are omitted.
-    let frames = raw_frames(11, EncodeMode::Parametric, 3, 6);
-    assert_eq!(frames.len(), 6);
-    for k in [1usize, 2, 4, 5] {
-        assert!(
-            frames[k].len() < frames[k - k % 3].len(),
-            "P-frame {k} ({} B) must be smaller than its I-frame ({} B)",
-            frames[k].len(),
-            frames[k - k % 3].len()
-        );
+    // Compare each frame against the all-I encode of the same content
+    // so content variation between frames cannot mask the saving.
+    let all_i = raw_frames(11, EncodeMode::Parametric, 1, 6);
+    let gop3 = raw_frames(11, EncodeMode::Parametric, 3, 6);
+    assert_eq!(all_i.len(), 6);
+    assert_eq!(gop3.len(), 6);
+    for k in 0..6 {
+        if k % 3 == 0 {
+            assert_eq!(gop3[k].len(), all_i[k].len(), "I-frame {k} identical size");
+        } else {
+            assert!(
+                gop3[k].len() < all_i[k].len(),
+                "P-frame {k} ({} B) must be smaller than the same content as an I-frame ({} B)",
+                gop3[k].len(),
+                all_i[k].len()
+            );
+        }
     }
 }
 

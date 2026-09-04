@@ -356,6 +356,20 @@ path. The previous fixed pad budgets (2–32 KiB per frame, zero-filled
 and silently truncated) are gone, so packet sizes now track content
 and P-frame savings are visible at the packet level.
 
+The **ASF band gate** (`Ac4ImsEncoder::asf_dynamic_range_db`,
+framework option `dynamic_range`, default 60 dB) is the encoder's
+first rate/quality control: a scale-factor band whose peak MDCT
+coefficient sits more than the configured range below the frame's
+peak is coded silent with spectral noise fill instead of at the
+per-band 26 dB-SNR resolution the historical quantiser gave every
+band that carried any energy. Applied through
+`encoder_asf::with_asf_quant` on the SIMPLE / ASF, SCPL and 22.2
+bodies (the A-SPX / A-CPL parameter layers are untouched). On the
+round-456 test tones it takes mono from ≈1 140 to ≈80 bytes/frame
+(15 kbit/s), 5.0 from ≈5 700 to ≈340 and 22.2 from ≈22 500 to ≈1 450,
+with the decoded parity unchanged (3–7 % settled relative RMS error);
+`dynamic_range = 0` restores the ungated quantiser.
+
 `Ac4ImsEncoder` emits IMS v2 frames for the channel-based layouts:
 
 - Mono / stereo (SIMPLE/ASF split-MDCT and joint M/S CPE).
