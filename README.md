@@ -370,6 +370,21 @@ round-456 test tones it takes mono from ≈1 140 to ≈80 bytes/frame
 with the decoded parity unchanged (3–7 % settled relative RMS error);
 `dynamic_range = 0` restores the ungated quantiser.
 
+**Frame-rate matrix**: the TOC writers now emit
+`frame_rate_multiply_info()` / `frame_rate_fractions_info()` per
+`frame_rate_index` (TS 103 190-1 §4.2.3.4, TS 103 190-2 §6.2.1.3-4 —
+one `b_multiplier` bit for indices 0..=4 / 7..=9, one
+`b_frame_rate_fraction` bit for 5..=12, nothing otherwise) and the
+immersive / 22.2 raw-frame writers take a `RawFrameHeader` (sample-
+rate / frame-rate indices) instead of hard-coding 48 kHz / 24 fps. Every
+long-frame index (48 kHz 0..=4 and 13 → 1920 / 2048 / 1536 samples;
+44,1 kHz 13 → 2048) round-trips on every layout in both tool families
+at the waveform parity floor; the framework encoder rejects the
+short-frame indices 5..=12 (< 1536 samples) because the body writers
+emit only the `b_long_frame` form of `asf_transform_info()`, not the
+Table 103 `transf_length` code + grouped psy layout those frame lengths
+require (§4.3.6.1).
+
 `Ac4ImsEncoder` emits IMS v2 frames for the channel-based layouts:
 
 - Mono / stereo (SIMPLE/ASF split-MDCT and joint M/S CPE).
@@ -466,6 +481,11 @@ with the decoded parity unchanged (3–7 % settled relative RMS error);
 
 ## Not yet supported
 
+- **Short-frame ASF syntax** — frame lengths below 1536 samples
+  (`frame_rate_index` 5..=12: 47,95 – 120 fps) need the Table 103
+  `transf_length` code and the grouped `asf_psy_info()` / spectral
+  layout in place of `b_long_frame`; no body writer emits them, so the
+  framework encoder rejects those indices.
 - **Dialogue enhancement remainders** — the 9.X.4 core-decoding
   refinements of §5.8.2.1 (A-JCC, `C_L`/`C_R` from the dry
   coefficients) and §5.8.2.2 (A-CPL, from `acpl_alpha5/6`) — the

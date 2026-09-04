@@ -1975,16 +1975,27 @@ pub fn encode_ice_raw_frame(
     b_iframe: bool,
     body: BitWriter,
 ) -> Result<Vec<u8>> {
-    let (code, code_bits) = ice_channel_mode_code(b_lfe, b_5fronts);
-    encode_chan_raw_frame(
-        sequence_counter,
-        code,
-        code_bits,
-        true,
-        b_iframe,
+    encode_ice_raw_frame_with_header(
+        &RawFrameHeader::default_48k_24fps(sequence_counter, b_iframe),
+        b_lfe,
+        b_5fronts,
         body,
-        None,
+        &[],
     )
+}
+
+/// [`encode_ice_raw_frame`] with an explicit TOC header (sample-rate /
+/// frame-rate indices) and trailing substream `metadata(…)` bytes.
+pub fn encode_ice_raw_frame_with_header(
+    hdr: &RawFrameHeader,
+    b_lfe: bool,
+    b_5fronts: bool,
+    body: BitWriter,
+    metadata: &[u8],
+) -> Result<Vec<u8>> {
+    let (code, code_bits) = ice_channel_mode_code(b_lfe, b_5fronts);
+    let meta = (!metadata.is_empty()).then_some(metadata);
+    encode_chan_raw_frame(hdr, code, code_bits, true, body, meta)
 }
 
 /// [`encode_ice_raw_frame`] with trailing substream `metadata(…)`
@@ -2003,11 +2014,10 @@ pub fn encode_ice_raw_frame_with_metadata(
 ) -> Result<Vec<u8>> {
     let (code, code_bits) = ice_channel_mode_code(b_lfe, b_5fronts);
     encode_chan_raw_frame(
-        sequence_counter,
+        &RawFrameHeader::default_48k_24fps(sequence_counter, b_iframe),
         code,
         code_bits,
         true,
-        b_iframe,
         body,
         Some(metadata),
     )
@@ -2020,15 +2030,22 @@ pub fn encode_22_2_raw_frame(
     b_iframe: bool,
     body: BitWriter,
 ) -> Result<Vec<u8>> {
-    encode_chan_raw_frame(
-        sequence_counter,
-        0b111111110,
-        9,
-        false,
-        b_iframe,
+    encode_22_2_raw_frame_with_header(
+        &RawFrameHeader::default_48k_24fps(sequence_counter, b_iframe),
         body,
-        None,
+        &[],
     )
+}
+
+/// [`encode_22_2_raw_frame`] with an explicit TOC header and trailing
+/// substream `metadata(…)` bytes.
+pub fn encode_22_2_raw_frame_with_header(
+    hdr: &RawFrameHeader,
+    body: BitWriter,
+    metadata: &[u8],
+) -> Result<Vec<u8>> {
+    let meta = (!metadata.is_empty()).then_some(metadata);
+    encode_chan_raw_frame(hdr, 0b111111110, 9, false, body, meta)
 }
 
 /// [`encode_22_2_raw_frame`] with trailing substream `metadata(…)`
@@ -2039,33 +2056,54 @@ pub fn encode_22_2_raw_frame_with_metadata(
     body: BitWriter,
     metadata: &[u8],
 ) -> Result<Vec<u8>> {
-    encode_chan_raw_frame(
-        sequence_counter,
-        0b111111110,
-        9,
-        false,
-        b_iframe,
+    encode_22_2_raw_frame_with_header(
+        &RawFrameHeader::default_48k_24fps(sequence_counter, b_iframe),
         body,
-        Some(metadata),
+        metadata,
     )
 }
 
+/// TOC-level header fields for the raw-frame writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawFrameHeader {
+    /// 10-bit rolling `sequence_counter`.
+    pub sequence_counter: u32,
+    /// `fs_index` (0 → 44,1 kHz, 1 → 48 kHz).
+    pub fs_index: u32,
+    /// `frame_rate_index` (TS 103 190-1 Table 83 / 84).
+    pub frame_rate_index: u32,
+    /// `b_iframe_global` / `b_pres_ndot` / `b_audio_ndot`.
+    pub b_iframe: bool,
+}
+
+impl RawFrameHeader {
+    /// 48 kHz, `frame_rate_index = 1` (24 fps, 1920 samples).
+    pub const fn default_48k_24fps(sequence_counter: u32, b_iframe: bool) -> Self {
+        Self {
+            sequence_counter,
+            fs_index: 1,
+            frame_rate_index: 1,
+            b_iframe,
+        }
+    }
+}
+
 fn encode_chan_raw_frame(
-    sequence_counter: u32,
+    hdr: &RawFrameHeader,
     mode_code: u32,
     mode_code_bits: u32,
     presence_fields: bool,
-    b_iframe: bool,
     body: BitWriter,
     metadata: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    let b_iframe = hdr.b_iframe;
     let mut bw = BitWriter::new();
     // ---- ac4_toc() (§6.2.1.1) ----
     bw.write_u32(2, 2); // bitstream_version = 2
-    bw.write_u32(sequence_counter & 0x3FF, 10);
+    bw.write_u32(hdr.sequence_counter & 0x3FF, 10);
     bw.write_bit(false); // b_wait_frames
-    bw.write_u32(1, 1); // fs_index = 48 kHz
-    bw.write_u32(1, 4); // frame_rate_index = 1 (1920 samples)
+    bw.write_u32(hdr.fs_index & 1, 1); // fs_index
+    bw.write_u32(hdr.frame_rate_index & 0xF, 4); // frame_rate_index
     bw.write_bit(b_iframe); // b_iframe_global
     bw.write_bit(true); // b_single_presentation
     bw.write_bit(false); // b_payload_base
@@ -2075,8 +2113,11 @@ fn encode_chan_raw_frame(
     bw.write_bit(false); // presentation_version() = 0
     bw.write_u32(0, 3); // mdcompat
     bw.write_bit(false); // b_presentation_id
-    bw.write_bit(false); // frame_rate_multiply_info: b_multiplier = 0
-                         // emdf_info(): version 0, key_id 0, no payloads-substream, no more.
+                         // frame_rate_multiply_info() + frame_rate_fractions_info()
+                         // for the unity factor / fraction (§6.2.1.3-4).
+    crate::toc::write_frame_rate_multiply_info_unity(&mut bw, hdr.frame_rate_index);
+    crate::toc::write_frame_rate_fractions_info_unity(&mut bw, hdr.frame_rate_index);
+    // emdf_info(): version 0, key_id 0, no payloads-substream, no more.
     bw.write_u32(0, 2);
     bw.write_u32(0, 3);
     bw.write_bit(false);
@@ -2104,7 +2145,9 @@ fn encode_chan_raw_frame(
         bw.write_bit(true);
         bw.write_u32(0, 2);
     }
-    bw.write_bit(false); // b_sf_multiplier (fs_index == 1)
+    if hdr.fs_index == 1 {
+        bw.write_bit(false); // b_sf_multiplier (48 kHz family only)
+    }
     bw.write_bit(false); // b_bitrate_info
     bw.write_bit(b_iframe); // b_audio_ndot = b_iframe (frame_rate_factor = 1)
     bw.write_u32(0, 2); // substream_index

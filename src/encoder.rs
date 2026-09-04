@@ -81,9 +81,12 @@ pub enum Framing {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ac4EncoderOptions {
     /// `frame_rate_index` (TS 103 190-1 Table 83 for 48 kHz, Table 84
-    /// for 44,1 kHz). Sets the AC-4 frame length: at 48 kHz index 1
-    /// (24 fps) is 1920 samples, index 2 (25 fps) 2048, index 4
-    /// (30 fps) 1536, index 7 (50 fps) 1024, index 9 (60 fps) 768, …
+    /// for 44,1 kHz). Sets the AC-4 frame length: at 48 kHz index 0 / 1
+    /// (23,976 / 24 fps) is 1920 samples, 2 (25 fps) 2048, 3 / 4
+    /// (29,97 / 30 fps) 1536, 13 (23,44 fps) 2048; at 44,1 kHz only
+    /// index 13 (2048 samples) exists. Indices 5..=12 (frame lengths
+    /// below 1536 samples) are rejected until the short-frame ASF
+    /// syntax is written.
     pub frame_rate_index: u32,
     /// Packet framing (`sync` / `sync_crc` / `raw`).
     pub framing: Framing,
@@ -124,7 +127,7 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
             name: "frame_rate_index",
             kind: OptionKind::U32,
             default: OptionValue::U32(1),
-            help: "TS 103 190-1 Table 83/84 frame_rate_index (1 = 24 fps, 1920 samples at 48 kHz)",
+            help: "TS 103 190-1 Table 83/84 frame_rate_index (0..=4, 13 at 48 kHz; 13 at 44.1 kHz; 1 = 24 fps / 1920 samples)",
         },
         OptionField {
             name: "framing",
@@ -325,6 +328,19 @@ impl Ac4Encoder {
         if frame_len == 0 {
             return Err(Error::unsupported(format!(
                 "ac4 encoder: frame_rate_index {} is reserved at {sample_rate} Hz",
+                opts.frame_rate_index
+            )));
+        }
+        if frame_len < 1536 {
+            // TS 103 190-1 §4.3.6.1: below frame_len_base 1536 the ASF
+            // transform info carries the Table 103 `transf_length` code
+            // and the grouped psy / spectral layout instead of
+            // `b_long_frame` — the body writers only emit the long-frame
+            // form today.
+            return Err(Error::unsupported(format!(
+                "ac4 encoder: frame_rate_index {} ({frame_len}-sample frames) needs the \
+                 short-frame ASF syntax (frame_len_base < 1536) which the body writers do \
+                 not emit yet — use an index with 1536 samples or more (0..=4, 13)",
                 opts.frame_rate_index
             )));
         }

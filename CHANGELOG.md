@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution — mono ≈1 140 → ≈80 bytes/frame, 5.0 ≈5 700 → ≈340, 22.2
   ≈22 500 → ≈1 450 on the round-456 tones at unchanged decoded parity.
 
+- Frame-rate matrix: `toc::write_frame_rate_multiply_info_unity` /
+  `write_frame_rate_fractions_info_unity` (per-index TOC bits), the
+  `ice::RawFrameHeader` form of the immersive / 22.2 raw-frame writers
+  (sample-rate / frame-rate indices), Table 106-capped immersive LFE
+  `max_sfb`; every long-frame index (48 kHz 0..=4, 13; 44,1 kHz 13)
+  round-trips on every layout. Short-frame indices 5..=12 are rejected
+  by the framework encoder with an explanatory error.
+
 ### Changed
 
 - `audio_size` announces the exact `audio_data()` byte length on every

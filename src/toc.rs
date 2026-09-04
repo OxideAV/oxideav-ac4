@@ -605,6 +605,32 @@ fn frame_rate_factor(frame_rate_index: u32, b_multiplier: bool, multiplier_bit: 
     }
 }
 
+/// Write `frame_rate_multiply_info()` (TS 103 190-1 §4.2.3.4 Table 7)
+/// for the unity `frame_rate_factor`: one `b_multiplier = 0` bit for
+/// `frame_rate_index` in `{0, 1, 2, 3, 4, 7, 8, 9}`, nothing otherwise
+/// — the exact inverse of `parse_frame_rate_multiply_info`.
+pub fn write_frame_rate_multiply_info_unity(
+    bw: &mut oxideav_core::bits::BitWriter,
+    frame_rate_index: u32,
+) {
+    if matches!(frame_rate_index, 0..=4 | 7..=9) {
+        bw.write_bit(false);
+    }
+}
+
+/// Write `frame_rate_fractions_info()` (TS 103 190-2 §6.2.1.4) for
+/// `frame_rate_fraction = 1` with the unity `frame_rate_factor`: one
+/// `b_frame_rate_fraction = 0` bit for `frame_rate_index` in `5..=12`,
+/// nothing otherwise — the inverse of `parse_frame_rate_fractions_info`.
+pub fn write_frame_rate_fractions_info_unity(
+    bw: &mut oxideav_core::bits::BitWriter,
+    frame_rate_index: u32,
+) {
+    if matches!(frame_rate_index, 5..=12) {
+        bw.write_bit(false);
+    }
+}
+
 fn parse_frame_rate_multiply_info(
     br: &mut BitReader<'_>,
     frame_rate_index: u32,

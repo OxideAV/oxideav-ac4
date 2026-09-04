@@ -363,8 +363,10 @@ impl Ac4ImsEncoder {
         bw.write_u32(0, 1); // presentation_version = 0
         bw.write_u32(0, 3); // md_compat
         bw.write_u32(0, 1); // b_belongs_to_presentation_id
-        bw.write_u32(0, 1); // frame_rate_multiply_info bit
-                            // emdf_info():
+                            // frame_rate_multiply_info() — unity factor
+                            // (0 or 1 bit depending on frame_rate_index).
+        crate::toc::write_frame_rate_multiply_info_unity(bw, self.frame_rate_index as u32);
+        // emdf_info():
         bw.write_u32(0, 2); // emdf_version
         bw.write_u32(0, 3); // key_id
         bw.write_u32(0, 1); // b_emdf_payloads_substream_info
@@ -404,11 +406,12 @@ impl Ac4ImsEncoder {
         bw.write_u32(0, 3);
         // b_presentation_id = 0.
         bw.write_u32(0, 1);
-        // frame_rate_multiply_info(): single b_multiplier bit for
-        // frame_rate_index in {0, 1, 7, 8, 9}.
-        bw.write_u32(0, 1);
-        // frame_rate_fractions_info(): nothing for frame_rate_index < 5
-        // or > 12.
+        // frame_rate_multiply_info() (unity factor: `b_multiplier = 0`
+        // for frame_rate_index in {0..=4, 7..=9}, nothing otherwise) and
+        // frame_rate_fractions_info() (`b_frame_rate_fraction = 0` for
+        // 5..=12, nothing otherwise) — TS 103 190-2 §6.2.1.3 / §6.2.1.4.
+        crate::toc::write_frame_rate_multiply_info_unity(bw, self.frame_rate_index as u32);
+        crate::toc::write_frame_rate_fractions_info_unity(bw, self.frame_rate_index as u32);
         // emdf_info(): emdf_version=0 (2b), key_id=0 (3b),
         //   b_emdf_payloads_substream_info=0, emdf_reserved.b_more=0.
         bw.write_u32(0, 2);
@@ -486,6 +489,30 @@ impl Ac4ImsEncoder {
             (0b1111100, 7) => 9,
             (0b1111101, 7) => 10,
             _ => 11,
+        }
+    }
+
+    /// The LFE `max_sfb` the immersive / 22.2 bodies announce: the
+    /// Table 106 `n_msfbl_bits` field width caps it (7 at 1920 / 2048 /
+    /// 1536 samples, 3 at 1024 / 960 / 768 / 512).
+    fn lfe_max_sfb(frame_len: u32) -> u32 {
+        let (_, _, bits) = crate::tables::n_msfb_bits_48(frame_len).unwrap_or((6, 5, 3));
+        if bits == 0 {
+            0
+        } else {
+            7u32.min((1 << bits) - 1)
+        }
+    }
+
+    /// The TOC header fields the immersive / 22.2 raw-frame writers
+    /// need (sequence counter, sample-rate / frame-rate indices,
+    /// `b_iframe_global`).
+    fn raw_frame_header(&self) -> crate::ice::RawFrameHeader {
+        crate::ice::RawFrameHeader {
+            sequence_counter: self.sequence_counter as u32,
+            fs_index: self.fs_index as u32,
+            frame_rate_index: self.frame_rate_index as u32,
+            b_iframe: self.b_iframe_global,
         }
     }
 
@@ -7208,7 +7235,9 @@ impl Ac4ImsEncoder {
             crate::ice::write_ice_body_aspx_scpl_real(
                 &mut body,
                 &spectra,
-                lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+                lfe_coeffs
+                    .as_deref()
+                    .map(|c| (c, Self::lfe_max_sfb(frame_len))),
                 false,
                 &aspx_cfg,
                 b_iframe,
@@ -7222,11 +7251,10 @@ impl Ac4ImsEncoder {
         })
         .expect("encoder: ice aspx_scpl body");
         let meta = self.trailing_metadata();
-        let out = crate::ice::encode_ice_raw_frame_with_metadata(
-            self.sequence_counter as u32,
+        let out = crate::ice::encode_ice_raw_frame_with_header(
+            &self.raw_frame_header(),
             lfe.is_some(),
             false,
-            b_iframe,
             body,
             &meta,
         )
@@ -7453,7 +7481,9 @@ impl Ac4ImsEncoder {
             crate::ice::write_ice_body_aspx_scpl_real(
                 &mut body,
                 &spectra,
-                lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+                lfe_coeffs
+                    .as_deref()
+                    .map(|c| (c, Self::lfe_max_sfb(frame_len))),
                 true,
                 &aspx_cfg,
                 b_iframe,
@@ -7467,11 +7497,10 @@ impl Ac4ImsEncoder {
         })
         .expect("encoder: ice aspx_scpl 5fronts body");
         let meta = self.trailing_metadata();
-        let out = crate::ice::encode_ice_raw_frame_with_metadata(
-            self.sequence_counter as u32,
+        let out = crate::ice::encode_ice_raw_frame_with_header(
+            &self.raw_frame_header(),
             lfe.is_some(),
             true,
-            b_iframe,
             body,
             &meta,
         )
@@ -7723,7 +7752,9 @@ impl Ac4ImsEncoder {
             &scpl_pairs,
             &acpl,
             &aspx_cfg,
-            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            lfe_coeffs
+                .as_deref()
+                .map(|c| (c, Self::lfe_max_sfb(frame_len))),
             false,
             b_iframe,
             frame_len,
@@ -7735,11 +7766,10 @@ impl Ac4ImsEncoder {
         )
         .expect("encoder: ice acpl body");
         let meta = self.trailing_metadata();
-        let out = crate::ice::encode_ice_raw_frame_with_metadata(
-            self.sequence_counter as u32,
+        let out = crate::ice::encode_ice_raw_frame_with_header(
+            &self.raw_frame_header(),
             lfe.is_some(),
             false,
-            b_iframe,
             body,
             &meta,
         )
@@ -8022,7 +8052,9 @@ impl Ac4ImsEncoder {
             &scpl_pairs,
             &acpl,
             &aspx_cfg,
-            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            lfe_coeffs
+                .as_deref()
+                .map(|c| (c, Self::lfe_max_sfb(frame_len))),
             true,
             b_iframe,
             frame_len,
@@ -8034,11 +8066,10 @@ impl Ac4ImsEncoder {
         )
         .expect("encoder: ice acpl 5fronts body");
         let meta = self.trailing_metadata();
-        let out = crate::ice::encode_ice_raw_frame_with_metadata(
-            self.sequence_counter as u32,
+        let out = crate::ice::encode_ice_raw_frame_with_header(
+            &self.raw_frame_header(),
             lfe.is_some(),
             true,
-            b_iframe,
             body,
             &meta,
         )
@@ -8263,7 +8294,6 @@ impl Ac4ImsEncoder {
             add_pair: [&wire[5], &wire[6]],
             scpl_pairs: &scpl_pairs,
         };
-        let b_iframe = self.b_iframe_global;
         let mut body = BitWriter::new();
         let quant = self.frame_quant(
             wire.iter()
@@ -8274,7 +8304,9 @@ impl Ac4ImsEncoder {
             crate::ice::write_ice_body_scpl_with_sap(
                 &mut body,
                 &spectra,
-                lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+                lfe_coeffs
+                    .as_deref()
+                    .map(|c| (c, Self::lfe_max_sfb(frame_len))),
                 b_5fronts,
                 frame_len,
                 max_sfb,
@@ -8284,11 +8316,10 @@ impl Ac4ImsEncoder {
         })
         .expect("encoder: ice scpl sap body");
         let meta = self.trailing_metadata();
-        let out = crate::ice::encode_ice_raw_frame_with_metadata(
-            self.sequence_counter as u32,
+        let out = crate::ice::encode_ice_raw_frame_with_header(
+            &self.raw_frame_header(),
             lfe.is_some(),
             b_5fronts,
-            b_iframe,
             body,
             &meta,
         )
@@ -8516,7 +8547,9 @@ impl Ac4ImsEncoder {
             &core,
             &ajcc,
             &aspx_cfg,
-            lfe_coeffs.as_deref().map(|c| (c, 7u32)),
+            lfe_coeffs
+                .as_deref()
+                .map(|c| (c, Self::lfe_max_sfb(frame_len))),
             b_iframe,
             frame_len,
             max_sfb,
@@ -8528,11 +8561,10 @@ impl Ac4ImsEncoder {
         )
         .expect("encoder: ice ajcc body");
         let meta = self.trailing_metadata();
-        let out = crate::ice::encode_ice_raw_frame_with_metadata(
-            self.sequence_counter as u32,
+        let out = crate::ice::encode_ice_raw_frame_with_header(
+            &self.raw_frame_header(),
             lfe.is_some(),
             b_5fronts,
-            b_iframe,
             body,
             &meta,
         )
@@ -8671,13 +8703,9 @@ impl Ac4ImsEncoder {
             .expect("encoder: 22_2 body");
         }
         let meta = self.trailing_metadata();
-        let out = crate::ice::encode_22_2_raw_frame_with_metadata(
-            self.sequence_counter as u32,
-            b_iframe,
-            body,
-            &meta,
-        )
-        .expect("encoder: 22_2 frame assembly");
+        let out =
+            crate::ice::encode_22_2_raw_frame_with_header(&self.raw_frame_header(), body, &meta)
+                .expect("encoder: 22_2 frame assembly");
         self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
         out
     }
