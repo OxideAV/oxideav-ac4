@@ -1,6 +1,7 @@
 //! 5.X / 7.X A-CPL element decode under corruption: the leading bytes
 //! pick the layout (5.0 / 5.1 / 7.0 / 7.1), the codec mode
-//! (ASPX_ACPL_1 / ASPX_ACPL_2), the I / P framing and up to four byte
+//! (ASPX_ACPL_1 / ASPX_ACPL_2, or ASPX_ACPL_3 on 5.X), the I / P
+//! framing and up to four byte
 //! mutations; the rest is S16 PCM that `Ac4ImsEncoder` turns into two
 //! raw frames (I then I or P). The mutations are applied to the coded
 //! bytes before `Ac4Decoder` walks them, so the reader lands deep in
@@ -31,6 +32,9 @@ fuzz_target!(|data: &[u8]| {
     };
     let acpl1 = ctl[0] & 4 != 0;
     let second_is_p = ctl[0] & 8 != 0;
+    // ASPX_ACPL_3 (5.X only): one stereo downmix + the eleven Table 62
+    // rows, with the Pseudocode 109 previous-set interpolation state.
+    let acpl3 = channels <= 6 && ctl[0] & 16 != 0;
     let max_sfb = 8 + u32::from(ctl[1] % 48);
     let max_sfb_master = 1 + u32::from(ctl[2] % 40);
     // Cheap deterministic PCM from the fuzz bytes: each channel is a
@@ -55,6 +59,15 @@ fuzz_target!(|data: &[u8]| {
         enc.b_iframe_global = k == 0 || !second_is_p;
         let slice: Vec<&[f32]> = chans.iter().map(|c| &c[k * N..(k + 1) * N]).collect();
         let bytes = match (channels, acpl1) {
+            (5, _) if acpl3 => enc.encode_frame_pcm_5_0_acpl3_real_aspx_with_max_sfb(
+                &[slice[0], slice[1], slice[2], slice[3], slice[4]],
+                max_sfb,
+            ),
+            (6, _) if acpl3 => enc.encode_frame_pcm_5_1_acpl3_real_aspx_with_max_sfb(
+                &[slice[0], slice[1], slice[2], slice[3], slice[4], slice[5]],
+                max_sfb,
+                7,
+            ),
             (5, false) => enc.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(
                 &[slice[0], slice[1], slice[2], slice[3], slice[4]],
                 max_sfb,
