@@ -8,10 +8,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_ac4::decoder::Ac4Decoder;
-use oxideav_ac4::encoder::{Ac4Encoder, Ac4EncoderOptions, EncodeMode, Framing};
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Decoder, Encoder, Frame, SampleFormat,
-};
+use oxideav_ac4::encoder::{Ac4Encoder, Ac4EncoderOptions, AcplMode, EncodeMode, Framing};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Decoder, Encoder, Frame, SampleFormat};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 8 || data.len() > 1 << 15 {
@@ -61,6 +59,13 @@ fuzz_target!(|data: &[u8]| {
         bandwidth_hz: 400 + 100 * u32::from(ctl[3]),
         dynamic_range_db: u32::from(ctl[4] % 100),
         gop: 1 + u32::from(ctl[5] % 4),
+        // 5.X / 7.X parametric: ASPX_ACPL_2 or ASPX_ACPL_1 (the
+        // joint-MDCT residual layer + Table 181 SAP on the reader).
+        acpl: if ctl[5] & 4 == 0 {
+            AcplMode::Acpl2
+        } else {
+            AcplMode::Acpl1
+        },
     };
     let mut p = CodecParameters::audio(CodecId::new("ac4"));
     p.sample_rate = Some(sample_rate);

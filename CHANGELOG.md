@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact `tools_metadata_size`; validated through the decoder's DE tool
   (+6,04 dB on an all-dialogue centre at `G_DE = 6 dB`, Gmax clamp).
 
+- Fuzz target `acpl_element`: 5.X / 7.X ASPX_ACPL_1 / _2 decode under
+  corruption — the fuzz bytes pick layout / codec mode / I-P framing /
+  band budgets, `Ac4ImsEncoder` authors two frames, up to four fuzz-
+  chosen byte mutations per frame land the reader on nearly valid
+  Table 181 / 184 tracks, residual / SAP, captured trailers and the
+  Pseudocode 117 / 120 synthesis; `encode_stream` also drives the
+  `acpl` option. 240 s + 150 s + 120 s of bounded runs clean.
 - Fuzz target `encode_stream`: framework-encoder round trip (layout /
   tool family / framing / frame-rate index / bandwidth / band gate / GOP
   from the leading bytes, S16 PCM through `Ac4Encoder` and back through

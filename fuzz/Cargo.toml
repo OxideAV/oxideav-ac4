@@ -42,5 +42,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "acpl_element"
+path = "fuzz_targets/acpl_element.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone package: keep the fuzz crate out of the umbrella workspace.
 [workspace]
