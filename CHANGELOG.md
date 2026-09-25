@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.8...v0.0.9) - 2026-09-25
+
+### Other
+
+- acpl_element covers 5.X ASPX_ACPL_3
+- 5.X ASPX_ACPL_3: interpolate from the previous parameter set (Pseudocode 109); encode the Pseudocode 118 downmix carriers
+- acpl_element target — 5.X / 7.X A-CPL decode under corruption; encode_stream drives the acpl option
+- framework `mode=parametric` on 5.X / 7.X drives the A-CPL routes (`acpl` option)
+- 5.X / 7.X ASPX_ACPL_1 / _2 author the Pseudocode 117 / 120 carriers — decoded-PCM parity closes
+- 5.X / 7.X ASPX_ACPL_1 / _2 render the coded carriers (Tables 181 / 184 / 202 / 213)
+- checked variable_bits escape accumulation everywhere (CI parse_toc fuzz finding)
+- encode_stream — framework-encoder round-trip target
+- dialogue-enhancement authoring — de_author + DE payload in the closing metadata()
+- frame-rate matrix — per-index TOC frame-rate info, RawFrameHeader on the immersive/22.2 writers, LFE max_sfb cap
+- ASF band gate — dynamic_range quantiser policy on every waveform body
+- tight audio_size on every substream body + the closing metadata() element
+- framework Encoder — make_encoder + registry entry, layout dispatch, FIFO framing, sync/raw packets, options schema
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - `encode_frame_pcm_5_{0,1}_acpl1_real_aspx` — 5.X ASPX_ACPL_1 with
