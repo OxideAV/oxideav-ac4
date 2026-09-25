@@ -163,14 +163,25 @@ fn multi_env_p_frame_codes_leading_envelope_in_time_direction() {
         1,
     );
     assert_eq!(qscf_i.len(), qscf_p.len());
+    // Only the subband groups that carry the transient (the I-frame
+    // rises by at least six quantizer steps there) are the TIME
+    // reference's witnesses; the lowest groups hold nothing but the
+    // leakage of the 660 / 880 / 1 100 Hz centre / surround tones that
+    // the Pseudocode 118 downmix folds into the carriers.
+    let mut witnessed = 0usize;
     for (sbg, (ri, rp)) in qscf_i.iter().zip(qscf_p.iter()).enumerate() {
         assert_eq!(ri.len(), 2);
         assert_eq!(rp.len(), 2);
+        if ri[1] - ri[0] < 6 {
+            continue;
+        }
+        witnessed += 1;
         assert!(
             (rp[0] - ri[1]).abs() <= 2,
             "sbg {sbg}: P leading row {rp:?} must sit on the I last row {ri:?}"
         );
     }
+    assert!(witnessed > 0, "the transient must reach at least one group");
 }
 
 /// A stationary single-envelope P-frame after a multi-envelope frame

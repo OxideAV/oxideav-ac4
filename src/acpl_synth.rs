@@ -1103,6 +1103,10 @@ pub fn acpl_module2(
     num_param_bands: u32,
     steep: bool,
     param_timeslots: &[u8],
+    // §5.7.7.3 Pseudocode 109 `acpl_param_prev[sb]` rows for
+    // (g1, g2, g1·a, g2·a, b) — the previous frame's last parameter
+    // set; all-zero on the first frame.
+    prev: [&[f32]; 5],
 ) -> (AcplQmfMatrix, AcplQmfMatrix) {
     let num_ts = x0.len();
     debug_assert_eq!(x1.len(), num_ts);
@@ -1113,26 +1117,25 @@ pub fn acpl_module2(
     let g1a_sb = expand_pb_to_sb(g1a_pb, num_param_bands);
     let g2a_sb = expand_pb_to_sb(g2a_pb, num_param_bands);
     let b_sb = expand_pb_to_sb(b_pb, num_param_bands);
-    let zero_prev = vec![0.0f32; NUM_QMF_SUBBANDS];
     let g1_inp = InterpInputs {
         by_pset: &g1_sb,
-        prev: &zero_prev,
+        prev: prev[0],
     };
     let g2_inp = InterpInputs {
         by_pset: &g2_sb,
-        prev: &zero_prev,
+        prev: prev[1],
     };
     let g1a_inp = InterpInputs {
         by_pset: &g1a_sb,
-        prev: &zero_prev,
+        prev: prev[2],
     };
     let g2a_inp = InterpInputs {
         by_pset: &g2a_sb,
-        prev: &zero_prev,
+        prev: prev[3],
     };
     let b_inp = InterpInputs {
         by_pset: &b_sb,
-        prev: &zero_prev,
+        prev: prev[4],
     };
 
     let mut z0_out = Vec::with_capacity(num_ts);
@@ -1230,6 +1233,8 @@ pub fn acpl_module3(
     num_param_bands: u32,
     steep: bool,
     param_timeslots: &[u8],
+    // §5.7.7.3 Pseudocode 109 `acpl_param_prev[sb]` rows for (b3, b3·a).
+    prev: [&[f32]; 2],
 ) {
     let num_ts = z0.len();
     debug_assert_eq!(z1.len(), num_ts);
@@ -1237,14 +1242,13 @@ pub fn acpl_module3(
     let num_pset = b3_pb.len() as u32;
     let b3_sb = expand_pb_to_sb(b3_pb, num_param_bands);
     let b3a_sb = expand_pb_to_sb(b3a_pb, num_param_bands);
-    let zero_prev = vec![0.0f32; NUM_QMF_SUBBANDS];
     let b3_inp = InterpInputs {
         by_pset: &b3_sb,
-        prev: &zero_prev,
+        prev: prev[0],
     };
     let b3a_inp = InterpInputs {
         by_pset: &b3a_sb,
-        prev: &zero_prev,
+        prev: prev[1],
     };
     for ts in 0..num_ts {
         for sb in 0..NUM_QMF_SUBBANDS as u32 {
@@ -1338,10 +1342,29 @@ pub struct AcplMchState {
     pub g2_prev_sb: Vec<f32>,
     pub g3_prev_sb: Vec<f32>,
     pub g4_prev_sb: Vec<f32>,
+    /// §5.7.7.3 Pseudocode 109 `acpl_param_prev[sb]` rows of every
+    /// other interpolated parameter or parameter product of Pseudocode
+    /// 118 / 119 (the previous frame's last parameter set, expanded per
+    /// subband): γ5, γ6, γ1·α1, γ2·α1, γ3·α2, γ4·α2, β1, β2, β3, β3·α1,
+    /// β3·α2 and the `Transform()` sums γ1+γ3+γ5 / γ2+γ4+γ6.
+    pub g5_prev_sb: Vec<f32>,
+    pub g6_prev_sb: Vec<f32>,
+    pub g1a1_prev_sb: Vec<f32>,
+    pub g2a1_prev_sb: Vec<f32>,
+    pub g3a2_prev_sb: Vec<f32>,
+    pub g4a2_prev_sb: Vec<f32>,
+    pub b1_prev_sb: Vec<f32>,
+    pub b2_prev_sb: Vec<f32>,
+    pub b3_prev_sb: Vec<f32>,
+    pub b3a1_prev_sb: Vec<f32>,
+    pub b3a2_prev_sb: Vec<f32>,
+    pub gsum1_prev_sb: Vec<f32>,
+    pub gsum2_prev_sb: Vec<f32>,
 }
 
 impl AcplMchState {
     pub fn new() -> Self {
+        let z = || vec![0.0; NUM_QMF_SUBBANDS];
         Self {
             d0: InputSignalModifier::new(DecorrelatorId::D0),
             d1: InputSignalModifier::new(DecorrelatorId::D1),
@@ -1349,10 +1372,23 @@ impl AcplMchState {
             ducker0: TransientDucker::new(),
             ducker1: TransientDucker::new(),
             ducker2: TransientDucker::new(),
-            g1_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
-            g2_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
-            g3_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
-            g4_prev_sb: vec![0.0; NUM_QMF_SUBBANDS],
+            g1_prev_sb: z(),
+            g2_prev_sb: z(),
+            g3_prev_sb: z(),
+            g4_prev_sb: z(),
+            g5_prev_sb: z(),
+            g6_prev_sb: z(),
+            g1a1_prev_sb: z(),
+            g2a1_prev_sb: z(),
+            g3a2_prev_sb: z(),
+            g4a2_prev_sb: z(),
+            b1_prev_sb: z(),
+            b2_prev_sb: z(),
+            b3_prev_sb: z(),
+            b3a1_prev_sb: z(),
+            b3a2_prev_sb: z(),
+            gsum1_prev_sb: z(),
+            gsum2_prev_sb: z(),
         }
     }
 }
@@ -1489,8 +1525,8 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
         &g_sum_1,
         &g_sum_2,
         frame.num_param_bands,
-        &vec![0.0; NUM_QMF_SUBBANDS],
-        &vec![0.0; NUM_QMF_SUBBANDS],
+        &state.gsum1_prev_sb,
+        &state.gsum2_prev_sb,
         frame.steep,
         frame.param_timeslots,
     );
@@ -1546,6 +1582,13 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
         frame.num_param_bands,
         frame.steep,
         frame.param_timeslots,
+        [
+            &state.g1_prev_sb,
+            &state.g2_prev_sb,
+            &state.g1a1_prev_sb,
+            &state.g2a1_prev_sb,
+            &state.b1_prev_sb,
+        ],
     );
 
     // Step 6: (z2, z3) = ACplModule2(g3, g4, alpha_2, beta_2, x0in, x1in, y1).
@@ -1563,10 +1606,18 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
         frame.num_param_bands,
         frame.steep,
         frame.param_timeslots,
+        [
+            &state.g3_prev_sb,
+            &state.g4_prev_sb,
+            &state.g3a2_prev_sb,
+            &state.g4a2_prev_sb,
+            &state.b2_prev_sb,
+        ],
     );
 
     // Step 7: (z4, z5) = ACplModule2(g5, g6, 1, 0, x0in, x1in, 0).
     // a == 1 → g*a == g; b == 0 → no decorrelator term; y == 0 too.
+    let zero_row = vec![0.0f32; NUM_QMF_SUBBANDS];
     let zero_y = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
     // β = 0 across all bands. The shape follows the gamma matrices.
     let zero_pb: Vec<Vec<f32>> = frame
@@ -1586,6 +1637,13 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
         frame.num_param_bands,
         frame.steep,
         frame.param_timeslots,
+        [
+            &state.g5_prev_sb,
+            &state.g6_prev_sb,
+            &state.g5_prev_sb,
+            &state.g6_prev_sb,
+            &zero_row,
+        ],
     );
     // _z5 is a temporary per the spec note ("Note that z5 is used as a
     // temporary variable only and does not constitute an output channel.").
@@ -1601,6 +1659,7 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
         frame.num_param_bands,
         frame.steep,
         frame.param_timeslots,
+        [&state.b3_prev_sb, &state.b3a1_prev_sb],
     );
 
     // Step 9: (z2, z3) += ACplModule3(beta_3, alpha_2, z2, z3, y2).
@@ -1614,11 +1673,13 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
         frame.num_param_bands,
         frame.steep,
         frame.param_timeslots,
+        [&state.b3_prev_sb, &state.b3a2_prev_sb],
     );
 
     // Step 10: (z4, z5) += ACplModule3(-beta_3, 1, z4, z5, y2). a == 1 →
     // beta3*a == beta3 (i.e. b3a == b3 with a sign flip on b3 — but the
     // spec writes -b3 for this row). So b3 is negated and b3a == -b3 too.
+    let neg_b3_prev: Vec<f32> = state.b3_prev_sb.iter().map(|v| -v).collect();
     let neg_b3 = pb_matrix_scale(frame.beta_3_dq, -1.0);
     let neg_b3_a = pb_matrix_scale(frame.beta_3_dq, -1.0); // a == 1 → -b3*1 = -b3.
     let mut z5_dummy = vec![[(0.0f32, 0.0f32); NUM_QMF_SUBBANDS]; num_ts];
@@ -1631,6 +1692,7 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
         frame.num_param_bands,
         frame.steep,
         frame.param_timeslots,
+        [&neg_b3_prev, &neg_b3_prev],
     );
 
     // Step 11: z1 *= sqrt(2), z3 *= sqrt(2), z4 *= sqrt(2).
@@ -1661,6 +1723,19 @@ pub fn run_pseudocode_118_5x(state: &mut AcplMchState, frame: AcplMchFrame<'_>) 
     update_prev(&mut state.g2_prev_sb, frame.g2_dq);
     update_prev(&mut state.g3_prev_sb, frame.g3_dq);
     update_prev(&mut state.g4_prev_sb, frame.g4_dq);
+    update_prev(&mut state.g5_prev_sb, frame.g5_dq);
+    update_prev(&mut state.g6_prev_sb, frame.g6_dq);
+    update_prev(&mut state.g1a1_prev_sb, &g1_a1);
+    update_prev(&mut state.g2a1_prev_sb, &g2_a1);
+    update_prev(&mut state.g3a2_prev_sb, &g3_a2);
+    update_prev(&mut state.g4a2_prev_sb, &g4_a2);
+    update_prev(&mut state.b1_prev_sb, frame.beta_1_dq);
+    update_prev(&mut state.b2_prev_sb, frame.beta_2_dq);
+    update_prev(&mut state.b3_prev_sb, frame.beta_3_dq);
+    update_prev(&mut state.b3a1_prev_sb, &b3_a1);
+    update_prev(&mut state.b3a2_prev_sb, &b3_a2);
+    update_prev(&mut state.gsum1_prev_sb, &g_sum_1);
+    update_prev(&mut state.gsum2_prev_sb, &g_sum_2);
 
     AcplMchOutput { z0, z2, z4, z1, z3 }
 }
@@ -3297,6 +3372,7 @@ mod tests {
         let x1 = vec![[(0.5f32, 1.0f32); NUM_QMF_SUBBANDS]; num_ts];
         let y = vec![[(2.0f32, 2.0f32); NUM_QMF_SUBBANDS]; num_ts];
         let zero = vec![vec![0.0f32; 15]];
+        let zp = vec![0.0f32; NUM_QMF_SUBBANDS];
         let (z0, z1) = acpl_module2(
             &x0,
             &x1,
@@ -3309,6 +3385,7 @@ mod tests {
             15,
             false,
             &[],
+            [&zp, &zp, &zp, &zp, &zp],
         );
         for ts in 0..num_ts {
             for sb in 0..NUM_QMF_SUBBANDS {
@@ -3337,7 +3414,21 @@ mod tests {
         let g1a = vec![vec![0.0f32; 15]]; // a=0 → g1*a=0
         let g2a = vec![vec![0.0f32; 15]];
         let b = vec![vec![0.0f32; 15]];
-        let (z0, z1) = acpl_module2(&x0, &x1, &y, &g1, &g2, &g1a, &g2a, &b, 15, false, &[]);
+        let zp = vec![0.0f32; NUM_QMF_SUBBANDS];
+        let (z0, z1) = acpl_module2(
+            &x0,
+            &x1,
+            &y,
+            &g1,
+            &g2,
+            &g1a,
+            &g2a,
+            &b,
+            15,
+            false,
+            &[],
+            [&zp, &zp, &zp, &zp, &zp],
+        );
         // smooth interpolation with prev=0, target=1 → at ts=num_ts-1, g1
         // hits 1.0, but z formula has g1+g1a so 1+0=1; z = 0.5*x0*1 = 0.5*x0.
         // Just assert the last ts converges.
@@ -3360,7 +3451,8 @@ mod tests {
         let y2 = vec![[(4.0f32, 4.0f32); NUM_QMF_SUBBANDS]; num_ts];
         let b3 = vec![vec![1.0f32; 15]];
         let b3a = vec![vec![0.0f32; 15]];
-        acpl_module3(&mut z0, &mut z1, &y2, &b3, &b3a, 15, false, &[]);
+        let zp = vec![0.0f32; NUM_QMF_SUBBANDS];
+        acpl_module3(&mut z0, &mut z1, &y2, &b3, &b3a, 15, false, &[], [&zp, &zp]);
         // After ramp completes (ts=num_ts-1) b3 = 1.0, b3a = 0:
         //   z0 += 0.25 * y2 * (1 + 0) = 0.25 * (4, 4) = (1, 1)
         //   z1 += 0.25 * y2 * (1 - 0) = (1, 1)
@@ -3381,7 +3473,18 @@ mod tests {
         let mut z1 = vec![[(0.0f32, 7.0f32); NUM_QMF_SUBBANDS]; num_ts];
         let y2 = vec![[(99.0f32, -99.0f32); NUM_QMF_SUBBANDS]; num_ts];
         let zero = vec![vec![0.0f32; 15]];
-        acpl_module3(&mut z0, &mut z1, &y2, &zero, &zero, 15, false, &[]);
+        let zp = vec![0.0f32; NUM_QMF_SUBBANDS];
+        acpl_module3(
+            &mut z0,
+            &mut z1,
+            &y2,
+            &zero,
+            &zero,
+            15,
+            false,
+            &[],
+            [&zp, &zp],
+        );
         for ts in 0..num_ts {
             for sb in 0..NUM_QMF_SUBBANDS {
                 assert_eq!(z0[ts][sb], (7.0, 0.0));

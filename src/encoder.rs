@@ -75,6 +75,10 @@ pub enum AcplMode {
     /// MDCT residual layer below `acpl_qmf_band` (mid/side exact
     /// there), parametric above.
     Acpl1,
+    /// `ASPX_ACPL_3` (5.X only, Table 97): one stereo downmix carries
+    /// all five channels, reconstructed through the Pseudocode 118
+    /// γ / α / β / β3 rows.
+    Acpl3,
 }
 
 /// Sync-frame wrapping of the emitted packets.
@@ -178,9 +182,9 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
         },
         OptionField {
             name: "acpl",
-            kind: OptionKind::Enum(&["acpl_2", "acpl_1"]),
+            kind: OptionKind::Enum(&["acpl_2", "acpl_1", "acpl_3"]),
             default: OptionValue::String(String::new()),
-            help: "A-CPL codec mode of the parametric 5.X / 7.X routes: acpl_2 (fully parametric pair) or acpl_1 (waveform side below acpl_qmf_band)",
+            help: "A-CPL codec mode of the parametric 5.X / 7.X routes: acpl_2 (fully parametric pair), acpl_1 (waveform side below acpl_qmf_band) or acpl_3 (5.X only: one stereo downmix for all five channels)",
         },
     ];
 
@@ -209,6 +213,7 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
                 self.acpl = match value.as_str()? {
                     "acpl_2" => AcplMode::Acpl2,
                     "acpl_1" => AcplMode::Acpl1,
+                    "acpl_3" => AcplMode::Acpl3,
                     other => {
                         return Err(Error::invalid(format!("ac4: unknown acpl mode '{other}'")))
                     }
@@ -379,6 +384,15 @@ impl Ac4Encoder {
         if opts.gop == 0 {
             return Err(Error::invalid("ac4 encoder: gop must be >= 1"));
         }
+        if opts.mode == EncodeMode::Parametric
+            && opts.acpl == AcplMode::Acpl3
+            && matches!(layout, Layout::S7_0 | Layout::S7_1)
+        {
+            return Err(Error::unsupported(
+                "ac4 encoder: acpl_3 (ASPX_ACPL_3) exists for the 5.X element only \
+                 (TS 103 190-1 Table 98 defines no 7.X ASPX_ACPL_3) — use acpl_2 / acpl_1",
+            ));
+        }
         let input_format = params.sample_format.unwrap_or(SampleFormat::S16);
         if !supported_input_format(input_format) {
             return Err(Error::unsupported(format!(
@@ -531,6 +545,9 @@ impl Ac4Encoder {
             // `max_sfb_master` at 20 scale-factor bands (≈ 1,4 kHz at
             // 1920 samples) — the mid/side band below acpl_qmf_band.
             (Layout::S5_0, EncodeMode::Parametric) => match self.opts.acpl {
+                AcplMode::Acpl3 => {
+                    enc.encode_frame_pcm_5_0_acpl3_real_aspx_with_max_sfb(&arr5(&s), sfb)
+                }
                 AcplMode::Acpl2 => {
                     enc.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(&arr5(&s), sfb)
                 }
@@ -541,6 +558,9 @@ impl Ac4Encoder {
                 ),
             },
             (Layout::S5_1, EncodeMode::Parametric) => match self.opts.acpl {
+                AcplMode::Acpl3 => {
+                    enc.encode_frame_pcm_5_1_acpl3_real_aspx_with_max_sfb(&arr6(&s), sfb, lfe)
+                }
                 AcplMode::Acpl2 => {
                     enc.encode_frame_pcm_5_1_acpl2_real_aspx_with_max_sfb(&arr6(&s), sfb, lfe)
                 }
@@ -552,7 +572,8 @@ impl Ac4Encoder {
                 ),
             },
             (Layout::S7_0, EncodeMode::Parametric) => match self.opts.acpl {
-                AcplMode::Acpl2 => {
+                // acpl_3 is rejected at construction for 7.X.
+                AcplMode::Acpl2 | AcplMode::Acpl3 => {
                     enc.encode_frame_pcm_7_0_acpl2_real_aspx_with_max_sfb(&arr7(&s), sfb)
                 }
                 AcplMode::Acpl1 => enc.encode_frame_pcm_7_0_acpl1_real_alpha_beta_with_max_sfb(
@@ -562,7 +583,8 @@ impl Ac4Encoder {
                 ),
             },
             (Layout::S7_1, EncodeMode::Parametric) => match self.opts.acpl {
-                AcplMode::Acpl2 => {
+                // acpl_3 is rejected at construction for 7.X.
+                AcplMode::Acpl2 | AcplMode::Acpl3 => {
                     enc.encode_frame_pcm_7_1_acpl2_real_aspx_with_max_sfb(&arr8(&s), sfb, lfe)
                 }
                 AcplMode::Acpl1 => enc.encode_frame_pcm_7_1_acpl1_real_alpha_beta_with_max_sfb(

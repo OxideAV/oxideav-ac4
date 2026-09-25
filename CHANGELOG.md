@@ -81,6 +81,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Table 25 `mono_data(1)` LFE (they used to emit 5.0 frames). Decoded
   PCM parity is pinned per channel on every 5.0 / 5.1 / 7.0 / 7.1
   ACPL_1 / ACPL_2 route (0,78–1,12× input RMS, I + P GOPs).
+- 5.X `ASPX_ACPL_3` decode: every Pseudocode 118 / 119 parameter and
+  parameter product (γ5, γ6, γ·α, β1, β2, β3, β3·α, the `Transform()`
+  sums) now interpolates from the previous frame's parameter set
+  (§5.7.7.3 Pseudocode 109 `acpl_param_prev`) — `acpl_module2` /
+  `acpl_module3` used an all-zero previous row, so every ACPL_3 gain
+  ramped 0 → value inside each frame (a stationary L / R pair decoded
+  at 0,59×). `AcplMchState` carries the thirteen extra rows.
+- 5.X `ASPX_ACPL_3` encode codes the Pseudocode 118 downmix carriers
+  (`acpl3_downmix_carriers`) and fits the Table 62 rows against them
+  (`extract_acpl3_spec_rows`); the centre least-squares / β3 residual
+  used `K = 1 + √½` where Pseudocode 119's `a = 1` centre call gives
+  `K = √2·(1 + √2)`; the γ least squares fall back to the stronger
+  carrier on a rank-deficient Gram matrix instead of dropping the band.
+  Decoded parity: L 0,90 / R 0,86 / C 0,88 / Ls 0,91 / Rs 0,97
+  (was 1,1 / 1,2 / 0,58 / 3,2 / 3,0); framework `acpl=acpl_3` on
+  5.0 / 5.1.
 - A-CPL element decode alignment: A-SPX'd carriers return one QMF
   round trip (`qmf::QMF_ROUND_TRIP_DELAY` = 577 samples) late; the
   ASPX_ACPL_1 residual pair, the 7_X waveform-coded L / R and the LFE

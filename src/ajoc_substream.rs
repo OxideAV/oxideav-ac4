@@ -1930,6 +1930,7 @@ pub fn write_audio_data_ajoc_static_acpl3(
         core.beta_scale,
         core.gamma_scale,
         core.beta3_scale,
+        None,
         acpl_prev,
     );
     write_ajoc_tail(bw, params, num_decorr, ctrl, qmats, b_iframe, enc_state)

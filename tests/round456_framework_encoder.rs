@@ -334,22 +334,34 @@ fn settled_level(input: &[f32], output: &[f32]) -> f64 {
 #[test]
 fn parametric_5_x_7_x_round_trip() {
     let reg = registry();
-    for acpl in ["acpl_2", "acpl_1"] {
+    for acpl in ["acpl_2", "acpl_1", "acpl_3"] {
         for ch in [5usize, 6, 7, 8] {
             let opts = CodecOptions::new()
                 .set("mode", "parametric")
                 .set("acpl", acpl);
             let p = params(ch as u16, SampleFormat::F32, opts);
+            if acpl == "acpl_3" && ch >= 7 {
+                // Table 98 defines no 7.X ASPX_ACPL_3.
+                assert!(
+                    reg.first_encoder(&p).is_err(),
+                    "{ch}ch acpl_3 must be rejected"
+                );
+                continue;
+            }
             let mut enc = reg.first_encoder(&p).expect("registry encoder");
             let chans = signals(ch);
             let pkts = encode_all(enc.as_mut(), &chans, 1000);
             assert_eq!(pkts.len(), FRAMES);
             let mut dec = reg.first_decoder(&p).expect("registry decoder");
             let out = decode_all(dec.as_mut(), &pkts, ch);
-            let waveform: &[usize] = match ch {
-                5 => &[2],
-                6 => &[2, 3],
-                7 => &[0, 1, 2],
+            // ASPX_ACPL_3 codes every channel parametrically (only the
+            // LFE is a waveform).
+            let waveform: &[usize] = match (ch, acpl) {
+                (5, "acpl_3") => &[],
+                (6, "acpl_3") => &[3],
+                (5, _) => &[2],
+                (6, _) => &[2, 3],
+                (7, _) => &[0, 1, 2],
                 _ => &[0, 1, 2, 3],
             };
             for c in 0..ch {

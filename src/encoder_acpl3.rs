@@ -2601,6 +2601,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
         beta3_scale,
         pad_target_bytes,
         None,
+        None,
     )
 }
 
@@ -2639,107 +2640,40 @@ pub fn write_5_x_acpl3_audio_data_directional(
     beta_scale: f32,
     gamma_scale: f32,
     beta3_scale: f32,
+    spec_carriers: Option<(&[f32], &[f32])>,
     acpl_prev: Option<&mut Acpl3ParamPrevRows>,
 ) {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
 
-    let alpha_q = extract_alpha_q_per_band_carrier_correlation(
+    let Acpl3Rows {
+        alpha1_q,
+        alpha2_q,
+        beta1_q,
+        beta2_q,
+        beta3_q,
+        g1_q,
+        g2_q,
+        g3_q,
+        g4_q,
+        g5_q,
+        g6_q,
+    } = acpl3_rows(
+        spec_carriers,
         coeffs_l,
         coeffs_r,
+        coeffs_c,
+        coeffs_ls,
+        coeffs_rs,
         transform_length,
         acpl_num_bands,
-        0,
+        acpl_qm0,
+        acpl_qm1,
         alpha_scale,
-        acpl_qm0,
-    );
-    let beta1_q = extract_beta_q_per_band_carrier_energy(
-        coeffs_l,
-        transform_length,
-        acpl_num_bands,
-        0,
         beta_scale,
-        acpl_qm0,
+        gamma_scale,
+        beta3_scale,
     );
-    let beta2_q = extract_beta_q_per_band_carrier_energy(
-        coeffs_r,
-        transform_length,
-        acpl_num_bands,
-        0,
-        beta_scale,
-        acpl_qm0,
-    );
-    let (g1_q, g2_q) = if let Some(coeffs_ls_buf) = coeffs_ls {
-        extract_gamma_1_2_q_per_band_surround_least_squares(
-            coeffs_l,
-            coeffs_r,
-            coeffs_ls_buf,
-            transform_length,
-            acpl_num_bands,
-            0,
-            gamma_scale,
-            acpl_qm1,
-        )
-    } else {
-        (
-            vec![0i32; acpl_num_bands as usize],
-            vec![0i32; acpl_num_bands as usize],
-        )
-    };
-    let (g3_q, g4_q) = if let Some(coeffs_rs_buf) = coeffs_rs {
-        extract_gamma_3_4_q_per_band_surround_least_squares(
-            coeffs_l,
-            coeffs_r,
-            coeffs_rs_buf,
-            transform_length,
-            acpl_num_bands,
-            0,
-            gamma_scale,
-            acpl_qm1,
-        )
-    } else {
-        (
-            vec![0i32; acpl_num_bands as usize],
-            vec![0i32; acpl_num_bands as usize],
-        )
-    };
-    let (g5_q, g6_q) = if let Some(coeffs_c_buf) = coeffs_c {
-        extract_gamma_5_6_q_per_band_centre_least_squares(
-            coeffs_l,
-            coeffs_r,
-            coeffs_c_buf,
-            transform_length,
-            acpl_num_bands,
-            0,
-            gamma_scale,
-            acpl_qm1,
-        )
-    } else {
-        (
-            vec![0i32; acpl_num_bands as usize],
-            vec![0i32; acpl_num_bands as usize],
-        )
-    };
-    let beta3_q = if let Some(coeffs_c_buf) = coeffs_c {
-        extract_beta3_q_per_band_centre_residual(
-            coeffs_l,
-            coeffs_r,
-            coeffs_c_buf,
-            &g1_q,
-            &g2_q,
-            &g3_q,
-            &g4_q,
-            &g5_q,
-            &g6_q,
-            transform_length,
-            acpl_num_bands,
-            0,
-            beta3_scale,
-            acpl_qm1,
-            acpl_qm0,
-        )
-    } else {
-        vec![0i32; acpl_num_bands as usize]
-    };
+    let (carrier_0, carrier_1) = spec_carriers.unwrap_or((coeffs_l, coeffs_r));
 
     // 5_X_codec_mode = ASPX_ACPL_3 (4) — 3 bits.
     bw.write_u32(4, 3);
@@ -2759,7 +2693,7 @@ pub fn write_5_x_acpl3_audio_data_directional(
     write_companding_control_sync_off(bw);
 
     // stereo_data(): split-MDCT L/R carriers.
-    write_stereo_split_data(bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_stereo_split_data(bw, transform_length, max_sfb, carrier_0, carrier_1);
 
     // Real-envelope aspx_data_2ch() + acpl_data_2ch() with real
     // α / β / β₃ / γ₁..γ₆. Per Table 25 both data elements are present
@@ -2786,7 +2720,7 @@ pub fn write_5_x_acpl3_audio_data_directional(
         // unprimed states emit DIFF_FREQ rows (byte-identical to the
         // legacy writer).
         let cur_rows: [&[i32]; 11] = [
-            &alpha_q, &alpha_q, &beta1_q, &beta2_q, &beta3_q, &g1_q, &g2_q, &g3_q, &g4_q, &g5_q,
+            &alpha1_q, &alpha2_q, &beta1_q, &beta2_q, &beta3_q, &g1_q, &g2_q, &g3_q, &g4_q, &g5_q,
             &g6_q,
         ];
         let use_prev = !b_iframe && acpl_prev.as_ref().map(|st| st.primed).unwrap_or(false);
@@ -2847,6 +2781,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     gamma_scale: f32,
     beta3_scale: f32,
     pad_target_bytes: usize,
+    spec_carriers: Option<(&[f32], &[f32])>,
     acpl_prev: Option<&mut Acpl3ParamPrevRows>,
 ) -> Vec<u8> {
     let mut bw = BitWriter::new();
@@ -2883,6 +2818,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
         beta_scale,
         gamma_scale,
         beta3_scale,
+        spec_carriers,
         acpl_prev,
     );
     finish_substream_body(bw)
@@ -2948,106 +2884,39 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     gamma_scale: f32,
     beta3_scale: f32,
     pad_target_bytes: usize,
+    spec_carriers: Option<(&[f32], &[f32])>,
 ) -> Vec<u8> {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
 
-    let alpha_q = extract_alpha_q_per_band_carrier_correlation(
+    let Acpl3Rows {
+        alpha1_q,
+        alpha2_q,
+        beta1_q,
+        beta2_q,
+        beta3_q,
+        g1_q,
+        g2_q,
+        g3_q,
+        g4_q,
+        g5_q,
+        g6_q,
+    } = acpl3_rows(
+        spec_carriers,
         coeffs_l,
         coeffs_r,
+        coeffs_c,
+        coeffs_ls,
+        coeffs_rs,
         transform_length,
         acpl_num_bands,
-        0,
+        acpl_qm0,
+        acpl_qm1,
         alpha_scale,
-        acpl_qm0,
-    );
-    let beta1_q = extract_beta_q_per_band_carrier_energy(
-        coeffs_l,
-        transform_length,
-        acpl_num_bands,
-        0,
         beta_scale,
-        acpl_qm0,
+        gamma_scale,
+        beta3_scale,
     );
-    let beta2_q = extract_beta_q_per_band_carrier_energy(
-        coeffs_r,
-        transform_length,
-        acpl_num_bands,
-        0,
-        beta_scale,
-        acpl_qm0,
-    );
-    let (g1_q, g2_q) = if let Some(coeffs_ls_buf) = coeffs_ls {
-        extract_gamma_1_2_q_per_band_surround_least_squares(
-            coeffs_l,
-            coeffs_r,
-            coeffs_ls_buf,
-            transform_length,
-            acpl_num_bands,
-            0,
-            gamma_scale,
-            acpl_qm1,
-        )
-    } else {
-        (
-            vec![0i32; acpl_num_bands as usize],
-            vec![0i32; acpl_num_bands as usize],
-        )
-    };
-    let (g3_q, g4_q) = if let Some(coeffs_rs_buf) = coeffs_rs {
-        extract_gamma_3_4_q_per_band_surround_least_squares(
-            coeffs_l,
-            coeffs_r,
-            coeffs_rs_buf,
-            transform_length,
-            acpl_num_bands,
-            0,
-            gamma_scale,
-            acpl_qm1,
-        )
-    } else {
-        (
-            vec![0i32; acpl_num_bands as usize],
-            vec![0i32; acpl_num_bands as usize],
-        )
-    };
-    let (g5_q, g6_q) = if let Some(coeffs_c_buf) = coeffs_c {
-        extract_gamma_5_6_q_per_band_centre_least_squares(
-            coeffs_l,
-            coeffs_r,
-            coeffs_c_buf,
-            transform_length,
-            acpl_num_bands,
-            0,
-            gamma_scale,
-            acpl_qm1,
-        )
-    } else {
-        (
-            vec![0i32; acpl_num_bands as usize],
-            vec![0i32; acpl_num_bands as usize],
-        )
-    };
-    let beta3_q = if let Some(coeffs_c_buf) = coeffs_c {
-        extract_beta3_q_per_band_centre_residual(
-            coeffs_l,
-            coeffs_r,
-            coeffs_c_buf,
-            &g1_q,
-            &g2_q,
-            &g3_q,
-            &g4_q,
-            &g5_q,
-            &g6_q,
-            transform_length,
-            acpl_num_bands,
-            0,
-            beta3_scale,
-            acpl_qm1,
-            acpl_qm0,
-        )
-    } else {
-        vec![0i32; acpl_num_bands as usize]
-    };
+    let (carrier_0, carrier_1) = spec_carriers.unwrap_or((coeffs_l, coeffs_r));
 
     let mut bw = BitWriter::new();
     // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
@@ -3074,7 +2943,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
-    write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_stereo_split_data(&mut bw, transform_length, max_sfb, carrier_0, carrier_1);
 
     // Multi-envelope real aspx_data_2ch() + acpl_data_2ch() with real
     // α / β / β₃ / γ₁..γ₆. Present on every frame per Table 25; only
@@ -3107,8 +2976,8 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
             acpl_num_bands,
             acpl_qm0,
             acpl_qm1,
-            &alpha_q,
-            &alpha_q,
+            &alpha1_q,
+            &alpha2_q,
             &beta1_q,
             &beta2_q,
             &beta3_q,
@@ -7811,6 +7680,332 @@ pub fn extract_beta_q_per_band(
         .collect()
 }
 
+/// The eleven `acpl_data_2ch()` parameter rows of a 5_X ASPX_ACPL_3
+/// frame (Table 62 order as [`write_acpl_data_2ch_directional`] takes
+/// them: α1, α2, β1, β2, β3, γ1..γ6).
+pub struct Acpl3Rows {
+    pub alpha1_q: Vec<i32>,
+    pub alpha2_q: Vec<i32>,
+    pub beta1_q: Vec<i32>,
+    pub beta2_q: Vec<i32>,
+    pub beta3_q: Vec<i32>,
+    pub g1_q: Vec<i32>,
+    pub g2_q: Vec<i32>,
+    pub g3_q: Vec<i32>,
+    pub g4_q: Vec<i32>,
+    pub g5_q: Vec<i32>,
+    pub g6_q: Vec<i32>,
+}
+
+/// The §5.7.7.6.2 Pseudocode 118 / 119 downmix carrier pair a 5_X
+/// ASPX_ACPL_3 encoder codes on the `stereo_data()` element, from the
+/// target `[L, R, C, Ls, Rs]` rows (PCM or MDCT — the mix is linear):
+///
+/// ```text
+///   x0 = (L + C/√2 + Ls/√2) / (1 + √2)
+///   x1 = (R + C/√2 + Rs/√2) / (1 + √2)
+/// ```
+///
+/// — the step-1 `x0in = x0·(1 + 2·√0.5)` rescale undoes exactly the
+/// `1 + √2` normalisation of this L / R-plus-half-power-centre-and-
+/// surround downmix, so every target channel is present in the two
+/// carriers the γ / α / β / β3 rows are then fitted against.
+pub fn acpl3_downmix_carriers(
+    l: &[f32],
+    r: &[f32],
+    c: &[f32],
+    ls: &[f32],
+    rs: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let k = 1.0 / std::f32::consts::SQRT_2;
+    let norm = 1.0 / (1.0 + std::f32::consts::SQRT_2);
+    let n = l
+        .len()
+        .min(r.len())
+        .min(c.len())
+        .min(ls.len())
+        .min(rs.len());
+    let x0 = (0..n)
+        .map(|i| norm * (l[i] + k * c[i] + k * ls[i]))
+        .collect();
+    let x1 = (0..n)
+        .map(|i| norm * (r[i] + k * c[i] + k * rs[i]))
+        .collect();
+    (x0, x1)
+}
+
+/// Pseudocode 118 / 119 parameter rows fitted to the coded carrier pair
+/// `(carrier_0, carrier_1)` — the [`acpl3_downmix_carriers`] downmix —
+/// and the target channels the decoder must reconstruct from it:
+///
+/// * `(γ1, γ2)` / `(γ3, γ4)`: per-band least-squares mix of the
+///   carriers onto `L + Ls/√2` / `R + Rs/√2` (the `v1` / `v2` outputs
+///   of `Transform()` — Pseudocode 118 steps 2 and 5 / 6 reconstruct
+///   `L = 0,5·v1·(1+α1) + …`, `Ls = √2·0,5·v1·(1−α1) − …`).
+/// * `(γ5, γ6)`: least-squares mix onto `C / (√2·(1+√2))` (step 7 with
+///   `a = 1`, step 11).
+/// * `(α1, β1)` / `(α2, β2)`: the Pseudocode 116-shaped mid / side fit
+///   ([`extract_acpl_pair_alpha_beta_q`]) with the mid being the
+///   *dequantised* `v1 / 2 = (1+√2)·(γ1·x0 + γ2·x1) / 2` the decoder
+///   will form and the side `(L − Ls/√2) / 2`.
+/// * `β3`: the centre dry-fit residual energy over the `v3`
+///   decorrelator drive ([`extract_beta3_q_per_band_centre_residual`]).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_acpl3_spec_rows(
+    carrier_0: &[f32],
+    carrier_1: &[f32],
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    qm0: crate::acpl::AcplQuantMode,
+    qm1: crate::acpl::AcplQuantMode,
+) -> Acpl3Rows {
+    let (g1_q, g2_q) = extract_gamma_pair_q_per_band_surround_least_squares(
+        carrier_0,
+        carrier_1,
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        num_param_bands,
+        0,
+        1.0,
+        qm1,
+    );
+    let (g3_q, g4_q) = extract_gamma_pair_q_per_band_surround_least_squares(
+        carrier_0,
+        carrier_1,
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        num_param_bands,
+        0,
+        1.0,
+        qm1,
+    );
+    let (g5_q, g6_q) = extract_gamma_5_6_q_per_band_centre_least_squares(
+        carrier_0,
+        carrier_1,
+        coeffs_c,
+        transform_length,
+        num_param_bands,
+        0,
+        1.0,
+        qm1,
+    );
+    // The decoder's v = (1+√2)·(γa·x0 + γb·x1) per bin with the
+    // dequantised γ of the bin's parameter band; the module mid is v/2.
+    let gd = crate::acpl_synth::gamma_delta(qm1);
+    let scale = 0.5 * (1.0 + std::f32::consts::SQRT_2);
+    let n = carrier_0.len().min(carrier_1.len());
+    let mid = |ga: &[i32], gb: &[i32]| -> Vec<f32> {
+        (0..n)
+            .map(|bin| {
+                let pb =
+                    mdct_bin_to_param_band(bin as u32, transform_length, num_param_bands) as usize;
+                let a = ga.get(pb).copied().unwrap_or(0) as f32 * gd;
+                let b = gb.get(pb).copied().unwrap_or(0) as f32 * gd;
+                scale * (a * carrier_0[bin] + b * carrier_1[bin])
+            })
+            .collect()
+    };
+    let k = 1.0 / std::f32::consts::SQRT_2;
+    let side = |front: &[f32], back: &[f32]| -> Vec<f32> {
+        front
+            .iter()
+            .zip(back)
+            .map(|(&f, &b)| 0.5 * (f - k * b))
+            .collect()
+    };
+    let (alpha1_q, beta1_q) = extract_acpl_pair_alpha_beta_q(
+        &mid(&g1_q, &g2_q),
+        &side(coeffs_l, coeffs_ls),
+        transform_length,
+        num_param_bands,
+        0,
+        qm0,
+    );
+    let (alpha2_q, beta2_q) = extract_acpl_pair_alpha_beta_q(
+        &mid(&g3_q, &g4_q),
+        &side(coeffs_r, coeffs_rs),
+        transform_length,
+        num_param_bands,
+        0,
+        qm0,
+    );
+    let beta3_q = extract_beta3_q_per_band_centre_residual(
+        carrier_0,
+        carrier_1,
+        coeffs_c,
+        &g1_q,
+        &g2_q,
+        &g3_q,
+        &g4_q,
+        &g5_q,
+        &g6_q,
+        transform_length,
+        num_param_bands,
+        0,
+        1.0,
+        qm1,
+        qm0,
+    );
+    Acpl3Rows {
+        alpha1_q,
+        alpha2_q,
+        beta1_q,
+        beta2_q,
+        beta3_q,
+        g1_q,
+        g2_q,
+        g3_q,
+        g4_q,
+        g5_q,
+        g6_q,
+    }
+}
+
+/// ASPX_ACPL_3 parameter rows for the two live body writers: the
+/// Pseudocode 118 / 119 fit against the coded downmix when
+/// `spec_carriers` is given ([`extract_acpl3_spec_rows`]), otherwise
+/// the historical L / R-carrier extractors with their scale knobs.
+#[allow(clippy::too_many_arguments)]
+fn acpl3_rows(
+    spec_carriers: Option<(&[f32], &[f32])>,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: Option<&[f32]>,
+    coeffs_ls: Option<&[f32]>,
+    coeffs_rs: Option<&[f32]>,
+    transform_length: u32,
+    acpl_num_bands: u32,
+    acpl_qm0: crate::acpl::AcplQuantMode,
+    acpl_qm1: crate::acpl::AcplQuantMode,
+    alpha_scale: f32,
+    beta_scale: f32,
+    gamma_scale: f32,
+    beta3_scale: f32,
+) -> Acpl3Rows {
+    if let (Some((c0, c1)), Some(c), Some(ls), Some(rs)) =
+        (spec_carriers, coeffs_c, coeffs_ls, coeffs_rs)
+    {
+        return extract_acpl3_spec_rows(
+            c0,
+            c1,
+            coeffs_l,
+            coeffs_r,
+            c,
+            ls,
+            rs,
+            transform_length,
+            acpl_num_bands,
+            acpl_qm0,
+            acpl_qm1,
+        );
+    }
+    let alpha_q = extract_alpha_q_per_band_carrier_correlation(
+        coeffs_l,
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        alpha_scale,
+        acpl_qm0,
+    );
+    let beta1_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_l,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let beta2_q = extract_beta_q_per_band_carrier_energy(
+        coeffs_r,
+        transform_length,
+        acpl_num_bands,
+        0,
+        beta_scale,
+        acpl_qm0,
+    );
+    let zeros = || vec![0i32; acpl_num_bands as usize];
+    let (g1_q, g2_q) = match coeffs_ls {
+        Some(buf) => extract_gamma_1_2_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        ),
+        None => (zeros(), zeros()),
+    };
+    let (g3_q, g4_q) = match coeffs_rs {
+        Some(buf) => extract_gamma_3_4_q_per_band_surround_least_squares(
+            coeffs_l,
+            coeffs_r,
+            buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        ),
+        None => (zeros(), zeros()),
+    };
+    let (g5_q, g6_q) = match coeffs_c {
+        Some(buf) => extract_gamma_5_6_q_per_band_centre_least_squares(
+            coeffs_l,
+            coeffs_r,
+            buf,
+            transform_length,
+            acpl_num_bands,
+            0,
+            gamma_scale,
+            acpl_qm1,
+        ),
+        None => (zeros(), zeros()),
+    };
+    let beta3_q = match coeffs_c {
+        Some(buf) => extract_beta3_q_per_band_centre_residual(
+            coeffs_l,
+            coeffs_r,
+            buf,
+            &g1_q,
+            &g2_q,
+            &g3_q,
+            &g4_q,
+            &g5_q,
+            &g6_q,
+            transform_length,
+            acpl_num_bands,
+            0,
+            beta3_scale,
+            acpl_qm1,
+            acpl_qm0,
+        ),
+        None => zeros(),
+    };
+    Acpl3Rows {
+        alpha1_q: alpha_q.clone(),
+        alpha2_q: alpha_q,
+        beta1_q,
+        beta2_q,
+        beta3_q,
+        g1_q,
+        g2_q,
+        g3_q,
+        g4_q,
+        g5_q,
+        g6_q,
+    }
+}
+
 /// Per-parameter-band `(alpha_q, beta_q)` for one channel-based A-CPL
 /// module (§5.7.7.5 Pseudocode 116 driven from Pseudocode 117 / 120).
 ///
@@ -8153,7 +8348,7 @@ fn quantise_beta3(beta3: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
 /// §5.7.7.6.2 Pseudocode 118:
 ///
 /// ```text
-///   z4 = 0.5 · (g5 · x0in + g6 · x1in)
+///   z4 = 0.5 · (x0in·(g5 + g5·1) + x1in·(g6 + g6·1)) = g5 · x0in + g6 · x1in
 ///   C  = √2 · z4         (Pseudocode 118 step 11 scales z4 by √2)
 ///   x0in = (1 + √2) · L  (Pseudocode 118 step 1 input scaling)
 ///   x1in = (1 + √2) · R
@@ -8163,7 +8358,7 @@ fn quantise_beta3(beta3: f32, qm: crate::acpl::AcplQuantMode) -> i32 {
 /// correction, ducker = 1) is:
 ///
 /// ```text
-///   C ≈ K · (γ5 · L + γ6 · R)        K = √2 · (1 + √2) / 2 = 1 + √(1/2)
+///   C ≈ K · (γ5 · L + γ6 · R)        K = √2 · (1 + √2)
 /// ```
 ///
 /// — i.e. `C / K ≈ γ5 · L + γ6 · R`. The per-band least-squares fit
@@ -8223,8 +8418,11 @@ pub fn extract_gamma_5_6_q_per_band_centre_least_squares(
         e_lc[pb] += xl * xc;
         e_rc[pb] += xr * xc;
     }
-    // K = √2 · (1 + √2) / 2 = 1 + √(1/2).
-    let k = 1.0 + (0.5f32).sqrt();
+    // Pseudocode 119 ACplModule2 with a = 1 for the centre call
+    // (Pseudocode 118 step 7): z4 = 0.5·(x0in·(g5 + g5) + x1in·(g6 + g6))
+    // = g5·x0in + g6·x1in, then step 11 scales z4 by √2 and step 1 the
+    // carriers by (1 + √2): K = √2 · (1 + √2).
+    let k = std::f32::consts::SQRT_2 * (1.0 + std::f32::consts::SQRT_2);
     let inv_k = 1.0 / k;
     let mut g5_q = vec![0i32; n];
     let mut g6_q = vec![0i32; n];
@@ -8236,15 +8434,24 @@ pub fn extract_gamma_5_6_q_per_band_centre_least_squares(
         let b = e_lr[pb];
         let c = e_rr[pb];
         let det = a * c - b * b;
-        if !det.is_finite() || det.abs() <= f32::EPSILON * (a.abs() + c.abs() + 1.0) {
-            continue;
-        }
         // Right-hand side is <L, C/K> = <L, C> / K and similarly for R.
         let rhs0 = e_lc[pb] * inv_k;
         let rhs1 = e_rc[pb] * inv_k;
-        // Inverse of [[a, b], [b, c]] is (1/det) · [[c, -b], [-b, a]].
-        let g5_raw = (c * rhs0 - b * rhs1) / det;
-        let g6_raw = (-b * rhs0 + a * rhs1) / det;
+        // Rank-deficient Gram matrix (one carrier silent, or the pair
+        // collinear): project onto the stronger carrier alone.
+        let (g5_raw, g6_raw) =
+            if !det.is_finite() || det.abs() <= f32::EPSILON * (a.abs() + c.abs() + 1.0) {
+                if a >= c && a > 0.0 {
+                    (rhs0 / a, 0.0)
+                } else if c > 0.0 {
+                    (0.0, rhs1 / c)
+                } else {
+                    continue;
+                }
+            } else {
+                // Inverse of [[a, b], [b, c]] is (1/det) · [[c, -b], [-b, a]].
+                ((c * rhs0 - b * rhs1) / det, (-b * rhs0 + a * rhs1) / det)
+            };
         let g5 = gamma_scale * g5_raw;
         let g6 = gamma_scale * g6_raw;
         if !g5.is_finite() || !g6.is_finite() {
@@ -8357,12 +8564,25 @@ fn extract_gamma_pair_q_per_band_surround_least_squares(
         let b = e_lr[pb];
         let c = e_rr[pb];
         let det = a * c - b * b;
-        if !det.is_finite() || det.abs() <= f32::EPSILON * (a.abs() + c.abs() + 1.0) {
-            continue;
-        }
-        // Inverse of [[a, b], [b, c]] is (1/det) · [[c, -b], [-b, a]].
-        let g_raw = (c * e_lt[pb] - b * e_rt[pb]) / det;
-        let gp_raw = (-b * e_lt[pb] + a * e_rt[pb]) / det;
+        // Rank-deficient Gram matrix (one carrier silent, or the pair
+        // collinear): project the target onto the stronger carrier
+        // alone instead of dropping the band.
+        let (g_raw, gp_raw) =
+            if !det.is_finite() || det.abs() <= f32::EPSILON * (a.abs() + c.abs() + 1.0) {
+                if a >= c && a > 0.0 {
+                    (e_lt[pb] / a, 0.0)
+                } else if c > 0.0 {
+                    (0.0, e_rt[pb] / c)
+                } else {
+                    continue;
+                }
+            } else {
+                // Inverse of [[a, b], [b, c]] is (1/det) · [[c, -b], [-b, a]].
+                (
+                    (c * e_lt[pb] - b * e_rt[pb]) / det,
+                    (-b * e_lt[pb] + a * e_rt[pb]) / det,
+                )
+            };
         let g = gamma_scale * g_raw;
         let gp = gamma_scale * gp_raw;
         if !g.is_finite() || !gp.is_finite() {
@@ -8479,7 +8699,7 @@ pub fn extract_gamma_3_4_q_per_band_surround_least_squares(
 /// 118 steps 8–10, `ACplModule3`). The decoder's centre channel is
 ///
 /// ```text
-///   z4  = 0.5 · (γ₅·x0in + γ₆·x1in)                    (step 7, dry)
+///   z4  = γ₅·x0in + γ₆·x1in                            (step 7, dry; a = 1)
 ///   z4 += 0.25 · y₂ · (−β₃ − β₃·1) = −0.5 · β₃ · y₂    (step 10, wet)
 ///   C   = √2 · z4                                       (step 11)
 /// ```
@@ -8499,7 +8719,7 @@ pub fn extract_gamma_3_4_q_per_band_surround_least_squares(
 ///
 /// The dry-fit residual the wet path must cover is the per-band
 /// least-squares remainder of the round-208 centre fit `C ≈ K·(γ₅·L +
-/// γ₆·R)` with `K = 1 + √(1/2)` (using the *quantised* γ₅ / γ₆ the
+/// γ₆·R)` with `K = √2·(1 + √2)` (using the *quantised* γ₅ / γ₆ the
 /// decoder will actually apply):
 ///
 /// ```text
@@ -8562,10 +8782,10 @@ pub fn extract_beta3_q_per_band_centre_residual(
         e_cc[pb] += xc * xc;
     }
     let gd = crate::acpl_synth::gamma_delta(qm_gamma);
-    // K = √2 · (1 + √2) / 2 = 1 + √(1/2) — step-1 carrier rescale folded
-    // with the step-7 0.5 and the step-11 √2 (same constant as the
-    // round-208 γ₅ / γ₆ centre fit).
-    let k = 1.0 + (0.5f32).sqrt();
+    // K = √2 · (1 + √2) — step-1 carrier rescale, the Pseudocode 119
+    // `a = 1` doubling of the step-7 centre call and the step-11 √2
+    // (same constant as the γ₅ / γ₆ centre fit).
+    let k = std::f32::consts::SQRT_2 * (1.0 + std::f32::consts::SQRT_2);
     // (1 + √2)² — step-1 carrier rescale entering the Transform() input.
     let s2 = {
         let s = 1.0 + (2.0f32).sqrt();
@@ -12364,7 +12584,7 @@ mod tests {
         let tl = 1920u32;
         let nb = 12u32;
         let gd = crate::acpl_synth::gamma_delta(Fine);
-        let k = 1.0 + (0.5f32).sqrt();
+        let k = std::f32::consts::SQRT_2 * (1.0 + std::f32::consts::SQRT_2);
         // L active everywhere; R quiet-but-distinct so the gamma Gram
         // matrix stays non-singular.
         let mut l = vec![0.0f32; tl as usize];

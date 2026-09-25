@@ -340,12 +340,13 @@ The `mode` option picks the tool family: `waveform` (SIMPLE / ASF on
 every channel, SCPL + automatic SAP decisions on the immersive
 element, 22.2 Simple; measured 3–7 % settled relative RMS error on
 every channel of every layout at the 20 kHz default `bandwidth`) or
-`parametric` (5.X / 7.X A-CPL — `ASPX_ACPL_2` by default or
-`ASPX_ACPL_1` through the `acpl` option (`acpl_2` / `acpl_1`), every
-channel at 0,78–1,12× its input level with the waveform-coded
-channels at the 10 % floor; immersive ASPX_SCPL and 22.2 A-SPX with
-real envelope synthesis, 4–7 %; `gop` selects the I-frame interval
-and the P-frames re-use the sticky `aspx_config` / `acpl_config`).
+`parametric` (5.X / 7.X A-CPL — `ASPX_ACPL_2` by default,
+`ASPX_ACPL_1` or, on 5.X, `ASPX_ACPL_3` through the `acpl` option
+(`acpl_2` / `acpl_1` / `acpl_3`), every channel at 0,78–1,12× its
+input level with the waveform-coded channels at the 10 % floor;
+immersive ASPX_SCPL and 22.2 A-SPX with real envelope synthesis,
+4–7 %; `gop` selects the I-frame interval and the P-frames re-use the
+sticky `aspx_config` / `acpl_config`).
 
 Every `ac4_substream()` the encoder emits is **tightly sized**: the
 `audio_size` header announces the exact byte length of `audio_data()`
@@ -433,6 +434,18 @@ parses back to the authored rows.
   The older scaffold entries (`encode_frame_pcm_5_0_acpl1{,_sap,
   _real_alpha,_real_alpha_beta}`, `..._acpl2{,_real_alpha_beta}`)
   emit the same carrier model with minimum-bit-cost A-SPX / α.
+- **5.X ASPX_ACPL_3 with decoded-PCM parity** (round 461):
+  `encode_frame_pcm_5_{0,1}_acpl3_real_aspx{,_with_max_sfb,_multi_env}`
+  code the Pseudocode 118 downmix `x0 = (L + C/√2 + Ls/√2)/(1+√2)`,
+  `x1 = (R + C/√2 + Rs/√2)/(1+√2)` on the `stereo_data()` pair
+  (`encoder_acpl3::acpl3_downmix_carriers`) and fit the eleven Table 62
+  rows against it (`extract_acpl3_spec_rows`: `(γ1, γ2)` / `(γ3, γ4)`
+  least squares onto `L + Ls/√2` / `R + Rs/√2`, `(γ5, γ6)` onto
+  `C / (√2·(1+√2))` — Pseudocode 119 with `a = 1` doubles the centre
+  call —, `(α, β)` on the dequantised `v/2` mid, β3 on the centre
+  residual). Measured: L 0,90 / R 0,86 / C 0,88 / Ls 0,91 / Rs 0,97 ×
+  input RMS on the round-461 multitones (was 1,1 / 1,2 / 0,58 / 3,2 /
+  3,0), I + 3×P GOPs included.
 - **P-frames (`b_iframe = 0`)** on every live A-SPX path (5_X ACPL_3
   single + multi-envelope, 5_X / 7_X ACPL_2, 7_X / 5_X-SAP ACPL_1, 7.0
   pure-ASPX): setting `b_iframe_global = false` emits the correct
@@ -559,15 +572,13 @@ parses back to the authored rows.
   real round-trip). The `aspx_tna_mode` / `aspx_add_harmonic` /
   `aspx_preflat` thresholds are encoder tuning choices calibrated to
   the live QMF pipeline, not against a perceptual reference.
-- **5.X ASPX_ACPL_3 PCM parity** — the ASPX_ACPL_3 encode paths are
-  pinned on structure (parse-back, envelope recovery, determinism)
-  and decode non-silent, but their `(γ, α, β, β3)` extractors still
-  assume an L / R-carrier model: through the decoder the 5_X
-  ASPX_ACPL_3 route lands ≈ 3× the input energy on Ls / Rs and 0,6×
-  on C (Pseudocode 118 / 119 needs the same carrier-model rework the
-  ACPL_1 / _2 routes received in round 461). The 5.X ACPL_1 SAP
-  selector entry (`encode_frame_pcm_5_0_acpl1_sap`) still writes the
-  α-less `acpl_data_1ch()` scaffold.
+- **A-CPL scaffold entries** — the 5.X ACPL_1 SAP selector entry
+  (`encode_frame_pcm_5_0_acpl1_sap`) still writes the α-less
+  `acpl_data_1ch()` scaffold, and the pre-round-461 ACPL_3 builders
+  (`build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta*` without
+  `spec_carriers`) keep the L / R-carrier extractors; the live
+  `encode_frame_pcm_5_{0,1}_acpl3_real_aspx{,_multi_env}` entries and
+  the framework `acpl_3` route use the Pseudocode 118 downmix model.
 - **Decoder output delay** — channels that go through a QMF-domain
   tool come back one round trip (`qmf::QMF_ROUND_TRIP_DELAY` = 577
   samples) later per pass; the ASPX_ACPL_1 / _2 element renderer

@@ -2928,6 +2928,40 @@ impl Ac4ImsEncoder {
         )
     }
 
+    /// `max_sfb`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_0_acpl3_real_aspx`] on the Pseudocode
+    /// 118 downmix-carrier model (the legacy scale knobs do not apply).
+    pub fn encode_frame_pcm_5_0_acpl3_real_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_5_x_acpl3_real_aspx_with_max_sfb(
+            frames, None, max_sfb, None, 1.0, 1.0, 1.0, 1.0,
+        )
+    }
+
+    /// `max_sfb` / `max_sfb_lfe`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_1_acpl3_real_aspx`].
+    pub fn encode_frame_pcm_5_1_acpl3_real_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 6],
+        max_sfb: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_5_x_acpl3_real_aspx_with_max_sfb(
+            &surround,
+            Some(frames[5]),
+            max_sfb,
+            Some(max_sfb_lfe),
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        )
+    }
+
     /// 5.1 counterpart to [`Self::encode_frame_pcm_5_0_acpl3_real_aspx`].
     /// `frames` is in `[L, R, C, Ls, Rs, LFE]` order.
     pub fn encode_frame_pcm_5_1_acpl3_real_aspx(
@@ -3051,6 +3085,11 @@ impl Ac4ImsEncoder {
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
         let max_sfb = max_sfb.min(n_msfb_cap);
+        // The coded carrier pair (`acpl3_downmix_carriers`): every A-SPX
+        // decision below is taken on the carriers the decoder extends.
+        let (x0, x1) = crate::encoder_acpl3::acpl3_downmix_carriers(
+            frames[0], frames[1], frames[2], frames[3], frames[4],
+        );
 
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
         if lfe.is_some() {
@@ -3061,7 +3100,9 @@ impl Ac4ImsEncoder {
             self.channel_mode_bits = 4;
         }
 
-        let n_channels = if lfe.is_some() { 6 } else { 5 };
+        // Pseudocode 118 downmix carriers on MDCT states 0 / 1, the five
+        // target channels on 2..=6 (the parameter fits), the LFE on 7.
+        let n_channels = 8;
         while self.mdct_states_multi.len() < n_channels {
             self.mdct_states_multi
                 .push(EncoderMdctState::new(frame_len));
@@ -3071,13 +3112,15 @@ impl Ac4ImsEncoder {
                 *state = EncoderMdctState::new(frame_len);
             }
         }
-        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        let car0 = self.mdct_states_multi[0].analyse_frame(&x0);
+        let car1 = self.mdct_states_multi[1].analyse_frame(&x1);
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(5);
         for (ch, f) in frames.iter().enumerate() {
-            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            let c = self.mdct_states_multi[2 + ch].analyse_frame(f);
             coeffs_per_channel.push(c);
         }
         let coeffs_lfe: Option<Vec<f32>> =
-            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
+            lfe.map(|buf| self.mdct_states_multi[7].analyse_frame(buf));
 
         let mut aspx_cfg = crate::aspx::AspxConfig {
             quant_mode_env: crate::aspx::AspxQuantStep::Fine,
@@ -3097,7 +3140,7 @@ impl Ac4ImsEncoder {
         // generation source — carries a strong overall spectral tilt
         // (§5.7.6.4.1.2 Pseudocode 85). One per-config flag governs the
         // element; derived from the primary (L) carrier.
-        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, x0.as_slice());
 
         // Real ASPX envelope extraction: run the QMF analysis bank over
         // the L / R input PCM, then aggregate the HF energy across the
@@ -3105,7 +3148,7 @@ impl Ac4ImsEncoder {
         // [F0, DF₁, …] quant-index vectors. The frequency tables provide
         // the absolute SBG borders + the cross-over subband `sbx`.
         let (l_sig_lvl, l_noise_lvl, r_sig_lvl, r_noise_lvl) =
-            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, x0.as_slice(), x1.as_slice());
         // §5.7.6.3.5: the pair is transmitted as (sum, pan) under
         // aspx_balance = 1 (Pseudocode 84). Convert here — before the
         // FREQ/TIME direction decision — so the cross-frame
@@ -3134,13 +3177,13 @@ impl Ac4ImsEncoder {
         // Encoder-side A-SPX inverse-filtering decision for the L carrier
         // (mirrored to R under aspx_balance = 1). Heavier where the low
         // band is more tonal (§4.3.10.6.1 / §5.7.6.4.1.3).
-        let aspx_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let aspx_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, x0.as_slice());
 
         // Encoder-side A-SPX missing-harmonic decision per carrier
         // (§4.2.12.6): a discrete tonal partial in a high-res signal
         // subband group's HF QMF band requests a restored sinusoid.
-        let aspx_l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
-        let aspx_r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let aspx_l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, x0.as_slice());
+        let aspx_r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, x1.as_slice());
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_qm0 = crate::acpl::AcplQuantMode::Fine;
@@ -3215,6 +3258,7 @@ impl Ac4ImsEncoder {
                 gamma_scale,
                 beta3_scale,
                 pad_target_bytes,
+                Some((car0.as_slice(), car1.as_slice())),
                 Some(&mut self.acpl3_param_prev),
             );
 
@@ -3590,6 +3634,11 @@ impl Ac4ImsEncoder {
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
         let max_sfb = max_sfb.min(n_msfb_cap);
+        // The coded carrier pair (`acpl3_downmix_carriers`): every A-SPX
+        // decision below is taken on the carriers the decoder extends.
+        let (x0, x1) = crate::encoder_acpl3::acpl3_downmix_carriers(
+            frames[0], frames[1], frames[2], frames[3], frames[4],
+        );
 
         let mut aspx_cfg = crate::aspx::AspxConfig {
             quant_mode_env: crate::aspx::AspxQuantStep::Fine,
@@ -3608,7 +3657,7 @@ impl Ac4ImsEncoder {
         // signal pre-flattening when the L carrier's QMF low band carries a
         // strong overall spectral tilt (§5.7.6.4.1.2 Pseudocode 85).
         // Orthogonal to the per-envelope SIGNAL/NOISE extraction below.
-        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, x0.as_slice());
 
         // Probe for a transient and build the multi-envelope rows. A
         // stationary frame returns num_env = 1, in which case we delegate
@@ -3622,14 +3671,14 @@ impl Ac4ImsEncoder {
         let (num_env, rows) = self.extract_aspx_lr_multi_env(
             &aspx_cfg,
             frame_len,
-            frames[0],
-            frames[1],
+            x0.as_slice(),
+            x1.as_slice(),
             env_prev.as_ref(),
         );
         // Per-channel real aspx_add_harmonic (§4.2.12.6) for the L / R
         // carriers — carried on the multi-envelope aspx_data_2ch() too.
-        let aspx_l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
-        let aspx_r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let aspx_l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, x0.as_slice());
+        let aspx_r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, x1.as_slice());
         if num_env <= 1 {
             return self.encode_frame_pcm_5_x_acpl3_real_aspx_with_max_sfb(
                 frames,
@@ -3652,7 +3701,9 @@ impl Ac4ImsEncoder {
             self.channel_mode_bits = 4;
         }
 
-        let n_channels = if lfe.is_some() { 6 } else { 5 };
+        // Pseudocode 118 downmix carriers on MDCT states 0 / 1, the five
+        // target channels on 2..=6 (the parameter fits), the LFE on 7.
+        let n_channels = 8;
         while self.mdct_states_multi.len() < n_channels {
             self.mdct_states_multi
                 .push(EncoderMdctState::new(frame_len));
@@ -3662,13 +3713,15 @@ impl Ac4ImsEncoder {
                 *state = EncoderMdctState::new(frame_len);
             }
         }
-        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        let car0 = self.mdct_states_multi[0].analyse_frame(&x0);
+        let car1 = self.mdct_states_multi[1].analyse_frame(&x1);
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(5);
         for (ch, f) in frames.iter().enumerate() {
-            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            let c = self.mdct_states_multi[2 + ch].analyse_frame(f);
             coeffs_per_channel.push(c);
         }
         let coeffs_lfe: Option<Vec<f32>> =
-            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
+            lfe.map(|buf| self.mdct_states_multi[7].analyse_frame(buf));
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_qm0 = crate::acpl::AcplQuantMode::Fine;
@@ -3706,6 +3759,7 @@ impl Ac4ImsEncoder {
                 gamma_scale,
                 beta3_scale,
                 pad_target_bytes,
+                Some((car0.as_slice(), car1.as_slice())),
             );
 
         // The multi-envelope body builder returns an empty Vec if the

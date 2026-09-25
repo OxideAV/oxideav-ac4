@@ -306,8 +306,8 @@ fn decode_of_encoder_probe_is_bit_exact_run_to_run() {
 }
 
 // ---------------------------------------------------------------------
-// Scaffold routes (minimum-bit-cost A-SPX / α-less SAP selector / the
-// ASPX_ACPL_3 model): decoded, never silent.
+// Scaffold routes (minimum-bit-cost A-SPX / α-less SAP selector):
+// decoded, never silent.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -328,20 +328,26 @@ fn decode_5_0_acpl1_sap_is_not_silent() {
     assert_non_silent(label, &N5, &r);
 }
 
+/// ASPX_ACPL_3 (Pseudocode 118 / 119): one stereo downmix carries all
+/// five channels; every channel within the parity window, I-only and
+/// with I + 3×P GOPs (the γ / α / β / β3 rows interpolate from the
+/// previous frame's parameter set — §5.7.7.3 Pseudocode 109).
 #[test]
-fn decode_5_0_acpl3_real_aspx_is_not_silent() {
+fn parity_5_0_acpl3_real_aspx() {
     let label = "5.0 ASPX_ACPL_3 (real aspx)";
-    let r = measure(label, &N5, &A5, 1, |e, p| {
-        e.encode_frame_pcm_5_0_acpl3_real_aspx(&a5(p), 1.0, 1.0, 1.0, 1.0)
-    });
-    assert_non_silent(label, &N5, &r);
+    for gop in [1usize, 4] {
+        let r = measure(label, &N5, &A5, gop, |e, p| {
+            e.encode_frame_pcm_5_0_acpl3_real_aspx(&a5(p), 1.0, 1.0, 1.0, 1.0)
+        });
+        assert_parity(label, &N5, &r, LO, HI);
+    }
 }
 
 #[test]
-fn decode_5_1_acpl3_real_aspx_is_not_silent() {
+fn parity_5_1_acpl3_real_aspx() {
     let label = "5.1 ASPX_ACPL_3 (real aspx)";
     let r = measure(label, &N6, &A6, 1, |e, p| {
         e.encode_frame_pcm_5_1_acpl3_real_aspx(&a6(p), 1.0, 1.0, 1.0, 1.0)
     });
-    assert_non_silent(label, &N6, &r);
+    assert_parity(label, &N6, &r, LO, HI);
 }
