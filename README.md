@@ -340,10 +340,12 @@ The `mode` option picks the tool family: `waveform` (SIMPLE / ASF on
 every channel, SCPL + automatic SAP decisions on the immersive
 element, 22.2 Simple; measured 3–7 % settled relative RMS error on
 every channel of every layout at the 20 kHz default `bandwidth`) or
-`parametric` (immersive ASPX_SCPL and 22.2 A-SPX with real envelope
-synthesis, 4–7 %; `gop` selects the I-frame interval and the P-frames
-re-use the sticky `aspx_config`). Parametric 5.X / 7.X (the A-CPL
-routes) is rejected at construction — see *Not yet supported*.
+`parametric` (5.X / 7.X A-CPL — `ASPX_ACPL_2` by default or
+`ASPX_ACPL_1` through the `acpl` option (`acpl_2` / `acpl_1`), every
+channel at 0,78–1,12× its input level with the waveform-coded
+channels at the 10 % floor; immersive ASPX_SCPL and 22.2 A-SPX with
+real envelope synthesis, 4–7 %; `gop` selects the I-frame interval
+and the P-frames re-use the sticky `aspx_config` / `acpl_config`).
 
 Every `ac4_substream()` the encoder emits is **tightly sized**: the
 `audio_size` header announces the exact byte length of `audio_data()`

@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `encode_frame_pcm_5_1_acpl2_real_aspx_with_max_sfb`; the live 7.X
   ACPL_1 / ACPL_2 builders take the back-channel sides.
 - `qmf::QMF_ROUND_TRIP_DELAY` (analysis + synthesis pair delay).
+- Framework encoder: `mode=parametric` on 5.0 / 5.1 / 7.0 / 7.1 (was
+  rejected) drives the A-CPL routes, with the `acpl` option (`acpl_2`
+  default / `acpl_1`; `Ac4EncoderOptions::acpl`, `encoder::AcplMode`)
+  and `gop` P-frames on them.
 - Framework encoder (`encoder::Ac4Encoder`, `make_encoder`, registered
   with an options schema): layout dispatch by channel count, any-format
   input FIFO framing, `frame_rate_index` / `framing` / `mode` /

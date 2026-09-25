@@ -54,13 +54,27 @@ pub enum EncodeMode {
     #[default]
     Waveform,
     /// A-SPX bandwidth extension with real per-channel envelope
-    /// synthesis: the immersive ASPX_SCPL codec mode (7.X.4 / 9.X.4)
-    /// and the 22.2 A-SPX codec mode. Mono / stereo fall back to the
-    /// waveform tools (no A-SPX synthesis path exists for them), and
-    /// the 5.X / 7.X A-CPL routes are rejected at construction until
-    /// their PCM parity is pinned. Honours [`Ac4EncoderOptions::gop`]
-    /// (P-frames re-use the I-frame-sticky `aspx_config`).
+    /// synthesis: the 5.X / 7.X A-CPL codec modes (ASPX_ACPL_2 by
+    /// default, ASPX_ACPL_1 via [`Ac4EncoderOptions::acpl`]), the
+    /// immersive ASPX_SCPL codec mode (7.X.4 / 9.X.4) and the 22.2
+    /// A-SPX codec mode. Mono / stereo fall back to the waveform tools
+    /// (no A-SPX synthesis path exists for them). Honours
+    /// [`Ac4EncoderOptions::gop`] (P-frames re-use the I-frame-sticky
+    /// `aspx_config` / `acpl_config`).
     Parametric,
+}
+
+/// A-CPL codec mode of the parametric 5.X / 7.X routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AcplMode {
+    /// `ASPX_ACPL_2`: fully parametric surround / back pair from the
+    /// coded carrier + `(α, β)` (Pseudocode 117 / 120).
+    #[default]
+    Acpl2,
+    /// `ASPX_ACPL_1`: the pair's side is waveform-coded on the joint-
+    /// MDCT residual layer below `acpl_qmf_band` (mid/side exact
+    /// there), parametric above.
+    Acpl1,
 }
 
 /// Sync-frame wrapping of the emitted packets.
@@ -102,10 +116,12 @@ pub struct Ac4EncoderOptions {
     pub dynamic_range_db: u32,
     /// I-frame interval: frame `k` is an I-frame when `k % gop == 0`.
     /// `1` (the default) makes every frame independently decodable.
-    /// Only the parametric immersive / 22.2 routes emit P-frames; the
-    /// waveform routes carry no I-frame-gated configuration and stay
-    /// all-I regardless.
+    /// Only the parametric routes emit P-frames; the waveform routes
+    /// carry no I-frame-gated configuration and stay all-I regardless.
     pub gop: u32,
+    /// A-CPL codec mode on the parametric 5.X / 7.X routes
+    /// (`acpl_2` / `acpl_1`).
+    pub acpl: AcplMode,
 }
 
 impl Default for Ac4EncoderOptions {
@@ -117,6 +133,7 @@ impl Default for Ac4EncoderOptions {
             bandwidth_hz: 20_000,
             dynamic_range_db: 60,
             gop: 1,
+            acpl: AcplMode::Acpl2,
         }
     }
 }
@@ -159,6 +176,12 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
             default: OptionValue::U32(1),
             help: "I-frame interval on the parametric routes (1 = all I-frames)",
         },
+        OptionField {
+            name: "acpl",
+            kind: OptionKind::Enum(&["acpl_2", "acpl_1"]),
+            default: OptionValue::String(String::new()),
+            help: "A-CPL codec mode of the parametric 5.X / 7.X routes: acpl_2 (fully parametric pair) or acpl_1 (waveform side below acpl_qmf_band)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -182,11 +205,24 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
             "bandwidth" => self.bandwidth_hz = value.as_u32()?,
             "dynamic_range" => self.dynamic_range_db = value.as_u32()?,
             "gop" => self.gop = value.as_u32()?,
+            "acpl" => {
+                self.acpl = match value.as_str()? {
+                    "acpl_2" => AcplMode::Acpl2,
+                    "acpl_1" => AcplMode::Acpl1,
+                    other => {
+                        return Err(Error::invalid(format!("ac4: unknown acpl mode '{other}'")))
+                    }
+                }
+            }
             _ => return Err(Error::invalid(format!("ac4: unknown option '{key}'"))),
         }
         Ok(())
     }
 }
+
+/// `max_sfb_master` of the ASPX_ACPL_1 joint-MDCT residual layer on the
+/// framework routes (scale-factor bands; 20 ≈ 1,4 kHz at 1920 samples).
+const ACPL1_RESIDUAL_SFB: u32 = 20;
 
 /// Channel layouts the framework encoder dispatches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,11 +293,7 @@ impl Layout {
 
     /// Does the (layout, mode) pair emit P-frames when `gop > 1`?
     fn supports_pframes(self, mode: EncodeMode) -> bool {
-        mode == EncodeMode::Parametric
-            && matches!(
-                self,
-                Self::I7_0_4 | Self::I7_1_4 | Self::I9_0_4 | Self::I9_1_4 | Self::I22_2
-            )
+        mode == EncodeMode::Parametric && !matches!(self, Self::Mono | Self::Stereo)
     }
 }
 
@@ -346,17 +378,6 @@ impl Ac4Encoder {
         }
         if opts.gop == 0 {
             return Err(Error::invalid("ac4 encoder: gop must be >= 1"));
-        }
-        if opts.mode == EncodeMode::Parametric
-            && matches!(
-                layout,
-                Layout::S5_0 | Layout::S5_1 | Layout::S7_0 | Layout::S7_1
-            )
-        {
-            return Err(Error::unsupported(
-                "ac4 encoder: parametric (A-CPL) coding on 5.X / 7.X is not wired \
-                 through the framework encoder yet — use mode=waveform",
-            ));
         }
         let input_format = params.sample_format.unwrap_or(SampleFormat::S16);
         if !supported_input_format(input_format) {
@@ -506,10 +527,51 @@ impl Ac4Encoder {
             (Layout::S7_1, EncodeMode::Waveform) => {
                 enc.encode_frame_pcm_7_1_with_max_sfb(&arr8(&s), sfb, sfb, lfe)
             }
-            // Rejected at construction (`with_options`).
-            (Layout::S5_0 | Layout::S5_1 | Layout::S7_0 | Layout::S7_1, EncodeMode::Parametric) => {
-                Vec::new()
-            }
+            // A-CPL routes: the residual layer of ASPX_ACPL_1 keeps
+            // `max_sfb_master` at 20 scale-factor bands (≈ 1,4 kHz at
+            // 1920 samples) — the mid/side band below acpl_qmf_band.
+            (Layout::S5_0, EncodeMode::Parametric) => match self.opts.acpl {
+                AcplMode::Acpl2 => {
+                    enc.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(&arr5(&s), sfb)
+                }
+                AcplMode::Acpl1 => enc.encode_frame_pcm_5_0_acpl1_real_aspx_with_max_sfb(
+                    &arr5(&s),
+                    sfb,
+                    sfb.min(ACPL1_RESIDUAL_SFB),
+                ),
+            },
+            (Layout::S5_1, EncodeMode::Parametric) => match self.opts.acpl {
+                AcplMode::Acpl2 => {
+                    enc.encode_frame_pcm_5_1_acpl2_real_aspx_with_max_sfb(&arr6(&s), sfb, lfe)
+                }
+                AcplMode::Acpl1 => enc.encode_frame_pcm_5_1_acpl1_real_aspx_with_max_sfb(
+                    &arr6(&s),
+                    sfb,
+                    sfb.min(ACPL1_RESIDUAL_SFB),
+                    lfe,
+                ),
+            },
+            (Layout::S7_0, EncodeMode::Parametric) => match self.opts.acpl {
+                AcplMode::Acpl2 => {
+                    enc.encode_frame_pcm_7_0_acpl2_real_aspx_with_max_sfb(&arr7(&s), sfb)
+                }
+                AcplMode::Acpl1 => enc.encode_frame_pcm_7_0_acpl1_real_alpha_beta_with_max_sfb(
+                    &arr7(&s),
+                    sfb,
+                    sfb.min(ACPL1_RESIDUAL_SFB),
+                ),
+            },
+            (Layout::S7_1, EncodeMode::Parametric) => match self.opts.acpl {
+                AcplMode::Acpl2 => {
+                    enc.encode_frame_pcm_7_1_acpl2_real_aspx_with_max_sfb(&arr8(&s), sfb, lfe)
+                }
+                AcplMode::Acpl1 => enc.encode_frame_pcm_7_1_acpl1_real_alpha_beta_with_max_sfb(
+                    &arr8(&s),
+                    sfb,
+                    sfb.min(ACPL1_RESIDUAL_SFB),
+                    lfe,
+                ),
+            },
             (Layout::I7_0_4, EncodeMode::Waveform) => {
                 enc.encode_frame_pcm_7_0_4_ice_scpl_sap_with_max_sfb(&arr11(&s), sfb)
             }

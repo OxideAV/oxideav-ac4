@@ -251,7 +251,14 @@ fn registry_exposes_encoder_and_schema() {
     let id = CodecId::new("ac4");
     assert!(reg.has_encoder(&id));
     let schema = reg.encoder_options_schema(&id).expect("schema");
-    for key in ["frame_rate_index", "framing", "mode", "bandwidth", "gop"] {
+    for key in [
+        "frame_rate_index",
+        "framing",
+        "mode",
+        "bandwidth",
+        "gop",
+        "acpl",
+    ] {
         assert!(schema.iter().any(|f| f.name == key), "schema lacks {key}");
     }
 }
@@ -294,19 +301,77 @@ fn waveform_22_2_round_trip() {
     }
 }
 
+/// Settled per-channel RMS ratio `output / input` at the best route lag
+/// (the A-CPL surround / back pairs are parametric — decorrelated
+/// synthesis — so the waveform error is not the metric there).
+fn settled_level(input: &[f32], output: &[f32]) -> f64 {
+    let start = N * SETTLED;
+    let reference = &input[start..start + N];
+    let denom = rms(reference).max(1e-9);
+    let mut best = (f64::INFINITY, 0.0f64);
+    for lag in 0..=MAX_ROUTE_LAG {
+        let base = start + N + lag;
+        if base + N > output.len() {
+            break;
+        }
+        let r = rms(&output[base..base + N]) / denom;
+        let d = (r - 1.0).abs();
+        if d < best.0 {
+            best = (d, r);
+        }
+    }
+    best.1
+}
+
+/// The parametric 5.X / 7.X routes (ASPX_ACPL_2 by default, ASPX_ACPL_1
+/// via `acpl=acpl_1`): the waveform-coded channels (C on 5.X; L / R / C
+/// on 7.X) and the LFE decode at 0,78–1,12× their input level and under
+/// the 10 % waveform-error floor; the parametrically synthesised pairs
+/// land within 0,6–1,4× on this three-tone content (a decorrelator
+/// cannot decorrelate a pure tone, so the `x·(1−α) − β·w` sum
+/// interferes by phase — tests/round461_acpl_5x_7x_parity.rs pins the
+/// 0,78–1,12× window on richer multitones).
 #[test]
-fn parametric_5_x_7_x_is_rejected_until_parity_is_pinned() {
+fn parametric_5_x_7_x_round_trip() {
     let reg = registry();
-    for ch in [5u16, 6, 7, 8] {
-        let p = params(
-            ch,
-            SampleFormat::F32,
-            CodecOptions::new().set("mode", "parametric"),
-        );
-        assert!(
-            reg.first_encoder(&p).is_err(),
-            "{ch}ch parametric must be rejected"
-        );
+    for acpl in ["acpl_2", "acpl_1"] {
+        for ch in [5usize, 6, 7, 8] {
+            let opts = CodecOptions::new()
+                .set("mode", "parametric")
+                .set("acpl", acpl);
+            let p = params(ch as u16, SampleFormat::F32, opts);
+            let mut enc = reg.first_encoder(&p).expect("registry encoder");
+            let chans = signals(ch);
+            let pkts = encode_all(enc.as_mut(), &chans, 1000);
+            assert_eq!(pkts.len(), FRAMES);
+            let mut dec = reg.first_decoder(&p).expect("registry decoder");
+            let out = decode_all(dec.as_mut(), &pkts, ch);
+            let waveform: &[usize] = match ch {
+                5 => &[2],
+                6 => &[2, 3],
+                7 => &[0, 1, 2],
+                _ => &[0, 1, 2, 3],
+            };
+            for c in 0..ch {
+                let o = &out[decoder_slot(ch, c)];
+                let level = settled_level(&chans[c], o);
+                eprintln!("ROUND-461 framework {ch}ch parametric {acpl} ch{c}: level {level:.3}");
+                let window = if waveform.contains(&c) {
+                    0.78..=1.12
+                } else {
+                    0.60..=1.40
+                };
+                assert!(
+                    window.contains(&level),
+                    "{ch}ch parametric {acpl} ch{c}: level {level:.3} outside {window:?}"
+                );
+                if waveform.contains(&c) {
+                    let (e, lag) = settled_err(&chans[c], o);
+                    eprintln!("   waveform ch{c}: rel err {e:.4} (lag {lag})");
+                    assert!(e < 0.10, "{ch}ch parametric {acpl} ch{c}: rel err {e:.4}");
+                }
+            }
+        }
     }
 }
 
