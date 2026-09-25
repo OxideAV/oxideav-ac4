@@ -384,6 +384,8 @@ fn build_7_x_acpl2_body_real_alpha_beta_diverges_from_scaffold_for_nonzero_surro
         &coeffs_r,
         &coeffs_ls,
         &coeffs_rs,
+        &coeffs_ls,
+        &coeffs_rs,
         &coeffs_c,
         None,
         &aspx_cfg,

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encode_frame_pcm_5_{0,1}_acpl1_real_aspx` — 5.X ASPX_ACPL_1 with
+  real A-SPX envelopes / tna / add_harmonic on the carrier pair and
+  the centre (`build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta_
+  real_aspx_tna`), plus `encode_frame_pcm_5_1_acpl1_real_alpha_beta` /
+  `encode_frame_pcm_5_1_acpl2_real_aspx_with_max_sfb`; the live 7.X
+  ACPL_1 / ACPL_2 builders take the back-channel sides.
+- `qmf::QMF_ROUND_TRIP_DELAY` (analysis + synthesis pair delay).
 - Framework encoder (`encoder::Ac4Encoder`, `make_encoder`, registered
   with an options schema): layout dispatch by channel count, any-format
   input FIFO framing, `frame_rate_index` / `framing` / `mode` /
@@ -49,6 +56,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- 5.X / 7.X `ASPX_ACPL_1` / `ASPX_ACPL_2` **encode** now codes the
+  carriers the decoder's Pseudocode 117 / 120 synthesis reconstructs
+  from (`Ac4ImsEncoder::acpl_5x_wire_channels` /
+  `acpl_7x_wire_channels`: `A = (L + Ls/√2)/2`, `D = (Ls + Lb)/(2√2)`,
+  …) with the per-band `(α, β)` fitted to the coded carrier and its
+  side (`encoder_acpl3::extract_acpl_pair_alpha_beta_q`), β quantised
+  against the column the decoder's α lane selects (Tables 203–206,
+  `quantise_beta_magnitude_for_lane`), `companding_control` written
+  off (the decoder's §5.7.5 expansion scaled the A-SPX band ≈ 9× when
+  the encoder never compressed), ASPX_ACPL_1 `acpl_qmf_band` derived
+  from the residual budget, and the 5.1 A-CPL entries carrying the
+  Table 25 `mono_data(1)` LFE (they used to emit 5.0 frames). Decoded
+  PCM parity is pinned per channel on every 5.0 / 5.1 / 7.0 / 7.1
+  ACPL_1 / ACPL_2 route (0,78–1,12× input RMS, I + P GOPs).
+- A-CPL element decode alignment: A-SPX'd carriers return one QMF
+  round trip (`qmf::QMF_ROUND_TRIP_DELAY` = 577 samples) late; the
+  ASPX_ACPL_1 residual pair, the 7_X waveform-coded L / R and the LFE
+  are now delayed to the same instants (the residual used to be
+  mid/side-combined with a 577-sample-shifted carrier).
 - 5.X / 7.X `ASPX_ACPL_1` / `ASPX_ACPL_2` decode no longer runs the
   channel-pair coupling on silence (round-456 finding): the element
   renderer now resolves the Table 181 / 184 preliminary tracks from the

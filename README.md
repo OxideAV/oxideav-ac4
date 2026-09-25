@@ -404,8 +404,33 @@ parses back to the authored rows.
 - 5.0 / 5.1 and 7.0 / 7.1 SIMPLE/Cfg3Five (per-channel forward MDCT +
   DP-optimal sectioning + HCB selection + SNF, with an LFE element for
   the `.1` layouts).
-- 5.X / 7.X ASPX_ACPL_1 / _2 / _3 paths with real per-parameter-band
-  α / β extraction from the input channels' MDCT energy / correlation.
+- **5.X / 7.X ASPX_ACPL_1 / ASPX_ACPL_2 with decoded-PCM parity**
+  (round 461): the live entry points
+  `encode_frame_pcm_5_{0,1}_acpl2_real_aspx`,
+  `encode_frame_pcm_5_{0,1}_acpl1_real_aspx`,
+  `encode_frame_pcm_7_{0,1}_acpl2_real_aspx` and
+  `encode_frame_pcm_7_{0,1}_acpl1_real_alpha_beta` code the Table 181 /
+  184 wire channels the decoder's Pseudocode 117 / 120 synthesis
+  expects (`Ac4ImsEncoder::acpl_5x_wire_channels` /
+  `acpl_7x_wire_channels`): 5.X carriers `A = (L + Ls/√2)/2`,
+  `B = (R + Rs/√2)/2` with the sides `(L − Ls/√2)/2` fitted by the
+  per-band `(α, β)` pair (`extract_acpl_pair_alpha_beta_q`, β
+  quantised against the α lane's Table 204 column); 7.X (3/4/0.x)
+  codes L / R / C as waveforms, `D = (Ls + Lb)/(2√2)` /
+  `E = (Rs + Rb)/(2√2)` as the Table 202 coupling carriers and
+  `(Ls − Lb)/(2√2)` as the side. ASPX_ACPL_1 carries the sides on the
+  joint-MDCT residual layer (identity chparam SAP) with `acpl_qmf_band`
+  derived from the residual budget (`acpl1_qmf_band_minus1`), so the
+  band below it is mid/side waveform-exact. Real A-SPX envelopes on
+  every Table 213 carrier, `companding_control` off (the encoder does
+  not run the §5.7.5 compression), the 5.1 layouts carry the Table 25
+  `mono_data(1)` LFE. Measured through the decoder on eight-frame
+  decorrelated multitones (tests/round461_acpl_5x_7x_parity.rs):
+  every channel of every route within 0,78–1,12× of its input RMS
+  (waveform band exact, surround parametric), I + 3×P GOPs included.
+  The older scaffold entries (`encode_frame_pcm_5_0_acpl1{,_sap,
+  _real_alpha,_real_alpha_beta}`, `..._acpl2{,_real_alpha_beta}`)
+  emit the same carrier model with minimum-bit-cost A-SPX / α.
 - **P-frames (`b_iframe = 0`)** on every live A-SPX path (5_X ACPL_3
   single + multi-envelope, 5_X / 7_X ACPL_2, 7_X / 5_X-SAP ACPL_1, 7.0
   pure-ASPX): setting `b_iframe_global = false` emits the correct
@@ -532,17 +557,21 @@ parses back to the authored rows.
   real round-trip). The `aspx_tna_mode` / `aspx_add_harmonic` /
   `aspx_preflat` thresholds are encoder tuning choices calibrated to
   the live QMF pipeline, not against a perceptual reference.
-- **Encoder coverage gaps** — no 7.X ASPX_ACPL_3 path; some advanced
-  A-CPL parameters (β3 / γ on certain paths) remain scaffolded at
-  minimum-bit-cost defaults.
-- **5.X / 7.X A-CPL PCM parity** — the ASPX_ACPL_1 / _2 / _3 encode
-  paths were pinned on structure (parse-back, envelope recovery,
-  determinism) but never on decoded PCM; measured through the
-  decoder, the 5_X / 7_X ASPX_ACPL_1 / _2 routes never render the
-  `two_channel_data()` L / R carrier pair (the pair synthesis runs
-  on silence) and the ASPX_ACPL_3 route lands 3–13× the input energy
-  on L / R / Ls / Rs. The framework encoder therefore rejects
-  `mode=parametric` on 5.X / 7.X until both sides are reconciled.
+- **5.X ASPX_ACPL_3 PCM parity** — the ASPX_ACPL_3 encode paths are
+  pinned on structure (parse-back, envelope recovery, determinism)
+  and decode non-silent, but their `(γ, α, β, β3)` extractors still
+  assume an L / R-carrier model: through the decoder the 5_X
+  ASPX_ACPL_3 route lands ≈ 3× the input energy on Ls / Rs and 0,6×
+  on C (Pseudocode 118 / 119 needs the same carrier-model rework the
+  ACPL_1 / _2 routes received in round 461). The 5.X ACPL_1 SAP
+  selector entry (`encode_frame_pcm_5_0_acpl1_sap`) still writes the
+  α-less `acpl_data_1ch()` scaffold.
+- **Decoder output delay** — channels that go through a QMF-domain
+  tool come back one round trip (`qmf::QMF_ROUND_TRIP_DELAY` = 577
+  samples) later per pass; the ASPX_ACPL_1 / _2 element renderer
+  lines its residual, waveform-coded L / R and LFE up with them, the
+  other A-SPX routes still emit the LFE undelayed and none applies
+  the §5.6 Table 188 `d_pcm` frame-alignment delay.
 
 ## Specs
 

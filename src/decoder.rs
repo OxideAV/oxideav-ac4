@@ -88,6 +88,10 @@ pub struct Ac4Decoder {
     /// pair pipeline (§5.7.7.6.1 Pseudocode 117). Carries the pair
     /// decorrelator + QMF analysis/synthesis banks across frames.
     acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState,
+    /// Alignment delay lines for the A-CPL element renderer: `[0]` /
+    /// `[1]` = the ASPX_ACPL_1 residual pair (`x3` / `x4`), `[2]` / `[3]`
+    /// = the 7_X waveform-coded L / R, `[4]` = the LFE.
+    acpl_align: [AlignDelay; 5],
     /// Per-substream state for the 5_X `ASPX_ACPL_3` multichannel
     /// synthesis pipeline (§5.7.7.6.2 Pseudocode 118). Carries the
     /// D0/D1/D2 + ducker IIR state + differential-decode rolling sums
@@ -219,6 +223,32 @@ type SyncCompandingChannelEntry<'a> = (
 /// (passthrough case).
 type FiveXChannelEntry<'a> = (usize, Vec<f32>, Option<(&'a aspx::FiveXAspxTrailer, bool)>);
 
+/// Streaming sample delay line used to line a time-domain channel up
+/// with channels that went through one or two QMF round trips
+/// ([`qmf::QMF_ROUND_TRIP_DELAY`] each). `delay(x, d)` returns `x`
+/// delayed by `d` samples, carrying the tail across calls.
+#[derive(Debug, Clone, Default)]
+struct AlignDelay {
+    buf: Vec<f32>,
+}
+
+impl AlignDelay {
+    fn delay(&mut self, x: &[f32], d: usize) -> Vec<f32> {
+        if d == 0 {
+            return x.to_vec();
+        }
+        if self.buf.len() != d {
+            self.buf = vec![0.0f32; d];
+        }
+        let mut joined = Vec::with_capacity(d + x.len());
+        joined.extend_from_slice(&self.buf);
+        joined.extend_from_slice(x);
+        let out = joined[..x.len()].to_vec();
+        self.buf.copy_from_slice(&joined[x.len()..]);
+        out
+    }
+}
+
 /// Preliminary channel spectra of an `ASPX_ACPL_1` / `ASPX_ACPL_2`
 /// element (see [`Ac4Decoder::resolve_acpl_pair_carriers`]).
 struct AcplPairCarriers {
@@ -280,6 +310,7 @@ impl Ac4Decoder {
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
+            acpl_align: Default::default(),
             acpl_5x_mch_state: acpl_synth::Acpl5xMchPcmState::new(),
             ssf_synth_state: Vec::new(),
             ssf_walker_state: Vec::new(),
@@ -1299,11 +1330,20 @@ impl Ac4Decoder {
         } else {
             (take(0), take(1), take(2))
         };
+        // The extended carriers come back one QMF round trip late
+        // (§5.7.1: the synthesis works on delayed data); the residual
+        // pair stayed in the time domain and must be delayed by the
+        // same amount so Pseudocode 116 combines the same instants.
+        let rt = qmf::QMF_ROUND_TRIP_DELAY;
         let (x3_in, x4_in) = match mode {
-            acpl_synth::Acpl5xPairMode::AspxAcpl1 => (
-                Some(x3_pcm.unwrap_or_else(|| vec![0.0f32; n])),
-                Some(x4_pcm.unwrap_or_else(|| vec![0.0f32; n])),
-            ),
+            acpl_synth::Acpl5xPairMode::AspxAcpl1 => {
+                let x3 = x3_pcm.unwrap_or_else(|| vec![0.0f32; n]);
+                let x4 = x4_pcm.unwrap_or_else(|| vec![0.0f32; n]);
+                (
+                    Some(self.acpl_align[0].delay(&x3, rt)),
+                    Some(self.acpl_align[1].delay(&x4, rt)),
+                )
+            }
             acpl_synth::Acpl5xPairMode::AspxAcpl2 => (None, None),
         };
         let Some(out) = acpl_synth::run_acpl_5x_pair_pcm(
@@ -1329,8 +1369,12 @@ impl Ac4Decoder {
             // Pseudocode 120, 3/4/0.x: z0 / z2 carry the extra √2.
             let sq2 = std::f32::consts::SQRT_2;
             let scale = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| x * sq2).collect() };
-            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&take(0)));
-            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&take(1)));
+            // L / R only saw the A-SPX round trip; the coupled outputs
+            // (and the centre passthrough) took a second one.
+            let l_out = self.acpl_align[2].delay(&take(0), rt);
+            let r_out = self.acpl_align[3].delay(&take(1), rt);
+            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&l_out));
+            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&r_out));
             pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
             pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&scale(&out.left)));
             pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&scale(&out.right)));
@@ -3521,6 +3565,14 @@ impl Ac4Decoder {
                     while pcm_per_channel.len() <= lfe_slot {
                         pcm_per_channel.push(None);
                     }
+                    // On the ASPX_ACPL_1 / _2 element routes every other
+                    // channel went through the A-SPX and the A-CPL QMF
+                    // round trips; line the time-domain LFE up with them.
+                    let pcm_f = if five_x_pair_active || seven_x_pair_active {
+                        self.acpl_align[4].delay(&pcm_f, 2 * qmf::QMF_ROUND_TRIP_DELAY)
+                    } else {
+                        pcm_f
+                    };
                     pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
                 }
             }

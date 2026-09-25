@@ -595,16 +595,25 @@ pub fn write_acpl_config_2ch(
 // companding_control(2) emitter — §4.2.11 Table 49
 // ====================================================================
 
-/// Emit a `companding_control(2)` element with sync_flag = 1 and
-/// `b_compand_on = 1` (companding ON, no `compand_avg`). Total: 2 bits.
+/// Emit a `companding_control(num_chan ≥ 2)` element with
+/// `sync_flag = 1`, `b_compand_on[0] = 0` and `b_compand_avg = 0` —
+/// the §5.7.5 companding tool switched **off** for every channel of
+/// the element. Total: 3 bits.
 ///
 /// Per §4.2.11 Table 49 the field order is:
 /// `sync_flag` (1 b, only when `num_chan > 1`) +
 /// `b_compand_on[0..nc]` (nc = 1 when sync_flag = 1, else num_chan) +
 /// `b_compand_avg` (1 b, only when at least one channel is OFF).
-pub fn write_companding_control_2ch_sync_on(bw: &mut BitWriter) {
+///
+/// The encoder does not run the §5.7.5.1 encoder-side compression on
+/// the A-SPX band of its carriers, so it must not ask the decoder for
+/// the expansion: with `b_compand_on = 1` the decoder's per-slot gain
+/// `g(ts) = L(ts)^((1−α)/α) · 2^α` (α = 0,65) scaled the A-SPX region
+/// of every 5.X / 7.X A-CPL carrier by ≈ 9× (round 461).
+pub fn write_companding_control_sync_off(bw: &mut BitWriter) {
     bw.write_bit(true); // sync_flag = 1 → single b_compand_on follows
-    bw.write_bit(true); // b_compand_on[0] = 1 → no avg follow-on
+    bw.write_bit(false); // b_compand_on[0] = 0
+    bw.write_bit(false); // b_compand_avg = 0 (present: a channel is OFF)
 }
 
 // ====================================================================
@@ -1617,7 +1626,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra(
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -1721,7 +1730,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_beta(
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -1857,7 +1866,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta(
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -2004,7 +2013,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_gamma(
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -2194,7 +2203,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma(
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -2396,7 +2405,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3(
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -2747,7 +2756,7 @@ pub fn write_5_x_acpl3_audio_data_directional(
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(bw);
+    write_companding_control_sync_off(bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -3062,7 +3071,7 @@ pub fn build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_re
     }
 
     // companding_control(2): sync=1, on=1, no avg.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // stereo_data(): split-MDCT L/R carriers.
     write_stereo_split_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
@@ -6332,7 +6341,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra(
 
     // companding_control(3): sync = 1, on = 1, no avg (same wire shape as
     // the 2-channel sync-on case).
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (1 b) — false → AcplLite2 / two_channel_data path.
     bw.write_bit(false);
@@ -6410,66 +6419,24 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
     // whose qmf_band masks the low bands).
     let start_band = 0u32;
 
-    // α extraction — identical to the round-128 / 132 ACPL_1 helper, run
-    // independently for the (L, Ls) and (R, Rs) decorrelator legs.
-    let (num_l, den_l) = compute_per_band_correlations(
+    // α / β per module from the coded carrier (mid) and the side it
+    // must reconstruct — Pseudocode 116/117 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_l,
         coeffs_ls,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let (num_r, den_r) = compute_per_band_correlations(
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_r,
         coeffs_rs,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let alpha_l_real = analytic_alpha_per_band(&num_l, &den_l, acpl_quant_mode);
-    let alpha_r_real = analytic_alpha_per_band(&num_r, &den_r, acpl_quant_mode);
-    let alpha_l_q: Vec<i32> = alpha_l_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-    let alpha_r_q: Vec<i32> = alpha_r_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-
-    // β — energy residual after α removes the level-only component.
-    let (e_c_l, e_s_l) = compute_per_band_energies(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let (e_c_r, e_s_r) = compute_per_band_energies(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let alpha_l_dq: Vec<f32> = alpha_l_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let alpha_r_dq: Vec<f32> = alpha_r_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let beta_l_real = analytic_beta_per_band(&e_c_l, &e_s_l, &alpha_l_dq, acpl_quant_mode);
-    let beta_r_real = analytic_beta_per_band(&e_c_r, &e_s_r, &alpha_r_dq, acpl_quant_mode);
-    let beta_l_q: Vec<i32> = beta_l_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
-    let beta_r_q: Vec<i32> = beta_r_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
 
     let mut bw = BitWriter::new();
     let audio_size = pad_target_bytes as u32;
@@ -6484,7 +6451,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
         write_aspx_config(&mut bw, aspx_cfg);
         write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
     }
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
     bw.write_bit(false); // coding_config = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
@@ -6563,64 +6530,24 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
     let start_band = 0u32;
 
-    // α / β extraction — identical to the round-144 real-α/β builder.
-    let (num_l, den_l) = compute_per_band_correlations(
+    // α / β per module from the coded carrier (mid) and the side it
+    // must reconstruct — Pseudocode 116/117 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_l,
         coeffs_ls,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let (num_r, den_r) = compute_per_band_correlations(
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_r,
         coeffs_rs,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let alpha_l_real = analytic_alpha_per_band(&num_l, &den_l, acpl_quant_mode);
-    let alpha_r_real = analytic_alpha_per_band(&num_r, &den_r, acpl_quant_mode);
-    let alpha_l_q: Vec<i32> = alpha_l_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-    let alpha_r_q: Vec<i32> = alpha_r_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-
-    let (e_c_l, e_s_l) = compute_per_band_energies(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let (e_c_r, e_s_r) = compute_per_band_energies(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let alpha_l_dq: Vec<f32> = alpha_l_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let alpha_r_dq: Vec<f32> = alpha_r_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let beta_l_real = analytic_beta_per_band(&e_c_l, &e_s_l, &alpha_l_dq, acpl_quant_mode);
-    let beta_r_real = analytic_beta_per_band(&e_c_r, &e_s_r, &alpha_r_dq, acpl_quant_mode);
-    let beta_l_q: Vec<i32> = beta_l_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
-    let beta_r_q: Vec<i32> = beta_r_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
 
     let mut bw = BitWriter::new();
     let audio_size = pad_target_bytes as u32;
@@ -6635,7 +6562,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
         write_aspx_config(&mut bw, aspx_cfg);
         write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
     }
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
     bw.write_bit(false); // coding_config = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
@@ -6714,6 +6641,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     transform_length: u32,
     max_sfb: u32,
     b_iframe: bool,
+    lfe: Option<(&[f32], u32)>,
     coeffs_l: &[f32],
     coeffs_r: &[f32],
     coeffs_c: &[f32],
@@ -6738,64 +6666,24 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
     let start_band = 0u32;
 
-    // α / β extraction — identical to the base real-α/β/real-ASPX builder.
-    let (num_l, den_l) = compute_per_band_correlations(
+    // α / β per module from the coded carrier (mid) and the side it
+    // must reconstruct — Pseudocode 116/117 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_l,
         coeffs_ls,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let (num_r, den_r) = compute_per_band_correlations(
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_r,
         coeffs_rs,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let alpha_l_real = analytic_alpha_per_band(&num_l, &den_l, acpl_quant_mode);
-    let alpha_r_real = analytic_alpha_per_band(&num_r, &den_r, acpl_quant_mode);
-    let alpha_l_q: Vec<i32> = alpha_l_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-    let alpha_r_q: Vec<i32> = alpha_r_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-
-    let (e_c_l, e_s_l) = compute_per_band_energies(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let (e_c_r, e_s_r) = compute_per_band_energies(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let alpha_l_dq: Vec<f32> = alpha_l_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let alpha_r_dq: Vec<f32> = alpha_r_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let beta_l_real = analytic_beta_per_band(&e_c_l, &e_s_l, &alpha_l_dq, acpl_quant_mode);
-    let beta_r_real = analytic_beta_per_band(&e_c_r, &e_s_r, &alpha_r_dq, acpl_quant_mode);
-    let beta_l_q: Vec<i32> = beta_l_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
-    let beta_r_q: Vec<i32> = beta_r_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
 
     let mut bw = BitWriter::new();
     let audio_size = pad_target_bytes as u32;
@@ -6810,7 +6698,12 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         write_aspx_config(&mut bw, aspx_cfg);
         write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
     }
-    write_companding_control_2ch_sync_on(&mut bw);
+    // Table 25: `if (b_has_lfe) mono_data(1)` between the I-frame
+    // config block and the codec-mode switch.
+    if let Some((coeffs_lfe, max_sfb_lfe)) = lfe {
+        write_lfe_mono_data(&mut bw, transform_length, max_sfb_lfe, coeffs_lfe);
+    }
+    write_companding_control_sync_off(&mut bw);
     bw.write_bit(false); // coding_config = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
@@ -6905,6 +6798,7 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     transform_length: u32,
     max_sfb: u32,
     b_iframe: bool,
+    lfe: Option<(&[f32], u32)>,
     coeffs_l: &[f32],
     coeffs_r: &[f32],
     coeffs_c: &[f32],
@@ -6927,64 +6821,24 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
     let start_band = 0u32;
 
-    // α / β extraction — identical to the single-envelope builder.
-    let (num_l, den_l) = compute_per_band_correlations(
+    // α / β per module from the coded carrier (mid) and the side it
+    // must reconstruct — Pseudocode 116/117 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_l,
         coeffs_ls,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let (num_r, den_r) = compute_per_band_correlations(
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_r,
         coeffs_rs,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let alpha_l_real = analytic_alpha_per_band(&num_l, &den_l, acpl_quant_mode);
-    let alpha_r_real = analytic_alpha_per_band(&num_r, &den_r, acpl_quant_mode);
-    let alpha_l_q: Vec<i32> = alpha_l_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-    let alpha_r_q: Vec<i32> = alpha_r_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-
-    let (e_c_l, e_s_l) = compute_per_band_energies(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let (e_c_r, e_s_r) = compute_per_band_energies(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let alpha_l_dq: Vec<f32> = alpha_l_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let alpha_r_dq: Vec<f32> = alpha_r_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let beta_l_real = analytic_beta_per_band(&e_c_l, &e_s_l, &alpha_l_dq, acpl_quant_mode);
-    let beta_r_real = analytic_beta_per_band(&e_c_r, &e_s_r, &alpha_r_dq, acpl_quant_mode);
-    let beta_l_q: Vec<i32> = beta_l_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
-    let beta_r_q: Vec<i32> = beta_r_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
 
     let mut bw = BitWriter::new();
     let audio_size = pad_target_bytes as u32;
@@ -6999,7 +6853,12 @@ pub fn build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
         write_aspx_config(&mut bw, aspx_cfg);
         write_acpl_config_1ch_full(&mut bw, acpl_num_param_bands_id, acpl_quant_mode);
     }
-    write_companding_control_2ch_sync_on(&mut bw);
+    // Table 25: `if (b_has_lfe) mono_data(1)` between the I-frame
+    // config block and the codec-mode switch.
+    if let Some((coeffs_lfe, max_sfb_lfe)) = lfe {
+        write_lfe_mono_data(&mut bw, transform_length, max_sfb_lfe, coeffs_lfe);
+    }
+    write_companding_control_sync_off(&mut bw);
     bw.write_bit(false); // coding_config = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
@@ -7347,7 +7206,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra(
     }
 
     // companding_control(3): sync = 1, on = 1.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (1 b) — false → AcplLite2 / two_channel_data path.
     bw.write_bit(false);
@@ -7443,7 +7302,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_sap(
         );
     }
 
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (false → AcplLite2 / two_channel_data path).
     bw.write_bit(false);
@@ -7688,7 +7547,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_sap_auto(
         );
     }
 
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (false → AcplLite2 / two_channel_data path).
     bw.write_bit(false);
@@ -7952,6 +7811,49 @@ pub fn extract_beta_q_per_band(
         .collect()
 }
 
+/// Per-parameter-band `(alpha_q, beta_q)` for one channel-based A-CPL
+/// module (§5.7.7.5 Pseudocode 116 driven from Pseudocode 117 / 120).
+///
+/// The decoder reconstructs the pair `(P, Q)` from the coded carrier
+/// `x = (P + Q')/2` (with `Q' = Q/√2`, the `z1 *= sqrt(2)` of
+/// Pseudocode 117 folded in — for the 7_X 3/4/0.x element both
+/// outputs carry the √2 and `x = (P + Q)/(2√2)`) as
+///
+/// ```text
+///   P̂  = x·(1+α) + w        Q̂' = x·(1−α) − w
+/// ```
+///
+/// (`w` = β-scaled ducked decorrelator output, `E[w²] ≈ β²·E[x²]`).
+/// With `mid = x` and `side = (P − Q')/2` the sum is reconstructed
+/// exactly and the least-squares parameters per band are
+///
+/// ```text
+///   α* = Σ(mid·side) / Σ(mid²)
+///   β² = max(0, Σ(side²)/Σ(mid²) − α_dq²)
+/// ```
+///
+/// which is the same estimator as [`extract_ice_acpl_pair_alpha_beta_q`]
+/// — the immersive module has the identical dry / wet shape. Bands
+/// below `start_pb` (the ACPL_1 `acpl_qmf_band` mid/side region) are
+/// returned as 0.
+pub fn extract_acpl_pair_alpha_beta_q(
+    mid_coeffs: &[f32],
+    side_coeffs: &[f32],
+    transform_length: u32,
+    num_param_bands: u32,
+    start_pb: u32,
+    qm: crate::acpl::AcplQuantMode,
+) -> (Vec<i32>, Vec<i32>) {
+    extract_ice_acpl_pair_alpha_beta_q(
+        mid_coeffs,
+        side_coeffs,
+        transform_length,
+        num_param_bands,
+        start_pb,
+        qm,
+    )
+}
+
 /// Extract the per-parameter-band `(alpha_q, beta_q)` rows for one
 /// **immersive** A-CPL module (TS 103 190-2 §5.5.2 Table 27 driving
 /// the part-1 §5.7.7.5 Pseudocode 115/116 pair synthesis with the √2
@@ -8016,7 +7918,7 @@ pub fn extract_ice_acpl_pair_alpha_beta_q(
         }
         let alpha = (num[pb] / d).clamp(-2.0, 2.0);
         let a_q = quantise_alpha(alpha, qm);
-        let a_dq = crate::acpl_synth::dequantize_alpha_index(qm, a_q).0;
+        let (a_dq, ibeta) = crate::acpl_synth::dequantize_alpha_index(qm, a_q);
         let em = e_mid.get(pb).copied().unwrap_or(0.0);
         let es = e_side.get(pb).copied().unwrap_or(0.0);
         let beta_sq = if em > 0.0 { es / em - a_dq * a_dq } else { 0.0 };
@@ -8026,7 +7928,9 @@ pub fn extract_ice_acpl_pair_alpha_beta_q(
             0.0
         };
         alpha_q.push(a_q);
-        beta_q.push(quantise_beta_magnitude(beta, qm));
+        // Tables 203-206: the decoder dequantises β through the column
+        // its α lane selects (`ibeta`), so quantise against that column.
+        beta_q.push(quantise_beta_magnitude_for_lane(beta, ibeta, qm));
     }
     (alpha_q, beta_q)
 }
@@ -8827,6 +8731,46 @@ pub(crate) fn quantise_beta_magnitude(beta_mag: f32, qm: crate::acpl::AcplQuantM
     best_lane as i32
 }
 
+/// Quantise a non-negative β magnitude to the nearest `beta_q` row of
+/// the `ibeta` column the decoder will read (Table 204 Fine / Table 206
+/// Coarse, column from the α lane's `ibeta` per Table 203 / 205 —
+/// [`crate::acpl_synth::dequantize_alpha_index`]). Column 0 reproduces
+/// [`quantise_beta_magnitude`]; the higher columns shrink every row,
+/// so a column-0 quantisation would under-shoot the wet energy for any
+/// α away from zero.
+pub(crate) fn quantise_beta_magnitude_for_lane(
+    beta_mag: f32,
+    ibeta: u8,
+    qm: crate::acpl::AcplQuantMode,
+) -> i32 {
+    let col: Vec<f32> = match qm {
+        crate::acpl::AcplQuantMode::Fine => {
+            let c = (ibeta as usize).min(8);
+            crate::acpl_synth::BETA_DQ_FINE
+                .iter()
+                .map(|row| row[c])
+                .collect()
+        }
+        crate::acpl::AcplQuantMode::Coarse => {
+            let c = (ibeta as usize).min(4);
+            crate::acpl_synth::BETA_DQ_COARSE
+                .iter()
+                .map(|row| row[c])
+                .collect()
+        }
+    };
+    let mut best_lane = 0usize;
+    let mut best_err = f32::INFINITY;
+    for (lane, &v) in col.iter().enumerate() {
+        let err = (v - beta_mag).abs();
+        if err < best_err {
+            best_err = err;
+            best_lane = lane;
+        }
+    }
+    best_lane as i32
+}
+
 /// Write the ACPL BETA F0 codeword for a recovered non-negative
 /// `beta_q` index per §A.3 Table A.41 (Fine) / Table A.40 (Coarse).
 /// The F0 codebook is addressed by `symbol_index = beta_q + cb_off`
@@ -9130,7 +9074,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha(
             acpl_qmf_band_minus1,
         );
     }
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
     bw.write_bit(false); // coding_config = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_acpl_1_residual_layer(
@@ -9195,6 +9139,7 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
     max_sfb: u32,
     max_sfb_master: u32,
     b_iframe: bool,
+    lfe: Option<(&[f32], u32)>,
     coeffs_l: &[f32],
     coeffs_r: &[f32],
     coeffs_c: &[f32],
@@ -9210,68 +9155,24 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
     let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
     let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
 
-    // α — same MDCT-energy correlation step as the round-128 path.
-    let (num_l, den_l) = compute_per_band_correlations(
+    // α / β per module from the coded carrier (mid) and the side it
+    // must reconstruct — Pseudocode 116/117 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_l,
         coeffs_ls,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let (num_r, den_r) = compute_per_band_correlations(
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_r,
         coeffs_rs,
         transform_length,
         acpl_num_bands,
         start_band,
+        acpl_quant_mode,
     );
-    let alpha_l_real = analytic_alpha_per_band(&num_l, &den_l, acpl_quant_mode);
-    let alpha_r_real = analytic_alpha_per_band(&num_r, &den_r, acpl_quant_mode);
-    let alpha_l_q: Vec<i32> = alpha_l_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-    let alpha_r_q: Vec<i32> = alpha_r_real
-        .iter()
-        .map(|&a| quantise_alpha(a, acpl_quant_mode))
-        .collect();
-
-    // β — energy residual after α removes the level-only component.
-    let (e_c_l, e_s_l) = compute_per_band_energies(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    let (e_c_r, e_s_r) = compute_per_band_energies(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-    );
-    // Use the *dequantised* α (the value the decoder will see) so that
-    // β closes the energy balance against the actually-reconstructed
-    // (1 − α_dq), not the analytic α.
-    let alpha_l_dq: Vec<f32> = alpha_l_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let alpha_r_dq: Vec<f32> = alpha_r_q
-        .iter()
-        .map(|&q| crate::acpl_synth::dequantize_alpha_index(acpl_quant_mode, q).0)
-        .collect();
-    let beta_l_real = analytic_beta_per_band(&e_c_l, &e_s_l, &alpha_l_dq, acpl_quant_mode);
-    let beta_r_real = analytic_beta_per_band(&e_c_r, &e_s_r, &alpha_r_dq, acpl_quant_mode);
-    let beta_l_q: Vec<i32> = beta_l_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
-    let beta_r_q: Vec<i32> = beta_r_real
-        .iter()
-        .map(|&b| quantise_beta_magnitude(b, acpl_quant_mode))
-        .collect();
 
     let mut bw = BitWriter::new();
     let audio_size = pad_target_bytes as u32;
@@ -9291,7 +9192,12 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
             acpl_qmf_band_minus1,
         );
     }
-    write_companding_control_2ch_sync_on(&mut bw);
+    // Table 25: `if (b_has_lfe) mono_data(1)` between the I-frame
+    // config block and the codec-mode switch.
+    if let Some((coeffs_lfe, max_sfb_lfe)) = lfe {
+        write_lfe_mono_data(&mut bw, transform_length, max_sfb_lfe, coeffs_lfe);
+    }
+    write_companding_control_sync_off(&mut bw);
     bw.write_bit(false); // coding_config = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_acpl_1_residual_layer(
@@ -9323,6 +9229,162 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
             Some(&beta_r_q),
         );
     }
+
+    finish_substream_body(bw)
+}
+
+/// 5_X ASPX_ACPL_1 body with **real** ASPX SIGNAL / NOISE envelopes on
+/// the `[A, B]` carrier pair (`aspx_data_2ch()`) and the centre carrier
+/// (`aspx_data_1ch()`), real `aspx_tna_mode` / `aspx_add_harmonic`, and
+/// the real per-band `(α, β)` A-CPL parameters — the ACPL_1 counterpart
+/// of [`build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna`].
+///
+/// Wire semantics (§5.3.4.3.2 Table 181 + §5.7.7.6.1 Pseudocode 117):
+/// `coeffs_l` / `coeffs_r` are the `[A, B]` carriers on the
+/// `two_channel_data()`, `coeffs_ls` / `coeffs_rs` the `[S3, S4]` sides
+/// on the joint-MDCT residual layer (identity chparam SAP), which
+/// Pseudocode 116 mid/side-combines with the carriers below
+/// `acpl_qmf_band` and which the `(α, β)` pairs fit above it.
+///
+/// Data elements are emitted on every frame (Table 25); the configs and
+/// the per-element xover offsets only on I-frames.
+///
+/// Refs ETSI TS 103 190-1 §4.2.6.6 Table 25 (`case ASPX_ACPL_1:`),
+/// §4.2.13.1 Table 59, §4.2.12.3 Table 51, §4.2.12.4 Table 52.
+#[allow(clippy::too_many_arguments)]
+pub fn build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    b_iframe: bool,
+    lfe: Option<(&[f32], u32)>,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_c: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    aspx_cfg: &aspx::AspxConfig,
+    l_sig: &[i32],
+    l_noise: &[i32],
+    r_sig: &[i32],
+    r_noise: &[i32],
+    c_sig: &[i32],
+    c_noise: &[i32],
+    lr_tna_mode: &[u8],
+    c_tna_mode: &[u8],
+    l_ah: &[bool],
+    r_ah: &[bool],
+    c_ah: &[bool],
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    pad_target_bytes: usize,
+) -> Vec<u8> {
+    let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
+    let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
+    let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
+
+    // α / β per module from the coded carrier (mid) and the side it
+    // must reconstruct above acpl_qmf_band — Pseudocode 116/117 fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
+        coeffs_l,
+        coeffs_ls,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
+        coeffs_r,
+        coeffs_rs,
+        transform_length,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+    );
+
+    let mut bw = BitWriter::new();
+    let audio_size = pad_target_bytes as u32;
+    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_bit(false);
+    bw.align_to_byte();
+
+    // 5_X_codec_mode = ASPX_ACPL_1 (2) — 3 bits.
+    bw.write_u32(2, 3);
+
+    if b_iframe {
+        write_aspx_config(&mut bw, aspx_cfg);
+        write_acpl_config_1ch_partial(
+            &mut bw,
+            acpl_num_param_bands_id,
+            acpl_quant_mode,
+            acpl_qmf_band_minus1,
+        );
+    }
+    // Table 25: `if (b_has_lfe) mono_data(1)` between the I-frame
+    // config block and the codec-mode switch.
+    if let Some((coeffs_lfe, max_sfb_lfe)) = lfe {
+        write_lfe_mono_data(&mut bw, transform_length, max_sfb_lfe, coeffs_lfe);
+    }
+    write_companding_control_sync_off(&mut bw);
+    bw.write_bit(false); // coding_config = 0
+    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+    write_acpl_1_residual_layer(
+        &mut bw,
+        transform_length,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+    );
+    write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
+
+    // Data elements are present on every frame per Table 25; only the
+    // configs and the per-element 3-bit xover offset are I-frame-gated.
+    write_aspx_data_2ch_real_envelope_tna_ah_framed(
+        &mut bw,
+        aspx_cfg,
+        AspxRealEnvelopeChannel {
+            sig: l_sig,
+            noise: l_noise,
+        },
+        AspxRealEnvelopeChannel {
+            sig: r_sig,
+            noise: r_noise,
+        },
+        lr_tna_mode,
+        l_ah,
+        r_ah,
+        b_iframe,
+    )
+    .expect("encoder: aspx config invalid");
+    write_aspx_data_1ch_real_envelope_tna_ah_framed(
+        &mut bw,
+        aspx_cfg,
+        AspxRealEnvelopeChannel {
+            sig: c_sig,
+            noise: c_noise,
+        },
+        c_tna_mode,
+        c_ah,
+        b_iframe,
+    )
+    .expect("encoder: aspx config invalid");
+    write_acpl_data_1ch_real_alpha_beta(
+        &mut bw,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+        &alpha_l_q,
+        Some(&beta_l_q),
+    );
+    write_acpl_data_1ch_real_alpha_beta(
+        &mut bw,
+        acpl_num_bands,
+        start_band,
+        acpl_quant_mode,
+        &alpha_r_q,
+        Some(&beta_r_q),
+    );
 
     finish_substream_body(bw)
 }
@@ -9448,7 +9510,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra(
     // the 5_X companding_control(2/3) sync-on case (the `num_chan`
     // argument only changes how many `b_compand_on` bits follow when
     // `sync_flag == 0`; here sync_flag == 1 so exactly one bit follows).
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (2 b) — Cfg0.
     bw.write_u32(0, 2);
@@ -9535,6 +9597,8 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
     coeffs_r: &[f32],
     coeffs_ls: &[f32],
     coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
     coeffs_c: &[f32],
     coeffs_lfe: Option<&[f32]>,
     aspx_cfg: &aspx::AspxConfig,
@@ -9548,38 +9612,23 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
 
     // α + β extraction — identical primitives to the round-144 5_X ACPL_2
     // path. D0 module models (L → Ls); D1 module models (R → Rs).
-    let alpha_l_q = extract_alpha_q_per_band(
-        coeffs_l,
+    // α / β per module from the coded surround carrier (mid: [D, E])
+    // and the back-channel side it must reconstruct — Table 202 /
+    // Pseudocode 120 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_ls,
+        side_ls,
         transform_length,
         acpl_num_bands,
         start_band,
         acpl_quant_mode,
     );
-    let alpha_r_q = extract_alpha_q_per_band(
-        coeffs_r,
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_rs,
+        side_rs,
         transform_length,
         acpl_num_bands,
         start_band,
-        acpl_quant_mode,
-    );
-    let beta_l_q = extract_beta_q_per_band(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_l_q,
-        acpl_quant_mode,
-    );
-    let beta_r_q = extract_beta_q_per_band(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_r_q,
         acpl_quant_mode,
     );
 
@@ -9605,7 +9654,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta(
     }
 
     // companding_control(5): sync = 1, on = 1.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (2 b) — Cfg0.
     bw.write_u32(0, 2);
@@ -9693,6 +9742,8 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
     coeffs_r: &[f32],
     coeffs_ls: &[f32],
     coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
     coeffs_c: &[f32],
     coeffs_lfe: Option<&[f32]>,
     aspx_cfg: &aspx::AspxConfig,
@@ -9716,38 +9767,23 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
 
     // α + β extraction — identical primitives to the round-202 7_X ACPL_2
     // real-α/β path. D0 module models (L → Ls); D1 module models (R → Rs).
-    let alpha_l_q = extract_alpha_q_per_band(
-        coeffs_l,
+    // α / β per module from the coded surround carrier (mid: [D, E])
+    // and the back-channel side it must reconstruct — Table 202 /
+    // Pseudocode 120 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_ls,
+        side_ls,
         transform_length,
         acpl_num_bands,
         start_band,
         acpl_quant_mode,
     );
-    let alpha_r_q = extract_alpha_q_per_band(
-        coeffs_r,
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_rs,
+        side_rs,
         transform_length,
         acpl_num_bands,
         start_band,
-        acpl_quant_mode,
-    );
-    let beta_l_q = extract_beta_q_per_band(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_l_q,
-        acpl_quant_mode,
-    );
-    let beta_r_q = extract_beta_q_per_band(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_r_q,
         acpl_quant_mode,
     );
 
@@ -9773,7 +9809,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx(
     }
 
     // companding_control(5): sync = 1, on = 1.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (2 b) — Cfg0.
     bw.write_u32(0, 2);
@@ -9879,6 +9915,8 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     coeffs_r: &[f32],
     coeffs_ls: &[f32],
     coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
     coeffs_c: &[f32],
     coeffs_lfe: Option<&[f32]>,
     aspx_cfg: &aspx::AspxConfig,
@@ -9907,39 +9945,23 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
     let start_band = 0u32;
 
-    // α + β extraction — identical to the base 7_X ACPL_2 real-ASPX builder.
-    let alpha_l_q = extract_alpha_q_per_band(
-        coeffs_l,
+    // α / β per module from the coded surround carrier (mid: [D, E])
+    // and the back-channel side it must reconstruct — Table 202 /
+    // Pseudocode 120 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_ls,
+        side_ls,
         transform_length,
         acpl_num_bands,
         start_band,
         acpl_quant_mode,
     );
-    let alpha_r_q = extract_alpha_q_per_band(
-        coeffs_r,
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_rs,
+        side_rs,
         transform_length,
         acpl_num_bands,
         start_band,
-        acpl_quant_mode,
-    );
-    let beta_l_q = extract_beta_q_per_band(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_l_q,
-        acpl_quant_mode,
-    );
-    let beta_r_q = extract_beta_q_per_band(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_r_q,
         acpl_quant_mode,
     );
 
@@ -9961,7 +9983,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
     }
 
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     bw.write_u32(0, 2); // coding_config = 0 — Cfg0
     bw.write_bit(false); // b_2ch_mode = 0
@@ -10075,6 +10097,8 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     coeffs_r: &[f32],
     coeffs_ls: &[f32],
     coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
     coeffs_c: &[f32],
     coeffs_lfe: Option<&[f32]>,
     aspx_cfg: &aspx::AspxConfig,
@@ -10100,38 +10124,23 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
     let start_band = 0u32;
 
-    let alpha_l_q = extract_alpha_q_per_band(
-        coeffs_l,
+    // α / β per module from the coded surround carrier (mid: [D, E])
+    // and the back-channel side it must reconstruct — Table 202 /
+    // Pseudocode 120 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_ls,
+        side_ls,
         transform_length,
         acpl_num_bands,
         start_band,
         acpl_quant_mode,
     );
-    let alpha_r_q = extract_alpha_q_per_band(
-        coeffs_r,
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_rs,
+        side_rs,
         transform_length,
         acpl_num_bands,
         start_band,
-        acpl_quant_mode,
-    );
-    let beta_l_q = extract_beta_q_per_band(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_l_q,
-        acpl_quant_mode,
-    );
-    let beta_r_q = extract_beta_q_per_band(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_r_q,
         acpl_quant_mode,
     );
 
@@ -10153,7 +10162,7 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_centre_mu
         write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
     }
 
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     bw.write_u32(0, 2); // coding_config = 0
     bw.write_bit(false); // b_2ch_mode = 0
@@ -10360,7 +10369,7 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra(
 
     // companding_control(5): sync = 1, on = 1 — same 2-bit wire shape as
     // the 5_X / 7_X ACPL_2 sync-on case.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (2 b) — Cfg0.
     bw.write_u32(0, 2);
@@ -10452,6 +10461,8 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
     coeffs_r: &[f32],
     coeffs_ls: &[f32],
     coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
     coeffs_c: &[f32],
     coeffs_lfe: Option<&[f32]>,
     aspx_cfg: &aspx::AspxConfig,
@@ -10466,38 +10477,23 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
 
     // α + β extraction — identical primitives to the round-128 / 132 5_X
     // path. D0 module models (L → Ls); D1 module models (R → Rs).
-    let alpha_l_q = extract_alpha_q_per_band(
-        coeffs_l,
+    // α / β per module from the coded surround carrier (mid: [D, E])
+    // and the back-channel side it must reconstruct — Table 202 /
+    // Pseudocode 120 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_ls,
+        side_ls,
         transform_length,
         acpl_num_bands,
         start_band,
         acpl_quant_mode,
     );
-    let alpha_r_q = extract_alpha_q_per_band(
-        coeffs_r,
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_rs,
+        side_rs,
         transform_length,
         acpl_num_bands,
         start_band,
-        acpl_quant_mode,
-    );
-    let beta_l_q = extract_beta_q_per_band(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_l_q,
-        acpl_quant_mode,
-    );
-    let beta_r_q = extract_beta_q_per_band(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_r_q,
         acpl_quant_mode,
     );
 
@@ -10528,7 +10524,7 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
     }
 
     // companding_control(5): sync = 1, on = 1.
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     // coding_config = 0 (2 b) — Cfg0.
     bw.write_u32(0, 2);
@@ -10539,13 +10535,10 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
 
     // ASPX_ACPL_1-only joint-MDCT residual layer: Ls/Rs surround residual.
-    write_acpl_1_residual_layer(
-        &mut bw,
-        transform_length,
-        max_sfb_master,
-        coeffs_ls,
-        coeffs_rs,
-    );
+    // Table 33 ASPX_ACPL_1 residual layer: the back-channel sides
+    // [F, G] (Pseudocode 120 x3 / x4), mid/side-combined with the
+    // [D, E] carriers below acpl_qmf_band (identity chparam SAP).
+    write_acpl_1_residual_layer(&mut bw, transform_length, max_sfb_master, side_ls, side_rs);
 
     // Trailing Cfg0 mono_data(0) — centre carrier.
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
@@ -10630,6 +10623,8 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     coeffs_r: &[f32],
     coeffs_ls: &[f32],
     coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
     coeffs_c: &[f32],
     coeffs_lfe: Option<&[f32]>,
     aspx_cfg: &aspx::AspxConfig,
@@ -10651,39 +10646,23 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
     let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
 
-    // α + β extraction — identical primitives to the real_alpha_beta path.
-    let alpha_l_q = extract_alpha_q_per_band(
-        coeffs_l,
+    // α / β per module from the coded surround carrier (mid: [D, E])
+    // and the back-channel side it must reconstruct — Table 202 /
+    // Pseudocode 120 least-squares fit.
+    let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_ls,
+        side_ls,
         transform_length,
         acpl_num_bands,
         start_band,
         acpl_quant_mode,
     );
-    let alpha_r_q = extract_alpha_q_per_band(
-        coeffs_r,
+    let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
         coeffs_rs,
+        side_rs,
         transform_length,
         acpl_num_bands,
         start_band,
-        acpl_quant_mode,
-    );
-    let beta_l_q = extract_beta_q_per_band(
-        coeffs_l,
-        coeffs_ls,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_l_q,
-        acpl_quant_mode,
-    );
-    let beta_r_q = extract_beta_q_per_band(
-        coeffs_r,
-        coeffs_rs,
-        transform_length,
-        acpl_num_bands,
-        start_band,
-        &alpha_r_q,
         acpl_quant_mode,
     );
 
@@ -10710,20 +10689,17 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         write_lfe_mono_data(&mut bw, transform_length, m_lfe, lfe);
     }
 
-    write_companding_control_2ch_sync_on(&mut bw);
+    write_companding_control_sync_off(&mut bw);
 
     bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
     bw.write_bit(false); // b_2ch_mode = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
 
-    write_acpl_1_residual_layer(
-        &mut bw,
-        transform_length,
-        max_sfb_master,
-        coeffs_ls,
-        coeffs_rs,
-    );
+    // Table 33 ASPX_ACPL_1 residual layer: the back-channel sides
+    // [F, G] (Pseudocode 120 x3 / x4), mid/side-combined with the
+    // [D, E] carriers below acpl_qmf_band (identity chparam SAP).
+    write_acpl_1_residual_layer(&mut bw, transform_length, max_sfb_master, side_ls, side_rs);
 
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 
@@ -11268,19 +11244,29 @@ mod tests {
         ));
     }
 
-    /// `write_companding_control_2ch_sync_on` emits exactly two bits and
-    /// round-trips through `parse_companding_control(2)`.
+    /// `write_companding_control_sync_off` emits exactly three bits
+    /// (sync_flag, one b_compand_on, b_compand_avg — Table 49) and
+    /// round-trips through `parse_companding_control(n)` for every
+    /// multichannel element size as the §5.7.5 tool switched off.
     #[test]
-    fn companding_control_2ch_sync_on_round_trips() {
-        let mut bw = BitWriter::new();
-        write_companding_control_2ch_sync_on(&mut bw);
-        bw.align_to_byte();
-        let bytes = bw.finish();
-        let mut br = BitReader::new(&bytes);
-        let cc = aspx::parse_companding_control(&mut br, 2).unwrap();
-        assert_eq!(cc.sync_flag, Some(true));
-        assert_eq!(cc.compand_on, vec![true]);
-        assert!(cc.compand_avg.is_none());
+    fn companding_control_sync_off_round_trips() {
+        for num_chan in [2u32, 3, 5] {
+            let mut bw = BitWriter::new();
+            write_companding_control_sync_off(&mut bw);
+            bw.align_to_byte();
+            let bytes = bw.finish();
+            // sync_flag = 1, b_compand_on = 0, b_compand_avg = 0, pad.
+            assert_eq!(bytes, vec![0b1000_0000], "num_chan {num_chan}");
+            let mut br = BitReader::new(&bytes);
+            let cc = aspx::parse_companding_control(&mut br, num_chan).unwrap();
+            assert_eq!(cc.sync_flag, Some(true));
+            assert_eq!(cc.compand_on, vec![false]);
+            assert_eq!(cc.compand_avg, Some(false));
+            assert!(matches!(
+                aspx::CompandingMode::from_control(&cc, 0),
+                aspx::CompandingMode::Off
+            ));
+        }
     }
 
     /// `write_acpl_data_2ch_minimal` produces a body that round-trips

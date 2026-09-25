@@ -3783,6 +3783,75 @@ impl Ac4ImsEncoder {
     /// carriers.
     ///
     /// `max_sfb` defaults to 40 (matching the round-95 ACPL_3 default).
+    /// 5.X A-CPL wire channels `[A, B, C, S3, S4]` for the Table 181
+    /// element from the target `[L, R, C, Ls, Rs]` PCM.
+    ///
+    /// §5.7.7.6.1 Pseudocode 117 reconstructs `L = A·(1+α) + w` and
+    /// `Ls = √2·(A·(1−α) − w)` from the coded carrier `A`, so the
+    /// carrier that reproduces the pair sum exactly is
+    /// `A = (L + Ls/√2)/2`; `S3 = (L − Ls/√2)/2` is the side the
+    /// `(α, β)` pair fits (ASPX_ACPL_2) or the ASPX_ACPL_1 residual
+    /// that Pseudocode 116 mid/side-combines below `acpl_qmf_band`.
+    /// Same for `(B, S4)` from `(R, Rs)`; the centre passes through.
+    pub fn acpl_5x_wire_channels(frames: &[&[f32]; 5]) -> [Vec<f32>; 5] {
+        let k = 1.0 / std::f32::consts::SQRT_2;
+        let mix = |x: &[f32], y: &[f32], sign: f32| -> Vec<f32> {
+            x.iter()
+                .zip(y)
+                .map(|(&a, &b)| 0.5 * (a + sign * k * b))
+                .collect()
+        };
+        [
+            mix(frames[0], frames[3], 1.0),
+            mix(frames[1], frames[4], 1.0),
+            frames[2].to_vec(),
+            mix(frames[0], frames[3], -1.0),
+            mix(frames[1], frames[4], -1.0),
+        ]
+    }
+
+    /// 7.X (3/4/0.x) A-CPL wire channels `[L, R, C, D, E, F, G]` for
+    /// the Table 184 / 202 element from the target
+    /// `[L, R, C, Ls, Rs, Lb, Rb]` PCM.
+    ///
+    /// Per Table 202 the coupling carriers are `x0 = D`, `x1 = E` and
+    /// §5.7.7.6.3 Pseudocode 120 reconstructs `Ls = √2·(D·(1+α) + w)`,
+    /// `Lb = √2·(D·(1−α) − w)` (both outputs carry the 3/4/0.x √2), so
+    /// `D = (Ls + Lb)/(2√2)` reproduces the pair sum exactly and
+    /// `F = (Ls − Lb)/(2√2)` is the side / ASPX_ACPL_1 residual. Same
+    /// for `(E, G)` from `(Rs, Rb)`; L, R and C are waveform-coded.
+    pub fn acpl_7x_wire_channels(frames: &[&[f32]; 7]) -> [Vec<f32>; 7] {
+        let k = 0.5 / std::f32::consts::SQRT_2;
+        let mix = |x: &[f32], y: &[f32], sign: f32| -> Vec<f32> {
+            x.iter().zip(y).map(|(&a, &b)| k * (a + sign * b)).collect()
+        };
+        [
+            frames[0].to_vec(),
+            frames[1].to_vec(),
+            frames[2].to_vec(),
+            mix(frames[3], frames[5], 1.0),
+            mix(frames[4], frames[6], 1.0),
+            mix(frames[3], frames[5], -1.0),
+            mix(frames[4], frames[6], -1.0),
+        ]
+    }
+
+    /// `acpl_qmf_band_minus1` (Table 59, 3 bits) for an ASPX_ACPL_1
+    /// element whose joint-MDCT residual layer is bounded by
+    /// `max_sfb_master`: the highest QMF subband the residual fully
+    /// covers (`sfb_offset[max_sfb_master] · 64 / frame_len`), so the
+    /// Pseudocode 116 mid/side region never reaches past the coded
+    /// residual; clamped to the field's 1..=8 range.
+    pub fn acpl1_qmf_band_minus1(frame_len: u32, max_sfb_master: u32) -> u8 {
+        let Some(sfbo) = crate::sfb_offset::sfb_offset_48(frame_len) else {
+            return 0;
+        };
+        let idx = (max_sfb_master as usize).min(sfbo.len().saturating_sub(1));
+        let bins = sfbo[idx] as u32;
+        let sb = (bins * 64) / frame_len.max(1);
+        (sb.clamp(1, 8) - 1) as u8
+    }
+
     pub fn encode_frame_pcm_5_0_acpl2(&mut self, frames: &[&[f32]; 3]) -> Vec<u8> {
         self.encode_frame_pcm_5_0_acpl2_with_max_sfb(frames, 40)
     }
@@ -4068,27 +4137,77 @@ impl Ac4ImsEncoder {
         frames: &[&[f32]; 5],
         max_sfb: u32,
     ) -> Vec<u8> {
+        self.encode_frame_pcm_5_x_acpl2_real_aspx_with_max_sfb(frames, None, max_sfb, None)
+    }
+
+    /// `max_sfb` / `max_sfb_lfe`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_1_acpl2_real_aspx`]; `frames` is in
+    /// `[L, R, C, Ls, Rs, LFE]` order.
+    pub fn encode_frame_pcm_5_1_acpl2_real_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 6],
+        max_sfb: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_5_x_acpl2_real_aspx_with_max_sfb(
+            &surround,
+            Some(frames[5]),
+            max_sfb,
+            Some(max_sfb_lfe),
+        )
+    }
+
+    /// Shared 5.0 / 5.1 ASPX_ACPL_2 body: `targets` is `[L, R, C, Ls,
+    /// Rs]`, mapped to the Table 181 wire channels by
+    /// [`Self::acpl_5x_wire_channels`] (the `[A, B]` carriers + the
+    /// sides the `(α, β)` pairs fit), `lfe` adds the Table 25
+    /// `mono_data(1)` and the 5.1 channel mode.
+    fn encode_frame_pcm_5_x_acpl2_real_aspx_with_max_sfb(
+        &mut self,
+        targets: &[&[f32]; 5],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_lfe: Option<u32>,
+    ) -> Vec<u8> {
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };
-        for (ch, f) in frames.iter().enumerate() {
+        for (ch, f) in targets.iter().enumerate() {
             assert_eq!(
                 f.len(),
                 frame_len as usize,
-                "encode_frame_pcm_5_0_acpl2_real_aspx: channel {ch} input length must match frame_len = {frame_len}"
+                "encode_frame_pcm_5_x_acpl2_real_aspx: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
-        let (n_msfb_bits, _, _) =
+        if let Some(lfe_buf) = lfe {
+            assert_eq!(
+                lfe_buf.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl2_real_aspx: LFE input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, n_msfbl_bits) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
         let max_sfb = max_sfb.min(n_msfb_cap);
+        let max_sfb_lfe = max_sfb_lfe.map(|m| {
+            assert!(
+                n_msfbl_bits > 0,
+                "encode_frame_pcm_5_x_acpl2_real_aspx: tl = {frame_len} not permitted for LFE"
+            );
+            m.min((1u32 << n_msfbl_bits) - 1)
+        });
 
-        // Force 5.0 channel_mode prefix '1101', 4 b → channel_mode 3.
+        // Table 85: 5.0 = '1101', 5.1 = '1110' (4 bits).
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1101;
+        self.channel_mode_value = if lfe.is_some() { 0b1110 } else { 0b1101 };
         self.channel_mode_bits = 4;
 
-        let n_channels = 5;
+        let wire = Self::acpl_5x_wire_channels(targets);
+        let frames: [&[f32]; 5] = [&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
+
+        let n_channels = if lfe.is_some() { 6 } else { 5 };
         while self.mdct_states_multi.len() < n_channels {
             self.mdct_states_multi
                 .push(EncoderMdctState::new(frame_len));
@@ -4103,6 +4222,8 @@ impl Ac4ImsEncoder {
             let c = self.mdct_states_multi[ch].analyse_frame(f);
             coeffs_per_channel.push(c);
         }
+        let coeffs_lfe: Option<Vec<f32>> =
+            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
 
         let aspx_cfg = crate::aspx::AspxConfig {
             quant_mode_env: crate::aspx::AspxQuantStep::Fine,
@@ -4118,24 +4239,24 @@ impl Ac4ImsEncoder {
         };
 
         // Encoder-side A-SPX spectral pre-flattening (Table 121), one
-        // per-config flag from the primary (L) carrier (§5.7.6.4.1.2).
+        // per-config flag from the primary (A) carrier (§5.7.6.4.1.2).
         let mut aspx_cfg = aspx_cfg;
         aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
 
-        // Real ASPX envelope extraction over the L / R carrier pair …
+        // Real ASPX envelope extraction over the [A, B] carrier pair …
         let (l_sig, l_noise, r_sig, r_noise) =
             self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
         // … and the centre carrier (the ACPL_2 body's `aspx_data_1ch()`).
         let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
 
         // Encoder-side A-SPX inverse-filtering decision per carrier: the
-        // L / R front pair shares the L-derived vector (aspx_balance = 1),
-        // and the centre carrier derives its own from its QMF low band.
+        // A / B pair shares the A-derived vector (aspx_balance = 1), and
+        // the centre carrier derives its own from its QMF low band.
         let lr_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
         let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
 
-        // Per-channel real aspx_add_harmonic (§4.2.12.6) for the L / R
-        // front pair + the centre carrier.
+        // Per-channel real aspx_add_harmonic (§4.2.12.6) for the A / B
+        // pair + the centre carrier.
         let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
         let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
         let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
@@ -4150,11 +4271,16 @@ impl Ac4ImsEncoder {
             _ => 32768,
         };
 
+        let lfe_arg = match (coeffs_lfe.as_deref(), max_sfb_lfe) {
+            (Some(c), Some(m)) => Some((c, m)),
+            _ => None,
+        };
         let body =
             crate::encoder_acpl3::build_5_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
                 frame_len,
                 max_sfb,
                 self.b_iframe_global,
+                lfe_arg,
                 &coeffs_per_channel[0],
                 &coeffs_per_channel[1],
                 &coeffs_per_channel[2],
@@ -4228,6 +4354,11 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_5_0_acpl2_real_aspx_centre_multi_env: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 181 wire channels (see `acpl_5x_wire_channels`); the
+        // single-envelope fallback re-derives them from the targets.
+        let targets = frames;
+        let wire = Self::acpl_5x_wire_channels(frames);
+        let frames: &[&[f32]; 5] = &[&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
         let (n_msfb_bits, _, _) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -4256,7 +4387,7 @@ impl Ac4ImsEncoder {
         let (c_num_env, c_sig_rows, c_noise_rows) =
             self.extract_aspx_mono_multi_env(&aspx_cfg, frame_len, frames[2]);
         if c_num_env <= 1 {
-            return self.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(frames, max_sfb);
+            return self.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(targets, max_sfb);
         }
 
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
@@ -4307,6 +4438,7 @@ impl Ac4ImsEncoder {
                 frame_len,
                 max_sfb,
                 self.b_iframe_global,
+                None,
                 &coeffs_per_channel[0],
                 &coeffs_per_channel[1],
                 &coeffs_per_channel[2],
@@ -4331,7 +4463,7 @@ impl Ac4ImsEncoder {
         if body.is_empty() {
             self.channel_mode_value = saved_mode.0;
             self.channel_mode_bits = saved_mode.1;
-            return self.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(frames, max_sfb);
+            return self.encode_frame_pcm_5_0_acpl2_real_aspx_with_max_sfb(targets, max_sfb);
         }
 
         let mut bw = BitWriter::new();
@@ -4353,13 +4485,7 @@ impl Ac4ImsEncoder {
     /// the `.1` low-frequency element from the same scaffold as the
     /// round-144 path; only the three ASPX carriers carry real envelopes.
     pub fn encode_frame_pcm_5_1_acpl2_real_aspx(&mut self, frames: &[&[f32]; 6]) -> Vec<u8> {
-        // ACPL_2 reconstructs the surround pair from L/R + the parameter
-        // sets, so the body shape is independent of LFE — route the first
-        // five channels through the 5.0 path. (The dedicated `.1`
-        // low-frequency element on the ACPL_2 wire is unchanged from the
-        // round-144 builder, which the 5.0 path already emits.)
-        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
-        self.encode_frame_pcm_5_0_acpl2_real_aspx(&surround)
+        self.encode_frame_pcm_5_1_acpl2_real_aspx_with_max_sfb(frames, 40, 7)
     }
 
     /// Derive the per-channel ASPX SIGNAL / NOISE envelope quant indices
@@ -4542,6 +4668,10 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_5_0_acpl1: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 181 wire channels: [A, B] carriers + [S3, S4] sides
+        // (see `acpl_5x_wire_channels`).
+        let wire = Self::acpl_5x_wire_channels(frames);
+        let frames: &[&[f32]; 5] = &[&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
         let (n_msfb_bits, _, _) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -4590,7 +4720,7 @@ impl Ac4ImsEncoder {
         // acpl_qmf_band_minus1 = 0 → qmf_band = 1 (PARTIAL mode).
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
-        let acpl_qmf_band_minus1: u8 = 0;
+        let acpl_qmf_band_minus1 = Self::acpl1_qmf_band_minus1(frame_len, max_sfb_master);
 
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
@@ -4677,6 +4807,10 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_5_0_acpl1_sap: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 181 wire channels: [A, B] carriers + [S3, S4] sides
+        // (see `acpl_5x_wire_channels`) are the SAP selector's targets.
+        let wire = Self::acpl_5x_wire_channels(frames);
+        let frames: &[&[f32]; 5] = &[&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
         let (n_msfb_bits, _, _) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -4719,7 +4853,7 @@ impl Ac4ImsEncoder {
         };
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
-        let acpl_qmf_band_minus1: u8 = 0;
+        let acpl_qmf_band_minus1 = Self::acpl1_qmf_band_minus1(frame_len, max_sfb_master);
 
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
@@ -4800,6 +4934,10 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_5_0_acpl1_real_alpha: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 181 wire channels: [A, B] carriers + [S3, S4] sides
+        // (see `acpl_5x_wire_channels`).
+        let wire = Self::acpl_5x_wire_channels(frames);
+        let frames: &[&[f32]; 5] = &[&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
         let (n_msfb_bits, _, _) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -4841,7 +4979,7 @@ impl Ac4ImsEncoder {
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
-        let acpl_qmf_band_minus1: u8 = 0;
+        let acpl_qmf_band_minus1 = Self::acpl1_qmf_band_minus1(frame_len, max_sfb_master);
 
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
@@ -4908,26 +5046,91 @@ impl Ac4ImsEncoder {
         max_sfb: u32,
         max_sfb_master: u32,
     ) -> Vec<u8> {
+        self.encode_frame_pcm_5_x_acpl1_real_alpha_beta_with_max_sfb(
+            frames,
+            None,
+            max_sfb,
+            max_sfb_master,
+            None,
+        )
+    }
+
+    /// 5.1 counterpart to [`Self::encode_frame_pcm_5_0_acpl1_real_alpha_beta`];
+    /// `frames` is in `[L, R, C, Ls, Rs, LFE]` order.
+    pub fn encode_frame_pcm_5_1_acpl1_real_alpha_beta(&mut self, frames: &[&[f32]; 6]) -> Vec<u8> {
+        self.encode_frame_pcm_5_1_acpl1_real_alpha_beta_with_max_sfb(frames, 40, 20, 7)
+    }
+
+    /// `max_sfb` / `max_sfb_master` / `max_sfb_lfe`-parameterised form
+    /// of [`Self::encode_frame_pcm_5_1_acpl1_real_alpha_beta`].
+    pub fn encode_frame_pcm_5_1_acpl1_real_alpha_beta_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 6],
+        max_sfb: u32,
+        max_sfb_master: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_5_x_acpl1_real_alpha_beta_with_max_sfb(
+            &surround,
+            Some(frames[5]),
+            max_sfb,
+            max_sfb_master,
+            Some(max_sfb_lfe),
+        )
+    }
+
+    /// Shared 5.0 / 5.1 ASPX_ACPL_1 body: `targets` is `[L, R, C, Ls,
+    /// Rs]`, mapped to the Table 181 wire channels by
+    /// [`Self::acpl_5x_wire_channels`] — `[A, B]` carriers on the
+    /// `two_channel_data()`, `[S3, S4]` sides on the joint-MDCT residual
+    /// layer (identity chparam SAP), `acpl_qmf_band` from the residual
+    /// budget via [`Self::acpl1_qmf_band_minus1`].
+    fn encode_frame_pcm_5_x_acpl1_real_alpha_beta_with_max_sfb(
+        &mut self,
+        targets: &[&[f32]; 5],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_master: u32,
+        max_sfb_lfe: Option<u32>,
+    ) -> Vec<u8> {
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };
-        for (ch, f) in frames.iter().enumerate() {
+        for (ch, f) in targets.iter().enumerate() {
             assert_eq!(
                 f.len(),
                 frame_len as usize,
-                "encode_frame_pcm_5_0_acpl1_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
+                "encode_frame_pcm_5_x_acpl1_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
-        let (n_msfb_bits, _, _) =
+        if let Some(lfe_buf) = lfe {
+            assert_eq!(
+                lfe_buf.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl1_real_alpha_beta: LFE input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, n_msfbl_bits) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
         let max_sfb = max_sfb.min(n_msfb_cap);
+        let max_sfb_lfe = max_sfb_lfe.map(|m| {
+            assert!(
+                n_msfbl_bits > 0,
+                "encode_frame_pcm_5_x_acpl1_real_alpha_beta: tl = {frame_len} not permitted for LFE"
+            );
+            m.min((1u32 << n_msfbl_bits) - 1)
+        });
 
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1101;
+        self.channel_mode_value = if lfe.is_some() { 0b1110 } else { 0b1101 };
         self.channel_mode_bits = 4;
 
-        let n_channels = 5;
+        let wire = Self::acpl_5x_wire_channels(targets);
+        let frames: [&[f32]; 5] = [&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
+
+        let n_channels = if lfe.is_some() { 6 } else { 5 };
         while self.mdct_states_multi.len() < n_channels {
             self.mdct_states_multi
                 .push(EncoderMdctState::new(frame_len));
@@ -4942,6 +5145,8 @@ impl Ac4ImsEncoder {
             let c = self.mdct_states_multi[ch].analyse_frame(f);
             coeffs_per_channel.push(c);
         }
+        let coeffs_lfe: Option<Vec<f32>> =
+            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
 
         let aspx_cfg = crate::aspx::AspxConfig {
             quant_mode_env: crate::aspx::AspxQuantStep::Fine,
@@ -4958,7 +5163,7 @@ impl Ac4ImsEncoder {
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
-        let acpl_qmf_band_minus1: u8 = 0;
+        let acpl_qmf_band_minus1 = Self::acpl1_qmf_band_minus1(frame_len, max_sfb_master);
 
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,
@@ -4967,11 +5172,16 @@ impl Ac4ImsEncoder {
             _ => 32768,
         };
 
+        let lfe_arg = match (coeffs_lfe.as_deref(), max_sfb_lfe) {
+            (Some(c), Some(m)) => Some((c, m)),
+            _ => None,
+        };
         let body = crate::encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
             frame_len,
             max_sfb,
             max_sfb_master,
             self.b_iframe_global,
+            lfe_arg,
             &coeffs_per_channel[0],
             &coeffs_per_channel[1],
             &coeffs_per_channel[2],
@@ -4983,6 +5193,204 @@ impl Ac4ImsEncoder {
             acpl_qmf_band_minus1,
             pad_target_bytes,
         );
+
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        out.extend(self.trailing_metadata());
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
+    }
+
+    /// 5.0 ASPX_ACPL_1 encode with **real** A-SPX envelopes on the
+    /// `[A, B]` carrier pair and the centre (the ACPL_1 counterpart of
+    /// [`Self::encode_frame_pcm_5_0_acpl2_real_aspx`]): the Table 181
+    /// wire channels from [`Self::acpl_5x_wire_channels`], the `[S3, S4]`
+    /// sides on the joint-MDCT residual layer, `acpl_qmf_band` from the
+    /// residual budget ([`Self::acpl1_qmf_band_minus1`]), real per-band
+    /// `(α, β)` above it. `frames` is `[L, R, C, Ls, Rs]`.
+    pub fn encode_frame_pcm_5_0_acpl1_real_aspx(&mut self, frames: &[&[f32]; 5]) -> Vec<u8> {
+        self.encode_frame_pcm_5_0_acpl1_real_aspx_with_max_sfb(frames, 40, 20)
+    }
+
+    /// `max_sfb` / `max_sfb_master`-parameterised form of
+    /// [`Self::encode_frame_pcm_5_0_acpl1_real_aspx`].
+    pub fn encode_frame_pcm_5_0_acpl1_real_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 5],
+        max_sfb: u32,
+        max_sfb_master: u32,
+    ) -> Vec<u8> {
+        self.encode_frame_pcm_5_x_acpl1_real_aspx_with_max_sfb(
+            frames,
+            None,
+            max_sfb,
+            max_sfb_master,
+            None,
+        )
+    }
+
+    /// 5.1 counterpart to [`Self::encode_frame_pcm_5_0_acpl1_real_aspx`];
+    /// `frames` is in `[L, R, C, Ls, Rs, LFE]` order.
+    pub fn encode_frame_pcm_5_1_acpl1_real_aspx(&mut self, frames: &[&[f32]; 6]) -> Vec<u8> {
+        self.encode_frame_pcm_5_1_acpl1_real_aspx_with_max_sfb(frames, 40, 20, 7)
+    }
+
+    /// `max_sfb` / `max_sfb_master` / `max_sfb_lfe`-parameterised form
+    /// of [`Self::encode_frame_pcm_5_1_acpl1_real_aspx`].
+    pub fn encode_frame_pcm_5_1_acpl1_real_aspx_with_max_sfb(
+        &mut self,
+        frames: &[&[f32]; 6],
+        max_sfb: u32,
+        max_sfb_master: u32,
+        max_sfb_lfe: u32,
+    ) -> Vec<u8> {
+        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        self.encode_frame_pcm_5_x_acpl1_real_aspx_with_max_sfb(
+            &surround,
+            Some(frames[5]),
+            max_sfb,
+            max_sfb_master,
+            Some(max_sfb_lfe),
+        )
+    }
+
+    /// Shared 5.0 / 5.1 ASPX_ACPL_1 real-A-SPX body (see
+    /// [`Self::encode_frame_pcm_5_0_acpl1_real_aspx`]).
+    fn encode_frame_pcm_5_x_acpl1_real_aspx_with_max_sfb(
+        &mut self,
+        targets: &[&[f32]; 5],
+        lfe: Option<&[f32]>,
+        max_sfb: u32,
+        max_sfb_master: u32,
+        max_sfb_lfe: Option<u32>,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in targets.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl1_real_aspx: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        if let Some(lfe_buf) = lfe {
+            assert_eq!(
+                lfe_buf.len(),
+                frame_len as usize,
+                "encode_frame_pcm_5_x_acpl1_real_aspx: LFE input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, n_msfbl_bits) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
+        let max_sfb = max_sfb.min(n_msfb_cap);
+        let max_sfb_lfe = max_sfb_lfe.map(|m| {
+            assert!(
+                n_msfbl_bits > 0,
+                "encode_frame_pcm_5_x_acpl1_real_aspx: tl = {frame_len} not permitted for LFE"
+            );
+            m.min((1u32 << n_msfbl_bits) - 1)
+        });
+
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        self.channel_mode_value = if lfe.is_some() { 0b1110 } else { 0b1101 };
+        self.channel_mode_bits = 4;
+
+        let wire = Self::acpl_5x_wire_channels(targets);
+        let frames: [&[f32]; 5] = [&wire[0], &wire[1], &wire[2], &wire[3], &wire[4]];
+
+        let n_channels = if lfe.is_some() { 6 } else { 5 };
+        while self.mdct_states_multi.len() < n_channels {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let mut coeffs_per_channel: Vec<Vec<f32>> = Vec::with_capacity(n_channels);
+        for (ch, f) in frames.iter().enumerate() {
+            let c = self.mdct_states_multi[ch].analyse_frame(f);
+            coeffs_per_channel.push(c);
+        }
+        let coeffs_lfe: Option<Vec<f32>> =
+            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
+
+        let aspx_cfg = crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        };
+        let mut aspx_cfg = aspx_cfg;
+        aspx_cfg.preflat = self.extract_aspx_preflat(&aspx_cfg, frame_len, frames[0]);
+
+        let (l_sig, l_noise, r_sig, r_noise) =
+            self.extract_aspx_lr_envelopes(&aspx_cfg, frame_len, frames[0], frames[1]);
+        let (c_sig, c_noise) = self.extract_aspx_mono_envelope(&aspx_cfg, frame_len, frames[2]);
+        let lr_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[0]);
+        let c_tna_mode = self.extract_aspx_l_tna_mode(&aspx_cfg, frames[2]);
+        let l_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[0]);
+        let r_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[1]);
+        let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
+
+        let acpl_num_param_bands_id: u8 = 3;
+        let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
+        let acpl_qmf_band_minus1 = Self::acpl1_qmf_band_minus1(frame_len, max_sfb_master);
+
+        let pad_target_bytes: usize = match max_sfb {
+            0..=20 => 4096,
+            21..=40 => 8192,
+            41..=50 => 16384,
+            _ => 32768,
+        };
+
+        let lfe_arg = match (coeffs_lfe.as_deref(), max_sfb_lfe) {
+            (Some(c), Some(m)) => Some((c, m)),
+            _ => None,
+        };
+        let body =
+            crate::encoder_acpl3::build_5_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+                frame_len,
+                max_sfb,
+                max_sfb_master,
+                self.b_iframe_global,
+                lfe_arg,
+                &coeffs_per_channel[0],
+                &coeffs_per_channel[1],
+                &coeffs_per_channel[2],
+                &coeffs_per_channel[3],
+                &coeffs_per_channel[4],
+                &aspx_cfg,
+                &l_sig,
+                &l_noise,
+                &r_sig,
+                &r_noise,
+                &c_sig,
+                &c_noise,
+                &lr_tna_mode,
+                &c_tna_mode,
+                &l_ah,
+                &r_ah,
+                &c_ah,
+                acpl_num_param_bands_id,
+                acpl_quant_mode,
+                acpl_qmf_band_minus1,
+                pad_target_bytes,
+            );
 
         let mut bw = BitWriter::new();
         self.write_toc(&mut bw);
@@ -5334,6 +5742,13 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_7_0_acpl2_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
+        // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
+        // back-channel sides.
+        let wire = Self::acpl_7x_wire_channels(frames);
+        let frames: &[&[f32]; 7] = &[
+            &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6],
+        ];
         let (n_msfb_bits, _, _) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -5401,6 +5816,8 @@ impl Ac4ImsEncoder {
             &coeffs_per_channel[1],
             &coeffs_per_channel[3],
             &coeffs_per_channel[4],
+            &coeffs_per_channel[5],
+            &coeffs_per_channel[6],
             &coeffs_per_channel[2],
             None, // 7.0 — no LFE
             &aspx_cfg,
@@ -5466,6 +5883,15 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_7_1_acpl2_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
+        // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
+        // back-channel sides; the LFE passes through.
+        let wire = Self::acpl_7x_wire_channels(&[
+            frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
+        ]);
+        let frames: &[&[f32]; 8] = &[
+            &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6], frames[7],
+        ];
         let (n_msfb_bits, _, n_msfbl_bits) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -5536,6 +5962,8 @@ impl Ac4ImsEncoder {
             &coeffs_per_channel[1],
             &coeffs_per_channel[3],
             &coeffs_per_channel[4],
+            &coeffs_per_channel[5],
+            &coeffs_per_channel[6],
             &coeffs_per_channel[2],
             Some(&coeffs_per_channel[7]),
             &aspx_cfg,
@@ -5600,6 +6028,13 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_7_0_acpl2_real_aspx: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
+        // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
+        // back-channel sides.
+        let wire = Self::acpl_7x_wire_channels(frames);
+        let frames: &[&[f32]; 7] = &[
+            &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6],
+        ];
         let (n_msfb_bits, _, _) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -5688,6 +6123,8 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[1],
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
                 &coeffs_per_channel[2],
                 None, // 7.0 — no LFE
                 &aspx_cfg,
@@ -5741,9 +6178,8 @@ impl Ac4ImsEncoder {
         &mut self,
         frames: &[&[f32]; 7],
     ) -> Vec<u8> {
-        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
         self.encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env_with_max_sfb(
-            &surround, None, 40, None, 0b1111000, 7,
+            frames, None, 40, None, 0b1111000, 7,
         )
     }
 
@@ -5754,9 +6190,11 @@ impl Ac4ImsEncoder {
         &mut self,
         frames: &[&[f32]; 8],
     ) -> Vec<u8> {
-        let surround: [&[f32]; 5] = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        let targets: [&[f32]; 7] = [
+            frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
+        ];
         self.encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env_with_max_sfb(
-            &surround,
+            &targets,
             Some(frames[7]),
             40,
             Some(7),
@@ -5774,7 +6212,7 @@ impl Ac4ImsEncoder {
     #[allow(clippy::too_many_arguments)]
     fn encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env_with_max_sfb(
         &mut self,
-        surround: &[&[f32]; 5],
+        targets: &[&[f32]; 7],
         lfe: Option<&[f32]>,
         max_sfb: u32,
         max_sfb_lfe: Option<u32>,
@@ -5784,13 +6222,18 @@ impl Ac4ImsEncoder {
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };
-        for (ch, f) in surround.iter().enumerate() {
+        for (ch, f) in targets.iter().enumerate() {
             assert_eq!(
                 f.len(),
                 frame_len as usize,
                 "encode_frame_pcm_7_x_acpl2_real_aspx_centre_multi_env: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`).
+        let wire = Self::acpl_7x_wire_channels(targets);
+        let surround: &[&[f32]; 7] = &[
+            &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6],
+        ];
         if let Some(lfe_buf) = lfe {
             assert_eq!(
                 lfe_buf.len(),
@@ -5827,7 +6270,7 @@ impl Ac4ImsEncoder {
             self.extract_aspx_mono_multi_env(&aspx_cfg, frame_len, surround[2]);
         if c_num_env <= 1 {
             return self.fallback_7_x_acpl2_real_aspx_single_env(
-                surround,
+                targets,
                 lfe,
                 max_sfb,
                 max_sfb_lfe,
@@ -5838,7 +6281,7 @@ impl Ac4ImsEncoder {
         self.channel_mode_value = channel_mode_value;
         self.channel_mode_bits = channel_mode_bits;
 
-        let n_channels = if lfe.is_some() { 6 } else { 5 };
+        let n_channels = if lfe.is_some() { 8 } else { 7 };
         while self.mdct_states_multi.len() < n_channels {
             self.mdct_states_multi
                 .push(EncoderMdctState::new(frame_len));
@@ -5854,7 +6297,7 @@ impl Ac4ImsEncoder {
             coeffs_per_channel.push(c);
         }
         let coeffs_lfe: Option<Vec<f32>> =
-            lfe.map(|buf| self.mdct_states_multi[5].analyse_frame(buf));
+            lfe.map(|buf| self.mdct_states_multi[7].analyse_frame(buf));
 
         // L/R front + Ls/Rs surround stay single-envelope.
         let (l_sig, l_noise, r_sig, r_noise) =
@@ -5894,6 +6337,8 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[1],
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
                 &coeffs_per_channel[2],
                 coeffs_lfe.as_deref(),
                 &aspx_cfg,
@@ -5921,7 +6366,7 @@ impl Ac4ImsEncoder {
             self.channel_mode_value = saved_mode.0;
             self.channel_mode_bits = saved_mode.1;
             return self.fallback_7_x_acpl2_real_aspx_single_env(
-                surround,
+                targets,
                 lfe,
                 max_sfb,
                 max_sfb_lfe,
@@ -5948,23 +6393,16 @@ impl Ac4ImsEncoder {
     /// the A-CPL coupling, never from these slots).
     fn fallback_7_x_acpl2_real_aspx_single_env(
         &mut self,
-        surround: &[&[f32]; 5],
+        targets: &[&[f32]; 7],
         lfe: Option<&[f32]>,
         max_sfb: u32,
         max_sfb_lfe: Option<u32>,
     ) -> Vec<u8> {
-        let c = surround[2];
         match lfe {
             Some(lfe_buf) => {
                 let frames: [&[f32]; 8] = [
-                    surround[0],
-                    surround[1],
-                    surround[2],
-                    surround[3],
-                    surround[4],
-                    c,
-                    c,
-                    lfe_buf,
+                    targets[0], targets[1], targets[2], targets[3], targets[4], targets[5],
+                    targets[6], lfe_buf,
                 ];
                 self.encode_frame_pcm_7_1_acpl2_real_aspx_with_max_sfb(
                     &frames,
@@ -5972,18 +6410,7 @@ impl Ac4ImsEncoder {
                     max_sfb_lfe.unwrap_or(7),
                 )
             }
-            None => {
-                let frames: [&[f32]; 7] = [
-                    surround[0],
-                    surround[1],
-                    surround[2],
-                    surround[3],
-                    surround[4],
-                    c,
-                    c,
-                ];
-                self.encode_frame_pcm_7_0_acpl2_real_aspx_with_max_sfb(&frames, max_sfb)
-            }
+            None => self.encode_frame_pcm_7_0_acpl2_real_aspx_with_max_sfb(targets, max_sfb),
         }
     }
 
@@ -6018,6 +6445,15 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_7_1_acpl2_real_aspx: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
+        // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
+        // back-channel sides; the LFE passes through.
+        let wire = Self::acpl_7x_wire_channels(&[
+            frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
+        ]);
+        let frames: &[&[f32]; 8] = &[
+            &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6], frames[7],
+        ];
         let (n_msfb_bits, _, n_msfbl_bits) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -6109,6 +6545,8 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[1],
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
                 &coeffs_per_channel[2],
                 Some(&coeffs_per_channel[7]),
                 &aspx_cfg,
@@ -6337,6 +6775,13 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_7_0_acpl1_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
+        // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
+        // back-channel sides.
+        let wire = Self::acpl_7x_wire_channels(frames);
+        let frames: &[&[f32]; 7] = &[
+            &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6],
+        ];
         let (n_msfb_bits, _, _) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -6385,7 +6830,7 @@ impl Ac4ImsEncoder {
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
-        let acpl_qmf_band_minus1: u8 = 0;
+        let acpl_qmf_band_minus1 = Self::acpl1_qmf_band_minus1(frame_len, max_sfb_master);
 
         // Real ASPX envelope extraction over the three A-CPL_1 carriers:
         // L/R front pair, Ls/Rs surround pair, centre.
@@ -6428,6 +6873,8 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[1],
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
                 &coeffs_per_channel[2],
                 None, // 7.0 — no LFE
                 &aspx_cfg,
@@ -6681,6 +7128,15 @@ impl Ac4ImsEncoder {
                 "encode_frame_pcm_7_1_acpl1_real_alpha_beta: channel {ch} input length must match frame_len = {frame_len}"
             );
         }
+        // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
+        // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
+        // back-channel sides; the LFE passes through.
+        let wire = Self::acpl_7x_wire_channels(&[
+            frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
+        ]);
+        let frames: &[&[f32]; 8] = &[
+            &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6], frames[7],
+        ];
         let (n_msfb_bits, _, n_msfbl_bits) =
             crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
         let n_msfb_cap = (1u32 << n_msfb_bits) - 1;
@@ -6735,7 +7191,7 @@ impl Ac4ImsEncoder {
 
         let acpl_num_param_bands_id: u8 = 3;
         let acpl_quant_mode = crate::acpl::AcplQuantMode::Fine;
-        let acpl_qmf_band_minus1: u8 = 0;
+        let acpl_qmf_band_minus1 = Self::acpl1_qmf_band_minus1(frame_len, max_sfb_master);
 
         // Real ASPX envelope extraction over the three A-CPL_1 carriers:
         // L/R front pair, Ls/Rs surround pair, centre.
@@ -6778,6 +7234,8 @@ impl Ac4ImsEncoder {
                 &coeffs_per_channel[1],
                 &coeffs_per_channel[3],
                 &coeffs_per_channel[4],
+                &coeffs_per_channel[5],
+                &coeffs_per_channel[6],
                 &coeffs_per_channel[2],
                 Some(&coeffs_per_channel[7]),
                 &aspx_cfg,

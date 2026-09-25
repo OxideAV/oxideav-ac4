@@ -195,6 +195,8 @@ fn real_aspx_tna_reaches_the_7x_acpl1_body() {
             &r,
             &ls,
             &rs,
+            &ls,
+            &rs,
             &c,
             None,
             &cfg,

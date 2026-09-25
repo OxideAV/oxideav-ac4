@@ -186,6 +186,8 @@ fn tna_reaches_the_7x_acpl2_body() {
             &r,
             &ls,
             &rs,
+            &ls,
+            &rs,
             &c,
             None,
             &cfg,

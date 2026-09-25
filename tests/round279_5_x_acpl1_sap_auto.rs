@@ -133,16 +133,20 @@ fn acpl1_sap_recovers_sap_rows_and_shrinks_residual_vs_identity() {
     );
 }
 
-/// When SAP prediction offers no benefit (`Ls = L`, `Rs = R` ⇒ zero
-/// side energy ⇒ `g* = 0` on every band) the decision falls back to
+/// When SAP prediction offers no benefit the decision falls back to
 /// header-only `SapMode::None` rows and the emitted frame is
-/// bit-for-bit identical to the round-103 identity path.
+/// bit-for-bit identical to the round-103 identity path. The SAP layer
+/// predicts between the Table 181 wire tracks `[A, S3]` =
+/// `[(L + Ls/√2)/2, (L − Ls/√2)/2]`; with a silent surround both tracks
+/// are the identical `L/2`, so its side `S' = (A − S3)/2` is exactly
+/// zero and `g* = 0` on every band.
 #[test]
 fn acpl1_sap_no_benefit_input_matches_identity_path_bytes() {
     let l = make_tone_frame(220.0, 0.3);
     let r = make_tone_frame(440.0, 0.3);
     let c = make_tone_frame(660.0, 0.2);
-    let frames: [&[f32]; 5] = [&l, &r, &c, &l, &r];
+    let silent = vec![0.0f32; l.len()];
+    let frames: [&[f32]; 5] = [&l, &r, &c, &silent, &silent];
 
     let mut enc_sap = Ac4ImsEncoder::new();
     let bytes_sap = enc_sap.encode_frame_pcm_5_0_acpl1_sap(&frames);

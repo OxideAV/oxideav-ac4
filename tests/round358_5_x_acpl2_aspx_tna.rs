@@ -167,7 +167,22 @@ fn live_5_1_acpl2_real_aspx_with_tna_round_trips() {
         panic!("expected audio frame");
     };
     assert_eq!(af.samples, 1920);
-    assert_eq!(af.data[0].len(), 1920 * 5 * 2, "5-channel S16 interleaved");
+    assert_eq!(
+        af.data[0].len(),
+        1920 * 6 * 2,
+        "5.1 → 6-channel S16 interleaved"
+    );
+    // The LFE (slot 5) is carried on the Table 25 `mono_data(1)`.
+    let lfe_energy: i64 = af.data[0]
+        .chunks_exact(2)
+        .enumerate()
+        .filter(|(i, _)| i % 6 == 5)
+        .map(|(_, c)| {
+            let s = i16::from_le_bytes([c[0], c[1]]) as i64;
+            s * s
+        })
+        .sum();
+    assert!(lfe_energy > 0, "5.1 ACPL_2 LFE slot must decode non-silent");
 }
 
 /// The `_tna` body with non-zero tna_mode differs from the all-zero body,
@@ -205,6 +220,7 @@ fn tna_reaches_both_acpl2_carriers_and_round_trips() {
             tl,
             40,
             true,
+            None,
             &l,
             &r,
             &c,

@@ -28,6 +28,16 @@ pub const NUM_QMF_SUBBANDS: usize = 64;
 /// Number of coefficients in the QMF prototype window (Annex D.3).
 pub const NUM_QMF_WIN_COEF: usize = 640;
 
+/// Combined group delay, in PCM samples, of the analysis + synthesis
+/// QMF pair ([`QmfAnalysisBank`] → [`QmfSynthesisBank`]): a sample at
+/// input position `i` reconstructs at output position `i + 577`
+/// (`NUM_QMF_WIN_COEF − NUM_QMF_SUBBANDS + 1`, verified by
+/// `qmf_impulse_response_peak_at_expected_delay`). Every channel that
+/// goes through a QMF-domain tool (A-SPX, A-CPL, companding) is delayed
+/// by this amount per round trip; channels that stay in the time domain
+/// must be delayed by the same amount to line up with them (§5.7.1).
+pub const QMF_ROUND_TRIP_DELAY: usize = NUM_QMF_WIN_COEF - NUM_QMF_SUBBANDS + 1;
+
 /// AC-4 QMF prototype window coefficients, Annex D.3 (Table D.3) of
 /// ETSI TS 103 190-1 V1.4.1. Used by both the analysis and synthesis
 /// filter-banks, shared between all channels.
@@ -572,7 +582,7 @@ mod tests {
     /// running the unit-impulse end-to-end test: the reconstruction is
     /// in-phase (scale = +1) and peaks 577 samples after the input
     /// impulse.
-    const QMF_RT_DELAY: usize = 577;
+    const QMF_RT_DELAY: usize = QMF_ROUND_TRIP_DELAY;
     const QMF_RT_SIGN: f32 = 1.0;
 
     /// Helper: compute PSNR between `pcm[start..end]` and the aligned
