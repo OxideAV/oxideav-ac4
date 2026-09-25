@@ -47,6 +47,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the leading bytes, S16 PCM through `Ac4Encoder` and back through
   `Ac4Decoder`); 540 s of bounded runs clean.
 
+### Fixed
+
+- 5.X / 7.X `ASPX_ACPL_1` / `ASPX_ACPL_2` decode no longer runs the
+  channel-pair coupling on silence (round-456 finding): the element
+  renderer now resolves the Table 181 / 184 preliminary tracks from the
+  walked `two_channel_data()` / `three_channel_data()` /
+  `four_channel_data()` / `five_channel_data()` bodies, mixes the ACPL_1
+  residual pair through the chparam SAP matrix, IMDCTs every track,
+  extends the Table 213 carriers with their own captured A-SPX trailers
+  (`SubstreamTools::acpl_pair_aspx_{front,surround,centre}` — the
+  centre `aspx_data_1ch()` used to overwrite the pair's envelope) under
+  the Table 212 companding, and only then runs Pseudocode 117 / 120.
+  The 7_X element follows Table 202 (3/4/0.x): L / R are the
+  waveform-coded `[A, B]`, the coupling carriers are `[D, E]`, the
+  outputs land on Ls / Rs (`√2·z0`, `√2·z2`) and Lb / Rb (`z1`, `z3`).
+  `run_acpl_5x_pair_pcm` honours the PARTIAL config's `acpl_qmf_band`
+  (Table 59 / Pseudocode 116) instead of forcing 0.
+
 ### Changed
 
 - `audio_size` announces the exact `audio_data()` byte length on every

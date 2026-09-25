@@ -2207,8 +2207,12 @@ pub fn run_acpl_5x_pair_pcm(
         alpha_2_dq: &alpha2_dq,
         beta_2_dq: &beta2_dq,
         num_param_bands: cfg_1.num_param_bands,
-        // 5.X multichannel paths set acpl_qmf_band = 0 per §5.7.7.6.1.
-        acpl_qmf_band: 0,
+        // Table 59: `acpl_config_1ch(FULL)` (ASPX_ACPL_2) initialises
+        // `acpl_qmf_band = 0`; `acpl_config_1ch(PARTIAL)` (ASPX_ACPL_1)
+        // carries `acpl_qmf_band_minus1 + 1`, the subband below which
+        // Pseudocode 116 mid/side-combines the carrier with the
+        // residual (§4.3.11.1.4) instead of running the coupling.
+        acpl_qmf_band: cfg_1.qmf_band as u32,
         steep_1: matches!(
             data_1.framing.interpolation_type,
             AcplInterpolationType::Steep

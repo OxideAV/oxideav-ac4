@@ -1004,15 +1004,26 @@ fn parse_aspx_acpl_1_2_inner_body(
     let Some(aspx_cfg) = tools.aspx_config else {
         return Ok(());
     };
-    // aspx_data_2ch() then aspx_data_1ch().
-    if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base).is_err()
-    {
+    // aspx_data_2ch() then aspx_data_1ch() — Table 213 row
+    // "5_X_channel_element, codec mode 2,3: (L, R), C". Each trailer is
+    // captured as its own `FiveXAspxTrailer` (the capture helpers
+    // snapshot / restore the generic slots, so the 1ch centre trailer
+    // no longer overwrites the pair's primary envelope) and then
+    // mirrored into the generic slots in wire order for inspection.
+    let Some(front) =
+        crate::asf::capture_aspx_data_2ch_trailer(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+    else {
         return Ok(());
-    }
-    if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base).is_err()
-    {
+    };
+    crate::asf::expose_trailer_in_tools(tools, &front);
+    tools.acpl_pair_aspx_front = Some(front);
+    let Some(centre) =
+        crate::asf::capture_aspx_data_1ch_trailer(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+    else {
         return Ok(());
-    }
+    };
+    crate::asf::expose_trailer_in_tools(tools, &centre);
+    tools.acpl_pair_aspx_centre = Some(centre);
     // acpl_data_1ch()×2 — pair entries [0] / [1] per Pseudocode 117.
     // The active acpl_config_1ch was parsed earlier in the I-frame
     // header — `acpl_config_1ch_partial` for ASPX_ACPL_1, full for ACPL_2.
@@ -1403,7 +1414,48 @@ pub fn parse_7x_audio_data_outer(
     // `if (7_X_codec_mode != SIMPLE) { aspx_data_2ch + aspx_data_2ch
     // + aspx_data_1ch }` — covers the L/R + Ls/Rs front pair and the
     // additional-channel pair plus the centre mono.
-    if !matches!(mode, SevenXCodecMode::Simple) {
+    if matches!(
+        mode,
+        SevenXCodecMode::AspxAcpl1 | SevenXCodecMode::AspxAcpl2
+    ) {
+        // Table 213 row "7_X_channel_element, codec mode 2,3:
+        // (L, R), (Ls, Rs), C" — three separately captured trailers
+        // (front pair, A-CPL carrier pair, centre), each mirrored
+        // into the generic slots in wire order for inspection.
+        let Some(front) = crate::asf::capture_aspx_data_2ch_trailer(
+            br,
+            tools,
+            &aspx_cfg,
+            b_iframe,
+            frame_len_base,
+        ) else {
+            return Ok(());
+        };
+        crate::asf::expose_trailer_in_tools(tools, &front);
+        tools.acpl_pair_aspx_front = Some(front);
+        let Some(surround) = crate::asf::capture_aspx_data_2ch_trailer(
+            br,
+            tools,
+            &aspx_cfg,
+            b_iframe,
+            frame_len_base,
+        ) else {
+            return Ok(());
+        };
+        crate::asf::expose_trailer_in_tools(tools, &surround);
+        tools.acpl_pair_aspx_surround = Some(surround);
+        let Some(centre) = crate::asf::capture_aspx_data_1ch_trailer(
+            br,
+            tools,
+            &aspx_cfg,
+            b_iframe,
+            frame_len_base,
+        ) else {
+            return Ok(());
+        };
+        crate::asf::expose_trailer_in_tools(tools, &centre);
+        tools.acpl_pair_aspx_centre = Some(centre);
+    } else if !matches!(mode, SevenXCodecMode::Simple) {
         if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {

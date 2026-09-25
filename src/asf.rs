@@ -1663,6 +1663,25 @@ pub struct SubstreamTools {
     /// for any path other than 5_X / 7_X ACPL_1, or when the inner
     /// walker bailed before reaching `max_sfb_master`.
     pub acpl_1_residual_max_sfb_master: Option<u32>,
+    /// A-SPX trailers of the 5_X / 7_X `ASPX_ACPL_1` / `ASPX_ACPL_2`
+    /// bodies, captured per element in the Table 213 order:
+    ///
+    /// * 5_X (`(L, R), C`): `acpl_pair_aspx_front` = the
+    ///   `aspx_data_2ch()` over the Table 181 `[A, B]` carrier pair,
+    ///   `acpl_pair_aspx_centre` = the `aspx_data_1ch()` over `C`.
+    /// * 7_X (`(L, R), (Ls, Rs), C`): `acpl_pair_aspx_front` = the
+    ///   first `aspx_data_2ch()` over the Table 184 `[A, B]` pair,
+    ///   `acpl_pair_aspx_surround` = the second one over `[D, E]` (the
+    ///   A-CPL carrier pair per Table 202), `acpl_pair_aspx_centre` =
+    ///   the `aspx_data_1ch()` over `C`.
+    ///
+    /// `None` when the walker bailed before the trailer or the mode
+    /// carries no such element (5_X has no surround trailer).
+    pub acpl_pair_aspx_front: Option<aspx::FiveXAspxTrailer>,
+    /// See [`Self::acpl_pair_aspx_front`] — 7_X `(Ls, Rs)` trailer.
+    pub acpl_pair_aspx_surround: Option<aspx::FiveXAspxTrailer>,
+    /// See [`Self::acpl_pair_aspx_front`] — centre `aspx_data_1ch()`.
+    pub acpl_pair_aspx_centre: Option<aspx::FiveXAspxTrailer>,
     /// `7_X_codec_mode` (§4.3.5.7 Table 98) for 7.X channel-element
     /// substreams. Populated by [`crate::mch::parse_7x_audio_data_outer`].
     /// Note this is a 2-bit field for 7_X (vs 3 bits for 5_X) — only
@@ -2258,6 +2277,56 @@ fn record_sticky_xover(tools: &mut SubstreamTools, idx: usize) {
             tools.aspx_xover_sticky.resize(idx + 1, x);
         }
         tools.aspx_xover_sticky[idx] = x;
+    }
+}
+
+/// Mirror a captured [`aspx::FiveXAspxTrailer`] into the per-substream
+/// "generic" A-SPX slots of `tools` (`aspx_data_sig_primary`, framing,
+/// xover, frequency tables, …). The capture helpers snapshot / restore
+/// those slots so consecutive trailers of one element never clobber
+/// each other; the multichannel A-CPL walkers still surface the parsed
+/// trailers here afterwards so the inspection surface (tests, the
+/// P-frame `has_aspx` probes) keeps seeing what the element carried.
+/// Secondary-channel slots are only written for 2-channel trailers.
+pub(crate) fn expose_trailer_in_tools(
+    tools: &mut SubstreamTools,
+    trailer: &aspx::FiveXAspxTrailer,
+) {
+    tools.aspx_xover_subband_offset = Some(trailer.xover);
+    tools.aspx_frequency_tables = Some(trailer.frequency_tables.clone());
+    tools.aspx_framing_primary = Some(trailer.primary.framing.clone());
+    tools.aspx_qmode_env_primary = Some(trailer.primary.qmode_env);
+    tools.aspx_delta_dir_primary = Some(trailer.primary.delta_dir.clone());
+    tools.aspx_data_sig_primary = Some(trailer.primary.data_sig.clone());
+    tools.aspx_data_noise_primary = Some(trailer.primary.data_noise.clone());
+    if let Some(sec) = trailer.secondary.as_ref() {
+        tools.aspx_balance = Some(trailer.balance);
+        tools.aspx_framing_secondary = Some(sec.framing.clone());
+        tools.aspx_qmode_env_secondary = Some(sec.qmode_env);
+        tools.aspx_delta_dir_secondary = Some(sec.delta_dir.clone());
+        tools.aspx_data_sig_secondary = Some(sec.data_sig.clone());
+        tools.aspx_data_noise_secondary = Some(sec.data_noise.clone());
+        if let (Some(ah0), Some(ah1), Some(t0), Some(t1)) = (
+            trailer.primary.add_harmonic.as_ref(),
+            sec.add_harmonic.as_ref(),
+            trailer.primary.tna_mode.as_ref(),
+            sec.tna_mode.as_ref(),
+        ) {
+            tools.aspx_hfgen_iwc_2ch = Some(aspx::AspxHfgenIwc2Ch {
+                add_harmonic: [ah0.clone(), ah1.clone()],
+                tna_mode: [t0.clone(), t1.clone()],
+                ..Default::default()
+            });
+        }
+    } else if let (Some(ah), Some(t)) = (
+        trailer.primary.add_harmonic.as_ref(),
+        trailer.primary.tna_mode.as_ref(),
+    ) {
+        tools.aspx_hfgen_iwc_1ch = Some(aspx::AspxHfgenIwc1Ch {
+            add_harmonic: ah.clone(),
+            tna_mode: t.clone(),
+            ..Default::default()
+        });
     }
 }
 
