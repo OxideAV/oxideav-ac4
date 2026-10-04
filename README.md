@@ -327,7 +327,7 @@ an S16 `AudioFrame`:
 
 The **framework encoder** (`encoder::Ac4Encoder`, registered next to
 the decoder and reachable through `oxideav_core::CodecRegistry::
-first_encoder` / `make_encoder`) turns the per-layout `Ac4ImsEncoder`
+first_encoder` or `oxideav_pipeline::make_encoder`) turns the per-layout `Ac4ImsEncoder`
 entry points into a stream encoder: `CodecParameters::channels`
 selects the layout (mono / stereo / 5.0 / 5.1 / 7.0 / 7.1 / 7.0.4 /
 7.1.4 / 9.0.4 / 9.1.4 / 22.2), input frames of any sample format are
@@ -596,7 +596,6 @@ parses back to the authored rows.
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
 oxideav-ac4 = "0.0"
 ```
 
