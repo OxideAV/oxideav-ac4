@@ -827,7 +827,7 @@ mod tests {
         let est = vec![vec![1.0_f32]; 2];
         let scf_sig = vec![vec![1.0_f32]; 2];
         let sig_gain = vec![vec![1000.0_f32]; 2]; // pretend Pseudocode 95
-                                                  // produced a runaway.
+        // produced a runaway.
         let sine = vec![vec![0.0_f32]; 2];
         let noise = vec![vec![0.5_f32]; 2];
         let out = run(

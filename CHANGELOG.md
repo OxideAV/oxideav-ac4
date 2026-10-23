@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95.
+
 ### Added
 
 - `encode_frame_pcm_5_{0,1}_acpl1_real_aspx` — 5.X ASPX_ACPL_1 with

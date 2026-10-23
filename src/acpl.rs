@@ -147,10 +147,10 @@ impl AcplHcb {
 /// §4.3.11.6.1 Pseudocode 8. Returns the matching A-CPL Huffman
 /// codebook handle that `acpl_huff_data()` should pull from.
 pub fn get_acpl_hcb(dt: AcplDataType, qm: AcplQuantMode, ht: AcplHcbType) -> AcplHcb {
-    use acpl_huffman::*;
     use AcplDataType::*;
     use AcplHcbType::*;
     use AcplQuantMode::*;
+    use acpl_huffman::*;
     match (dt, qm, ht) {
         // ALPHA — Tables A.34..A.39
         // ALPHA F0 codebooks are symmetric around the center index — Coarse

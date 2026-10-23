@@ -109,11 +109,7 @@ pub fn n_msfb_bits_48(transform_length: u32) -> Option<(u32, u32, u32)> {
 /// `transf_length` *index* (0..=3), not the resolved transform length.
 #[inline]
 pub fn n_sect_bits(transf_length_idx: u32) -> u32 {
-    if transf_length_idx <= 2 {
-        3
-    } else {
-        5
-    }
+    if transf_length_idx <= 2 { 3 } else { 5 }
 }
 
 // TODO: `sfb_offset_48()` — Tables B.4 / B.5 / B.6. These are long

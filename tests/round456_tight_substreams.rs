@@ -13,7 +13,7 @@
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder::{Ac4Encoder, Ac4EncoderOptions, EncodeMode, Framing};
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
-use oxideav_ac4::metadata::{parse_metadata, parse_metadata_v2, MetadataContext, MetadataState};
+use oxideav_ac4::metadata::{MetadataContext, MetadataState, parse_metadata, parse_metadata_v2};
 use oxideav_ac4::toc::parse_ac4_toc;
 use oxideav_core::bits::BitReader;
 use oxideav_core::{

@@ -49,7 +49,9 @@ fn decode_one(dec: &mut Ac4Decoder, bytes: Vec<u8>, expect_ch: usize) -> Vec<i16
     assert_eq!(af.samples, 1920);
     let raw = &af.data[0];
     assert_eq!(raw.len(), 1920 * expect_ch * 2, "{expect_ch}-ch S16");
-    raw.chunks_exact(2)
+    raw.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
 }

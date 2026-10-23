@@ -430,10 +430,8 @@ pub fn parse_de_data(br: &mut BitReader<'_>, cfg: DeConfig, b_iframe: bool) -> R
                 de_par.push(bands);
                 // Per spec: ref_val = de_par[ch][0] for the next channel
                 // when iterating across channels in I-frames.
-                if b_iframe {
-                    if let Some(last) = de_par.last() {
-                        ref_val = last[0];
-                    }
+                if b_iframe && let Some(last) = de_par.last() {
+                    ref_val = last[0];
                 }
             }
 
@@ -579,7 +577,7 @@ mod tests {
         bw.write_u32(0, 2); // de_method = 0
         bw.write_u32(0, 2); // de_max_gain
         bw.write_u32(1, 3); // de_channel_config = 1 -> Centre, nr_channels=1
-                            // No Huffman data follows. parse_de_data should hit EOF.
+        // No Huffman data follows. parse_de_data should hit EOF.
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -738,7 +736,7 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(7, 5); // mix_coef1_idx = 7
         bw.write_u32(11, 5); // mix_coef2_idx = 11
-                             // ch=0: ABS_1 value 0 (sym 30)
+        // ch=0: ABS_1 value 0 (sym 30)
         bw.write_u32(DE_HCB_ABS_1_CW[30], DE_HCB_ABS_1_LEN[30] as u32);
         for _ in 1..DE_NR_BANDS {
             bw.write_u32(DE_HCB_DIFF_1_CW[60], DE_HCB_DIFF_1_LEN[60] as u32);
@@ -812,11 +810,11 @@ mod tests {
         // method=0 (ChannelIndependent), 1 channel (Centre).
         let mut bw = BitWriter::new();
         bw.write_u32(1, 1); // b_de_data_present
-                            // de_config inline
+        // de_config inline
         bw.write_u32(0, 2); // method 0
         bw.write_u32(0, 2); // max_gain 0
         bw.write_u32(0b001, 3); // channel_config = Centre = 1 ch
-                                // de_data: ABS_0 sym 0 then 7 DIFF_0 zeros
+        // de_data: ABS_0 sym 0 then 7 DIFF_0 zeros
         bw.write_u32(DE_HCB_ABS_0_CW[0], DE_HCB_ABS_0_LEN[0] as u32);
         for _ in 1..DE_NR_BANDS {
             bw.write_u32(DE_HCB_DIFF_0_CW[31], DE_HCB_DIFF_0_LEN[31] as u32);
@@ -847,7 +845,7 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(1, 1); // b_de_data_present
         bw.write_u32(0, 1); // de_config_flag=0
-                            // method 0 + nr_channels 1 → no cross-channel pan bits.
+        // method 0 + nr_channels 1 → no cross-channel pan bits.
         bw.write_u32(1, 1); // de_keep_data_flag=1 → no de_par bits
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -956,7 +954,7 @@ mod tests {
         };
         let mut bw = BitWriter::new();
         bw.write_u32(9, 5); // mix_coef1_idx (no mix_coef2 for 2 ch)
-                            // ch0: abs + 7 diffs; ch1: 8 diffs (table_idx for method 1 == 1).
+        // ch0: abs + 7 diffs; ch1: 8 diffs (table_idx for method 1 == 1).
         write_de_abs_huffman(&mut bw, 1, 0).unwrap();
         for _ in 0..7 {
             write_de_diff_huffman(&mut bw, 1, 0).unwrap();

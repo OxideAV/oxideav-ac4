@@ -35,8 +35,8 @@
 
 use crate::acpl::{AcplHcbType, AcplQuantMode};
 use crate::ajcc::{
+    AJCC_NUM_BANDS_TABLE, AjccData, AjccDataType, AjccFramingData, AjccState, Ajced,
     ajcc_differential_decode, encode_ajcc_deltas_freq, encode_ajcc_deltas_time, get_ajcc_hcb,
-    AjccData, AjccDataType, AjccFramingData, AjccState, Ajced, AJCC_NUM_BANDS_TABLE,
 };
 use crate::ajoc::AjocDiffType;
 
@@ -96,11 +96,7 @@ pub fn quantize_ajcc_alpha_raw(alpha: f32, qm: AcplQuantMode) -> i32 {
 /// extractors.
 pub fn quantize_ajcc_beta(beta: f32, qm: AcplQuantMode) -> i32 {
     let q = crate::encoder_acpl3::quantise_beta_magnitude(beta.abs(), qm);
-    if beta < 0.0 {
-        -q
-    } else {
-        q
-    }
+    if beta < 0.0 { -q } else { q }
 }
 
 // ---------------------------------------------------------------------
@@ -549,10 +545,10 @@ pub fn build_ajcc_data(
     }
     // A stored state from the other layout has a different SET roster
     // and cannot serve as a TIME reference.
-    if let Some(p) = &state.prev {
-        if p.dry_prev.len() != rows.dry.len() || p.wet_prev.len() != rows.wet.len() {
-            state.prev = None;
-        }
+    if let Some(p) = &state.prev
+        && (p.dry_prev.len() != rows.dry.len() || p.wet_prev.len() != rows.wet.len())
+    {
+        state.prev = None;
     }
     let have_prev = state.prev.is_some();
     let mut prev = state
@@ -565,11 +561,7 @@ pub fn build_ajcc_data(
             // dry SETs 0..4 are front (qm_f), 4..8 back (qm_b); wet
             // SETs 0..6 front, 6..12 back.
             let front = if is_dry { set_idx < 4 } else { set_idx < 6 };
-            if front {
-                cfg.qm_first
-            } else {
-                cfg.qm_second
-            }
+            if front { cfg.qm_first } else { cfg.qm_second }
         } else {
             cfg.qm_second
         }
@@ -861,14 +853,17 @@ mod tests {
         let data_p = build_ajcc_data(&rows, &cfg, &mut enc_state, false);
         // Stationary rows on a P-frame: TIME rows are all-zero deltas,
         // strictly cheaper than re-sending FREQ.
-        assert!(data_p.dry.iter().all(|s| s
-            .iter()
-            .all(|(d, v)| *d == AjocDiffType::Time && v.iter().all(|&x| x == 0))));
+        assert!(data_p.dry.iter().all(|s| {
+            s.iter()
+                .all(|(d, v)| *d == AjocDiffType::Time && v.iter().all(|&x| x == 0))
+        }));
         // A new I-frame must go back to FREQ everywhere.
         let data_i = build_ajcc_data(&rows, &cfg, &mut enc_state, true);
-        assert!(data_i
-            .dry
-            .iter()
-            .all(|s| s.iter().all(|(d, _)| *d == AjocDiffType::Freq)));
+        assert!(
+            data_i
+                .dry
+                .iter()
+                .all(|s| s.iter().all(|(d, _)| *d == AjocDiffType::Freq))
+        );
     }
 }

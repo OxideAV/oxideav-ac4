@@ -556,14 +556,13 @@ pub fn hf_tile_tns(
                         sample.1 += prod.1;
                     }
                 }
-                if let Some(gv) = gain_vec {
-                    if let Some(&g_p) = gv.get(p) {
-                        if g_p != 0.0 {
-                            let inv = 1.0 / g_p;
-                            sample.0 *= inv;
-                            sample.1 *= inv;
-                        }
-                    }
+                if let Some(gv) = gain_vec
+                    && let Some(&g_p) = gv.get(p)
+                    && g_p != 0.0
+                {
+                    let inv = 1.0 / g_p;
+                    sample.0 *= inv;
+                    sample.1 *= inv;
                 }
                 q_high[sb_high as usize][ts] = sample;
             }
@@ -621,8 +620,8 @@ mod tests {
         let mut state = AspxTnsState::new();
         state.tna_mode_prev = vec![3]; // prev=Heavy
         state.chirp_prev = vec![0.9]; // high
-                                      // curr=None → tab[Heavy][None]=0.0; new=0.0 < 0.9 → decay.
-                                      // result = 0.75 * 0.0 + 0.25 * 0.9 = 0.225.
+        // curr=None → tab[Heavy][None]=0.0; new=0.0 < 0.9 → decay.
+        // result = 0.75 * 0.0 + 0.25 * 0.9 = 0.225.
         let r = chirp_factors(&[0_u8], &state);
         assert!((r.chirp_arr[0] - 0.225).abs() < 1e-6);
     }
@@ -633,8 +632,8 @@ mod tests {
         let mut state = AspxTnsState::new();
         state.tna_mode_prev = vec![0];
         state.chirp_prev = vec![0.01]; // already small
-                                       // curr=None → tab=0; attack? 0 >= 0.01? false → decay branch.
-                                       // result = 0.75 * 0 + 0.25 * 0.01 = 0.0025 < 0.015625 → 0.
+        // curr=None → tab=0; attack? 0 >= 0.01? false → decay branch.
+        // result = 0.75 * 0 + 0.25 * 0.01 = 0.0025 < 0.015625 → 0.
         let r = chirp_factors(&[0_u8], &state);
         assert_eq!(r.chirp_arr[0], 0.0);
     }

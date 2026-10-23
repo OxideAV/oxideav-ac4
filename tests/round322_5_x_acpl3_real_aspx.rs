@@ -47,14 +47,15 @@
 //! Pseudocodes 90–91.
 
 use oxideav_ac4::aspx::{
+    AspxConfig, AspxDataType, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, AspxStereoMode,
     derive_aspx_frequency_tables, num_aspx_timeslots, num_ts_in_ats, parse_aspx_delta_dir,
-    parse_aspx_ec_data, parse_aspx_framing, parse_aspx_hfgen_iwc_2ch, AspxConfig, AspxDataType,
-    AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, AspxStereoMode,
+    parse_aspx_ec_data, parse_aspx_framing, parse_aspx_hfgen_iwc_2ch,
 };
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_acpl3::{
+    AspxQmfEnvelopeChannel,
     build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx,
-    build_aspx_real_envelope_channel_from_qmf, qmf_slots_to_sb_major, AspxQmfEnvelopeChannel,
+    build_aspx_real_envelope_channel_from_qmf, qmf_slots_to_sb_major,
 };
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
 use oxideav_ac4::qmf::QmfAnalysisBank;
@@ -274,7 +275,7 @@ fn acpl3_real_aspx_body_recovers_envelope_through_parser() {
 
     // Re-emit just the aspx_data_2ch() element with the same envelopes
     // and confirm the parser recovers them entry-for-entry.
-    use oxideav_ac4::encoder_acpl3::{write_aspx_data_2ch_real_envelope, AspxRealEnvelopeChannel};
+    use oxideav_ac4::encoder_acpl3::{AspxRealEnvelopeChannel, write_aspx_data_2ch_real_envelope};
     use oxideav_core::bits::BitWriter;
     let mut bw = BitWriter::new();
     write_aspx_data_2ch_real_envelope(

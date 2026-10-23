@@ -515,11 +515,7 @@ pub enum AspxMasterFreqScale {
 
 impl AspxMasterFreqScale {
     pub fn from_bit(v: u32) -> Self {
-        if v == 0 {
-            Self::LowRes
-        } else {
-            Self::HighRes
-        }
+        if v == 0 { Self::LowRes } else { Self::HighRes }
     }
 }
 
@@ -537,11 +533,7 @@ pub enum AspxQuantStep {
 
 impl AspxQuantStep {
     pub fn from_bit(v: u32) -> Self {
-        if v == 0 {
-            Self::Fine
-        } else {
-            Self::Coarse
-        }
+        if v == 0 { Self::Fine } else { Self::Coarse }
     }
 }
 
@@ -846,11 +838,7 @@ pub fn apply_companding_on_qmf_with_mode(
         // Avoid 0^negative_exp = inf when l == 0; identity-gain
         // (g = 1) on a silent slot is well-defined and avoids
         // surprising the downstream noise / tone injection.
-        if l > 0.0 {
-            l.powf(exp_g)
-        } else {
-            1.0
-        }
+        if l > 0.0 { l.powf(exp_g) } else { 1.0 }
     };
     let scales: Vec<f32> = match mode {
         CompandingMode::PerSlot | CompandingMode::SyncPerSlot => {
@@ -1767,11 +1755,7 @@ pub fn num_qmf_timeslots(frame_len_base: u32) -> u32 {
 /// time slot — per ETSI TS 103 190-1 §5.7.6.3.3.0 (Table 192). Two for
 /// `frame_length >= 1536`, one for shorter frames.
 pub fn num_ts_in_ats(frame_len_base: u32) -> u32 {
-    if frame_len_base >= 1536 {
-        2
-    } else {
-        1
-    }
+    if frame_len_base >= 1536 { 2 } else { 1 }
 }
 
 /// Return `num_aspx_timeslots = num_qmf_timeslots / num_ts_in_ats` per
@@ -2109,7 +2093,7 @@ pub fn derive_sig_sbg_tables(
     let num_sbg_sig_lowres = num_sbg_sig_highres - num_sbg_sig_highres / 2;
     let mut sbg_sig_lowres = Vec::with_capacity((num_sbg_sig_lowres + 1) as usize);
     sbg_sig_lowres.push(sbg_sig_highres[0]);
-    if num_sbg_sig_highres % 2 == 0 {
+    if num_sbg_sig_highres.is_multiple_of(2) {
         for sbg in 1..=num_sbg_sig_lowres {
             sbg_sig_lowres.push(sbg_sig_highres[(2 * sbg) as usize]);
         }
@@ -2500,7 +2484,7 @@ pub fn derive_fixvar_atsg(num_aspx_timeslots: u32, framing: &AspxFraming) -> Opt
     borders.push(t); // border_vector[num_env] = T
     let b_right = t - var_bord_right;
     borders.push(b_right); // border_vector[num_env - 1] = T - var_bord_right
-                           // Remaining from rel_bord_right (applied right-to-left).
+    // Remaining from rel_bord_right (applied right-to-left).
     let mut anchor = b_right;
     for &rel in framing.rel_bord_right.iter().rev() {
         let rel = rel as u32;
@@ -2511,7 +2495,7 @@ pub fn derive_fixvar_atsg(num_aspx_timeslots: u32, framing: &AspxFraming) -> Opt
         borders.push(anchor);
     }
     borders.reverse(); // now ascending
-                       // Verify monotone strictly increasing.
+    // Verify monotone strictly increasing.
     for w in borders.windows(2) {
         if w[0] >= w[1] {
             return None;
@@ -2594,7 +2578,7 @@ pub fn derive_varvar_atsg(num_aspx_timeslots: u32, framing: &AspxFraming) -> Opt
         return None;
     }
     let b_right_anchor = t - var_bord_right; // T - var_bord_right
-                                             // Left anchors.
+    // Left anchors.
     let mut borders: Vec<u32> = Vec::with_capacity(num_env + 1);
     borders.push(var_bord_left);
     let mut anchor = var_bord_left;
@@ -5757,7 +5741,7 @@ mod tests {
         // sbx, run HF tile copy into the high band, and check that the
         // high-band QMF matrix is non-zero. This is the key "ASPX
         // substream should produce actual audio" building block.
-        use crate::qmf::{QmfAnalysisBank, NUM_QMF_SUBBANDS};
+        use crate::qmf::{NUM_QMF_SUBBANDS, QmfAnalysisBank};
         let n_slots = 32usize;
         let n = n_slots * 64;
         let mut pcm = vec![0.0f32; n];
@@ -5810,7 +5794,7 @@ mod tests {
         // synthesise back to PCM. The output PCM must be non-silent —
         // this is the end-to-end check that the whole bandwidth
         // extension pipeline delivers audio rather than zeros.
-        use crate::qmf::{QmfAnalysisBank, QmfSynthesisBank, NUM_QMF_SUBBANDS};
+        use crate::qmf::{NUM_QMF_SUBBANDS, QmfAnalysisBank, QmfSynthesisBank};
         let n_slots = 60usize;
         let n = n_slots * 64;
         let mut pcm = vec![0.0f32; n];
@@ -6582,7 +6566,7 @@ mod tests {
     /// signature of the added harmonic + noise floor.
     #[test]
     fn inject_noise_and_tone_adds_tone_and_noise_floor() {
-        use crate::qmf::{QmfAnalysisBank, QmfSynthesisBank, NUM_QMF_SUBBANDS};
+        use crate::qmf::{NUM_QMF_SUBBANDS, QmfAnalysisBank, QmfSynthesisBank};
         // 48 kHz, 1 kHz sine source.
         let fs = 48_000.0_f32;
         let f0 = 1_000.0_f32;

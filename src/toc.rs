@@ -24,11 +24,7 @@ use oxideav_core::{Error, Result};
 /// via the `sf_multiplier` inside each substream.
 #[inline]
 pub fn base_sample_rate(fs_index: u32) -> u32 {
-    if fs_index == 0 {
-        44_100
-    } else {
-        48_000
-    }
+    if fs_index == 0 { 44_100 } else { 48_000 }
 }
 
 /// `frame_rate_index` → (frames-per-second × 1000, internal frame length

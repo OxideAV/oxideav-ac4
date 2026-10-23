@@ -164,7 +164,7 @@ fn extract_beta_q_emits_nonzero_for_carrier_only_input() {
 /// non-zero case.
 #[test]
 fn acpl_data_1ch_real_alpha_beta_round_trips_byte_exact() {
-    use oxideav_ac4::acpl::{parse_acpl_data_1ch, AcplQuantMode};
+    use oxideav_ac4::acpl::{AcplQuantMode, parse_acpl_data_1ch};
     use oxideav_ac4::encoder_acpl3::write_acpl_data_1ch_real_alpha_beta_bytes;
     use oxideav_core::bits::BitReader;
 

@@ -806,7 +806,7 @@ fn validate_ssf_pred_coeff_matrices() {
     let r = parse_c_arrays(&src);
 
     macro_rules! check_mat {
-        ($($idx:expr),* $(,)?) => {
+        ($($idx:expr_2021),* $(,)?) => {
             $(
                 {
                     let name = concat!("ssf_pred_coeff_mat", stringify!($idx));

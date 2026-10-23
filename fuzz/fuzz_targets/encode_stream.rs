@@ -1,7 +1,7 @@
 //! Framework-encoder round trip: the leading bytes pick the layout,
 //! tool family, packet framing, frame-rate index, bandwidth, band gate
-//! and GOP; the rest is S16 PCM fed through `Ac4Encoder` (FIFO framing
-//! + flush) and every produced packet is decoded again with
+//! and GOP; the rest is S16 PCM fed through `Ac4Encoder` (FIFO framing and
+//! flush) and every produced packet is decoded again with
 //! `Ac4Decoder`. Construction errors and decode errors are fine; a
 //! panic anywhere on the writer / reader path is a finding.
 #![no_main]

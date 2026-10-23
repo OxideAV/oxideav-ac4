@@ -34,7 +34,7 @@
 
 use crate::acpl::sb_to_pb;
 use crate::acpl_synth::{
-    apply_transient_ducker, compute_p_energy, DecorrelatorId, InputSignalModifier, TransientDucker,
+    DecorrelatorId, InputSignalModifier, TransientDucker, apply_transient_ducker, compute_p_energy,
 };
 use crate::ajcc::AjccFramingData;
 use crate::qmf::NUM_QMF_SUBBANDS;
@@ -98,11 +98,7 @@ pub fn interpolate_ajcc(
         // Steep interpolation.
         let slot = |i: usize| framing.param_timeslot.get(i).copied().unwrap_or(0) as usize;
         if num_pset == 1 {
-            if ts < slot(0) {
-                prev_sb
-            } else {
-                p(0)
-            }
+            if ts < slot(0) { prev_sb } else { p(0) }
         } else if ts < slot(0) {
             prev_sb
         } else if ts < slot(1) {
@@ -1544,7 +1540,7 @@ mod tests {
         // the targets and the output is exactly flat.
         use crate::acpl::AcplQuantMode;
         use crate::ajcc::{
-            decode_ajcc, encode_ajcc_deltas_freq, write_ajcc_data, AjccData, AjccState,
+            AjccData, AjccState, decode_ajcc, encode_ajcc_deltas_freq, write_ajcc_data,
         };
         use crate::ajoc::AjocDiffType;
         use oxideav_core::bits::{BitReader, BitWriter};
@@ -1563,11 +1559,7 @@ mod tests {
 
         let mk_frame = |iframe: bool| -> AjccData {
             let row = |q: &[i32]| {
-                if iframe {
-                    freq_row(q)
-                } else {
-                    time_zero_row()
-                }
+                if iframe { freq_row(q) } else { time_zero_row() }
             };
             AjccData {
                 b_5fronts: false,

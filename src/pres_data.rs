@@ -13,10 +13,10 @@
 //! §6.3.10.3 (downmix coefficients — shared with
 //! [`crate::dmx_coeff`]).
 
-use crate::dmx_coeff::{parse_stereo_dmx_coeff, write_stereo_dmx_coeff, StereoDmxCoeff};
+use crate::dmx_coeff::{StereoDmxCoeff, parse_stereo_dmx_coeff, write_stereo_dmx_coeff};
 use crate::oamd::{
-    parse_tool_three_way, parse_tool_two_way, write_tool_three_way, write_tool_two_way,
-    ToolThreeWay, ToolTwoWay,
+    ToolThreeWay, ToolTwoWay, parse_tool_three_way, parse_tool_two_way, write_tool_three_way,
+    write_tool_two_way,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
@@ -431,11 +431,7 @@ pub fn bs_ch_config(
             if pres_ch_mode >= 13 && b_pres_4_back_channels_present {
                 0
             } else if pres_ch_mode <= 12 {
-                if b_pres_4_back_channels_present {
-                    1
-                } else {
-                    2
-                }
+                if b_pres_4_back_channels_present { 1 } else { 2 }
             } else {
                 -1
             }
@@ -444,11 +440,7 @@ pub fn bs_ch_config(
             if pres_ch_mode >= 13 && b_pres_4_back_channels_present {
                 3
             } else if pres_ch_mode <= 12 {
-                if b_pres_4_back_channels_present {
-                    4
-                } else {
-                    5
-                }
+                if b_pres_4_back_channels_present { 4 } else { 5 }
             } else {
                 -1
             }
@@ -1203,29 +1195,33 @@ mod tests {
     #[test]
     fn loud_corr_write_rejects_closed_gates() {
         let mut bw = BitWriter::new();
-        assert!(write_loud_corr(
-            &mut bw,
-            &LoudCorr {
-                b_obj_loud_corr: true,
-                ..Default::default()
-            },
-            0,
-            -1,
-            false,
-        )
-        .is_err());
+        assert!(
+            write_loud_corr(
+                &mut bw,
+                &LoudCorr {
+                    b_obj_loud_corr: true,
+                    ..Default::default()
+                },
+                0,
+                -1,
+                false,
+            )
+            .is_err()
+        );
         let mut bw = BitWriter::new();
-        assert!(write_loud_corr(
-            &mut bw,
-            &LoudCorr {
-                loro_dmx_loud_corr: Some(1),
-                ..Default::default()
-            },
-            1,
-            -1,
-            false,
-        )
-        .is_err());
+        assert!(
+            write_loud_corr(
+                &mut bw,
+                &LoudCorr {
+                    loro_dmx_loud_corr: Some(1),
+                    ..Default::default()
+                },
+                1,
+                -1,
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]

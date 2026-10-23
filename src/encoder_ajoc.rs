@@ -29,9 +29,9 @@
 
 use crate::ajoc::{AjocCtrlInfo, AjocDiffState, AjocDiffType, AjocMatrixKind, AjocQuantMode};
 use crate::ajoc_data::{
-    encode_ajoc_deltas_freq, encode_ajoc_deltas_time, write_ajoc, AjocData, AjocHuffRow,
+    AjocData, AjocHuffRow, encode_ajoc_deltas_freq, encode_ajoc_deltas_time, write_ajoc,
 };
-use crate::ajoc_huffman::{get_ajoc_hcb, AjocHcbType};
+use crate::ajoc_huffman::{AjocHcbType, get_ajoc_hcb};
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{Error, Result};
 
@@ -108,14 +108,12 @@ pub fn choose_row_coding(
     let freq_cost = freq_row_bits(&freq_deltas, kind, mode, b_dfonly)
         .ok_or_else(|| Error::invalid("ac4: A-JOC quantised row out of grid"))?;
 
-    if !b_dfonly {
-        if let Some(prev) = prev {
-            let time_deltas = encode_ajoc_deltas_time(q, prev);
-            if let Some(dt_bits) = row_bits(&time_deltas, kind, mode, AjocHcbType::Dt) {
-                let time_cost = dt_bits + 1; // diff_type bit
-                if time_cost < freq_cost {
-                    return Ok((AjocDiffType::Time, time_deltas, time_cost));
-                }
+    if !b_dfonly && let Some(prev) = prev {
+        let time_deltas = encode_ajoc_deltas_time(q, prev);
+        if let Some(dt_bits) = row_bits(&time_deltas, kind, mode, AjocHcbType::Dt) {
+            let time_cost = dt_bits + 1; // diff_type bit
+            if time_cost < freq_cost {
+                return Ok((AjocDiffType::Time, time_deltas, time_cost));
             }
         }
     }
@@ -305,7 +303,7 @@ pub fn encode_ajoc(
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
-    use crate::ajoc::{dequantize_dry, dequantize_wet, AjocDataPointInfo};
+    use crate::ajoc::{AjocDataPointInfo, dequantize_dry, dequantize_wet};
     use crate::ajoc_data::{decode_ajoc, new_ajoc_diff_state};
     use oxideav_core::bits::BitReader;
 
@@ -397,29 +395,35 @@ mod tests {
             // Smoothly evolving real-valued matrices.
             let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..2)
                 .map(|o| {
-                    vec![(0..2)
-                        .map(|ch| {
-                            (0..nb)
-                                .map(|pb| {
-                                    0.3 * (o as f64 - 0.5)
-                                        + 0.05 * ch as f64
-                                        + 0.02 * pb as f64
-                                        + 0.01 * frame as f64
-                                })
-                                .collect()
-                        })
-                        .collect()]
+                    vec![
+                        (0..2)
+                            .map(|ch| {
+                                (0..nb)
+                                    .map(|pb| {
+                                        0.3 * (o as f64 - 0.5)
+                                            + 0.05 * ch as f64
+                                            + 0.02 * pb as f64
+                                            + 0.01 * frame as f64
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                    ]
                 })
                 .collect();
             let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..2)
                 .map(|o| {
-                    vec![(0..1)
-                        .map(|_| {
-                            (0..nb)
-                                .map(|pb| 0.1 + 0.01 * pb as f64 - 0.005 * frame as f64 * o as f64)
-                                .collect()
-                        })
-                        .collect()]
+                    vec![
+                        (0..1)
+                            .map(|_| {
+                                (0..nb)
+                                    .map(|pb| {
+                                        0.1 + 0.01 * pb as f64 - 0.005 * frame as f64 * o as f64
+                                    })
+                                    .collect()
+                            })
+                            .collect(),
+                    ]
                 })
                 .collect();
             let q = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
@@ -475,26 +479,33 @@ mod tests {
         // only, fresh state) and compare row bits.
         let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..2)
             .map(|o| {
-                vec![(0..2)
-                    .map(|ch| {
-                        (0..nb)
-                            .map(|pb| {
-                                0.3 * (o as f64 - 0.5) + 0.05 * ch as f64 + 0.02 * pb as f64 + 0.03
-                            })
-                            .collect()
-                    })
-                    .collect()]
+                vec![
+                    (0..2)
+                        .map(|ch| {
+                            (0..nb)
+                                .map(|pb| {
+                                    0.3 * (o as f64 - 0.5)
+                                        + 0.05 * ch as f64
+                                        + 0.02 * pb as f64
+                                        + 0.03
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                ]
             })
             .collect();
         let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..2)
             .map(|o| {
-                vec![(0..1)
-                    .map(|_| {
-                        (0..nb)
-                            .map(|pb| 0.1 + 0.01 * pb as f64 - 0.015 * o as f64)
-                            .collect()
-                    })
-                    .collect()]
+                vec![
+                    (0..1)
+                        .map(|_| {
+                            (0..nb)
+                                .map(|pb| 0.1 + 0.01 * pb as f64 - 0.015 * o as f64)
+                                .collect()
+                        })
+                        .collect(),
+                ]
             })
             .collect();
         let q = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
@@ -528,9 +539,11 @@ mod tests {
                     .collect(),
                 vec![0.0; nb], // absent row: content ignored
             ]]];
-            let wet = vec![vec![vec![(0..nb)
-                .map(|pb| -0.3 + 0.02 * pb as f64 + 0.01 * frame as f64)
-                .collect()]]];
+            let wet = vec![vec![vec![
+                (0..nb)
+                    .map(|pb| -0.3 + 0.02 * pb as f64 + 0.01 * frame as f64)
+                    .collect(),
+            ]]];
             let q = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
 
             let mut bw = BitWriter::new();
@@ -566,9 +579,11 @@ mod tests {
         let nb = 5usize;
         let dry = vec![vec![
             vec![(0..nb).map(|pb| 0.2 * pb as f64).collect::<Vec<f64>>()],
-            vec![(0..nb)
-                .map(|pb| 0.2 * pb as f64 + 0.2)
-                .collect::<Vec<f64>>()],
+            vec![
+                (0..nb)
+                    .map(|pb| 0.2 * pb as f64 + 0.2)
+                    .collect::<Vec<f64>>(),
+            ],
         ]];
         let wet = vec![vec![Vec::<Vec<f64>>::new(), Vec::<Vec<f64>>::new()]];
         let q = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);

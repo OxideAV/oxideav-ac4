@@ -35,7 +35,7 @@ use oxideav_core::{Error, Result};
 
 use crate::asf_data;
 use crate::aspx;
-use crate::huffman::{huff_decode, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN};
+use crate::huffman::{HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN, huff_decode};
 use crate::sfb_offset;
 use crate::tables;
 use crate::toc::variable_bits;
@@ -49,11 +49,7 @@ pub enum MonoCodecMode {
 
 impl MonoCodecMode {
     pub fn from_bit(v: u32) -> Self {
-        if v == 0 {
-            Self::Simple
-        } else {
-            Self::Aspx
-        }
+        if v == 0 { Self::Simple } else { Self::Aspx }
     }
 }
 
@@ -88,11 +84,7 @@ pub enum SpecFrontend {
 
 impl SpecFrontend {
     pub fn from_bit(v: u32) -> Self {
-        if v == 0 {
-            Self::Asf
-        } else {
-            Self::Ssf
-        }
+        if v == 0 { Self::Asf } else { Self::Ssf }
     }
 }
 
@@ -1025,7 +1017,7 @@ pub fn build_chparam_info_sap_data_from_alpha_q(
             // `dpcm_out[sfb] = 0` — the writer walks `sfb += 2` so the
             // odd slot is never read on emit and the decoder inherits
             // from the pair-mate anyway.
-            if used && sfb % 2 == 0 {
+            if used && sfb.is_multiple_of(2) {
                 let code_delta = g != 0 && max_sfb_per_group[g] == max_sfb_prev && delta_code_time;
                 let prev = if code_delta {
                     prev_alpha_row
@@ -1964,10 +1956,11 @@ pub fn parse_mono_audio_data_outer_stateful(
             //     on non-I-frames (the xover-subband-offset is likewise
             //     I-frame-sticky; `parse_aspx_data_1ch_body` skips its
             //     3-bit read when `b_iframe == 0`).
-            if mode != MonoCodecMode::Simple && body_ok {
-                if let Some(cfg) = tools.aspx_config {
-                    parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
-                }
+            if mode != MonoCodecMode::Simple
+                && body_ok
+                && let Some(cfg) = tools.aspx_config
+            {
+                parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
             }
         }
     }
@@ -3290,29 +3283,27 @@ pub fn parse_stereo_audio_data_outer_stateful(
                 StereoCodecMode::AspxAcpl2 => parse_aspx_acpl2_mdct_body(br, tools, frame_len_base),
                 _ => false,
             };
-            if body_ok {
-                if let Some(cfg) = tools.aspx_config {
-                    if parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base).is_ok() {
-                        if let Some(acfg) = acpl_cfg_active {
-                            // §4.2.13.3 Table 61: num_bands =
-                            // acpl_num_param_bands; start =
-                            // acpl_param_band (= sb_to_pb(qmf_band) for
-                            // PARTIAL, 0 for FULL).
-                            let start_band = if acfg.qmf_band == 0 {
-                                0
-                            } else {
-                                crate::acpl::sb_to_pb(acfg.qmf_band as u32, acfg.num_param_bands)
-                            };
-                            if let Ok(d) = crate::acpl::parse_acpl_data_1ch(
-                                br,
-                                acfg.num_param_bands,
-                                start_band,
-                                acfg.quant_mode,
-                            ) {
-                                tools.acpl_data_1ch = Some(d);
-                            }
-                        }
-                    }
+            if body_ok
+                && let Some(cfg) = tools.aspx_config
+                && parse_aspx_data_1ch_body(br, tools, &cfg, b_iframe, frame_len_base).is_ok()
+                && let Some(acfg) = acpl_cfg_active
+            {
+                // §4.2.13.3 Table 61: num_bands =
+                // acpl_num_param_bands; start =
+                // acpl_param_band (= sb_to_pb(qmf_band) for
+                // PARTIAL, 0 for FULL).
+                let start_band = if acfg.qmf_band == 0 {
+                    0
+                } else {
+                    crate::acpl::sb_to_pb(acfg.qmf_band as u32, acfg.num_param_bands)
+                };
+                if let Ok(d) = crate::acpl::parse_acpl_data_1ch(
+                    br,
+                    acfg.num_param_bands,
+                    start_band,
+                    acfg.quant_mode,
+                ) {
+                    tools.acpl_data_1ch = Some(d);
                 }
             }
             return Ok(());
@@ -3333,10 +3324,8 @@ pub fn parse_stereo_audio_data_outer_stateful(
                 frame_len_base,
                 ssf_states.as_deref_mut(),
             );
-            if body_ok {
-                if let Some(cfg) = tools.aspx_config {
-                    parse_aspx_data_2ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
-                }
+            if body_ok && let Some(cfg) = tools.aspx_config {
+                parse_aspx_data_2ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
             }
         }
         return Ok(());
@@ -3514,20 +3503,20 @@ pub(crate) fn parse_stereo_data_body_stateful(
             if tools.scaled_spec_primary.is_none() {
                 body_ok = false;
             }
-        } else if matches!(l, SpecFrontend::Ssf) {
-            if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
-                // The split-MDCT stereo walker doesn't know whether the
-                // surrounding `audio_data()` came from an I-frame —
-                // assume non-I (the safe default; an I-frame body would
-                // have been gated by `b_iframe_global` upstream and
-                // pulled `b_ssf_iframe = 1` from the AC layer
-                // explicitly). We surface the parsed body when
-                // available and silently skip on parse miss.
-                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, state_l_ref) {
-                    tools.ssf_data_primary = Some(d);
-                } else {
-                    body_ok = false;
-                }
+        } else if matches!(l, SpecFrontend::Ssf)
+            && let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base)
+        {
+            // The split-MDCT stereo walker doesn't know whether the
+            // surrounding `audio_data()` came from an I-frame —
+            // assume non-I (the safe default; an I-frame body would
+            // have been gated by `b_iframe_global` upstream and
+            // pulled `b_ssf_iframe = 1` from the AC layer
+            // explicitly). We surface the parsed body when
+            // available and silently skip on parse miss.
+            if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, state_l_ref) {
+                tools.ssf_data_primary = Some(d);
+            } else {
+                body_ok = false;
             }
         }
         if let (Some(ti), Some(psy)) = (ti_r, psy_r.as_ref()) {
@@ -3535,13 +3524,13 @@ pub(crate) fn parse_stereo_data_body_stateful(
             if tools.scaled_spec_secondary.is_none() {
                 body_ok = false;
             }
-        } else if matches!(r, SpecFrontend::Ssf) {
-            if let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base) {
-                if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, state_r_ref) {
-                    tools.ssf_data_secondary = Some(d);
-                } else {
-                    body_ok = false;
-                }
+        } else if matches!(r, SpecFrontend::Ssf)
+            && let Some(cfg) = crate::ssf::SsfFrameConfig::from_frame_len_base(frame_len_base)
+        {
+            if let Ok(d) = crate::ssf::parse_ssf_data(br, false, &cfg, state_r_ref) {
+                tools.ssf_data_secondary = Some(d);
+            } else {
+                body_ok = false;
             }
         }
         body_ok
@@ -3715,10 +3704,8 @@ pub fn walk_ac4_substream_sticky(
     };
     // Non-I-frames reuse the I-frame-sticky configs (aspx_config /
     // acpl_config_* / xover offset) from the last I-frame.
-    if !b_iframe {
-        if let Some(st) = sticky.as_ref() {
-            st.seed(&mut tools);
-        }
+    if !b_iframe && let Some(st) = sticky.as_ref() {
+        st.seed(&mut tools);
     }
     match channels {
         1 => parse_mono_audio_data_outer_stateful(
@@ -3822,10 +3809,8 @@ pub fn walk_ac4_substream_sticky(
 
     // Every I-frame refreshes the sticky configs for the P-frames that
     // follow it (§4.2.6.x: configs are only transmitted on I-frames).
-    if b_iframe {
-        if let Some(st) = sticky {
-            st.harvest(&tools);
-        }
+    if b_iframe && let Some(st) = sticky {
+        st.harvest(&tools);
     }
 
     Ok(Ac4SubstreamInfo {
@@ -4235,7 +4220,7 @@ mod tests {
         };
         let mut bw = BitWriter::new();
         bw.write_u32(20, 6); // max_sfb[0]
-                             // scale_factor_grouping bits (3): 1, 0, 1 => one new group at bit 1.
+        // scale_factor_grouping bits (3): 1, 0, 1 => one new group at bit 1.
         bw.write_u32(1, 1);
         bw.write_u32(0, 1);
         bw.write_u32(1, 1);
@@ -4335,10 +4320,10 @@ mod tests {
         let mut bw = BitWriter::new();
         // n_msfb_bits at 240 = 5 (Table 106).
         bw.write_u32(10, 5); // max_sfb[0]
-                             // b_different_framing triggers:
-                             // n_msfb_bits at 480 = 6.
+        // b_different_framing triggers:
+        // n_msfb_bits at 480 = 6.
         bw.write_u32(15, 6); // max_sfb[1]
-                             // scale_factor_grouping bits (4): 0,0,0,0
+        // scale_factor_grouping bits (4): 0,0,0,0
         bw.write_u32(0, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -4408,7 +4393,7 @@ mod tests {
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(0b01, 2); // ASPX
-                               // aspx_config: all-zero fields.
+        // aspx_config: all-zero fields.
         bw.write_u32(0, 15);
         // companding_control(2): sync_flag=0, compand_on=[1,1].
         bw.write_bit(false);
@@ -4437,7 +4422,7 @@ mod tests {
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(0b01, 2); // ASPX
-                               // No aspx_config — go straight to companding_control(2).
+        // No aspx_config — go straight to companding_control(2).
         bw.write_bit(true); // sync_flag = 1 -> single compand_on
         bw.write_bit(true); // compand_on[0] = 1
         bw.align_to_byte();
@@ -4503,7 +4488,7 @@ mod tests {
         bw.write_u32(0, 2); // noise_sbg
         bw.write_u32(0, 1); // num_env_bits_fixfix = 0 -> 1-bit tmp_num_env
         bw.write_u32(3, 2); // freq_res_mode = 3 (High)
-                            // companding_control(1): compand_on[0] = 1, no avg.
+        // companding_control(1): compand_on[0] = 1, no avg.
         bw.write_bit(true);
         // mono_data(0): spec_frontend = 0 (ASF).
         bw.write_u32(0, 1);
@@ -4555,7 +4540,7 @@ mod tests {
         assert_eq!(framing.num_env, 2);
         assert_eq!(framing.num_noise, 2);
         assert!(framing.freq_res.is_empty()); // freq_res_mode = High
-                                              // Stereo sidecar untouched on mono.
+        // Stereo sidecar untouched on mono.
         assert!(info.tools.aspx_framing_secondary.is_none());
         assert!(info.tools.aspx_balance.is_none());
         // aspx_delta_dir(0) followed on the same path: consumed
@@ -4582,7 +4567,7 @@ mod tests {
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(1, 1); // mono_codec_mode = ASPX
-                            // No aspx_config (b_iframe = false).
+        // No aspx_config (b_iframe = false).
         bw.write_bit(true); // companding_control(1): compand_on[0] = 1.
         bw.write_u32(0, 1); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame = 1
@@ -4625,9 +4610,9 @@ mod tests {
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(1, 1); // mono_codec_mode = ASPX
-                            // aspx_config(): quant_mode=0, start=3, stop=3, scale=1
-                            // (highres -> 22 - 6 - 6 = 10 master groups), freq_res_mode=3
-                            // (High -> no per-env freq_res bits), other flags zero.
+        // aspx_config(): quant_mode=0, start=3, stop=3, scale=1
+        // (highres -> 22 - 6 - 6 = 10 master groups), freq_res_mode=3
+        // (High -> no per-env freq_res bits), other flags zero.
         bw.write_u32(0, 1); // quant_mode_env
         bw.write_u32(3, 3); // start_freq
         bw.write_u32(3, 2); // stop_freq
@@ -4638,7 +4623,7 @@ mod tests {
         bw.write_u32(0, 2); // noise_sbg
         bw.write_u32(0, 1); // num_env_bits_fixfix
         bw.write_u32(3, 2); // freq_res_mode = High
-                            // companding_control(1): compand_on[0] = 1.
+        // companding_control(1): compand_on[0] = 1.
         bw.write_bit(true);
         // mono_data(0): ASF frontend, long frame, max_sfb=10, zero
         // spectra + scalefac 120 + no snf.
@@ -4655,13 +4640,13 @@ mod tests {
         }
         bw.write_u32(120, 8); // reference scalefac
         bw.write_u32(0, 1); // b_snf_data_exists
-                            // aspx_data_1ch(): xover=7 -> num_sbg_sig_highres = 10 - 7 = 3
-                            // and num_sbg_sig_lowres = 2. num_sbg_noise clamps to 1 since
-                            // aspx_noise_sbg = 0. FIXFIX + tmp_num_env=0 -> num_env = 1.
+        // aspx_data_1ch(): xover=7 -> num_sbg_sig_highres = 10 - 7 = 3
+        // and num_sbg_sig_lowres = 2. num_sbg_noise clamps to 1 since
+        // aspx_noise_sbg = 0. FIXFIX + tmp_num_env=0 -> num_env = 1.
         bw.write_u32(7, 3); // aspx_xover_subband_offset
         bw.write_bit(false); // FIXFIX
         bw.write_bit(false); // tmp_num_env = 0
-                             // aspx_delta_dir(0): sig[0]=0, noise[0]=0 (FREQ for both).
+        // aspx_delta_dir(0): sig[0]=0, noise[0]=0 (FREQ for both).
         bw.write_bit(false);
         bw.write_bit(false);
         // aspx_hfgen_iwc_1ch: tna_mode[0] = 0 (2 bits), ah_present=0,
@@ -4727,7 +4712,7 @@ mod tests {
         bw.align_to_byte();
         bw.write_u32(0b10, 2); // ASPX_ACPL_1
         bw.write_u32(0, 15); // aspx_config (all zero)
-                             // acpl_config_1ch(PARTIAL): id=1 (12 bands), coarse, qmf_minus1=3
+        // acpl_config_1ch(PARTIAL): id=1 (12 bands), coarse, qmf_minus1=3
         bw.write_u32(0b01, 2);
         bw.write_u32(1, 1);
         bw.write_u32(0b011, 3);
@@ -4768,7 +4753,7 @@ mod tests {
         bw.align_to_byte();
         bw.write_u32(0b11, 2); // ASPX_ACPL_2
         bw.write_u32(0, 15); // aspx_config (all zero)
-                             // acpl_config_1ch(FULL): id=2 (9 bands), fine, no qmf_band field
+        // acpl_config_1ch(FULL): id=2 (9 bands), fine, no qmf_band field
         bw.write_u32(0b10, 2);
         bw.write_u32(0, 1);
         bw.align_to_byte();
@@ -4848,7 +4833,7 @@ mod tests {
         bw.write_bit(false); // sap_coeff_all
         bw.write_bit(true); // pair flag for sfb 0/1
         bw.write_bit(true); // pair flag for sfb 2/3
-                            // 2 dpcm_alpha_q codewords (one per pair = sfbs 0 and 2).
+        // 2 dpcm_alpha_q codewords (one per pair = sfbs 0 and 2).
         bw.write_u32(HCB_SCALEFAC_CW[60], HCB_SCALEFAC_LEN[60] as u32);
         bw.write_u32(HCB_SCALEFAC_CW[61], HCB_SCALEFAC_LEN[61] as u32);
         bw.align_to_byte();
@@ -4892,7 +4877,7 @@ mod tests {
         bw.write_u32(3, 2);
         bw.write_bit(true); // sap_coeff_all = 1 (no pair flags)
         bw.write_bit(true); // delta_code_time
-                            // Group 0 max_sfb = 2 -> 1 codeword.
+        // Group 0 max_sfb = 2 -> 1 codeword.
         bw.write_u32(HCB_SCALEFAC_CW[60], HCB_SCALEFAC_LEN[60] as u32);
         // Group 1 max_sfb = 2 -> 1 codeword.
         bw.write_u32(HCB_SCALEFAC_CW[60], HCB_SCALEFAC_LEN[60] as u32);
@@ -5479,12 +5464,12 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_bit(false); // mono_codec_mode = SIMPLE
         bw.write_bit(false); // spec_frontend = ASF
-                             // asf_transform_info: frame_len_base=1920 -> b_long_frame bit
-                             // + 2-bit transf_length[0] + 2-bit transf_length[1].
+        // asf_transform_info: frame_len_base=1920 -> b_long_frame bit
+        // + 2-bit transf_length[0] + 2-bit transf_length[1].
         bw.write_bit(false); // b_long_frame = 0
         bw.write_u32(2, 2); // transf_length[0] = 2 (tl=480)
         bw.write_u32(2, 2); // transf_length[1] = 2 (tl=480)
-                            // asf_psy_info(0, 0): max_sfb[0] read with 6 bits at tl=480.
+        // asf_psy_info(0, 0): max_sfb[0] read with 6 bits at tl=480.
         bw.write_u32(max_sfb, 6);
         // n_grp_bits_ge_1536(2, 2) = 3. Pattern [1, 0, 1] -> one zero ->
         // num_window_groups = 2.
@@ -5639,12 +5624,12 @@ mod tests {
         //   ssf_granule(b_iframe=1):
         bw.write_u32(0, 1); // stride_flag = LONG_STRIDE
         bw.write_u32(0, 3); // num_bands_minus12 = 0 → num_bands = 12
-                            // Per-block predictor loop runs zero iterations (start_block ==
-                            // end_block == 0 for LONG_STRIDE I-frame).
-                            // ssf_st_data():
+        // Per-block predictor loop runs zero iterations (start_block ==
+        // end_block == 0 for LONG_STRIDE I-frame).
+        // ssf_st_data():
         bw.write_u32(0, 5); // env_curr_band0_bits
-                            // SHORT_STRIDE-gated env_startup / gain not present.
-                            // Per-block st-data: variance_preserving (1) + alloc_offset_bits (5).
+        // SHORT_STRIDE-gated env_startup / gain not present.
+        // Per-block st-data: variance_preserving (1) + alloc_offset_bits (5).
         bw.write_u32(0, 1);
         bw.write_u32(0, 5);
         // ssf_ac_data(): Init pulls 30 bits, then envelope decode etc.
@@ -5778,7 +5763,7 @@ mod tests {
         assert!((row[0].2 - 0.5).abs() < 1e-6);
         assert_eq!(row[0].3, -1.0);
         assert_eq!(row[1], row[0]); // pair inherit
-                                    // sfb 2: alpha=8 -> sap_gain=0.8 -> (1.8, 1, 0.2, -1).
+        // sfb 2: alpha=8 -> sap_gain=0.8 -> (1.8, 1, 0.2, -1).
         assert!((row[2].0 - 1.8).abs() < 1e-6);
         assert!((row[2].2 - 0.2).abs() < 1e-6);
         assert_eq!(row[3], row[2]);

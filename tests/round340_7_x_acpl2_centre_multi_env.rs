@@ -19,8 +19,8 @@
 //! Table 51, §4.3.10.4.11.
 
 use oxideav_ac4::aspx::{
-    derive_aspx_frequency_tables, num_aspx_timeslots, num_ts_in_ats, AspxConfig, AspxFreqResMode,
-    AspxMasterFreqScale, AspxQuantStep,
+    AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, derive_aspx_frequency_tables,
+    num_aspx_timeslots, num_ts_in_ats,
 };
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_acpl3::{qmf_slots_to_sb_major, select_aspx_num_env_from_qmf};

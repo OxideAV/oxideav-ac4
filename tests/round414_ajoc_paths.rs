@@ -13,7 +13,7 @@
 use oxideav_ac4::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
 use oxideav_ac4::ajoc_data::new_ajoc_diff_state;
 use oxideav_ac4::ajoc_substream::{
-    encode_ajoc_raw_frame_aspx, encode_ajoc_raw_frame_static, AjocBodyParams,
+    AjocBodyParams, encode_ajoc_raw_frame_aspx, encode_ajoc_raw_frame_static,
 };
 use oxideav_ac4::aspx::{AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep};
 use oxideav_ac4::decoder::Ac4Decoder;
@@ -56,9 +56,11 @@ fn selector_setup(
     };
     let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
         .map(|o| {
-            vec![(0..num_dmx)
-                .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
-                .collect()]
+            vec![
+                (0..num_dmx)
+                    .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
+                    .collect(),
+            ]
         })
         .collect();
     let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)

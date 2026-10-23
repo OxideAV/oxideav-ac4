@@ -74,7 +74,7 @@ fn decode_one(dec: &mut Ac4Decoder, bytes: Vec<u8>, ch: usize) -> (Vec<Vec<f32>>
     let raw = &af.data[0];
     assert_eq!(raw.len(), N * ch * 2, "{ch}-ch S16");
     let mut out = vec![Vec::with_capacity(N); ch];
-    for (i, c) in raw.chunks_exact(2).enumerate() {
+    for (i, c) in raw.as_chunks::<2>().0.iter().enumerate() {
         out[i % ch].push(i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0);
     }
     (out, raw.to_vec())

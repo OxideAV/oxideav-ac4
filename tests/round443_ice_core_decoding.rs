@@ -20,10 +20,10 @@
 //!   reproduces the full-decode output folded to 5.X.2 with the same
 //!   customized downmix gains.
 
-use oxideav_ac4::core_render::{render_core_to_5_x_2, CoreRenderGains};
+use oxideav_ac4::core_render::{CoreRenderGains, render_core_to_5_x_2};
 use oxideav_ac4::decoder::{Ac4Decoder, DecodingMode};
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
-use oxideav_ac4::ice::{encode_ice_raw_frame, write_ice_body_scpl, IceScplSpectra};
+use oxideav_ac4::ice::{IceScplSpectra, encode_ice_raw_frame, write_ice_body_scpl};
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 
@@ -752,7 +752,7 @@ mod ajoc_core {
     use oxideav_ac4::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
     use oxideav_ac4::ajoc_data::new_ajoc_diff_state;
     use oxideav_ac4::ajoc_substream::{
-        encode_ajoc_raw_frame_aspx, encode_ajoc_raw_frame_static, AjocBodyParams,
+        AjocBodyParams, encode_ajoc_raw_frame_aspx, encode_ajoc_raw_frame_static,
     };
     use oxideav_ac4::aspx::{AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep};
     use oxideav_ac4::decoder::{Ac4Decoder, DecodingMode};
@@ -819,9 +819,11 @@ mod ajoc_core {
         };
         let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
             .map(|o| {
-                vec![(0..num_dmx)
-                    .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
-                    .collect()]
+                vec![
+                    (0..num_dmx)
+                        .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
+                        .collect(),
+                ]
             })
             .collect();
         let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)

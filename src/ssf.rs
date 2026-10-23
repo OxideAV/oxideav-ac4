@@ -44,7 +44,7 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::ssf_ac::{
-    decode_envelope_indices, decode_predictor_gain, AcError, AcState, SsfRandGenState,
+    AcError, AcState, SsfRandGenState, decode_envelope_indices, decode_predictor_gain,
 };
 use crate::ssf_tables::{AC_COEFF_MAX_INDEX, ENVELOPE_CDF_LUT, STEP_SIZES_Q4_15};
 
@@ -596,11 +596,11 @@ pub fn parse_ssf_ac_data(
     // Build the static envelope CDF used by `decode_envelope_indices`.
     let env_cdf: Vec<u32> = ENVELOPE_CDF_LUT.iter().map(|&x| x as u32).collect();
     let _ = env_cdf; // silence unused-warning if helper changes upstream.
-                     // Initialize the arithmetic decoder.
+    // Initialize the arithmetic decoder.
     let mut ac = AcState::init(br).map_err(map_ac_err)?;
     let bit_cursor_start = ac.bits_consumed; // == SSF_RANGE_BITS.
-                                             // env_curr: env_idx[0] from env_curr_band0_bits, env_idx[1..] from
-                                             // the AC stream.
+    // env_curr: env_idx[0] from env_curr_band0_bits, env_idx[1..] from
+    // the AC stream.
     let mut env_curr = vec![0i32; num_bands];
     env_curr[0] = i32::from(env_curr_band0_bits) + ENV_BAND0_MIN;
     if num_bands > 1 {
@@ -771,10 +771,10 @@ mod tests {
         // ssf_granule(b_iframe=1):
         bw.write_u32(0, 1); // stride_flag = LONG_STRIDE.
         bw.write_u32(0, 3); // num_bands_minus12 = 0 → num_bands = 12.
-                            // For LONG_STRIDE + b_iframe == 1, start_block = 0, end_block = 0
-                            // → per-block predictor loop runs zero iterations.
-                            // ssf_st_data():
-                            //   env_curr_band0_bits (5).
+        // For LONG_STRIDE + b_iframe == 1, start_block = 0, end_block = 0
+        // → per-block predictor loop runs zero iterations.
+        // ssf_st_data():
+        //   env_curr_band0_bits (5).
         bw.write_u32(0, 5);
         // env_startup_band0_bits NOT present (LONG_STRIDE).
         // SHORT_STRIDE gain_bits NOT present.
@@ -828,14 +828,14 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(1, 1); // stride_flag = SHORT_STRIDE.
         bw.write_u32(0, 3); // num_bands_minus12 = 0 → num_bands = 12.
-                            // Per-block predictor loop: block 1, 2, 3 each predictor_presence_flag = 0.
+        // Per-block predictor loop: block 1, 2, 3 each predictor_presence_flag = 0.
         for _ in 1..4 {
             bw.write_bit(false);
         }
         // ssf_st_data():
         bw.write_u32(0, 5); // env_curr_band0_bits.
         bw.write_u32(0, 5); // env_startup_band0_bits (I + SHORT_STRIDE).
-                            // gain_bits[0..3] — 4 bits each.
+        // gain_bits[0..3] — 4 bits each.
         for _ in 0..4 {
             bw.write_u32(0, 4);
         }

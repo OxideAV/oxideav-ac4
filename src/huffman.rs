@@ -251,7 +251,7 @@ mod tests {
             let (sym_idx, &min_len) = lens
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, &l)| l)
+                .min_by_key(|&(_, &l)| l)
                 .expect("non-empty codebook");
             let cw = cws[sym_idx];
 

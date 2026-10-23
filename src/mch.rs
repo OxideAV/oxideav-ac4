@@ -50,13 +50,13 @@
 //! long-frame, single-window-group case; short / grouped frames still
 //! parse the outer shells and leave the per-channel slot `None`.
 
-use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
+use oxideav_core::bits::BitReader;
 
 use crate::asf::{
+    AsfPsyInfo, AsfTransformInfo, ChparamInfo, SubstreamTools,
     decode_asf_long_lfe_body_with_max_sfb_lfe, decode_asf_long_mono_body_with_max_sfb,
     parse_asf_psy_info, parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info,
-    AsfPsyInfo, AsfTransformInfo, ChparamInfo, SubstreamTools,
 };
 use crate::tables;
 
@@ -305,15 +305,15 @@ pub fn parse_mono_data(
             if let Some(scaled) = decode_asf_long_mono_body_with_max_sfb(br, &ti, psy.max_sfb_0) {
                 out.scaled_spec = Some(scaled);
             }
-        } else if psy.num_window_groups > 0 {
-            if let Some(scaled) = decode_asf_grouped_mono_body_with_max_sfb(
+        } else if psy.num_window_groups > 0
+            && let Some(scaled) = decode_asf_grouped_mono_body_with_max_sfb(
                 br,
                 &ti,
                 psy.max_sfb_0,
                 psy.num_window_groups,
-            ) {
-                out.scaled_spec = Some(scaled);
-            }
+            )
+        {
+            out.scaled_spec = Some(scaled);
         }
     } else if b_lfe {
         // LFE: `sf_info_lfe()` forces long-frame, single window group;
@@ -818,26 +818,18 @@ pub fn parse_5x_audio_data_outer(
             let body_ok = crate::asf::parse_stereo_data_body(br, tools, frame_len_base);
             // Runs on P-frames as well — aspx_config / acpl_config_2ch
             // are I-frame-sticky and pre-seeded into `tools`.
-            if body_ok {
-                if let Some(cfg) = tools.aspx_config {
-                    crate::asf::parse_aspx_data_2ch_body(
+            if body_ok && let Some(cfg) = tools.aspx_config {
+                crate::asf::parse_aspx_data_2ch_body(br, tools, &cfg, b_iframe, frame_len_base)?;
+                if let Some(acfg) = tools.acpl_config_2ch
+                    && let Ok(d) = crate::acpl::parse_acpl_data_2ch(
                         br,
-                        tools,
-                        &cfg,
-                        b_iframe,
-                        frame_len_base,
-                    )?;
-                    if let Some(acfg) = tools.acpl_config_2ch {
-                        if let Ok(d) = crate::acpl::parse_acpl_data_2ch(
-                            br,
-                            acfg.num_param_bands,
-                            0,
-                            acfg.quant_mode_0,
-                            acfg.quant_mode_1,
-                        ) {
-                            tools.acpl_data_2ch = Some(d);
-                        }
-                    }
+                        acfg.num_param_bands,
+                        0,
+                        acfg.quant_mode_0,
+                        acfg.quant_mode_1,
+                    )
+                {
+                    tools.acpl_data_2ch = Some(d);
                 }
             }
         }
@@ -1844,11 +1836,11 @@ mod tests {
         // Then five_channel_data outer shell + 5x sf_data(ASF).
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
-                            // No I-frame config (SIMPLE).
-                            // No LFE.
-                            // No companding.
+        // No I-frame config (SIMPLE).
+        // No LFE.
+        // No companding.
         bw.write_u32(3, 2); // coding_config = 3
-                            // five_channel_data outer:
+        // five_channel_data outer:
         bw.write_bit(true); // b_long_frame
         bw.write_u32(15, 6); // max_sfb[0]
         bw.write_u32(0, 4); // chel_matsel
@@ -1882,11 +1874,11 @@ mod tests {
         // Then coding_config=3 + five_channel_data shell + 5x sf_data.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
-                            // LFE mono_data(1):
+        // LFE mono_data(1):
         bw.write_bit(true); // b_long_frame
         bw.write_u32(4, 3); // max_sfb[0] -- n_msfbl_bits = 3 for tl=1920
         write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
-                                                // coding_config = 3, then five_channel_data:
+        // coding_config = 3, then five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true);
         bw.write_u32(10, 6);
@@ -1946,22 +1938,22 @@ mod tests {
         // there.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
-                            // No LFE, no I-frame config.
+        // No LFE, no I-frame config.
         bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
         bw.write_bit(true); // b_2ch_mode
-                            // two_channel_data #1: long-frame, max_sfb=10, chparam=0.
+        // two_channel_data #1: long-frame, max_sfb=10, chparam=0.
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
         write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #1
         write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #2
-                                                 // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
+        // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
         write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #1
         write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #2
-                                                 // mono_data(0): spec_frontend bit + transform + psy.
+        // mono_data(0): spec_frontend bit + transform + psy.
         bw.write_bit(false); // spec_frontend = 0 (ASF)
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
@@ -2005,8 +1997,8 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
         bw.write_u32(1, 2); // coding_config = 1 (Cfg1ThreeStereo)
-                            // three_channel_data: long-frame, max_sfb=14, chel_matsel=0,
-                            // 2x chparam_info(sap_mode=0).
+        // three_channel_data: long-frame, max_sfb=14, chel_matsel=0,
+        // 2x chparam_info(sap_mode=0).
         bw.write_bit(true);
         bw.write_u32(14, 6);
         bw.write_u32(0, 4);
@@ -2050,7 +2042,7 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
         bw.write_u32(2, 2); // coding_config = 2 (Cfg2FourMono)
-                            // four_channel_data: long-frame, max_sfb=22, 4x chparam_info.
+        // four_channel_data: long-frame, max_sfb=22, 4x chparam_info.
         bw.write_bit(true);
         bw.write_u32(22, 6);
         for _ in 0..4 {
@@ -2091,16 +2083,16 @@ mod tests {
         // a non-iframe to dodge it.
         let mut bw = BitWriter::new();
         bw.write_u32(4, 3); // 5_X_codec_mode = ASPX_ACPL_3
-                            // b_iframe=0: skip aspx_config + acpl_config_2ch.
-                            // No LFE (b_has_lfe=0).
-                            // companding_control(2): per Table 41 it's 1 bit
-                            // (b_compand_avg) + per-channel bits. For the round-trip we
-                            // just need the bits to be consumed correctly.
+        // b_iframe=0: skip aspx_config + acpl_config_2ch.
+        // No LFE (b_has_lfe=0).
+        // companding_control(2): per Table 41 it's 1 bit
+        // (b_compand_avg) + per-channel bits. For the round-trip we
+        // just need the bits to be consumed correctly.
         bw.write_bit(false); // b_compand_avg = 0
         bw.write_bit(false); // b_compand_on[0]
         bw.write_bit(false); // b_compand_on[1]
-                             // ASPX_ACPL_3 body: stereo_data() + aspx_data_2ch +
-                             // acpl_data_2ch — all opaque for r19.
+        // ASPX_ACPL_3 body: stereo_data() + aspx_data_2ch +
+        // acpl_data_2ch — all opaque for r19.
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2426,9 +2418,9 @@ mod tests {
         // n_msfb_bits for tl=480 short-frame at 48 kHz: per Table 106
         // tl=480 column 1 (n_msfb_bits) = 6.
         bw.write_u32(max_sfb, 6); // max_sfb[0]
-                                  // scale_factor_grouping bits = 3 (n_grp_bits_ge_1536(2,2)).
-                                  // Pattern [1, 0, 1] -> exactly one group boundary (one zero) ->
-                                  // num_window_groups = 1 + 1 = 2.
+        // scale_factor_grouping bits = 3 (n_grp_bits_ge_1536(2,2)).
+        // Pattern [1, 0, 1] -> exactly one group boundary (one zero) ->
+        // num_window_groups = 1 + 1 = 2.
         bw.write_u32(1, 1);
         bw.write_u32(0, 1);
         bw.write_u32(1, 1);
@@ -2470,7 +2462,7 @@ mod tests {
         bw.write_u32(2, 2); // transf_length[1] = 2 (tl=480)
         let max_sfb = 4u32;
         bw.write_u32(max_sfb, 6); // max_sfb[0]
-                                  // n_grp_bits = 3 from n_grp_bits_ge_1536(2,2). [0,0,0] -> 4 groups.
+        // n_grp_bits = 3 from n_grp_bits_ge_1536(2,2). [0,0,0] -> 4 groups.
         bw.write_u32(0, 1);
         bw.write_u32(0, 1);
         bw.write_u32(0, 1);
@@ -2543,7 +2535,7 @@ mod tests {
     fn parse_5x_aspx_acpl_3_non_iframe_leaves_acpl_data_2ch_none() {
         let mut bw = BitWriter::new();
         bw.write_u32(4, 3); // 5_X_codec_mode = ASPX_ACPL_3
-                            // companding_control(2): all-zero.
+        // companding_control(2): all-zero.
         bw.write_bit(false);
         bw.write_bit(false);
         bw.write_bit(false);
@@ -2570,7 +2562,7 @@ mod tests {
     fn parse_5x_aspx_acpl_3_iframe_parses_aspx_and_acpl_configs() {
         let mut bw = BitWriter::new();
         bw.write_u32(4, 3); // 5_X_codec_mode = ASPX_ACPL_3
-                            // aspx_config(): 15 bits all-zero.
+        // aspx_config(): 15 bits all-zero.
         bw.write_u32(0, 15);
         // acpl_config_2ch(): 2-bit num_param_bands_id + 2x 1-bit
         // quant_mode. id=0 -> 15 bands; both quant modes = Fine.
@@ -2582,8 +2574,8 @@ mod tests {
         bw.write_bit(false); // compand_on[0]
         bw.write_bit(false); // compand_on[1]
         bw.write_bit(false); // compand_avg
-                             // stereo_data() body — feed enough zeros that the body walker
-                             // either succeeds or bails cleanly without panicking.
+        // stereo_data() body — feed enough zeros that the body walker
+        // either succeeds or bails cleanly without panicking.
         bw.align_to_byte();
         while bw.byte_len() < 256 {
             bw.write_u32(0, 8);
@@ -2645,7 +2637,7 @@ mod tests {
         bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
         write_companding_3_all_on(&mut bw);
         bw.write_bit(false); // coding_config = 0 -> two_channel_data + mono(0)
-                             // two_channel_data() outer + 2x sf_data:
+        // two_channel_data() outer + 2x sf_data:
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
@@ -2682,7 +2674,7 @@ mod tests {
         bw.write_u32(2, 3); // 5_X_codec_mode = ASPX_ACPL_1
         write_companding_3_all_on(&mut bw);
         bw.write_bit(true); // coding_config = 1 -> three_channel_data
-                            // three_channel_data outer:
+        // three_channel_data outer:
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
         bw.write_u32(0, 4); // chel_matsel
@@ -2698,7 +2690,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info residual ch1
         write_zero_sf_data_body(&mut bw, 8, 0); // residual ch0 sf_data
         write_zero_sf_data_body(&mut bw, 8, 0); // residual ch1 sf_data
-                                                // Pad to be safe.
+        // Pad to be safe.
         bw.align_to_byte();
         while bw.byte_len() < 64 {
             bw.write_u32(0, 8);
@@ -2748,7 +2740,7 @@ mod tests {
         write_acpl_config_1ch_full(&mut bw);
         write_companding_3_all_on(&mut bw);
         bw.write_bit(true); // coding_config = 1 -> three_channel_data
-                            // three_channel_data outer:
+        // three_channel_data outer:
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
         bw.write_u32(0, 4); // chel_matsel
@@ -2794,7 +2786,7 @@ mod tests {
         write_acpl_config_1ch_partial(&mut bw);
         write_companding_3_all_on(&mut bw);
         bw.write_bit(false); // coding_config = 0 -> two_channel_data
-                             // two_channel_data outer (Table 26):
+        // two_channel_data outer (Table 26):
         bw.write_bit(true); // b_long_frame
         bw.write_u32(12, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
@@ -2811,7 +2803,7 @@ mod tests {
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(7, 6); // max_sfb[0] for centre mono
-                            // Pad for downstream aspx_data / acpl_data.
+        // Pad for downstream aspx_data / acpl_data.
         bw.align_to_byte();
         while bw.byte_len() < 256 {
             bw.write_u32(0, 8);
@@ -2853,8 +2845,8 @@ mod tests {
         bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
         write_companding_3_all_on(&mut bw);
         bw.write_bit(true); // coding_config = 1 -> three_channel_data
-                            // start three_channel_data but truncate after b_long_frame
-                            // (no max_sfb bits).
+        // start three_channel_data but truncate after b_long_frame
+        // (no max_sfb bits).
         bw.write_bit(true);
         // intentionally cut here — the next byte boundary won't have
         // the 6-bit max_sfb field complete.
@@ -2882,7 +2874,7 @@ mod tests {
         write_acpl_config_1ch_partial(&mut bw);
         write_companding_3_all_on(&mut bw);
         bw.write_bit(true); // coding_config = 1 -> three_channel_data
-                            // three_channel_data outer:
+        // three_channel_data outer:
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
         bw.write_u32(0, 4); // chel_matsel
@@ -2987,11 +2979,11 @@ mod tests {
     fn parse_7x_outer_simple_71_walks_lfe_and_five_channel() {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 2); // SIMPLE
-                            // LFE mono_data(1):
+        // LFE mono_data(1):
         bw.write_bit(true); // b_long_frame
         bw.write_u32(4, 3); // max_sfb[0] (n_msfbl_bits=3 @ tl=1920)
         write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
-                                                // coding_config = 3 -> five_channel_data:
+        // coding_config = 3 -> five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
@@ -3029,7 +3021,7 @@ mod tests {
     fn parse_7x_outer_simple_cfg0_walks_two_pairs_then_centre_mono() {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 2); // SIMPLE
-                            // coding_config = 0:
+        // coding_config = 0:
         bw.write_u32(0, 2);
         // 2ch_mode (1 bit).
         bw.write_bit(false);
@@ -3047,7 +3039,7 @@ mod tests {
         write_zero_sf_data_body(&mut bw, 12, 0);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
-                             // additional two_channel_data:
+        // additional two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
@@ -3080,7 +3072,7 @@ mod tests {
     fn parse_7x_outer_simple_cfg2_walks_four_then_back_mono() {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 2); // SIMPLE
-                            // coding_config = 2 -> four_channel_data:
+        // coding_config = 2 -> four_channel_data:
         bw.write_u32(2, 2);
         bw.write_bit(true); // b_long_frame
         bw.write_u32(11, 6); // max_sfb[0]
@@ -3122,7 +3114,7 @@ mod tests {
     fn parse_7x_outer_simple_cfg1_no_mono_trailer() {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 2); // SIMPLE
-                            // coding_config = 1 -> three_channel_data + two_channel_data
+        // coding_config = 1 -> three_channel_data + two_channel_data
         bw.write_u32(1, 2);
         // three_channel_data:
         bw.write_bit(true);
@@ -3184,7 +3176,7 @@ mod tests {
         bw.write_bit(true); // b_use_sap_add_ch = 1
         bw.write_u32(0, 2); // chparam_info #0 sap_mode = 0
         bw.write_u32(0, 2); // chparam_info #1 sap_mode = 0
-                            // additional two_channel_data:
+        // additional two_channel_data:
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
@@ -3215,7 +3207,7 @@ mod tests {
         bw.write_u32(3, 2); // 7_X_codec_mode = ASPX_ACPL_2
         write_companding_5_all_on(&mut bw);
         bw.write_u32(1, 2); // coding_config = 1 -> three_channel + two_channel
-                            // three_channel_data outer:
+        // three_channel_data outer:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 4);
@@ -3264,7 +3256,7 @@ mod tests {
         write_companding_5_all_on(&mut bw);
         bw.write_u32(0, 2); // coding_config = 0 -> 2ch_mode + 2x two_channel_data
         bw.write_bit(false); // 2ch_mode
-                             // two_channel_data #0:
+        // two_channel_data #0:
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
@@ -3321,7 +3313,7 @@ mod tests {
         write_acpl_config_1ch_partial(&mut bw);
         write_companding_5_all_on(&mut bw);
         bw.write_u32(1, 2); // coding_config = 1 -> three_channel + two_channel
-                            // three_channel_data:
+        // three_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 4);
@@ -3361,9 +3353,9 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 2); // SIMPLE
         bw.write_u32(3, 2); // coding_config = 3
-                            // start five_channel_data but truncate:
+        // start five_channel_data but truncate:
         bw.write_bit(true); // b_long_frame
-                            // intentionally cut here.
+        // intentionally cut here.
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
         let mut tools = SubstreamTools::default();

@@ -526,7 +526,7 @@ impl Ac4Decoder {
     ) -> Option<AspxQmfPhase1> {
         const NUM_QMF: usize = qmf::NUM_QMF_SUBBANDS;
         // Need PCM length as a multiple of 64 for whole QMF slots.
-        if pcm_in.is_empty() || pcm_in.len() % NUM_QMF != 0 {
+        if pcm_in.is_empty() || !pcm_in.len().is_multiple_of(NUM_QMF) {
             return None;
         }
         let sbx = tables.sbx as usize;
@@ -587,43 +587,42 @@ impl Ac4Decoder {
         if let (Some(tna), Some(frm)) = (tna_mode, framing) {
             let num_aspx_ts = (n_slots as u32) / num_ts_in_ats.max(1);
             let atsg_sig_opt = aspx::derive_atsg_borders(num_aspx_ts, frm).map(|(s, _)| s);
-            if let Some(atsg_sig) = atsg_sig_opt {
-                if !tna.is_empty() {
-                    let q_low_ext =
-                        crate::aspx_tns::build_q_low_ext(&q, &state.q_low_prev, tables.sba);
-                    let cov = crate::aspx_tns::compute_covariance(&q_low_ext, tables.sba);
-                    let (alpha0, alpha1) = crate::aspx_tns::compute_alphas(&cov);
-                    let chirp = crate::aspx_tns::chirp_factors(tna, &state.tns);
-                    let gain_vec = if cfg.preflat {
-                        Some(crate::aspx_tns::compute_preflat_gains(
-                            &q,
-                            tables.sbx,
-                            &atsg_sig,
-                            num_ts_in_ats,
-                        ))
-                    } else {
-                        None
-                    };
-                    let q_high = crate::aspx_tns::hf_tile_tns(
-                        &q_low_ext,
-                        &patches,
-                        &tables.sbg_noise,
-                        &chirp.chirp_arr,
-                        &alpha0,
-                        &alpha1,
-                        gain_vec.as_deref(),
+            if let Some(atsg_sig) = atsg_sig_opt
+                && !tna.is_empty()
+            {
+                let q_low_ext = crate::aspx_tns::build_q_low_ext(&q, &state.q_low_prev, tables.sba);
+                let cov = crate::aspx_tns::compute_covariance(&q_low_ext, tables.sba);
+                let (alpha0, alpha1) = crate::aspx_tns::compute_alphas(&cov);
+                let chirp = crate::aspx_tns::chirp_factors(tna, &state.tns);
+                let gain_vec = if cfg.preflat {
+                    Some(crate::aspx_tns::compute_preflat_gains(
+                        &q,
                         tables.sbx,
-                        NUM_QMF as u32,
                         &atsg_sig,
                         num_ts_in_ats,
-                    );
-                    for (dst, src) in q.iter_mut().zip(q_high.iter()).take(sbz).skip(sbx) {
-                        let len = dst.len().min(src.len());
-                        dst[..len].copy_from_slice(&src[..len]);
-                    }
-                    crate::aspx_tns::advance_tns_state(&mut state.tns, &chirp);
-                    tns_used = true;
+                    ))
+                } else {
+                    None
+                };
+                let q_high = crate::aspx_tns::hf_tile_tns(
+                    &q_low_ext,
+                    &patches,
+                    &tables.sbg_noise,
+                    &chirp.chirp_arr,
+                    &alpha0,
+                    &alpha1,
+                    gain_vec.as_deref(),
+                    tables.sbx,
+                    NUM_QMF as u32,
+                    &atsg_sig,
+                    num_ts_in_ats,
+                );
+                for (dst, src) in q.iter_mut().zip(q_high.iter()).take(sbz).skip(sbx) {
+                    let len = dst.len().min(src.len());
+                    dst[..len].copy_from_slice(&src[..len]);
                 }
+                crate::aspx_tns::advance_tns_state(&mut state.tns, &chirp);
+                tns_used = true;
             }
         }
         if !tns_used {
@@ -977,7 +976,7 @@ impl Ac4Decoder {
         // run_acpl_5x_pair_pcm requires every PCM input to be a multiple
         // of 64 (one QMF slot). Frame length in AC-4 is always a
         // multiple of 64 by spec, but be defensive.
-        if n == 0 || n % qmf::NUM_QMF_SUBBANDS != 0 {
+        if n == 0 || !n.is_multiple_of(qmf::NUM_QMF_SUBBANDS) {
             return;
         }
         let pcm_l_f32: Vec<f32> = pcm_per_channel
@@ -1206,7 +1205,7 @@ impl Ac4Decoder {
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
     ) {
         let n = samples;
-        if n == 0 || n % qmf::NUM_QMF_SUBBANDS != 0 {
+        if n == 0 || !n.is_multiple_of(qmf::NUM_QMF_SUBBANDS) {
             return;
         }
         let Some(carriers) = self.resolve_acpl_pair_carriers(is_7x, n) else {
@@ -1248,33 +1247,34 @@ impl Ac4Decoder {
                 out[..take].copy_from_slice(&v[..take]);
                 out
             };
-            if let [Some((tl3, s3)), Some((tl4, s4))] = &residual {
-                if *tl3 as usize == n && *tl4 as usize == n {
-                    let s3 = pad(s3);
-                    let s4 = pad(s4);
-                    let sap = match (&chparam, msm) {
-                        ([Some(cp0), Some(cp1)], Some(msm)) if msm > 0 => asf::apply_sap_table_181(
-                            &x0_spec,
-                            &x1_spec,
-                            &s3,
-                            &s4,
-                            &[cp0.clone(), cp1.clone()],
-                            msm,
-                            n as u32,
-                        ),
-                        _ => None,
-                    };
-                    match sap {
-                        Some((p0, p1, p3, p4)) => {
-                            x0_spec = p0;
-                            x1_spec = p1;
-                            x3_spec = Some(p3);
-                            x4_spec = Some(p4);
-                        }
-                        None => {
-                            x3_spec = Some(s3);
-                            x4_spec = Some(s4);
-                        }
+            if let [Some((tl3, s3)), Some((tl4, s4))] = &residual
+                && *tl3 as usize == n
+                && *tl4 as usize == n
+            {
+                let s3 = pad(s3);
+                let s4 = pad(s4);
+                let sap = match (&chparam, msm) {
+                    ([Some(cp0), Some(cp1)], Some(msm)) if msm > 0 => asf::apply_sap_table_181(
+                        &x0_spec,
+                        &x1_spec,
+                        &s3,
+                        &s4,
+                        &[cp0.clone(), cp1.clone()],
+                        msm,
+                        n as u32,
+                    ),
+                    _ => None,
+                };
+                match sap {
+                    Some((p0, p1, p3, p4)) => {
+                        x0_spec = p0;
+                        x1_spec = p1;
+                        x3_spec = Some(p3);
+                        x4_spec = Some(p4);
+                    }
+                    None => {
+                        x3_spec = Some(s3);
+                        x4_spec = Some(s4);
                     }
                 }
             }
@@ -1999,11 +1999,11 @@ impl Ac4Decoder {
             let pcm_f = self.imdct_channel_f32(slot, scaled, n);
             entries.push((slot, pcm_f, trailers_for_ch[ch_in]));
         }
-        if let Some(mono) = back_mono {
-            if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
-                let centre_pair = aspx_centre.map(|t| (t, false));
-                entries.push((2, pcm_f, centre_pair));
-            }
+        if let Some(mono) = back_mono
+            && let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples)
+        {
+            let centre_pair = aspx_centre.map(|t| (t, false));
+            entries.push((2, pcm_f, centre_pair));
         }
         self.extend_5x_entries(
             entries,
@@ -2108,14 +2108,14 @@ impl Ac4Decoder {
                 Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
             ));
         }
-        if let Some(mono) = centre_mono {
-            if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
-                entries.push((
-                    2,
-                    pcm_f,
-                    Self::trailer_for_5x_slot(2, aspx_lr, aspx_ls_rs, aspx_centre),
-                ));
-            }
+        if let Some(mono) = centre_mono
+            && let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples)
+        {
+            entries.push((
+                2,
+                pcm_f,
+                Self::trailer_for_5x_slot(2, aspx_lr, aspx_ls_rs, aspx_centre),
+            ));
         }
         self.extend_5x_entries(
             entries,
@@ -3109,68 +3109,68 @@ impl Ac4Decoder {
             }
         }
         if !use_stereo_cpe_synced {
-            if let Some((scaled, n)) = primary_in {
-                if n > 0 && n == samples as usize && !pcm_per_channel.is_empty() {
-                    if use_aspx_ext {
-                        let pcm_f = self.imdct_channel_f32(0, &scaled, n);
-                        let state = &mut self.aspx_ext_state[0];
-                        let extended = Self::aspx_extend_pcm(
-                            &pcm_f,
-                            aspx_tables.as_ref().unwrap(),
-                            aspx_cfg.as_ref().unwrap(),
-                            framing_pri.as_ref(),
-                            sig_pri.as_deref(),
-                            noise_pri.as_deref(),
-                            qmode_pri,
-                            delta_dir_pri.as_ref(),
-                            ah_pri.as_deref(),
-                            tna_pri.as_deref(),
-                            pre_scf_pri.as_ref(),
-                            state,
-                            num_ts_in_ats,
-                            compand_mode_pri,
-                            compand_sb0_override,
-                        );
-                        if use_acpl {
-                            if let (Some(cfg), Some(data)) =
-                                (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
-                            {
-                                // ASPX_ACPL_1: feed both M (extended) and S
-                                // PCM into the stereo A-CPL. The S spectrum
-                                // is already in `secondary_in`; we IMDCT it
-                                // here without ASPX (the `aspx_data_1ch` in
-                                // ACPL_1 covers the M channel only).
-                                let acpl1_result = if acpl1_active {
-                                    if let Some((s_scaled, s_n)) = secondary_in.as_ref() {
-                                        if *s_n == n {
-                                            let s_pcm = self.imdct_channel_f32(1, s_scaled, *s_n);
-                                            acpl_synth::run_acpl_1ch_pcm_stereo(
-                                                &extended,
-                                                &s_pcm,
-                                                cfg,
-                                                data,
-                                                &mut self.acpl_state,
-                                            )
-                                        } else {
-                                            None
-                                        }
+            if let Some((scaled, n)) = primary_in
+                && n > 0
+                && n == samples as usize
+                && !pcm_per_channel.is_empty()
+            {
+                if use_aspx_ext {
+                    let pcm_f = self.imdct_channel_f32(0, &scaled, n);
+                    let state = &mut self.aspx_ext_state[0];
+                    let extended = Self::aspx_extend_pcm(
+                        &pcm_f,
+                        aspx_tables.as_ref().unwrap(),
+                        aspx_cfg.as_ref().unwrap(),
+                        framing_pri.as_ref(),
+                        sig_pri.as_deref(),
+                        noise_pri.as_deref(),
+                        qmode_pri,
+                        delta_dir_pri.as_ref(),
+                        ah_pri.as_deref(),
+                        tna_pri.as_deref(),
+                        pre_scf_pri.as_ref(),
+                        state,
+                        num_ts_in_ats,
+                        compand_mode_pri,
+                        compand_sb0_override,
+                    );
+                    if use_acpl {
+                        if let (Some(cfg), Some(data)) =
+                            (acpl_active_cfg.as_ref(), acpl_active_data.as_ref())
+                        {
+                            // ASPX_ACPL_1: feed both M (extended) and S
+                            // PCM into the stereo A-CPL. The S spectrum
+                            // is already in `secondary_in`; we IMDCT it
+                            // here without ASPX (the `aspx_data_1ch` in
+                            // ACPL_1 covers the M channel only).
+                            let acpl1_result = if acpl1_active {
+                                if let Some((s_scaled, s_n)) = secondary_in.as_ref() {
+                                    if *s_n == n {
+                                        let s_pcm = self.imdct_channel_f32(1, s_scaled, *s_n);
+                                        acpl_synth::run_acpl_1ch_pcm_stereo(
+                                            &extended,
+                                            &s_pcm,
+                                            cfg,
+                                            data,
+                                            &mut self.acpl_state,
+                                        )
                                     } else {
                                         None
                                     }
                                 } else {
-                                    acpl_synth::run_acpl_1ch_pcm(
-                                        &extended,
-                                        cfg,
-                                        data,
-                                        &mut self.acpl_state,
-                                    )
-                                };
-                                if let Some((left, right)) = acpl1_result {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
-                                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
-                                } else {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                                    None
                                 }
+                            } else {
+                                acpl_synth::run_acpl_1ch_pcm(
+                                    &extended,
+                                    cfg,
+                                    data,
+                                    &mut self.acpl_state,
+                                )
+                            };
+                            if let Some((left, right)) = acpl1_result {
+                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
+                                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
                             } else {
                                 pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
                             }
@@ -3178,64 +3178,68 @@ impl Ac4Decoder {
                             pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
                         }
                     } else {
-                        pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
+                        pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
                     }
+                } else {
+                    pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
                 }
             }
-            if channels as usize >= 2 && !use_acpl {
-                if let Some((scaled, n)) = secondary_in {
-                    if n > 0 && n == samples as usize {
-                        if use_aspx_ext {
-                            let pcm_f = self.imdct_channel_f32(1, &scaled, n);
-                            let state = &mut self.aspx_ext_state[1];
-                            let extended = Self::aspx_extend_pcm(
-                                &pcm_f,
-                                aspx_tables.as_ref().unwrap(),
-                                aspx_cfg.as_ref().unwrap(),
-                                framing_sec.as_ref().or(framing_pri.as_ref()),
-                                sig_sec.as_deref(),
-                                noise_sec.as_deref(),
-                                qmode_sec.or(qmode_pri),
-                                delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
-                                ah_sec.as_deref().or(ah_pri.as_deref()),
-                                tna_sec.as_deref().or(tna_pri.as_deref()),
-                                pre_scf_sec.as_ref(),
-                                state,
-                                num_ts_in_ats,
-                                compand_mode_sec,
-                                compand_sb0_override,
-                            );
-                            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
-                        } else {
-                            pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
-                        }
-                    }
+            if channels as usize >= 2
+                && !use_acpl
+                && let Some((scaled, n)) = secondary_in
+                && n > 0
+                && n == samples as usize
+            {
+                if use_aspx_ext {
+                    let pcm_f = self.imdct_channel_f32(1, &scaled, n);
+                    let state = &mut self.aspx_ext_state[1];
+                    let extended = Self::aspx_extend_pcm(
+                        &pcm_f,
+                        aspx_tables.as_ref().unwrap(),
+                        aspx_cfg.as_ref().unwrap(),
+                        framing_sec.as_ref().or(framing_pri.as_ref()),
+                        sig_sec.as_deref(),
+                        noise_sec.as_deref(),
+                        qmode_sec.or(qmode_pri),
+                        delta_dir_sec.as_ref().or(delta_dir_pri.as_ref()),
+                        ah_sec.as_deref().or(ah_pri.as_deref()),
+                        tna_sec.as_deref().or(tna_pri.as_deref()),
+                        pre_scf_sec.as_ref(),
+                        state,
+                        num_ts_in_ats,
+                        compand_mode_sec,
+                        compand_sb0_override,
+                    );
+                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
+                } else {
+                    pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
                 }
             }
         } // end `if !use_stereo_cpe_synced`
-          // SSF synthesis path — if either ssf_data_* is populated and
-          // the corresponding `pcm_per_channel[ch]` slot is still empty
-          // (the ASF Huffman pipeline didn't fire because spec_frontend
-          // was SSF), drive §5.2.3-5.2.7 → IMDCT to produce real PCM.
-          // Synthesize each granule into a `num_blocks * n_mdct`-long
-          // spectrum vector, then IMDCT each `n_mdct` block independently
-          // and concat the resulting overlap-added PCM.
-        if let Some(data) = ssf_primary.as_ref() {
-            if !pcm_per_channel.is_empty() && pcm_per_channel[0].is_none() {
-                let pcm = self.run_ssf_channel(0, data, samples as usize);
-                if !pcm.is_empty() {
-                    pcm_per_channel[0] = Some(pcm);
-                }
+        // SSF synthesis path — if either ssf_data_* is populated and
+        // the corresponding `pcm_per_channel[ch]` slot is still empty
+        // (the ASF Huffman pipeline didn't fire because spec_frontend
+        // was SSF), drive §5.2.3-5.2.7 → IMDCT to produce real PCM.
+        // Synthesize each granule into a `num_blocks * n_mdct`-long
+        // spectrum vector, then IMDCT each `n_mdct` block independently
+        // and concat the resulting overlap-added PCM.
+        if let Some(data) = ssf_primary.as_ref()
+            && !pcm_per_channel.is_empty()
+            && pcm_per_channel[0].is_none()
+        {
+            let pcm = self.run_ssf_channel(0, data, samples as usize);
+            if !pcm.is_empty() {
+                pcm_per_channel[0] = Some(pcm);
             }
         }
-        if channels as usize >= 2 {
-            if let Some(data) = ssf_secondary.as_ref() {
-                if pcm_per_channel.len() >= 2 && pcm_per_channel[1].is_none() {
-                    let pcm = self.run_ssf_channel(1, data, samples as usize);
-                    if !pcm.is_empty() {
-                        pcm_per_channel[1] = Some(pcm);
-                    }
-                }
+        if channels as usize >= 2
+            && let Some(data) = ssf_secondary.as_ref()
+            && pcm_per_channel.len() >= 2
+            && pcm_per_channel[1].is_none()
+        {
+            let pcm = self.run_ssf_channel(1, data, samples as usize);
+            if !pcm.is_empty() {
+                pcm_per_channel[1] = Some(pcm);
             }
         }
         // §5.7.7.6.2 ASPX_ACPL_3 5_X synthesis (Pseudocode 118) —
@@ -3245,47 +3249,47 @@ impl Ac4Decoder {
         // Only fires when all five pcm_per_channel slots are still empty
         // (i.e. the standard stereo path didn't already claim them), or
         // when the frame is explicitly a 5_X ASPX_ACPL_3 substream.
-        if five_x_acpl3_active {
-            if let (Some(cfg), Some(data), Some(centre)) = (
+        if five_x_acpl3_active
+            && let (Some(cfg), Some(data), Some(centre)) = (
                 five_x_acpl3_cfg.as_ref(),
                 five_x_acpl3_data.as_ref(),
                 five_x_centre_spec.as_deref(),
+            )
+        {
+            // Carrier L and R come from pcm_per_channel[0] / [1] (already
+            // filled by the stereo ASF / ASPX decode path above). If they
+            // are present use them; otherwise zero-fill as placeholders so
+            // the A-CPL synthesis still produces shaped Ls/Rs.
+            let n = samples as usize;
+            let pcm_l_f32: Vec<f32> = pcm_per_channel
+                .first()
+                .and_then(|p| p.as_ref())
+                .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
+                .unwrap_or_else(|| vec![0.0_f32; n]);
+            let pcm_r_f32: Vec<f32> = pcm_per_channel
+                .get(1)
+                .and_then(|p| p.as_ref())
+                .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
+                .unwrap_or_else(|| vec![0.0_f32; n]);
+            if let Some(out) = acpl_synth::run_acpl_5x_mch_pcm(
+                &pcm_l_f32,
+                &pcm_r_f32,
+                centre,
+                cfg,
+                data,
+                &mut self.acpl_5x_mch_state,
             ) {
-                // Carrier L and R come from pcm_per_channel[0] / [1] (already
-                // filled by the stereo ASF / ASPX decode path above). If they
-                // are present use them; otherwise zero-fill as placeholders so
-                // the A-CPL synthesis still produces shaped Ls/Rs.
-                let n = samples as usize;
-                let pcm_l_f32: Vec<f32> = pcm_per_channel
-                    .first()
-                    .and_then(|p| p.as_ref())
-                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
-                    .unwrap_or_else(|| vec![0.0_f32; n]);
-                let pcm_r_f32: Vec<f32> = pcm_per_channel
-                    .get(1)
-                    .and_then(|p| p.as_ref())
-                    .map(|v| v.iter().map(|&s| s as f32 / 32767.0).collect())
-                    .unwrap_or_else(|| vec![0.0_f32; n]);
-                if let Some(out) = acpl_synth::run_acpl_5x_mch_pcm(
-                    &pcm_l_f32,
-                    &pcm_r_f32,
-                    centre,
-                    cfg,
-                    data,
-                    &mut self.acpl_5x_mch_state,
-                ) {
-                    // Output channel mapping for 5.0/5.1:
-                    //   ch0 = L, ch1 = R, ch2 = C, ch3 = Ls, ch4 = Rs.
-                    // Resize pcm_per_channel to 5 slots if needed.
-                    while pcm_per_channel.len() < 5 {
-                        pcm_per_channel.push(None);
-                    }
-                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
-                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
-                    pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
-                    pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
-                    pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
+                // Output channel mapping for 5.0/5.1:
+                //   ch0 = L, ch1 = R, ch2 = C, ch3 = Ls, ch4 = Rs.
+                // Resize pcm_per_channel to 5 slots if needed.
+                while pcm_per_channel.len() < 5 {
+                    pcm_per_channel.push(None);
                 }
+                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
+                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
+                pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
+                pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
+                pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
             }
         }
         // §5.7.7.6.1 Pseudocode 117 (5_X) / §5.7.7.6.3 Pseudocode 120
@@ -3294,43 +3298,44 @@ impl Ac4Decoder {
         // the `acpl_data_1ch()` pair; `render_acpl_pair_element` does
         // the Table 181 / 184 track resolution, the Table 213 A-SPX
         // extension of the carriers and the QMF-domain coupling.
-        if five_x_pair_active && !five_x_acpl3_active {
-            if let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
+        if five_x_pair_active
+            && !five_x_acpl3_active
+            && let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
                 five_x_pair_mode,
                 five_x_pair_cfg.as_ref(),
                 five_x_pair_data_1.as_ref(),
                 five_x_pair_data_2.as_ref(),
-            ) {
-                self.render_acpl_pair_element(
-                    false,
-                    mode,
-                    cfg,
-                    data_1,
-                    data_2,
-                    samples as usize,
-                    num_ts_in_ats,
-                    &mut pcm_per_channel,
-                );
-            }
+            )
+        {
+            self.render_acpl_pair_element(
+                false,
+                mode,
+                cfg,
+                data_1,
+                data_2,
+                samples as usize,
+                num_ts_in_ats,
+                &mut pcm_per_channel,
+            );
         }
-        if seven_x_pair_active {
-            if let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
+        if seven_x_pair_active
+            && let (Some(mode), Some(cfg), Some(data_1), Some(data_2)) = (
                 seven_x_pair_mode,
                 seven_x_pair_cfg.as_ref(),
                 seven_x_pair_data_1.as_ref(),
                 seven_x_pair_data_2.as_ref(),
-            ) {
-                self.render_acpl_pair_element(
-                    true,
-                    mode,
-                    cfg,
-                    data_1,
-                    data_2,
-                    samples as usize,
-                    num_ts_in_ats,
-                    &mut pcm_per_channel,
-                );
-            }
+            )
+        {
+            self.render_acpl_pair_element(
+                true,
+                mode,
+                cfg,
+                data_1,
+                data_2,
+                samples as usize,
+                num_ts_in_ats,
+                &mut pcm_per_channel,
+            );
         }
         // Round 38 / 39: §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX
         // end-to-end decode. Round 38 wired Cfg2; round 39 wires Cfg0,
@@ -3437,24 +3442,22 @@ impl Ac4Decoder {
                     .and_then(|sub| sub.tools.seven_x_coding_config),
                 Some(crate::mch::FiveXCodingConfig::Cfg3Five)
             )
-        {
-            if let Some(five) = self
+            && let Some(five) = self
                 .last_substream
                 .as_ref()
                 .and_then(|sub| sub.tools.five_channel_data.clone())
-            {
-                self.dispatch_5x_cfg3_simple_aspx(
-                    &five,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    num_ts_in_ats,
-                    samples as usize,
-                    &mut pcm_per_channel,
-                );
-            }
+        {
+            self.dispatch_5x_cfg3_simple_aspx(
+                &five,
+                None,
+                None,
+                None,
+                None,
+                None,
+                num_ts_in_ats,
+                samples as usize,
+                &mut pcm_per_channel,
+            );
         }
         // Round 39 / 40: §5.3.4.4.1 / Table 182 + Table 183 — 7_X
         // SIMPLE/ASPX additional-channel pair render. The walker populates
@@ -3476,76 +3479,73 @@ impl Ac4Decoder {
         // The 7_X ACPL_1/_2 walker has its own additional-channel
         // handling per §5.3.4.4.2/.3 (z6/z7 in Pseudocode 120) — this
         // branch is gated on the SIMPLE/ASPX active-flag.
-        if seven_x_simple_aspx_active {
-            if let Some(add) = seven_x_additional_channel_data.as_ref() {
-                // Resolve partner spectra + slots based on the active
-                // 7_X coding_config. Per Table 183 row "3/4/0.x" (the
-                // standard 7.0/7.1 layout that our 7_X walker handles)
-                // the partner pair is (Ls, Rs) — slot 3 / slot 4 in our
-                // 5.X-core dispatch; F/G lift to (Lb, Rb) on slot 5/6.
-                let partner_slots: [usize; 2] = [3, 4];
-                let (partner_d, partner_e): (Option<Vec<f32>>, Option<Vec<f32>>) =
-                    match five_x_coding_cfg {
-                        Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
-                            // 5_X cfg2 four_channel_data carries [L, R, Ls, Rs]
-                            // in indices [0, 1, 2, 3] per Table 180. The
-                            // surround pair lives at four[2]/four[3].
-                            let (d, e) = match cfg2_four_channel_data.as_ref() {
-                                Some(four) => (
-                                    four.scaled_spec_per_channel.get(2).cloned().flatten(),
-                                    four.scaled_spec_per_channel.get(3).cloned().flatten(),
-                                ),
-                                None => (None, None),
-                            };
-                            (d, e)
-                        }
-                        Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
-                            // 5_X cfg3 five_channel_data lays out [L, R, C,
-                            // Ls, Rs] per Table 180. Surround pair lives at
-                            // five[3]/five[4].
-                            let (d, e) = match cfg_five_channel_data.as_ref() {
-                                Some(five) => (
-                                    five.scaled_spec_per_channel.get(3).cloned().flatten(),
-                                    five.scaled_spec_per_channel.get(4).cloned().flatten(),
-                                ),
-                                None => (None, None),
-                            };
-                            (d, e)
-                        }
-                        Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
-                            // 5_X cfg1 three_channel_data + two_channel_data:
-                            // surround pair lives at the trailing
-                            // two_channel_data[0]/[1] (slots 3/4 in our
-                            // dispatch). Use the parsed scaled_spec.
-                            let (d, e) = match cfg_two_channel_data.first() {
-                                Some(tcd) => (
-                                    tcd.scaled_spec_per_channel.first().cloned().flatten(),
-                                    tcd.scaled_spec_per_channel.get(1).cloned().flatten(),
-                                ),
-                                None => (None, None),
-                            };
-                            (d, e)
-                        }
-                        _ => (None, None),
-                    };
-                let chparam_pair = self
-                    .last_substream
-                    .as_ref()
-                    .and_then(|sub| sub.tools.seven_x_add_chparam_info.as_ref().cloned());
-                let partner_pair: Option<[&[f32]; 2]> =
-                    match (partner_d.as_ref(), partner_e.as_ref()) {
-                        (Some(d), Some(e)) => Some([d.as_slice(), e.as_slice()]),
-                        _ => None,
-                    };
-                self.dispatch_7x_additional_channel_pair(
-                    add,
-                    partner_pair,
-                    partner_slots,
-                    chparam_pair.as_ref(),
-                    samples as usize,
-                    &mut pcm_per_channel,
-                );
-            }
+        if seven_x_simple_aspx_active && let Some(add) = seven_x_additional_channel_data.as_ref() {
+            // Resolve partner spectra + slots based on the active
+            // 7_X coding_config. Per Table 183 row "3/4/0.x" (the
+            // standard 7.0/7.1 layout that our 7_X walker handles)
+            // the partner pair is (Ls, Rs) — slot 3 / slot 4 in our
+            // 5.X-core dispatch; F/G lift to (Lb, Rb) on slot 5/6.
+            let partner_slots: [usize; 2] = [3, 4];
+            let (partner_d, partner_e): (Option<Vec<f32>>, Option<Vec<f32>>) =
+                match five_x_coding_cfg {
+                    Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
+                        // 5_X cfg2 four_channel_data carries [L, R, Ls, Rs]
+                        // in indices [0, 1, 2, 3] per Table 180. The
+                        // surround pair lives at four[2]/four[3].
+                        let (d, e) = match cfg2_four_channel_data.as_ref() {
+                            Some(four) => (
+                                four.scaled_spec_per_channel.get(2).cloned().flatten(),
+                                four.scaled_spec_per_channel.get(3).cloned().flatten(),
+                            ),
+                            None => (None, None),
+                        };
+                        (d, e)
+                    }
+                    Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
+                        // 5_X cfg3 five_channel_data lays out [L, R, C,
+                        // Ls, Rs] per Table 180. Surround pair lives at
+                        // five[3]/five[4].
+                        let (d, e) = match cfg_five_channel_data.as_ref() {
+                            Some(five) => (
+                                five.scaled_spec_per_channel.get(3).cloned().flatten(),
+                                five.scaled_spec_per_channel.get(4).cloned().flatten(),
+                            ),
+                            None => (None, None),
+                        };
+                        (d, e)
+                    }
+                    Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
+                        // 5_X cfg1 three_channel_data + two_channel_data:
+                        // surround pair lives at the trailing
+                        // two_channel_data[0]/[1] (slots 3/4 in our
+                        // dispatch). Use the parsed scaled_spec.
+                        let (d, e) = match cfg_two_channel_data.first() {
+                            Some(tcd) => (
+                                tcd.scaled_spec_per_channel.first().cloned().flatten(),
+                                tcd.scaled_spec_per_channel.get(1).cloned().flatten(),
+                            ),
+                            None => (None, None),
+                        };
+                        (d, e)
+                    }
+                    _ => (None, None),
+                };
+            let chparam_pair = self
+                .last_substream
+                .as_ref()
+                .and_then(|sub| sub.tools.seven_x_add_chparam_info.as_ref().cloned());
+            let partner_pair: Option<[&[f32]; 2]> = match (partner_d.as_ref(), partner_e.as_ref()) {
+                (Some(d), Some(e)) => Some([d.as_slice(), e.as_slice()]),
+                _ => None,
+            };
+            self.dispatch_7x_additional_channel_pair(
+                add,
+                partner_pair,
+                partner_slots,
+                chparam_pair.as_ref(),
+                samples as usize,
+                &mut pcm_per_channel,
+            );
         }
         // Round 80: 5.1 / 7.1 LFE channel render. When the 5_X / 7_X
         // walker parsed a `mono_data(b_lfe = 1)` payload (per §4.2.6.6
@@ -3560,21 +3560,21 @@ impl Ac4Decoder {
                 .last_substream
                 .as_ref()
                 .and_then(|sub| sub.tools.lfe_mono_data.clone());
-            if let Some(lfe) = lfe_mono.as_ref() {
-                if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(lfe, lfe_slot, samples as usize) {
-                    while pcm_per_channel.len() <= lfe_slot {
-                        pcm_per_channel.push(None);
-                    }
-                    // On the ASPX_ACPL_1 / _2 element routes every other
-                    // channel went through the A-SPX and the A-CPL QMF
-                    // round trips; line the time-domain LFE up with them.
-                    let pcm_f = if five_x_pair_active || seven_x_pair_active {
-                        self.acpl_align[4].delay(&pcm_f, 2 * qmf::QMF_ROUND_TRIP_DELAY)
-                    } else {
-                        pcm_f
-                    };
-                    pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
+            if let Some(lfe) = lfe_mono.as_ref()
+                && let Some(pcm_f) = self.imdct_mono_lfe_data_f32(lfe, lfe_slot, samples as usize)
+            {
+                while pcm_per_channel.len() <= lfe_slot {
+                    pcm_per_channel.push(None);
                 }
+                // On the ASPX_ACPL_1 / _2 element routes every other
+                // channel went through the A-SPX and the A-CPL QMF
+                // round trips; line the time-domain LFE up with them.
+                let pcm_f = if five_x_pair_active || seven_x_pair_active {
+                    self.acpl_align[4].delay(&pcm_f, 2 * qmf::QMF_ROUND_TRIP_DELAY)
+                } else {
+                    pcm_f
+                };
+                pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
             }
         }
         pcm_per_channel
@@ -4321,10 +4321,8 @@ impl Ac4Decoder {
             // overlap slot past the 13 track slots. Decoded the same
             // way in both §4.7 decoding modes (no core-mode gain —
             // §4.8.3.14 excepts the LFE).
-            if b_lfe {
-                if let Some(spec) = ice_el.lfe_spectrum().map(<[f32]>::to_vec) {
-                    lfe_pcm = Some(self.imdct_channel_f32(13, &spec, n));
-                }
+            if b_lfe && let Some(spec) = ice_el.lfe_spectrum().map(<[f32]>::to_vec) {
+                lfe_pcm = Some(self.imdct_channel_f32(13, &spec, n));
             }
             if core_mode {
                 if tl_ok {
@@ -4672,167 +4670,165 @@ impl Ac4Decoder {
                         sub_acpl_full
                     };
                     let n_modules = if b_5fronts { 6 } else { 4 };
-                    if let Some(acfg) = acfg {
-                        if ice_el.acpl_data.len() >= n_modules {
-                            let num_ts = n / qmf::NUM_QMF_SUBBANDS;
-                            let cols: Vec<Vec<ajcc_synth::QmfCol>> =
-                                q_tr.iter().map(|q| Self::ice_qmf_cols(q, num_ts)).collect();
-                            let state_ok =
-                                matches!(&self.ice_acpl, Some(s) if s.b_5fronts == b_5fronts);
-                            if !state_ok {
-                                self.ice_acpl = Some(IceAcplState::new(b_5fronts));
-                            }
-                            let st = self.ice_acpl.as_mut().expect("ice acpl state ensured");
-                            // Module routing: (main track, ASPX_ACPL_1
-                            // residual track, (z_main, z_sub)). The
-                            // carriers are the 5.X.2-core mids D..G
-                            // (tracks 3..6 — §5.5.2 Pseudocode 2 reads
-                            // x5, x6, x9, x10); ASPX_ACPL_1's residual
-                            // tracks are the S-CPL-section sides H..K
-                            // (tracks 7..10 — x7, x8, x11, x12), while
-                            // ASPX_ACPL_2 runs decorrelator-only.
-                            let mut routing: Vec<(usize, Option<usize>, usize, usize, bool)> =
-                                if is_acpl1 {
-                                    vec![
-                                        (3, Some(7), 5, 6, true),    // (Ls, Lb)
-                                        (4, Some(8), 7, 8, true),    // (Rs, Rb)
-                                        (5, Some(9), 9, 10, true),   // (Tfl, Tbl)
-                                        (6, Some(10), 11, 12, true), // (Tfr, Tbr)
-                                    ]
-                                } else {
-                                    vec![
-                                        (3, None, 5, 6, true),
-                                        (4, None, 7, 8, true),
-                                        (5, None, 9, 10, true),
-                                        (6, None, 11, 12, true),
-                                    ]
-                                };
-                            if b_5fronts {
-                                let res_l = if is_acpl1 { Some(11) } else { None };
-                                let res_m = if is_acpl1 { Some(12) } else { None };
-                                routing.push((0, res_l, 0, 1, false)); // (L, Lscr)
-                                routing.push((1, res_m, 2, 3, false)); // (R, Rscr)
-                            }
-                            let sq2 = std::f32::consts::SQRT_2;
-                            let mut z: Vec<Option<Vec<ajcc_synth::QmfCol>>> = vec![None; 13];
-                            for (m, &(main, res, z_main, z_sub, scale)) in
-                                routing.iter().enumerate()
-                            {
-                                let data = &ice_el.acpl_data[m];
-                                let (ad, bd) = &mut st.diffs[m];
-                                let alpha_q = acpl_synth::differential_decode(
-                                    &data.alpha1,
-                                    acfg.num_param_bands,
-                                    ad,
-                                );
-                                let beta_q = acpl_synth::differential_decode(
-                                    &data.beta1,
-                                    acfg.num_param_bands,
-                                    bd,
-                                );
-                                let (alpha_dq, beta_dq) = acpl_synth::dequantize_alpha_beta(
-                                    &alpha_q,
-                                    &beta_q,
-                                    acfg.quant_mode,
-                                );
-                                if alpha_dq.is_empty() {
-                                    continue;
-                                }
-                                let frame = acpl_synth::AcplCpeFrame {
-                                    x0: &cols[main],
-                                    x1: res.map(|r| cols[r].as_slice()),
-                                    alpha_dq: &alpha_dq,
-                                    beta_dq: &beta_dq,
-                                    num_param_bands: acfg.num_param_bands,
-                                    // ASPX_ACPL_1 keeps the M/S-coded
-                                    // residual band below acpl_qmf_band
-                                    // (PARTIAL config); FULL runs fully
-                                    // parametric from band 0.
-                                    acpl_qmf_band: if is_acpl1 { acfg.qmf_band as u32 } else { 0 },
-                                    steep: matches!(
-                                        data.framing.interpolation_type,
-                                        crate::acpl::AcplInterpolationType::Steep
-                                    ),
-                                    param_timeslots: &data.framing.param_timeslots,
-                                };
-                                let out =
-                                    acpl_synth::run_pseudocode_115_pair(&mut st.modules[m], frame);
-                                let (mut z0, mut z1) = (out.z0, out.z1);
-                                if scale {
-                                    for col in z0.iter_mut().chain(z1.iter_mut()) {
-                                        for v in col.iter_mut() {
-                                            v.0 *= sq2;
-                                            v.1 *= sq2;
-                                        }
-                                    }
-                                }
-                                z[z_main] = Some(z0);
-                                z[z_sub] = Some(z1);
-                            }
-                            // Passthrough rows: z4 = 2·x2 (C), and the
-                            // non-b_5fronts z0 = 2·x0 / z2 = 2·x1.
-                            let double = |cols: &[ajcc_synth::QmfCol]| {
-                                cols.iter()
-                                    .map(|col| {
-                                        let mut c = *col;
-                                        for v in c.iter_mut() {
-                                            v.0 *= 2.0;
-                                            v.1 *= 2.0;
-                                        }
-                                        c
-                                    })
-                                    .collect::<Vec<_>>()
-                            };
-                            z[4] = Some(double(&cols[2]));
-                            if !b_5fronts {
-                                z[0] = Some(double(&cols[0]));
-                                z[2] = Some(double(&cols[1]));
-                            }
-                            // Table 26 z → output-slot mapping (slot
-                            // order [L, R, C, (Lscr, Rscr,) Ls, Rs,
-                            // Lb, Rb, Tfl, Tfr, Tbl, Tbr]).
-                            let z_to_slot: &[(usize, usize)] = if b_5fronts {
-                                &[
-                                    (0, 0),
-                                    (2, 1),
-                                    (4, 2),
-                                    (1, 3),
-                                    (3, 4),
-                                    (5, 5),
-                                    (7, 6),
-                                    (6, 7),
-                                    (8, 8),
-                                    (9, 9),
-                                    (11, 10),
-                                    (10, 11),
-                                    (12, 12),
+                    if let Some(acfg) = acfg
+                        && ice_el.acpl_data.len() >= n_modules
+                    {
+                        let num_ts = n / qmf::NUM_QMF_SUBBANDS;
+                        let cols: Vec<Vec<ajcc_synth::QmfCol>> =
+                            q_tr.iter().map(|q| Self::ice_qmf_cols(q, num_ts)).collect();
+                        let state_ok =
+                            matches!(&self.ice_acpl, Some(s) if s.b_5fronts == b_5fronts);
+                        if !state_ok {
+                            self.ice_acpl = Some(IceAcplState::new(b_5fronts));
+                        }
+                        let st = self.ice_acpl.as_mut().expect("ice acpl state ensured");
+                        // Module routing: (main track, ASPX_ACPL_1
+                        // residual track, (z_main, z_sub)). The
+                        // carriers are the 5.X.2-core mids D..G
+                        // (tracks 3..6 — §5.5.2 Pseudocode 2 reads
+                        // x5, x6, x9, x10); ASPX_ACPL_1's residual
+                        // tracks are the S-CPL-section sides H..K
+                        // (tracks 7..10 — x7, x8, x11, x12), while
+                        // ASPX_ACPL_2 runs decorrelator-only.
+                        let mut routing: Vec<(usize, Option<usize>, usize, usize, bool)> =
+                            if is_acpl1 {
+                                vec![
+                                    (3, Some(7), 5, 6, true),    // (Ls, Lb)
+                                    (4, Some(8), 7, 8, true),    // (Rs, Rb)
+                                    (5, Some(9), 9, 10, true),   // (Tfl, Tbl)
+                                    (6, Some(10), 11, 12, true), // (Tfr, Tbr)
                                 ]
                             } else {
-                                &[
-                                    (0, 0),
-                                    (2, 1),
-                                    (4, 2),
-                                    (5, 3),
-                                    (7, 4),
-                                    (6, 5),
-                                    (8, 6),
-                                    (9, 7),
-                                    (11, 8),
-                                    (10, 9),
-                                    (12, 10),
+                                vec![
+                                    (3, None, 5, 6, true),
+                                    (4, None, 7, 8, true),
+                                    (5, None, 9, 10, true),
+                                    (6, None, 11, 12, true),
                                 ]
                             };
-                            let inv_scale = 1.0 / aspx::ASPX_QMF_PCM_SCALE;
-                            for &(zi, slot) in z_to_slot {
-                                let Some(zm) = &z[zi] else { continue };
-                                let syn = self.ice_out_syn_bank(slot);
-                                let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
-                                for col in zm.iter().take(num_ts) {
-                                    let row = syn.process_slot(col);
-                                    pcm.extend(row.iter().map(|&v| v * inv_scale));
-                                }
-                                chans[slot] = pcm;
+                        if b_5fronts {
+                            let res_l = if is_acpl1 { Some(11) } else { None };
+                            let res_m = if is_acpl1 { Some(12) } else { None };
+                            routing.push((0, res_l, 0, 1, false)); // (L, Lscr)
+                            routing.push((1, res_m, 2, 3, false)); // (R, Rscr)
+                        }
+                        let sq2 = std::f32::consts::SQRT_2;
+                        let mut z: Vec<Option<Vec<ajcc_synth::QmfCol>>> = vec![None; 13];
+                        for (m, &(main, res, z_main, z_sub, scale)) in routing.iter().enumerate() {
+                            let data = &ice_el.acpl_data[m];
+                            let (ad, bd) = &mut st.diffs[m];
+                            let alpha_q = acpl_synth::differential_decode(
+                                &data.alpha1,
+                                acfg.num_param_bands,
+                                ad,
+                            );
+                            let beta_q = acpl_synth::differential_decode(
+                                &data.beta1,
+                                acfg.num_param_bands,
+                                bd,
+                            );
+                            let (alpha_dq, beta_dq) = acpl_synth::dequantize_alpha_beta(
+                                &alpha_q,
+                                &beta_q,
+                                acfg.quant_mode,
+                            );
+                            if alpha_dq.is_empty() {
+                                continue;
                             }
+                            let frame = acpl_synth::AcplCpeFrame {
+                                x0: &cols[main],
+                                x1: res.map(|r| cols[r].as_slice()),
+                                alpha_dq: &alpha_dq,
+                                beta_dq: &beta_dq,
+                                num_param_bands: acfg.num_param_bands,
+                                // ASPX_ACPL_1 keeps the M/S-coded
+                                // residual band below acpl_qmf_band
+                                // (PARTIAL config); FULL runs fully
+                                // parametric from band 0.
+                                acpl_qmf_band: if is_acpl1 { acfg.qmf_band as u32 } else { 0 },
+                                steep: matches!(
+                                    data.framing.interpolation_type,
+                                    crate::acpl::AcplInterpolationType::Steep
+                                ),
+                                param_timeslots: &data.framing.param_timeslots,
+                            };
+                            let out =
+                                acpl_synth::run_pseudocode_115_pair(&mut st.modules[m], frame);
+                            let (mut z0, mut z1) = (out.z0, out.z1);
+                            if scale {
+                                for col in z0.iter_mut().chain(z1.iter_mut()) {
+                                    for v in col.iter_mut() {
+                                        v.0 *= sq2;
+                                        v.1 *= sq2;
+                                    }
+                                }
+                            }
+                            z[z_main] = Some(z0);
+                            z[z_sub] = Some(z1);
+                        }
+                        // Passthrough rows: z4 = 2·x2 (C), and the
+                        // non-b_5fronts z0 = 2·x0 / z2 = 2·x1.
+                        let double = |cols: &[ajcc_synth::QmfCol]| {
+                            cols.iter()
+                                .map(|col| {
+                                    let mut c = *col;
+                                    for v in c.iter_mut() {
+                                        v.0 *= 2.0;
+                                        v.1 *= 2.0;
+                                    }
+                                    c
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        z[4] = Some(double(&cols[2]));
+                        if !b_5fronts {
+                            z[0] = Some(double(&cols[0]));
+                            z[2] = Some(double(&cols[1]));
+                        }
+                        // Table 26 z → output-slot mapping (slot
+                        // order [L, R, C, (Lscr, Rscr,) Ls, Rs,
+                        // Lb, Rb, Tfl, Tfr, Tbl, Tbr]).
+                        let z_to_slot: &[(usize, usize)] = if b_5fronts {
+                            &[
+                                (0, 0),
+                                (2, 1),
+                                (4, 2),
+                                (1, 3),
+                                (3, 4),
+                                (5, 5),
+                                (7, 6),
+                                (6, 7),
+                                (8, 8),
+                                (9, 9),
+                                (11, 10),
+                                (10, 11),
+                                (12, 12),
+                            ]
+                        } else {
+                            &[
+                                (0, 0),
+                                (2, 1),
+                                (4, 2),
+                                (5, 3),
+                                (7, 4),
+                                (6, 5),
+                                (8, 6),
+                                (9, 7),
+                                (11, 8),
+                                (10, 9),
+                                (12, 10),
+                            ]
+                        };
+                        let inv_scale = 1.0 / aspx::ASPX_QMF_PCM_SCALE;
+                        for &(zi, slot) in z_to_slot {
+                            let Some(zm) = &z[zi] else { continue };
+                            let syn = self.ice_out_syn_bank(slot);
+                            let mut pcm = Vec::with_capacity(num_ts * qmf::NUM_QMF_SUBBANDS);
+                            for col in zm.iter().take(num_ts) {
+                                let row = syn.process_slot(col);
+                                pcm.extend(row.iter().map(|&v| v * inv_scale));
+                            }
+                            chans[slot] = pcm;
                         }
                     }
                 }
@@ -4935,83 +4931,79 @@ impl Ac4Decoder {
         let mut lfe_pcm: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
         let mut chans: Vec<Vec<f32>> = vec![Vec::new(); 22];
         let sub_aspx_cfg = sub.tools.aspx_config;
-        if let Some(el) = sub.tools.el_22_2.as_deref() {
-            if el.transform_length() == Some(samples) {
-                // LFEs — dedicated overlap slots past the 22 fullband
-                // slots.
-                for (i, lfe_body) in el.lfe.iter().enumerate() {
-                    if let Some(pcm) = self.imdct_mono_lfe_data_f32(lfe_body, 22 + i, n) {
-                        lfe_pcm[i] = pcm;
+        if let Some(el) = sub.tools.el_22_2.as_deref()
+            && el.transform_length() == Some(samples)
+        {
+            // LFEs — dedicated overlap slots past the 22 fullband
+            // slots.
+            for (i, lfe_body) in el.lfe.iter().enumerate() {
+                if let Some(pcm) = self.imdct_mono_lfe_data_f32(lfe_body, 22 + i, n) {
+                    lfe_pcm[i] = pcm;
+                }
+            }
+            let specs: Vec<Vec<f32>> = el
+                .fullband_spectra()
+                .into_iter()
+                .map(|s| s.map(<[f32]>::to_vec).unwrap_or_default())
+                .collect();
+            for (ch, spec) in specs.iter().enumerate() {
+                chans[ch] = self.imdct_channel_f32(ch, spec, n);
+            }
+            // A-SPX extension per pair (payload p → channels
+            // (2p, 2p + 1)); no output gain stage for 22.2.
+            if el.aspx_mode
+                && let Some(cfg) = sub_aspx_cfg
+            {
+                let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
+                // Pair-level aspx_balance == 1 joint decode
+                // (Pseudocode 84): payload p covers channels
+                // (2p, 2p + 1).
+                let mut pre: Vec<Option<aspx::AspxDecodedScf>> = vec![None; 22];
+                for p in 0..11usize {
+                    let Some(trailer) = el.aspx_elements.get(p).and_then(|t| t.as_deref()) else {
+                        continue;
+                    };
+                    if !trailer.balance {
+                        continue;
+                    }
+                    let trailer = trailer.clone();
+                    let (st_a, st_b) = self.two_ext_states(2 * p, 2 * p + 1);
+                    if let Some((scf_a, scf_b)) = Self::trailer_balance_scf(&trailer, st_a, st_b) {
+                        pre[2 * p] = Some(scf_a);
+                        pre[2 * p + 1] = Some(scf_b);
                     }
                 }
-                let specs: Vec<Vec<f32>> = el
-                    .fullband_spectra()
-                    .into_iter()
-                    .map(|s| s.map(<[f32]>::to_vec).unwrap_or_default())
-                    .collect();
-                for (ch, spec) in specs.iter().enumerate() {
-                    chans[ch] = self.imdct_channel_f32(ch, spec, n);
-                }
-                // A-SPX extension per pair (payload p → channels
-                // (2p, 2p + 1)); no output gain stage for 22.2.
-                if el.aspx_mode {
-                    if let Some(cfg) = sub_aspx_cfg {
-                        let num_ts_in_ats = aspx::num_ts_in_ats(samples.max(1));
-                        // Pair-level aspx_balance == 1 joint decode
-                        // (Pseudocode 84): payload p covers channels
-                        // (2p, 2p + 1).
-                        let mut pre: Vec<Option<aspx::AspxDecodedScf>> = vec![None; 22];
-                        for p in 0..11usize {
-                            let Some(trailer) = el.aspx_elements.get(p).and_then(|t| t.as_deref())
-                            else {
-                                continue;
-                            };
-                            if !trailer.balance {
-                                continue;
-                            }
-                            let trailer = trailer.clone();
-                            let (st_a, st_b) = self.two_ext_states(2 * p, 2 * p + 1);
-                            if let Some((scf_a, scf_b)) =
-                                Self::trailer_balance_scf(&trailer, st_a, st_b)
-                            {
-                                pre[2 * p] = Some(scf_a);
-                                pre[2 * p + 1] = Some(scf_b);
-                            }
-                        }
-                        for (ch, chan) in chans.iter_mut().enumerate().take(22) {
-                            let Some(trailer) =
-                                el.aspx_elements.get(ch / 2).and_then(|t| t.as_deref())
-                            else {
-                                continue;
-                            };
-                            let trailer = trailer.clone();
-                            let chd = if ch % 2 == 1 {
-                                trailer.secondary.as_ref().unwrap_or(&trailer.primary)
-                            } else {
-                                &trailer.primary
-                            };
-                            while self.aspx_ext_state.len() <= ch {
-                                self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
-                            }
-                            *chan = Self::aspx_extend_pcm(
-                                chan,
-                                &trailer.frequency_tables,
-                                &cfg,
-                                Some(&chd.framing),
-                                Some(&chd.data_sig),
-                                Some(&chd.data_noise),
-                                Some(chd.qmode_env),
-                                Some(&chd.delta_dir),
-                                chd.add_harmonic.as_deref(),
-                                chd.tna_mode.as_deref(),
-                                pre[ch].as_ref(),
-                                &mut self.aspx_ext_state[ch],
-                                num_ts_in_ats,
-                                aspx::CompandingMode::Off,
-                                None,
-                            );
-                        }
+                for (ch, chan) in chans.iter_mut().enumerate().take(22) {
+                    let Some(trailer) = el.aspx_elements.get(ch / 2).and_then(|t| t.as_deref())
+                    else {
+                        continue;
+                    };
+                    let trailer = trailer.clone();
+                    let chd = if ch % 2 == 1 {
+                        trailer.secondary.as_ref().unwrap_or(&trailer.primary)
+                    } else {
+                        &trailer.primary
+                    };
+                    while self.aspx_ext_state.len() <= ch {
+                        self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
                     }
+                    *chan = Self::aspx_extend_pcm(
+                        chan,
+                        &trailer.frequency_tables,
+                        &cfg,
+                        Some(&chd.framing),
+                        Some(&chd.data_sig),
+                        Some(&chd.data_noise),
+                        Some(chd.qmode_env),
+                        Some(&chd.delta_dir),
+                        chd.add_harmonic.as_deref(),
+                        chd.tna_mode.as_deref(),
+                        pre[ch].as_ref(),
+                        &mut self.aspx_ext_state[ch],
+                        num_ts_in_ats,
+                        aspx::CompandingMode::Off,
+                        None,
+                    );
                 }
             }
         }
@@ -5124,11 +5116,7 @@ impl Decoder for Ac4Decoder {
             // Unknown frame length (reserved frame_rate_index): fall back
             // to 1024 samples at 48 kHz, 480 @ 44.1 kHz — both
             // round-numbers the resampler handles cleanly.
-            if sample_rate == 44_100 {
-                480
-            } else {
-                1024
-            }
+            if sample_rate == 44_100 { 480 } else { 1024 }
         } else {
             // frame_length in the table is expressed at the base sample
             // rate; for 96/192 kHz (sf_multiplier) we scale up.
@@ -5157,11 +5145,7 @@ impl Decoder for Ac4Decoder {
             } else if let Some(sz) = first_size {
                 let sz = sz as usize;
                 let end = start.saturating_add(sz).min(raw.len());
-                if sz > 0 {
-                    Some(&raw[start..end])
-                } else {
-                    None
-                }
+                if sz > 0 { Some(&raw[start..end]) } else { None }
             } else {
                 // Single-substream frame with implicit size: the
                 // substream spans to the end of the packet (possibly
@@ -5290,7 +5274,7 @@ mod tests {
         bw.write_u32(0, 1); // b_content_type
         bw.write_u32(1, 1); // b_iframe
         bw.write_u32(0, 2); // substream_index
-                            // b_pre_virtualized = 0, b_add_emdf_substreams = 0.
+        // b_pre_virtualized = 0, b_add_emdf_substreams = 0.
         bw.write_u32(0, 1);
         bw.write_u32(0, 1);
         // substream_index_table(): n_substreams=1, b_size_present=0.
@@ -5343,13 +5327,13 @@ mod tests {
         bw.write_u32(1, 1); // b_iframe_global
         bw.write_u32(1, 1); // b_single_presentation
         bw.write_u32(0, 1); // b_payload_base
-                            // ac4_presentation_info:
+        // ac4_presentation_info:
         bw.write_u32(1, 1); // b_single_substream
         bw.write_u32(0, 1); // presentation_version = 0
         bw.write_u32(0, 3); // md_compat
         bw.write_u32(0, 1); // b_belongs_to_presentation_id
         bw.write_u32(0, 1); // frame_rate_multiply_info
-                            // emdf_info:
+        // emdf_info:
         bw.write_u32(0, 2);
         bw.write_u32(0, 3);
         bw.write_u32(0, 1);
@@ -5363,7 +5347,7 @@ mod tests {
         bw.write_u32(0, 2); // substream_index
         bw.write_u32(0, 1); // b_pre_virtualized
         bw.write_u32(0, 1); // b_add_emdf_substreams
-                            // substream_index_table:
+        // substream_index_table:
         bw.write_u32(1, 2); // n_substreams - 1
         bw.write_u32(0, 1); // b_size_present
         bw.align_to_byte();
@@ -5526,7 +5510,9 @@ mod tests {
         assert!(scaled[0].abs() > 0.0);
         // PCM should have non-trivial energy.
         let samples_i16: Vec<i16> = af.data[0]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let nonzero_count = samples_i16.iter().filter(|&&s| s != 0).count();
@@ -5562,11 +5548,11 @@ mod tests {
         bw.write_u32(0, 1); // spec_frontend_l = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(max_sfb, 6); // max_sfb[0]
-                                  // --- Right channel ---
+        // --- Right channel ---
         bw.write_u32(0, 1); // spec_frontend_r = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(max_sfb, 6); // max_sfb[0]
-                                  // sf_data(spec_frontend_l): section_data + spectral + scalefac + snf.
+        // sf_data(spec_frontend_l): section_data + spectral + scalefac + snf.
         let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
         let end_line = sfbo[max_sfb as usize] as u32;
         let hcb = huffman::asf_hcb(5).unwrap();
@@ -5606,8 +5592,8 @@ mod tests {
         // channels must carry real PCM (non-silent), and their sample
         // streams must differ.
         let mut bytes = build_minimal_toc(); // stereo TOC — channel_mode '10'
-                                             // cb_idx=49 is (q0=1, q1=0); cb_idx=58 is (q0=2, q1=0).
-                                             // Different tones -> different PCM per channel.
+        // cb_idx=49 is (q0=1, q1=0); cb_idx=58 is (q0=2, q1=0).
+        // Different tones -> different PCM per channel.
         let body = build_stereo_asf_split_body_with_tones(1920, 10, 49, 58);
         bytes.extend(body);
         let params = CodecParameters::audio(CodecId::new("ac4"));
@@ -5985,12 +5971,12 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 1); // stride_flag = LONG_STRIDE
         bw.write_u32(0, 3); // num_bands_minus12 = 0 → num_bands = 12
-                            // No per-block predictor loop iterations in this layout.
-                            // ssf_st_data():
+        // No per-block predictor loop iterations in this layout.
+        // ssf_st_data():
         bw.write_u32(0, 5); // env_curr_band0_bits
         bw.write_u32(0, 1); // variance_preserving_flag
         bw.write_u32(0, 5); // alloc_offset_bits
-                            // ssf_ac_data() init + payload — pad ample zeros.
+        // ssf_ac_data() init + payload — pad ample zeros.
         for _ in 0..(30 + 256) {
             bw.write_bit(false);
         }
@@ -8123,7 +8109,7 @@ mod tests {
     #[test]
     fn decoder_routes_ajoc_object_frames_end_to_end() {
         use crate::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
-        use crate::ajoc_substream::{encode_ajoc_raw_frame, AjocBodyParams};
+        use crate::ajoc_substream::{AjocBodyParams, encode_ajoc_raw_frame};
         use crate::encoder_ajoc::AjocQuantMatrices;
         use crate::oamd::ObjType;
 
@@ -8155,9 +8141,11 @@ mod tests {
         };
         let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
             .map(|o| {
-                vec![(0..num_dmx)
-                    .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
-                    .collect()]
+                vec![
+                    (0..num_dmx)
+                        .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
+                        .collect(),
+                ]
             })
             .collect();
         let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
@@ -8234,7 +8222,7 @@ mod tests {
     #[test]
     fn decoder_ajoc_lfe_slot_carries_decoded_pcm() {
         use crate::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
-        use crate::ajoc_substream::{encode_ajoc_raw_frame, AjocBodyParams};
+        use crate::ajoc_substream::{AjocBodyParams, encode_ajoc_raw_frame};
         use crate::encoder_ajoc::AjocQuantMatrices;
         use crate::oamd::ObjType;
 
@@ -8267,9 +8255,11 @@ mod tests {
         };
         let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
             .map(|o| {
-                vec![(0..num_dmx)
-                    .map(|ch| vec![if ch == o { 1.0 } else { 0.0 }])
-                    .collect()]
+                vec![
+                    (0..num_dmx)
+                        .map(|ch| vec![if ch == o { 1.0 } else { 0.0 }])
+                        .collect(),
+                ]
             })
             .collect();
         let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)

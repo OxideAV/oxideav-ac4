@@ -21,7 +21,7 @@
 //!    wire and decodes to the same settled output.
 //! 5. Determinism.
 
-use oxideav_ac4::ajcc::{decode_ajcc_parsed, AjccState};
+use oxideav_ac4::ajcc::{AjccState, decode_ajcc_parsed};
 use oxideav_ac4::ajoc::AjocDiffType;
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;

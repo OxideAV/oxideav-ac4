@@ -29,12 +29,12 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::de::{parse_dialog_enhancement, write_dialog_enhancement, DeConfig, DialogEnhancement};
+use crate::de::{DeConfig, DialogEnhancement, parse_dialog_enhancement, write_dialog_enhancement};
 use crate::drc::{
-    nr_drc_channels, nr_drc_subframes, parse_drc_frame, write_drc_frame, DrcChannelInfo, DrcConfig,
-    DrcFrame,
+    DrcChannelInfo, DrcConfig, DrcFrame, nr_drc_channels, nr_drc_subframes, parse_drc_frame,
+    write_drc_frame,
 };
-use crate::emdf::{parse_emdf_payloads_substream, EmdfPayloadsSubstream};
+use crate::emdf::{EmdfPayloadsSubstream, parse_emdf_payloads_substream};
 use crate::toc::variable_bits;
 
 // ---------------------------------------------------------------------
@@ -382,7 +382,7 @@ pub fn write_further_loudness_info(
         _ => {
             return Err(Error::invalid(
                 "ac4: loudspchgat and its dialgate_prac_type must both be present or absent",
-            ))
+            ));
         }
     }
 
@@ -424,7 +424,7 @@ pub fn write_further_loudness_info(
         _ => {
             return Err(Error::invalid(
                 "ac4: lra and lra_prac_type must both be present or absent",
-            ))
+            ));
         }
     }
 
@@ -473,7 +473,7 @@ pub fn write_basic_metadata(
             _ => {
                 return Err(Error::invalid(
                     "ac4: pre_dmixtyp_2ch and phase90_info_2ch must both be present or absent",
-                ))
+                ));
             }
         }
     } else if channel_mode > channel_mode::STEREO {
@@ -503,7 +503,7 @@ pub fn write_basic_metadata(
                 _ => {
                     return Err(Error::invalid(
                         "ac4: ltrt centre/surround mixgain must both be present or absent",
-                    ))
+                    ));
                 }
             }
             write_opt_u(bw, v.ltrt_dmx_loud_corr.map(|x| x as u32), 5);
@@ -1840,7 +1840,7 @@ mod tests {
         bw.write_bit(true); // b_substream_loudness_info
         bw.write_u32(0xA5, 8); // substream_loudness_bits
         bw.write_bit(true); // b_further_substream_loudness_info
-                            // further_loudness_info(sus_ver = 1, b_presentation_ldn = 0):
+        // further_loudness_info(sus_ver = 1, b_presentation_ldn = 0):
         bw.write_bit(true); // b_loudcorr_dialgate (headerless form)
         bw.write_bit(false); // b_loudrelgat
         bw.write_bit(false); // b_loudspchgat
@@ -1849,19 +1849,19 @@ mod tests {
         bw.write_bit(false); // b_max_loudstrm3s
         bw.write_bit(false); // b_truepk
         bw.write_bit(false); // b_max_truepk
-                             // (no prgmbndy block — b_presentation_ldn = 0)
+        // (no prgmbndy block — b_presentation_ldn = 0)
         bw.write_bit(false); // b_lra
         bw.write_bit(false); // b_loudmntry
         bw.write_bit(false); // b_max_loudmntry
         bw.write_bit(true); // b_rtllcomp
         bw.write_u32(77, 8); // rtll_comp
         bw.write_bit(false); // b_extension
-                             // stereo branch: b_prev_dmx_info = 1.
+        // stereo branch: b_prev_dmx_info = 1.
         bw.write_bit(true);
         bw.write_u32(5, 3); // pre_dmixtyp_2ch
         bw.write_u32(2, 2); // phase90_info_2ch
         bw.write_bit(false); // b_dc_blocking
-                             // extended_metadata v2: b_dialog = 1 with a max gain.
+        // extended_metadata v2: b_dialog = 1 with a max gain.
         bw.write_bit(true); // b_dialog
         bw.write_bit(true); // b_dialog_max_gain
         bw.write_u32(2, 2); // dialog_max_gain
@@ -2059,10 +2059,10 @@ mod tests {
         bw.write_bit(false); // more
         bw.write_bit(false); // b_channels_classifier
         bw.write_bit(false); // b_event_probability
-                             // tools_metadata_size = 23.
+        // tools_metadata_size = 23.
         bw.write_u32(23, 7);
         bw.write_bit(false); // b_more_bits
-                             // DRC frame.
+        // DRC frame.
         bw.write_bit(true); // b_drc_present
         bw.write_u32(0, 3); // drc_decoder_nr_modes = 0 (1 mode)
         bw.write_u32(0, 3); // drc_decoder_mode_id = 0
@@ -2071,12 +2071,12 @@ mod tests {
         bw.write_u32(0, 3); // drc_eac3_profile
         bw.write_bit(false); // drc_reset_flag
         bw.write_u32(0, 2); // drc_reserved
-                            // DE.
+        // DE.
         bw.write_bit(true); // b_de_data_present
         bw.write_u32(0, 2); // de_method = 0 (ChannelIndependent)
         bw.write_u32(0, 2); // de_max_gain
         bw.write_u32(0, 3); // de_channel_config = 0 → 0 channels
-                            // EMDF flag.
+        // EMDF flag.
         bw.write_bit(false);
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2122,11 +2122,11 @@ mod tests {
         bw.write_bit(false); // b_event_probability
         bw.write_u32(7, 7); // tools_metadata_size = 7
         bw.write_bit(false); // b_more_bits
-                             // DRC P-frame.
+        // DRC P-frame.
         bw.write_bit(true); // b_drc_present
         bw.write_bit(false); // drc_reset_flag
         bw.write_u32(0, 2); // drc_reserved
-                            // DE P-frame.
+        // DE P-frame.
         bw.write_bit(true); // b_de_data_present
         bw.write_bit(false); // de_config_flag (re-use prev)
         bw.write_bit(false); // b_emdf_payloads_substream
@@ -2193,8 +2193,8 @@ mod tests {
         write_minimal_drc_absent(&mut bw);
         write_minimal_de_absent(&mut bw);
         bw.write_bit(true); // b_emdf_payloads_substream = 1
-                            // emdf_payloads_substream(): just the terminator id == 0, then
-                            // the byte_align inside parse_emdf_payloads_substream.
+        // emdf_payloads_substream(): just the terminator id == 0, then
+        // the byte_align inside parse_emdf_payloads_substream.
         bw.write_u32(0, 5);
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2229,18 +2229,18 @@ mod tests {
         write_minimal_drc_absent(&mut bw);
         write_minimal_de_absent(&mut bw);
         bw.write_bit(true); // b_emdf_payloads_substream = 1
-                            // Payload 1: id=9, all-zero config gates + discard=1, size=0.
+        // Payload 1: id=9, all-zero config gates + discard=1, size=0.
         bw.write_u32(9, 5);
         bw.write_bit(false); // b_smpoffst
         bw.write_bit(false); // b_duration
         bw.write_bit(false); // b_groupid
         bw.write_bit(false); // b_codecdata
         bw.write_bit(true); // b_discard_unknown_payload
-                            // emdf_payload_size = variable_bits(8) → just 8 bits of zero
-                            // and the 1-bit "more" terminator.
+        // emdf_payload_size = variable_bits(8) → just 8 bits of zero
+        // and the 1-bit "more" terminator.
         bw.write_u32(0, 8);
         bw.write_bit(false); // more
-                             // Terminator id == 0.
+        // Terminator id == 0.
         bw.write_u32(0, 5);
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2629,8 +2629,8 @@ mod tests {
         write_minimal_drc_absent(&mut bw);
         write_minimal_de_absent(&mut bw);
         bw.write_bit(true); // b_emdf_payloads_substream
-                            // emdf_payloads_substream(): one payload id 7, minimal config,
-                            // 1 byte, then terminator + byte_align.
+        // emdf_payloads_substream(): one payload id 7, minimal config,
+        // 1 byte, then terminator + byte_align.
         bw.write_u32(7, 5); // emdf_payload_id
         bw.write_bit(false); // b_smpoffst
         bw.write_bit(false); // b_duration

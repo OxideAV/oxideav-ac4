@@ -72,7 +72,7 @@
 //!   walker doesn't yet drive [`run_pseudocode_118_5x`] /
 //!   [`run_pseudocode_117_5x`]).
 
-use crate::acpl::{sb_to_pb, AcplHuffParam, AcplQuantMode};
+use crate::acpl::{AcplHuffParam, AcplQuantMode, sb_to_pb};
 use crate::qmf::NUM_QMF_SUBBANDS;
 
 // =====================================================================
@@ -216,11 +216,7 @@ pub fn dequantize_beta_index(qm: AcplQuantMode, beta_q: i32, ibeta: u8) -> f32 {
             BETA_DQ_COARSE[row][col]
         }
     };
-    if beta_q < 0 {
-        -val
-    } else {
-        val
-    }
+    if beta_q < 0 { -val } else { val }
 }
 
 // =====================================================================
@@ -2003,7 +1999,7 @@ pub fn run_acpl_1ch_pcm(
     data: &AcplData1ch,
     state: &mut AcplSubstreamState,
 ) -> Option<(Vec<f32>, Vec<f32>)> {
-    if pcm_in.is_empty() || pcm_in.len() % NUM_QMF_SUBBANDS != 0 {
+    if pcm_in.is_empty() || !pcm_in.len().is_multiple_of(NUM_QMF_SUBBANDS) {
         return None;
     }
     let n_slots = pcm_in.len() / NUM_QMF_SUBBANDS;
@@ -2074,7 +2070,10 @@ pub fn run_acpl_1ch_pcm_stereo(
     data: &AcplData1ch,
     state: &mut AcplSubstreamState,
 ) -> Option<(Vec<f32>, Vec<f32>)> {
-    if pcm_m.is_empty() || pcm_m.len() % NUM_QMF_SUBBANDS != 0 || pcm_m.len() != pcm_s.len() {
+    if pcm_m.is_empty()
+        || !pcm_m.len().is_multiple_of(NUM_QMF_SUBBANDS)
+        || pcm_m.len() != pcm_s.len()
+    {
         return None;
     }
     let n_slots = pcm_m.len() / NUM_QMF_SUBBANDS;
@@ -2211,7 +2210,7 @@ pub fn run_acpl_5x_pair_pcm(
     data_2: &AcplData1chTy,
     state: &mut Acpl5xPairPcmState,
 ) -> Option<Acpl5xPcmOutput> {
-    if pcm_l.is_empty() || pcm_l.len() % NUM_QMF_SUBBANDS != 0 {
+    if pcm_l.is_empty() || !pcm_l.len().is_multiple_of(NUM_QMF_SUBBANDS) {
         return None;
     }
     if pcm_l.len() != pcm_r.len() || pcm_l.len() != pcm_c.len() {
@@ -2403,7 +2402,7 @@ pub fn run_acpl_5x_mch_pcm(
     data: &AcplData2ch,
     state: &mut Acpl5xMchPcmState,
 ) -> Option<Acpl5xPcmOutput> {
-    if pcm_l.is_empty() || pcm_l.len() % NUM_QMF_SUBBANDS != 0 {
+    if pcm_l.is_empty() || !pcm_l.len().is_multiple_of(NUM_QMF_SUBBANDS) {
         return None;
     }
     if pcm_l.len() != pcm_r.len() || pcm_l.len() != pcm_c.len() {
@@ -4046,51 +4045,57 @@ mod tests {
         let mut state = Acpl5xPairPcmState::new();
         // Length not a multiple of 64 → None.
         let pcm_short = vec![0.0f32; 65];
-        assert!(run_acpl_5x_pair_pcm(
-            Acpl5xPairMode::AspxAcpl2,
-            &pcm_short,
-            &pcm_short,
-            &pcm_short,
-            None,
-            None,
-            &cfg,
-            &data,
-            &cfg,
-            &data,
-            &mut state,
-        )
-        .is_none());
+        assert!(
+            run_acpl_5x_pair_pcm(
+                Acpl5xPairMode::AspxAcpl2,
+                &pcm_short,
+                &pcm_short,
+                &pcm_short,
+                None,
+                None,
+                &cfg,
+                &data,
+                &cfg,
+                &data,
+                &mut state,
+            )
+            .is_none()
+        );
         // Surround present in ASPX_ACPL_2 mode → None.
         let pcm = vec![0.0f32; 64];
-        assert!(run_acpl_5x_pair_pcm(
-            Acpl5xPairMode::AspxAcpl2,
-            &pcm,
-            &pcm,
-            &pcm,
-            Some(&pcm),
-            Some(&pcm),
-            &cfg,
-            &data,
-            &cfg,
-            &data,
-            &mut state,
-        )
-        .is_none());
+        assert!(
+            run_acpl_5x_pair_pcm(
+                Acpl5xPairMode::AspxAcpl2,
+                &pcm,
+                &pcm,
+                &pcm,
+                Some(&pcm),
+                Some(&pcm),
+                &cfg,
+                &data,
+                &cfg,
+                &data,
+                &mut state,
+            )
+            .is_none()
+        );
         // Surround missing in ASPX_ACPL_1 mode → None.
-        assert!(run_acpl_5x_pair_pcm(
-            Acpl5xPairMode::AspxAcpl1,
-            &pcm,
-            &pcm,
-            &pcm,
-            None,
-            None,
-            &cfg,
-            &data,
-            &cfg,
-            &data,
-            &mut state,
-        )
-        .is_none());
+        assert!(
+            run_acpl_5x_pair_pcm(
+                Acpl5xPairMode::AspxAcpl1,
+                &pcm,
+                &pcm,
+                &pcm,
+                None,
+                None,
+                &cfg,
+                &data,
+                &cfg,
+                &data,
+                &mut state,
+            )
+            .is_none()
+        );
     }
 
     /// End-to-end: feed three sine carriers (L/R/C) into the

@@ -1157,17 +1157,17 @@ mod tests {
         // implicitly 1, no gainset payload), no curve transmitted.
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_drc_present
-                            // drc_config():
+        // drc_config():
         bw.write_u32(0, 3); // drc_decoder_nr_modes = 0 -> 1 mode
-                            // mode 0:
+        // mode 0:
         bw.write_u32(2, 3); // drc_decoder_mode_id = 2 (Portable Speakers)
-                            // mode_id <= 3 so no output_level_from/to.
+        // mode_id <= 3 so no output_level_from/to.
         bw.write_bit(false); // drc_repeat_profile_flag = 0
         bw.write_bit(true); // drc_default_profile_flag = 1 -> implicit curve flag
         bw.write_u32(1, 3); // drc_eac3_profile = 1 (Film standard)
-                            // drc_data(): mode 0 has compression_curve_flag = 1 ->
-                            // curve_present = 1, no gainsets, then drc_reset_flag (1b) +
-                            // drc_reserved (2b).
+        // drc_data(): mode 0 has compression_curve_flag = 1 ->
+        // curve_present = 1, no gainsets, then drc_reset_flag (1b) +
+        // drc_reserved (2b).
         bw.write_bit(false); // drc_reset_flag
         bw.write_u32(0, 2); // drc_reserved
         bw.align_to_byte();
@@ -1211,7 +1211,7 @@ mod tests {
 
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_drc_present
-                            // drc_config:
+        // drc_config:
         bw.write_u32(0, 3); // drc_decoder_nr_modes = 0 -> 1 mode
         bw.write_u32(0, 3); // drc_decoder_mode_id = 0 (Home Theatre)
         bw.write_bit(false); // drc_repeat_profile_flag
@@ -1219,11 +1219,11 @@ mod tests {
         bw.write_bit(false); // drc_compression_curve_flag = 0 -> gainset
         bw.write_u32(1, 2); // drc_gains_config = 1 (wideband, ch-dep)
         bw.write_u32(0, 3); // drc_eac3_profile = 0 (None)
-                            // drc_data:
+        // drc_data:
         bw.write_u32(drc_gainset_size, 6); // drc_gainset_size_value
         bw.write_bit(false); // b_more_bits = 0
         bw.write_u32(0, 2); // drc_version = 0
-                            // drc_gains payload starts here:
+        // drc_gains payload starts here:
         bw.write_u32(drc_gain_val as u32, 7);
         write_plus_one_diff(&mut bw);
         bw.align_to_byte();
@@ -1388,7 +1388,7 @@ mod tests {
         // via drc_repeat_profile_flag.
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_drc_present
-                            // drc_config:
+        // drc_config:
         bw.write_u32(1, 3); // drc_decoder_nr_modes = 1 -> 2 modes
 
         // Mode 0: id=0, default profile (implicit curve flag).
@@ -1402,8 +1402,8 @@ mod tests {
         bw.write_u32(0, 3); // drc_repeat_id = 0 -> mode 0
 
         bw.write_u32(0, 3); // drc_eac3_profile
-                            // drc_data: both modes have curve_flag = 1 (implicit), so
-                            // gainsets are empty; just the curve_present trailer.
+        // drc_data: both modes have curve_flag = 1 (implicit), so
+        // gainsets are empty; just the curve_present trailer.
         bw.write_bit(true); // drc_reset_flag
         bw.write_u32(2, 2); // drc_reserved
         bw.align_to_byte();
@@ -1433,7 +1433,7 @@ mod tests {
 
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_drc_present
-                            // No drc_config() because !b_iframe.
+        // No drc_config() because !b_iframe.
         bw.write_u32(drc_gainset_size, 6); // drc_gainset_size_value
         bw.write_bit(false); // b_more_bits
         bw.write_u32(0, 2); // drc_version
@@ -1537,7 +1537,7 @@ mod tests {
         assert_eq!(n, 16);
         let expected: Vec<f32> = [1.0, 2.0, 4.0, 8.0]
             .iter()
-            .flat_map(|&g| std::iter::repeat(g).take(4))
+            .flat_map(|&g| std::iter::repeat_n(g, 4))
             .collect();
         for (got, want) in pcm[0].iter().zip(expected.iter()) {
             assert!((got - want).abs() < 1e-4, "got {got}, want {want}");

@@ -47,7 +47,7 @@
 //!    state.
 
 use oxideav_ac4::acpl::AcplQuantMode;
-use oxideav_ac4::acpl_synth::{differential_decode, AcplDiffState};
+use oxideav_ac4::acpl_synth::{AcplDiffState, differential_decode};
 use oxideav_ac4::asf::SubstreamTools;
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_acpl3::{
@@ -57,7 +57,7 @@ use oxideav_ac4::encoder_acpl3::{
     extract_gamma_5_6_q_per_band_centre_least_squares,
 };
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
-use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode};
+use oxideav_ac4::mch::{FiveXCodecMode, parse_5x_audio_data_outer};
 use oxideav_core::bits::BitReader;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 

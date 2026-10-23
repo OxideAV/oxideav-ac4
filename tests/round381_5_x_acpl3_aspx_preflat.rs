@@ -45,8 +45,8 @@
 //! control data), §5.7.6.4.1.4 Pseudocode 89 (gain application).
 
 use oxideav_ac4::aspx::{
-    derive_aspx_frequency_tables, num_aspx_timeslots, num_ts_in_ats, AspxConfig, AspxFreqResMode,
-    AspxMasterFreqScale, AspxQuantStep,
+    AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, derive_aspx_frequency_tables,
+    num_aspx_timeslots, num_ts_in_ats,
 };
 use oxideav_ac4::aspx_preflat_select::select_preflat;
 use oxideav_ac4::decoder::Ac4Decoder;
@@ -261,7 +261,7 @@ fn preflat_path_is_deterministic() {
 /// why the encoder leaves it at `0`.
 #[test]
 fn preflat_changes_the_decoded_hf_tile() {
-    use oxideav_ac4::aspx::{derive_patch_tables, AspxMasterFreqScale, AspxPatchTables};
+    use oxideav_ac4::aspx::{AspxMasterFreqScale, AspxPatchTables, derive_patch_tables};
     use oxideav_ac4::aspx_tns::{compute_preflat_gains, hf_tile_tns};
 
     let cfg = live_cfg();

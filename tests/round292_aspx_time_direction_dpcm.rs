@@ -21,9 +21,9 @@
 //!
 //! Refs ETSI TS 103 190-1 §5.7.6.3.4 Pseudocode 80 / 81.
 
-use oxideav_ac4::aspx::{delta_decode_noise, delta_decode_sig, AspxHuffEnv};
+use oxideav_ac4::aspx::{AspxHuffEnv, delta_decode_noise, delta_decode_sig};
 use oxideav_ac4::encoder_acpl3::{
-    dpcm_encode_qscf_envelopes, freq_dpcm_encode_qscf, time_dpcm_encode_qscf, AspxEncodedEnvelope,
+    AspxEncodedEnvelope, dpcm_encode_qscf_envelopes, freq_dpcm_encode_qscf, time_dpcm_encode_qscf,
 };
 
 /// `time_dpcm_encode_qscf` is the exact inverse of the decoder's TIME

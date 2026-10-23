@@ -33,7 +33,7 @@
 //! identity mapping on those layouts.
 
 use oxideav_core::options::{
-    parse_options, CodecOptionsStruct, OptionField, OptionKind, OptionValue,
+    CodecOptionsStruct, OptionField, OptionKind, OptionValue, parse_options,
 };
 use oxideav_core::{
     AudioFrame, ChannelLayout, CodecId, CodecParameters, Encoder, Error, Frame, Packet, Result,
@@ -215,7 +215,7 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
                     "acpl_1" => AcplMode::Acpl1,
                     "acpl_3" => AcplMode::Acpl3,
                     other => {
-                        return Err(Error::invalid(format!("ac4: unknown acpl mode '{other}'")))
+                        return Err(Error::invalid(format!("ac4: unknown acpl mode '{other}'")));
                     }
                 }
             }
@@ -263,7 +263,7 @@ impl Layout {
                 return Err(Error::unsupported(format!(
                     "ac4 encoder: no channel layout for {other} channels \
                      (supported: 1, 2, 5, 6, 7, 8, 11, 12, 13, 14, 24)"
-                )))
+                )));
             }
         })
     }
@@ -354,7 +354,7 @@ impl Ac4Encoder {
             other => {
                 return Err(Error::unsupported(format!(
                     "ac4 encoder: sample rate {other} Hz (48000 or 44100 only)"
-                )))
+                )));
             }
         };
         if opts.frame_rate_index > 15 {
@@ -520,7 +520,7 @@ impl Ac4Encoder {
     /// to the matching `Ac4ImsEncoder` path.
     fn encode_one(&mut self, chans: &[Vec<f32>]) -> Vec<u8> {
         let iframe = !self.layout.supports_pframes(self.opts.mode)
-            || self.frame_index % self.opts.gop as u64 == 0;
+            || self.frame_index.is_multiple_of(self.opts.gop as u64);
         self.inner.b_iframe_global = iframe;
         let s: Vec<&[f32]> = chans.iter().map(|c| c.as_slice()).collect();
         let sfb = self.max_sfb;

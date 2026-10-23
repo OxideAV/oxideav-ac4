@@ -23,7 +23,7 @@ use oxideav_ac4::asf::extract_sap_a_prime;
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
 use oxideav_ac4::encoder_mdct::EncoderMdctState;
-use oxideav_ac4::ice::{encode_ice_raw_frame, write_ice_body_scpl, IceCodecMode, IceScplSpectra};
+use oxideav_ac4::ice::{IceCodecMode, IceScplSpectra, encode_ice_raw_frame, write_ice_body_scpl};
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 

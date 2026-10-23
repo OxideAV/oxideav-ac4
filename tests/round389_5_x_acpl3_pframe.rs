@@ -24,7 +24,7 @@
 //! Refs ETSI TS 103 190-1 §4.2.6.6 Table 25, §4.2.12.3/4 Tables 51/52,
 //! §4.3.3.7.8 (`b_iframe`), §4.3.3.2.7 (`b_iframe_global`).
 
-use oxideav_ac4::asf::{walk_ac4_substream_sticky, StickyConfig};
+use oxideav_ac4::asf::{StickyConfig, walk_ac4_substream_sticky};
 use oxideav_ac4::aspx::{AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep};
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_acpl3::build_5_x_acpl3_body_from_pcm_spectra_real_alpha_beta_full_gamma_beta3_real_aspx_tna;
@@ -125,7 +125,9 @@ fn decode_one(dec: &mut Ac4Decoder, bytes: Vec<u8>, _pts: i64) -> Vec<i16> {
     };
     assert_eq!(af.samples, 1920);
     let raw = &af.data[0];
-    raw.chunks_exact(2)
+    raw.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
 }

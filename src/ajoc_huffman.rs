@@ -433,41 +433,47 @@ mod tests {
 
         let mut br = BitReader::new(&without);
         assert!(!br.read_bit().unwrap()); // diff_type = 0 transmitted
-                                          // Time direction is rejected under b_dfonly.
+        // Time direction is rejected under b_dfonly.
         let mut bw = BitWriter::new();
-        assert!(write_ajoc_huff_data(
-            &mut bw,
-            AjocMatrixKind::Wet,
-            AjocQuantMode::Coarse,
-            true,
-            AjocDiffType::Time,
-            &values,
-        )
-        .is_err());
+        assert!(
+            write_ajoc_huff_data(
+                &mut bw,
+                AjocMatrixKind::Wet,
+                AjocQuantMode::Coarse,
+                true,
+                AjocDiffType::Time,
+                &values,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn out_of_range_symbols_rejected() {
         let mut bw = BitWriter::new();
         // Dry coarse F0 has 51 symbols (0..=50).
-        assert!(write_ajoc_huff_data(
-            &mut bw,
-            AjocMatrixKind::Dry,
-            AjocQuantMode::Coarse,
-            false,
-            AjocDiffType::Freq,
-            &[51],
-        )
-        .is_err());
+        assert!(
+            write_ajoc_huff_data(
+                &mut bw,
+                AjocMatrixKind::Dry,
+                AjocQuantMode::Coarse,
+                false,
+                AjocDiffType::Freq,
+                &[51],
+            )
+            .is_err()
+        );
         // Wet coarse DT deltas are limited to [-20, 20].
-        assert!(write_ajoc_huff_data(
-            &mut bw,
-            AjocMatrixKind::Wet,
-            AjocQuantMode::Coarse,
-            false,
-            AjocDiffType::Time,
-            &[21],
-        )
-        .is_err());
+        assert!(
+            write_ajoc_huff_data(
+                &mut bw,
+                AjocMatrixKind::Wet,
+                AjocQuantMode::Coarse,
+                false,
+                AjocDiffType::Time,
+                &[21],
+            )
+            .is_err()
+        );
     }
 }

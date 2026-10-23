@@ -28,9 +28,9 @@
 //! encoder emits it on every frame with the keep-flags clear, so P
 //! frames stay self-contained.
 
-use crate::de::{DeConfig, DeData, DeMethod, DE_NR_BANDS};
-use crate::de_apply::{processed_slots, DE_BAND_LAST_SB, DE_PAR_DQ_CI};
-use crate::qmf::{QmfAnalysisBank, NUM_QMF_SUBBANDS};
+use crate::de::{DE_NR_BANDS, DeConfig, DeData, DeMethod};
+use crate::de_apply::{DE_BAND_LAST_SB, DE_PAR_DQ_CI, processed_slots};
+use crate::qmf::{NUM_QMF_SUBBANDS, QmfAnalysisBank};
 
 /// Quantise a channel-independent parameter to the nearest Table 209
 /// index (`0..=31`; the table spans `0,0..=9,0`).
@@ -197,8 +197,10 @@ mod tests {
             max_gain: 0,
             channel_config: 0b111,
         };
-        assert!(DeAuthor::new()
-            .author_channel_independent(&cfg, [&[], &[], &[]], [&[], &[], &[]])
-            .is_none());
+        assert!(
+            DeAuthor::new()
+                .author_channel_independent(&cfg, [&[], &[], &[]], [&[], &[], &[]])
+                .is_none()
+        );
     }
 }

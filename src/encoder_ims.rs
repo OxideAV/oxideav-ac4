@@ -70,12 +70,11 @@
 use oxideav_core::bits::BitWriter;
 
 use crate::encoder_asf::{
-    average_per_sfb_correlation, build_5_0_simple_asf_body_from_pcm_spectra,
+    AsfQuant, average_per_sfb_correlation, build_5_0_simple_asf_body_from_pcm_spectra,
     build_5_1_simple_asf_body_from_pcm_spectra, build_7_0_simple_asf_body_from_pcm_spectra,
     build_7_1_simple_asf_body_from_pcm_spectra, build_mono_simple_asf_body_from_pcm_spectrum,
     build_stereo_simple_asf_joint_body_from_pcm_spectra,
     build_stereo_simple_asf_split_body_from_pcm_spectra, finish_substream_body, with_asf_quant,
-    AsfQuant,
 };
 use crate::encoder_mdct::EncoderMdctState;
 
@@ -371,15 +370,15 @@ impl Ac4ImsEncoder {
         bw.write_u32(0, 1); // presentation_version = 0
         bw.write_u32(0, 3); // md_compat
         bw.write_u32(0, 1); // b_belongs_to_presentation_id
-                            // frame_rate_multiply_info() — unity factor
-                            // (0 or 1 bit depending on frame_rate_index).
+        // frame_rate_multiply_info() — unity factor
+        // (0 or 1 bit depending on frame_rate_index).
         crate::toc::write_frame_rate_multiply_info_unity(bw, self.frame_rate_index as u32);
         // emdf_info():
         bw.write_u32(0, 2); // emdf_version
         bw.write_u32(0, 3); // key_id
         bw.write_u32(0, 1); // b_emdf_payloads_substream_info
         bw.write_u32(0, 1); // emdf_reserved.b_more
-                            // ac4_substream_info():
+        // ac4_substream_info():
         bw.write_u32(
             self.channel_mode_value as u32,
             self.channel_mode_bits as u32,
@@ -468,12 +467,12 @@ impl Ac4ImsEncoder {
             bw.write_u32(0, 1); // b_sf_multiplier
         }
         bw.write_u32(0, 1); // b_bitrate_info
-                            // frame_rate_factor for {0,1,7,8,9} with
-                            // b_multiplier=0 is 1; for {2,3,4} also 1; otherwise 1.
-                            // → 1 b_audio_ndot bit = b_iframe (§6.3.2.x).
+        // frame_rate_factor for {0,1,7,8,9} with
+        // b_multiplier=0 is 1; for {2,3,4} also 1; otherwise 1.
+        // → 1 b_audio_ndot bit = b_iframe (§6.3.2.x).
         bw.write_u32(if self.b_iframe_global { 1 } else { 0 }, 1);
         bw.write_u32(0, 2); // substream_index
-                            // b_content_type = 0.
+        // b_content_type = 0.
         bw.write_u32(0, 1);
     }
 }
@@ -671,9 +670,9 @@ pub fn build_mono_simple_asf_tone_body(
     bw.write_u32(0, 1); // spec_frontend = ASF
     bw.write_bit(true); // b_long_frame = 1
     bw.write_u32(max_sfb, 6); // max_sfb[0]
-                              // asf_section_data: one section covering 0..max_sfb with cb=5
-                              // (HCB5, dim=2, signed). n_sect_bits = 3 (transf_length_idx=0
-                              // for long frame).
+    // asf_section_data: one section covering 0..max_sfb with cb=5
+    // (HCB5, dim=2, signed). n_sect_bits = 3 (transf_length_idx=0
+    // for long frame).
     bw.write_u32(5, 4); // sect_cb
     write_sect_len_incr(&mut bw, max_sfb, 3, 7);
     // asf_spectral_data: emit `tone_cb_idx` for pair `tone_pair_idx`,
@@ -9427,7 +9426,7 @@ mod tests {
         use crate::decoder::Ac4Decoder;
         use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
         let mut enc = Ac4ImsEncoder::new(); // v2, mono
-                                            // cb_idx 49 → (q0=+1, q1=0); pair_idx 0 → bin 0.
+        // cb_idx 49 → (q0=+1, q1=0); pair_idx 0 → bin 0.
         let frame_bytes = enc.encode_frame_mono_tone(49, 0);
         let params = CodecParameters::audio(CodecId::new("ac4"));
         let mut dec = Ac4Decoder::new(&params);
@@ -9441,7 +9440,9 @@ mod tests {
         assert_eq!(af.data[0].len(), 1_920 * 2);
         // Decoded PCM must be non-silent.
         let samples_i16: Vec<i16> = af.data[0]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let nonzero_count = samples_i16.iter().filter(|&&s| s != 0).count();
@@ -9496,7 +9497,9 @@ mod tests {
         );
         // PCM should still be non-silent.
         let samples_i16: Vec<i16> = af.data[0]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let nonzero_count = samples_i16.iter().filter(|&&s| s != 0).count();
@@ -9559,7 +9562,9 @@ mod tests {
             assert_eq!(af.samples, 1_920);
             assert_eq!(af.data.len(), 1);
             let pcm: Vec<i16> = af.data[0]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             out.push(pcm);
@@ -9698,7 +9703,9 @@ mod tests {
             assert_eq!(af.samples, 1_920);
             assert_eq!(af.data.len(), 1);
             let pcm: Vec<i16> = af.data[0]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             out.push(pcm);
@@ -9768,7 +9775,9 @@ mod tests {
             err_e += (o - r) * (o - r);
         }
         let snr_db = 10.0 * (sig_e / err_e.max(1e-30)).log10();
-        eprintln!("ROUND-49 white-noise spectral SNR (HCB1..11 optimiser, q_target=12, max_sfb=50): {snr_db:.1} dB");
+        eprintln!(
+            "ROUND-49 white-noise spectral SNR (HCB1..11 optimiser, q_target=12, max_sfb=50): {snr_db:.1} dB"
+        );
         assert!(
             snr_db > 18.0,
             "white-noise spectral SNR did not improve over HCB5-only ceiling: \
@@ -9941,7 +9950,9 @@ mod tests {
             err_e += (o - r) * (o - r);
         }
         let snr_db = 10.0 * (sig_e / err_e.max(1e-30)).log10();
-        eprintln!("ROUND-48 baseline white-noise spectral SNR (HCB5-only, q_target=4, max_sfb=50): {snr_db:.1} dB");
+        eprintln!(
+            "ROUND-48 baseline white-noise spectral SNR (HCB5-only, q_target=4, max_sfb=50): {snr_db:.1} dB"
+        );
         // Sanity: round-48 should be in the 8-15 dB range.
         assert!(
             snr_db < 18.0,

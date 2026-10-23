@@ -8,7 +8,7 @@
 //! representative edge cases (multi-group, sap_coeff_all, asymmetric
 //! pair entry, sub-`max_sfb` rows in the input).
 
-use oxideav_ac4::asf::{parse_chparam_info, ChparamInfo, SapData, SapMode};
+use oxideav_ac4::asf::{ChparamInfo, SapData, SapMode, parse_chparam_info};
 use oxideav_ac4::encoder_asf::write_chparam_info;
 use oxideav_core::bits::{BitReader, BitWriter};
 

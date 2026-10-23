@@ -484,9 +484,9 @@ mod tests {
         bw.write_bit(true); // b_codecdata
         bw.write_u32(0xA5, 8); // codecdata
         bw.write_bit(false); // b_discard_unknown_payload
-                             // b_smpoffst is 1, so the inner "if (b_smpoffst == 0)" branch
-                             // is skipped — `b_payload_frame_aligned` is NOT in the bitstream.
-                             // Then the `if (b_smpoffst == 1 || ...)` branch fires:
+        // b_smpoffst is 1, so the inner "if (b_smpoffst == 0)" branch
+        // is skipped — `b_payload_frame_aligned` is NOT in the bitstream.
+        // Then the `if (b_smpoffst == 1 || ...)` branch fires:
         bw.write_u32(11, 5); // priority
         bw.write_u32(2, 2); // proc_allowed
 

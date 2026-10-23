@@ -47,7 +47,7 @@ fuzz_target!(|data: &[u8]| {
         let mut v: Vec<f32> = (0..2 * N)
             .map(|i| amp * (2.0 * std::f32::consts::PI * f * i as f32 / 48_000.0).sin())
             .collect();
-        for (i, s) in pcm.chunks_exact(2).enumerate().take(2 * N) {
+        for (i, s) in pcm.as_chunks::<2>().0.iter().enumerate().take(2 * N) {
             let x = i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0;
             v[i] = 0.5 * (v[i] + x);
         }

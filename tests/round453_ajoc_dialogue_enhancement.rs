@@ -9,7 +9,7 @@
 
 use oxideav_ac4::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocDmxDeData, AjocQuantMode};
 use oxideav_ac4::ajoc_data::new_ajoc_diff_state;
-use oxideav_ac4::ajoc_substream::{encode_ajoc_raw_frame_with_dmx_de, AjocBodyParams};
+use oxideav_ac4::ajoc_substream::{AjocBodyParams, encode_ajoc_raw_frame_with_dmx_de};
 use oxideav_ac4::decoder::{Ac4Decoder, DecodingMode};
 use oxideav_ac4::encoder_ajoc::AjocQuantMatrices;
 use oxideav_ac4::oamd::ObjType;
@@ -47,9 +47,11 @@ fn selector_setup(num_decorr: usize) -> (AjocCtrlInfo, AjocQuantMatrices) {
     };
     let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..NUM_UMX)
         .map(|o| {
-            vec![(0..NUM_DMX)
-                .map(|ch| vec![if ch == o % NUM_DMX { 1.0 } else { 0.0 }])
-                .collect()]
+            vec![
+                (0..NUM_DMX)
+                    .map(|ch| vec![if ch == o % NUM_DMX { 1.0 } else { 0.0 }])
+                    .collect(),
+            ]
         })
         .collect();
     let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..NUM_UMX)

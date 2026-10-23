@@ -482,9 +482,10 @@ fn flush_pads_partial_tail_and_reports_eof() {
     assert_eq!(pkts.len(), 2, "1 full frame + 1 padded tail frame");
     assert_eq!(pkts[1].pts, Some(N as i64));
     assert!(enc.receive_packet().unwrap_err().is_eof());
-    assert!(enc
-        .send_frame(&Frame::Audio(f32_interleaved(&chans, 0, 10)))
-        .is_err());
+    assert!(
+        enc.send_frame(&Frame::Audio(f32_interleaved(&chans, 0, 10)))
+            .is_err()
+    );
 }
 
 #[test]

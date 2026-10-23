@@ -51,8 +51,8 @@
 //! 86–89.
 
 use oxideav_ac4::aspx::{
-    derive_aspx_frequency_tables, parse_aspx_hfgen_iwc_1ch, parse_aspx_hfgen_iwc_2ch, AspxConfig,
-    AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep,
+    AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, derive_aspx_frequency_tables,
+    parse_aspx_hfgen_iwc_1ch, parse_aspx_hfgen_iwc_2ch,
 };
 use oxideav_ac4::aspx_tna_select::select_tna_mode;
 use oxideav_ac4::aspx_tns::build_q_low_ext;
@@ -174,7 +174,9 @@ fn live_5_1_acpl2_real_aspx_with_tna_round_trips() {
     );
     // The LFE (slot 5) is carried on the Table 25 `mono_data(1)`.
     let lfe_energy: i64 = af.data[0]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(i, _)| i % 6 == 5)
         .map(|(_, c)| {
@@ -266,7 +268,7 @@ fn tna_reaches_both_acpl2_carriers_and_round_trips() {
 #[test]
 fn centre_1ch_tna_round_trips_through_parser() {
     use oxideav_ac4::encoder_acpl3::{
-        write_aspx_data_1ch_real_envelope_tna, AspxRealEnvelopeChannel,
+        AspxRealEnvelopeChannel, write_aspx_data_1ch_real_envelope_tna,
     };
     use oxideav_core::bits::BitWriter;
 
@@ -320,7 +322,7 @@ fn centre_1ch_tna_round_trips_through_parser() {
 #[test]
 fn front_pair_2ch_tna_round_trips_through_parser() {
     use oxideav_ac4::encoder_acpl3::{
-        write_aspx_data_2ch_real_envelope_tna, AspxRealEnvelopeChannel,
+        AspxRealEnvelopeChannel, write_aspx_data_2ch_real_envelope_tna,
     };
     use oxideav_core::bits::BitWriter;
 

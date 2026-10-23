@@ -30,11 +30,11 @@ use oxideav_ac4::acpl::{
     AcplInterpolationType, AcplQuantMode,
 };
 use oxideav_ac4::acpl_synth::{
-    run_acpl_5x_mch_pcm, run_acpl_5x_pair_pcm, Acpl5xMchPcmState, Acpl5xPairMode,
-    Acpl5xPairPcmState,
+    Acpl5xMchPcmState, Acpl5xPairMode, Acpl5xPairPcmState, run_acpl_5x_mch_pcm,
+    run_acpl_5x_pair_pcm,
 };
 use oxideav_ac4::asf::SubstreamTools;
-use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode};
+use oxideav_ac4::mch::{FiveXCodecMode, parse_5x_audio_data_outer};
 use oxideav_ac4::qmf::NUM_QMF_SUBBANDS;
 use oxideav_core::bits::{BitReader, BitWriter};
 
@@ -108,7 +108,7 @@ fn five_x_aspx_acpl_3_walker_to_synthesis_glue() {
     // which is exactly what the downstream pipeline keys on.
     let mut bw = BitWriter::new();
     bw.write_u32(4, 3); // 5_X_codec_mode = ASPX_ACPL_3
-                        // companding_control(2) = b_compand_avg + 2x b_compand_on
+    // companding_control(2) = b_compand_avg + 2x b_compand_on
     bw.write_bit(false); // b_compand_avg
     bw.write_bit(false); // b_compand_on[0]
     bw.write_bit(false); // b_compand_on[1]
@@ -177,8 +177,8 @@ fn five_x_aspx_acpl_2_walker_to_synthesis_glue() {
     // config block to side-step the aspx_config opaque exercise.
     let mut bw = BitWriter::new();
     bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
-                        // companding_control(3): sync_flag=1, 1-bit compand_on=1
-                        // (no need for compand_avg).
+    // companding_control(3): sync_flag=1, 1-bit compand_on=1
+    // (no need for compand_avg).
     bw.write_bit(true); // sync_flag
     bw.write_bit(true); // compand_on (sync=1 → only 1 channel-bit)
     bw.write_bit(true); // coding_config = 1 (Cfg1ThreeStereo)
@@ -252,7 +252,7 @@ fn five_x_aspx_acpl_2_walker_to_synthesis_glue() {
 fn five_x_aspx_acpl_1_walker_to_synthesis_glue() {
     let mut bw = BitWriter::new();
     bw.write_u32(2, 3); // 5_X_codec_mode = ASPX_ACPL_1
-                        // companding_control(3): sync_flag=1, 1-bit compand_on=1.
+    // companding_control(3): sync_flag=1, 1-bit compand_on=1.
     bw.write_bit(true); // sync_flag
     bw.write_bit(true); // compand_on
     bw.write_bit(true); // coding_config = 1 (Cfg1ThreeStereo)
@@ -341,21 +341,21 @@ fn five_x_aspx_acpl_2_walker_inner_body_populates_three_channel_data() {
 
     let mut bw = BitWriter::new();
     bw.write_u32(3, 3); // 5_X_codec_mode = ASPX_ACPL_2
-                        // companding_control(3): sync_flag=1, compand_on=1.
+    // companding_control(3): sync_flag=1, compand_on=1.
     bw.write_bit(true);
     bw.write_bit(true);
     bw.write_bit(true); // coding_config = 1 -> three_channel_data
-                        // three_channel_data outer:
+    // three_channel_data outer:
     bw.write_bit(true); // b_long_frame
     bw.write_u32(10, 6); // max_sfb[0]
     bw.write_u32(0, 4); // chel_matsel
     bw.write_u32(0, 2); // chparam_info #0
     bw.write_u32(0, 2); // chparam_info #1
-                        // 3x sf_data(ASF) bodies — each one-section, all-zero spectra:
-                        // sect_cb=0 (4 bits), sect_len_incr (3 bits, 7-escape over max_sfb=10):
-                        //   max_sfb-1 = 9, esc=7 -> write 7 then 2.
-                        // scalefac reference (8 bits) = 120.
-                        // snf b_data_exists = 0 (1 bit).
+    // 3x sf_data(ASF) bodies — each one-section, all-zero spectra:
+    // sect_cb=0 (4 bits), sect_len_incr (3 bits, 7-escape over max_sfb=10):
+    //   max_sfb-1 = 9, esc=7 -> write 7 then 2.
+    // scalefac reference (8 bits) = 120.
+    // snf b_data_exists = 0 (1 bit).
     for _ in 0..3 {
         bw.write_u32(0, 4); // sect_cb=0
         bw.write_u32(7, 3); // sect_len_incr (esc)
@@ -439,17 +439,17 @@ fn five_x_aspx_acpl_1_walker_inner_body_populates_two_channel_and_centre() {
 
     let mut bw = BitWriter::new();
     bw.write_u32(2, 3); // 5_X_codec_mode = ASPX_ACPL_1
-                        // companding_control(3): sync_flag=1, compand_on=1.
+    // companding_control(3): sync_flag=1, compand_on=1.
     bw.write_bit(true);
     bw.write_bit(true);
     bw.write_bit(false); // coding_config = 0 -> two_channel_data + Cfg0 mono
-                         // two_channel_data outer (Table 26):
+    // two_channel_data outer (Table 26):
     bw.write_bit(true); // b_long_frame
     bw.write_u32(8, 6); // max_sfb[0]
     bw.write_u32(0, 2); // chparam sap_mode = 0
-                        // 2x sf_data(ASF) bodies (max_sfb=8, transf_length_idx=0):
-                        //   sect_cb=0 (4) + sect_len_incr=7 (3) + sect_len_incr=0 (3)
-                        //   + scalefac ref (8) + snf b_data_exists (1).
+    // 2x sf_data(ASF) bodies (max_sfb=8, transf_length_idx=0):
+    //   sect_cb=0 (4) + sect_len_incr=7 (3) + sect_len_incr=0 (3)
+    //   + scalefac ref (8) + snf b_data_exists (1).
     for _ in 0..2 {
         bw.write_u32(0, 4);
         bw.write_u32(7, 3);
@@ -559,19 +559,19 @@ fn five_x_aspx_acpl_1_walker_inner_body_populates_two_channel_and_centre() {
 /// 5-channel core (L/R/C/Ls/Rs) — same as the 5_X path.
 #[test]
 fn seven_x_aspx_acpl_2_walker_to_synthesis_glue() {
-    use oxideav_ac4::mch::{parse_7x_audio_data_outer, SevenXCodecMode};
+    use oxideav_ac4::mch::{SevenXCodecMode, parse_7x_audio_data_outer};
     // 7_X_codec_mode = ASPX_ACPL_2 (2 bits, value 3).
     let mut bw = BitWriter::new();
     bw.write_u32(3, 2); // 7_X_codec_mode = ASPX_ACPL_2
-                        // No b_iframe path -> no aspx_config / acpl_config_1ch in the
-                        // bitstream. companding_control(5) for ACPL_{1,2}:
-                        //   sync_flag=1 -> single b_compand_on bit (5 channels share).
+    // No b_iframe path -> no aspx_config / acpl_config_1ch in the
+    // bitstream. companding_control(5) for ACPL_{1,2}:
+    //   sync_flag=1 -> single b_compand_on bit (5 channels share).
     bw.write_bit(true); // sync_flag
     bw.write_bit(true); // compand_on (sync=1 → 1 channel-bit)
-                        // coding_config = 0 (Cfg0Stereo2plusMono). Body bails
-                        // before the inner 2ch_mode bit due to non-iframe gate
-                        // on aspx_data trailers — that's fine; we exit cleanly
-                        // and verify the seven_x_mode resolves correctly.
+    // coding_config = 0 (Cfg0Stereo2plusMono). Body bails
+    // before the inner 2ch_mode bit due to non-iframe gate
+    // on aspx_data trailers — that's fine; we exit cleanly
+    // and verify the seven_x_mode resolves correctly.
     bw.write_u32(0, 2); // coding_config = 0
     bw.align_to_byte();
     let bytes = bw.finish();
@@ -643,7 +643,7 @@ fn seven_x_aspx_acpl_2_walker_to_synthesis_glue() {
 #[test]
 fn five_x_simple_cfg2_walker_populates_four_plus_back_mono() {
     use oxideav_ac4::asf::SubstreamTools;
-    use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode, FiveXCodingConfig};
+    use oxideav_ac4::mch::{FiveXCodecMode, FiveXCodingConfig, parse_5x_audio_data_outer};
 
     // 5_X_codec_mode = SIMPLE (3 bits, value 0). No LFE.
     // coding_config = 2 (Cfg2FourMono).
@@ -725,12 +725,12 @@ fn five_x_simple_cfg2_walker_populates_four_plus_back_mono() {
 #[test]
 fn five_x_simple_cfg0_walker_populates_two_two_plus_centre() {
     use oxideav_ac4::asf::SubstreamTools;
-    use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode, FiveXCodingConfig};
+    use oxideav_ac4::mch::{FiveXCodecMode, FiveXCodingConfig, parse_5x_audio_data_outer};
     let mut bw = BitWriter::new();
     bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
     bw.write_u32(0, 2); // coding_config = 0 (Cfg0Stereo2plusMono)
     bw.write_bit(false); // b_2ch_mode = 0
-                         // 2x two_channel_data: long-frame max_sfb=20, chparam_info, 2x sf_data
+    // 2x two_channel_data: long-frame max_sfb=20, chparam_info, 2x sf_data
     let write_zero = |bw: &mut BitWriter, max_sfb: u32| {
         bw.write_u32(0, 4);
         let mut remaining = max_sfb.saturating_sub(1);
@@ -789,12 +789,12 @@ fn five_x_simple_cfg0_walker_populates_two_two_plus_centre() {
 #[test]
 fn five_x_simple_cfg3_walker_populates_five_channel_data() {
     use oxideav_ac4::asf::SubstreamTools;
-    use oxideav_ac4::mch::{parse_5x_audio_data_outer, FiveXCodecMode, FiveXCodingConfig};
+    use oxideav_ac4::mch::{FiveXCodecMode, FiveXCodingConfig, parse_5x_audio_data_outer};
     let mut bw = BitWriter::new();
     bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
     bw.write_u32(3, 2); // coding_config = 3 (Cfg3Five)
-                        // five_channel_data: long-frame max_sfb=20, chel_matsel(4) +
-                        // 5x chparam_info + 5x sf_data(ASF)
+    // five_channel_data: long-frame max_sfb=20, chel_matsel(4) +
+    // 5x chparam_info + 5x sf_data(ASF)
     bw.write_bit(true); // b_long_frame
     bw.write_u32(20, 6); // max_sfb[0]
     bw.write_u32(0, 4); // chel_matsel

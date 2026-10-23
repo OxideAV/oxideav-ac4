@@ -31,15 +31,15 @@
 //! * §4.2.12.4 Table 52 (`aspx_data_2ch()`).
 
 use oxideav_ac4::aspx::{
-    delta_decode_noise, delta_decode_sig, dequantize_noise_scf_balance, dequantize_sig_scf_balance,
-    derive_aspx_frequency_tables, num_aspx_timeslots, parse_aspx_delta_dir, parse_aspx_ec_data,
-    parse_aspx_framing, parse_aspx_hfgen_iwc_2ch, AspxConfig, AspxDataType, AspxFreqResMode,
-    AspxIntClass, AspxMasterFreqScale, AspxQuantStep, AspxStereoMode,
+    AspxConfig, AspxDataType, AspxFreqResMode, AspxIntClass, AspxMasterFreqScale, AspxQuantStep,
+    AspxStereoMode, delta_decode_noise, delta_decode_sig, dequantize_noise_scf_balance,
+    dequantize_sig_scf_balance, derive_aspx_frequency_tables, num_aspx_timeslots,
+    parse_aspx_delta_dir, parse_aspx_ec_data, parse_aspx_framing, parse_aspx_hfgen_iwc_2ch,
 };
 use oxideav_ac4::encoder_acpl3::{
-    build_aspx_real_envelope_channel, extract_aspx_noise_envelope_indices,
-    extract_aspx_sig_envelope_indices, freq_dpcm_encode_qscf, quantize_noise_scf, quantize_sig_scf,
-    write_aspx_data_2ch_real_envelope, AspxEnvelopeScfChannel, AspxRealEnvelopeChannel,
+    AspxEnvelopeScfChannel, AspxRealEnvelopeChannel, build_aspx_real_envelope_channel,
+    extract_aspx_noise_envelope_indices, extract_aspx_sig_envelope_indices, freq_dpcm_encode_qscf,
+    quantize_noise_scf, quantize_sig_scf, write_aspx_data_2ch_real_envelope,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
 

@@ -55,20 +55,20 @@
 //!   elsewhere (see [`crate::asf::extract_sap_a_prime`]).
 
 use crate::acpl::{
-    parse_acpl_config_1ch, parse_acpl_data_1ch, sb_to_pb, Acpl1chMode, AcplConfig1ch, AcplData1ch,
+    Acpl1chMode, AcplConfig1ch, AcplData1ch, parse_acpl_config_1ch, parse_acpl_data_1ch, sb_to_pb,
 };
-use crate::ajcc::{parse_ajcc_data, write_ajcc_data, AjccData};
+use crate::ajcc::{AjccData, parse_ajcc_data, write_ajcc_data};
 use crate::asf::{
-    capture_aspx_data_1ch_trailer, capture_aspx_data_2ch_trailer, parse_chparam_info, ChparamInfo,
-    SubstreamTools,
+    ChparamInfo, SubstreamTools, capture_aspx_data_1ch_trailer, capture_aspx_data_2ch_trailer,
+    parse_chparam_info,
 };
 use crate::aspx::{
-    parse_aspx_config, parse_companding_control, AspxConfig, CompandingControl, FiveXAspxTrailer,
+    AspxConfig, CompandingControl, FiveXAspxTrailer, parse_aspx_config, parse_companding_control,
 };
 use crate::mch::{
+    FiveChannelData, FourChannelData, MonoLfeData, ThreeChannelData, TwoChannelData,
     parse_five_channel_data, parse_four_channel_data, parse_mono_data, parse_three_channel_data,
-    parse_two_channel_data, FiveChannelData, FourChannelData, MonoLfeData, ThreeChannelData,
-    TwoChannelData,
+    parse_two_channel_data,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{Error, Result};
@@ -252,11 +252,7 @@ pub struct IceElement {
 /// Number of SMP tracks the element produces (Table 22): 11, or 13
 /// with `b_5fronts`.
 pub fn num_ice_tracks(b_5fronts: bool) -> usize {
-    if b_5fronts {
-        13
-    } else {
-        11
-    }
+    if b_5fronts { 13 } else { 11 }
 }
 
 impl IceElement {
@@ -406,35 +402,35 @@ pub fn apply_sap_steps(specs: &mut [Vec<f32>], ice: &IceElement, transform_lengt
         }
     }
     // Steps 3-4: b_use_sap_add_ch quartets on (D, F) and (E, G).
-    if ice.b_use_sap_add_ch == Some(true) {
-        if let (Some(cp), Ok(ctx)) = (ice.sap_add_chparam.as_deref(), core_de_max_sfb(&ice.core)) {
-            for (i, info) in cp.iter().enumerate() {
-                let coeffs = crate::asf::extract_sap_abcd(info, &[ctx]);
-                let abcd: &[(f32, f32, f32, f32)] =
-                    coeffs.abcd.first().map(|v| v.as_slice()).unwrap_or(&[]);
-                let usable = abcd.len().min(ctx as usize);
-                let hi_bin = sfbo
-                    .get(usable)
-                    .copied()
-                    .map(|v| (v as usize).min(n))
-                    .unwrap_or(0);
-                let (lo_idx, hi_idx) = (3 + i, 5 + i); // (D, F) / (E, G)
-                let (head, tail) = specs.split_at_mut(hi_idx);
-                let x_row = &mut head[lo_idx];
-                let y_row = &mut tail[0];
-                ensure_len(x_row, hi_bin);
-                ensure_len(y_row, hi_bin);
-                for (sfb, &(a, b, c, d)) in abcd.iter().enumerate().take(usable) {
-                    let hi = (sfbo[sfb + 1] as usize).min(n);
-                    // A short transform can leave sfbo[sfb] past `n`;
-                    // clamp so the band degenerates to empty instead
-                    // of an inverted slice.
-                    let lo = (sfbo[sfb] as usize).min(hi);
-                    for (x, y) in x_row[lo..hi].iter_mut().zip(y_row[lo..hi].iter_mut()) {
-                        let (xv, yv) = (*x, *y);
-                        *x = a * xv + b * yv;
-                        *y = c * xv + d * yv;
-                    }
+    if ice.b_use_sap_add_ch == Some(true)
+        && let (Some(cp), Ok(ctx)) = (ice.sap_add_chparam.as_deref(), core_de_max_sfb(&ice.core))
+    {
+        for (i, info) in cp.iter().enumerate() {
+            let coeffs = crate::asf::extract_sap_abcd(info, &[ctx]);
+            let abcd: &[(f32, f32, f32, f32)] =
+                coeffs.abcd.first().map(|v| v.as_slice()).unwrap_or(&[]);
+            let usable = abcd.len().min(ctx as usize);
+            let hi_bin = sfbo
+                .get(usable)
+                .copied()
+                .map(|v| (v as usize).min(n))
+                .unwrap_or(0);
+            let (lo_idx, hi_idx) = (3 + i, 5 + i); // (D, F) / (E, G)
+            let (head, tail) = specs.split_at_mut(hi_idx);
+            let x_row = &mut head[lo_idx];
+            let y_row = &mut tail[0];
+            ensure_len(x_row, hi_bin);
+            ensure_len(y_row, hi_bin);
+            for (sfb, &(a, b, c, d)) in abcd.iter().enumerate().take(usable) {
+                let hi = (sfbo[sfb + 1] as usize).min(n);
+                // A short transform can leave sfbo[sfb] past `n`;
+                // clamp so the band degenerates to empty instead
+                // of an inverted slice.
+                let lo = (sfbo[sfb] as usize).min(hi);
+                for (x, y) in x_row[lo..hi].iter_mut().zip(y_row[lo..hi].iter_mut()) {
+                    let (xv, yv) = (*x, *y);
+                    *x = a * xv + b * yv;
+                    *y = c * xv + d * yv;
                 }
             }
         }
@@ -834,12 +830,11 @@ pub fn parse_ice_audio_data_outer(
         // one-xover-per-substream convention as the 5_X / 7_X ASPX
         // trailer paths); harvest the first payload's xover for the
         // P-frames that follow this I-frame.
-        if b_iframe {
-            if let Some(IceAspxElement::TwoCh(Some(t)) | IceAspxElement::OneCh(Some(t))) =
+        if b_iframe
+            && let Some(IceAspxElement::TwoCh(Some(t)) | IceAspxElement::OneCh(Some(t))) =
                 aspx_elements.first()
-            {
-                tools.aspx_xover_subband_offset = Some(t.xover);
-            }
+        {
+            tools.aspx_xover_subband_offset = Some(t.xover);
         }
     }
     // ajcc_data(b_5fronts) — ASPX_AJCC only.
@@ -1000,10 +995,8 @@ pub fn parse_22_2_audio_data_outer(
         }
         // Same one-xover-per-substream sticky convention as the ICE /
         // 5_X / 7_X trailer paths.
-        if b_iframe {
-            if let Some(Some(t)) = aspx_elements.first() {
-                tools.aspx_xover_subband_offset = Some(t.xover);
-            }
+        if b_iframe && let Some(Some(t)) = aspx_elements.first() {
+            tools.aspx_xover_subband_offset = Some(t.xover);
         }
     }
     tools.el_22_2 = Some(Box::new(El222 {
@@ -1769,11 +1762,7 @@ pub fn write_ice_body_acpl_real(
         return Err(Error::invalid("ac4: ice acpl 2ch payload count"));
     }
     let want_pairs = if is_acpl1 {
-        if b_5fronts {
-            3
-        } else {
-            2
-        }
+        if b_5fronts { 3 } else { 2 }
     } else {
         0
     };
@@ -2108,13 +2097,13 @@ fn encode_chan_raw_frame(
     bw.write_bit(true); // b_single_presentation
     bw.write_bit(false); // b_payload_base
     bw.write_bit(false); // b_program_id
-                         // ---- ac4_presentation_v1_info() (§6.2.1.3) ----
+    // ---- ac4_presentation_v1_info() (§6.2.1.3) ----
     bw.write_bit(true); // b_single_substream_group
     bw.write_bit(false); // presentation_version() = 0
     bw.write_u32(0, 3); // mdcompat
     bw.write_bit(false); // b_presentation_id
-                         // frame_rate_multiply_info() + frame_rate_fractions_info()
-                         // for the unity factor / fraction (§6.2.1.3-4).
+    // frame_rate_multiply_info() + frame_rate_fractions_info()
+    // for the unity factor / fraction (§6.2.1.3-4).
     crate::toc::write_frame_rate_multiply_info_unity(&mut bw, hdr.frame_rate_index);
     crate::toc::write_frame_rate_fractions_info_unity(&mut bw, hdr.frame_rate_index);
     // emdf_info(): version 0, key_id 0, no payloads-substream, no more.
@@ -2126,8 +2115,8 @@ fn encode_chan_raw_frame(
     bw.write_u32(0, 3); // ac4_sgi_specifier(): group_index = 0
     bw.write_bit(false); // b_pre_virtualized
     bw.write_bit(false); // b_add_emdf_substreams
-                         // ac4_presentation_substream_info(): b_alternative = 0,
-                         // b_pres_ndot = b_iframe (§6.3.2.11.2), substream_index = 0.
+    // ac4_presentation_substream_info(): b_alternative = 0,
+    // b_pres_ndot = b_iframe (§6.3.2.11.2), substream_index = 0.
     bw.write_bit(false);
     bw.write_bit(b_iframe);
     bw.write_u32(0, 2);
@@ -2136,7 +2125,7 @@ fn encode_chan_raw_frame(
     bw.write_bit(false); // b_hsf_ext
     bw.write_bit(true); // b_single_substream
     bw.write_bit(true); // b_channel_coded
-                        // ac4_substream_info_chan() (§6.2.1.8):
+    // ac4_substream_info_chan() (§6.2.1.8):
     bw.write_u32(mode_code, mode_code_bits);
     if presence_fields {
         // §6.3.2.7.3-5 presence fields (immersive modes only): back
@@ -2152,7 +2141,7 @@ fn encode_chan_raw_frame(
     bw.write_bit(b_iframe); // b_audio_ndot = b_iframe (frame_rate_factor = 1)
     bw.write_u32(0, 2); // substream_index
     bw.write_bit(false); // b_content_type (group level, §6.2.1.6)
-                         // ---- substream_index_table() ----
+    // ---- substream_index_table() ----
     bw.write_u32(1, 2); // n_substreams = 1
     bw.write_bit(false); // b_size_present = 0 (spans to frame end)
     bw.align_to_byte();
@@ -2313,11 +2302,7 @@ mod tests {
         };
         let time_row = || vec![(AjocDiffType::Time, vec![0i32; nb])];
         let row = |q: i32| {
-            if iframe {
-                freq_row(q)
-            } else {
-                time_row()
-            }
+            if iframe { freq_row(q) } else { time_row() }
         };
         let framing = vec![
             AjccFramingData {
@@ -2525,7 +2510,7 @@ mod tests {
         let mut bw = BitWriter::new();
         IceCodecMode::Scpl.write(&mut bw);
         bw.write_u32(2, 2); // core_5ch_grouping = 2
-                            // four_channel_data(): sf_info + four_channel_info + 4 bodies.
+        // four_channel_data(): sf_info + four_channel_info + 4 bodies.
         let sfbo = crate::sfb_offset::sfb_offset_48(TL).unwrap();
         let (n_msfb_bits, _, _) = crate::tables::n_msfb_bits_48(TL).unwrap();
         bw.write_bit(true); // b_long_frame

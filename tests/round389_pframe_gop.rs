@@ -15,10 +15,10 @@
 //! element forms (no config block, no xover, TIME/DT rows) for a
 //! stationary signal.
 
-use oxideav_ac4::acpl_synth::{differential_decode, AcplDiffState};
+use oxideav_ac4::acpl_synth::{AcplDiffState, differential_decode};
 use oxideav_ac4::aspx::{
-    delta_decode_sig_p80, derive_aspx_frequency_tables, AspxConfig, AspxFreqResMode,
-    AspxMasterFreqScale, AspxQuantStep,
+    AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, delta_decode_sig_p80,
+    derive_aspx_frequency_tables,
 };
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
@@ -72,7 +72,9 @@ fn decode_one(dec: &mut Ac4Decoder, bytes: Vec<u8>) -> Vec<i16> {
         panic!("expected audio frame");
     };
     af.data[0]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -191,8 +193,8 @@ fn gop_chained_reconstruction_matches_all_iframe_reference() {
 #[test]
 fn stationary_p_frame_element_bits_are_cheaper() {
     use oxideav_ac4::encoder_acpl3::{
-        choose_acpl_direction, choose_envelope_direction, qscf_row_from_freq_dpcm,
-        write_aspx_data_2ch_directional_envelope_tna_ah_framed, AspxEncodedEnvelope,
+        AspxEncodedEnvelope, choose_acpl_direction, choose_envelope_direction,
+        qscf_row_from_freq_dpcm, write_aspx_data_2ch_directional_envelope_tna_ah_framed,
     };
     use oxideav_core::bits::BitWriter;
 

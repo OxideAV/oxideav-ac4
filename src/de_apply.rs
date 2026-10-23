@@ -30,7 +30,7 @@
 //! `de_par_prev` zero-default live in [`DeApplyState`], which also
 //! carries the previous frame's matrices for interpolation.
 
-use crate::de::{DeConfig, DeData, DeMethod, DE_NR_BANDS};
+use crate::de::{DE_NR_BANDS, DeConfig, DeData, DeMethod};
 use crate::qmf::NUM_QMF_SUBBANDS;
 
 /// Table 209 — dequantization vector for the channel-independent

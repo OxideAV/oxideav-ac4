@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn hf_assemble_adds_both_noise_and_tone() {
-        use crate::aspx_noise::{generate_qmf_noise, NoiseGenState};
+        use crate::aspx_noise::{NoiseGenState, generate_qmf_noise};
         let atsg_sig = vec![0_u32, 2];
         let atsg_noise = vec![0_u32, 2];
         let noise_lev = vec![vec![1.0_f32]; 2];
@@ -469,8 +469,8 @@ mod tests {
     /// Pseudocode 107/108 combined assembler all at once.
     #[test]
     fn noise_plus_tone_inject_hf_energy_round_trip() {
-        use crate::aspx_noise::{generate_qmf_noise, NoiseGenState};
-        use crate::qmf::{QmfAnalysisBank, QmfSynthesisBank, NUM_QMF_SUBBANDS};
+        use crate::aspx_noise::{NoiseGenState, generate_qmf_noise};
+        use crate::qmf::{NUM_QMF_SUBBANDS, QmfAnalysisBank, QmfSynthesisBank};
         let fs = 48_000.0_f32;
         let f0 = 1_000.0_f32;
         let n_samples = NUM_QMF_SUBBANDS * 16;

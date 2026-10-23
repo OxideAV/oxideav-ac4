@@ -26,21 +26,21 @@
 //! whole chain bitstream → dequantized matrices + downmix spectra.
 
 use crate::ajoc::{
-    parse_ajoc_bed_info, parse_ajoc_dmx_de_data, AjocBedInfo, AjocDiffState, AjocDmxDeData,
+    AjocBedInfo, AjocDiffState, AjocDmxDeData, parse_ajoc_bed_info, parse_ajoc_dmx_de_data,
 };
-use crate::ajoc_data::{decode_ajoc, AjocFrame};
+use crate::ajoc_data::{AjocFrame, decode_ajoc};
 use crate::asf::SubstreamTools;
 use crate::aspx::{
-    parse_aspx_config, parse_companding_control, AspxConfig, CompandingControl, FiveXAspxTrailer,
+    AspxConfig, CompandingControl, FiveXAspxTrailer, parse_aspx_config, parse_companding_control,
 };
 use crate::mch::{
-    parse_mono_data, parse_three_channel_data, parse_two_channel_data, MonoLfeData,
-    ThreeChannelData, TwoChannelData,
+    MonoLfeData, ThreeChannelData, TwoChannelData, parse_mono_data, parse_three_channel_data,
+    parse_two_channel_data,
 };
 use crate::oamd::{
-    parse_oamd_dyndata_single, parse_oamd_timing_data, write_oamd_dyndata_single,
-    write_oamd_timing_data, InfoStatus, OaSampleOffset, OamdDynDataSingle, OamdTimingBlock,
-    OamdTimingData, ObjType, ObjectInfoBlock, RampDuration,
+    InfoStatus, OaSampleOffset, OamdDynDataSingle, OamdTimingBlock, OamdTimingData, ObjType,
+    ObjectInfoBlock, RampDuration, parse_oamd_dyndata_single, parse_oamd_timing_data,
+    write_oamd_dyndata_single, write_oamd_timing_data,
 };
 use crate::toc::variable_bits;
 use oxideav_core::bits::{BitReader, BitWriter};
@@ -201,7 +201,7 @@ pub fn parse_var_channel_element(
             (None, None) => {
                 return Err(Error::invalid(
                     "ac4: non-iframe var_channel_element A-SPX without sticky config",
-                ))
+                ));
             }
         };
         // Scratch tools shared across the captures — carries the
@@ -379,10 +379,8 @@ pub fn parse_audio_data_ajoc_with_static_sticky(
             channel_mode_channels: if params.b_lfe { 6 } else { 5 },
             ..Default::default()
         });
-        if !b_iframe {
-            if let Some(st) = static_sticky.as_ref() {
-                st.seed(&mut tools);
-            }
+        if !b_iframe && let Some(st) = static_sticky.as_ref() {
+            st.seed(&mut tools);
         }
         crate::mch::parse_5x_audio_data_outer(
             br,
@@ -391,10 +389,8 @@ pub fn parse_audio_data_ajoc_with_static_sticky(
             b_iframe,
             frame_len_base,
         )?;
-        if b_iframe {
-            if let Some(st) = static_sticky {
-                st.harvest(&tools);
-            }
+        if b_iframe && let Some(st) = static_sticky {
+            st.harvest(&tools);
         }
         static_chan_tools = Some(tools);
     } else {
@@ -612,7 +608,7 @@ fn static_dmx_spectra(tools: &SubstreamTools) -> Result<[Option<&[f32]>; 5]> {
         _ => {
             return Err(Error::invalid(
                 "ac4: static-dmx core without a coding_config",
-            ))
+            ));
         }
     }
     Ok(out)
@@ -1060,10 +1056,10 @@ impl AjocSubstreamDecoder {
         // channel-based decoder instance sharing this substream's
         // history. The reconstruction then sees plain PCM (no separate
         // extension matrix).
-        if let Some(tools) = ajoc.static_chan_tools.as_deref() {
-            if !matches!(tools.five_x_mode, Some(crate::mch::FiveXCodecMode::Simple)) {
-                return self.decode_static_core_stage(tools, frame_len_base);
-            }
+        if let Some(tools) = ajoc.static_chan_tools.as_deref()
+            && !matches!(tools.five_x_mode, Some(crate::mch::FiveXCodecMode::Simple))
+        {
+            return self.decode_static_core_stage(tools, frame_len_base);
         }
         // Downmix spectra in channel order + the LFE body, from either
         // the static 5.X core or the dynamic var_channel_element.
@@ -1321,16 +1317,14 @@ impl AjocSubstreamDecoder {
         // Harvest the I-frame-sticky A-SPX config + xover for the
         // P-frames that follow (single-xover convention — the first
         // payload's offset stands for the element).
-        if b_iframe {
-            if let Some(elem) = ajoc.var_element.as_ref().filter(|e| e.aspx_mode) {
-                let first = elem
-                    .aspx_pair_trailers
-                    .first()
-                    .and_then(|t| t.as_deref())
-                    .or(elem.aspx_odd_trailer.as_deref());
-                if let (Some(cfg), Some(t)) = (elem.aspx_config, first) {
-                    self.sticky_aspx = Some((cfg, t.xover));
-                }
+        if b_iframe && let Some(elem) = ajoc.var_element.as_ref().filter(|e| e.aspx_mode) {
+            let first = elem
+                .aspx_pair_trailers
+                .first()
+                .and_then(|t| t.as_deref())
+                .or(elem.aspx_odd_trailer.as_deref());
+            if let (Some(cfg), Some(t)) = (elem.aspx_config, first) {
+                self.sticky_aspx = Some((cfg, t.xover));
             }
         }
         // The walk must stay inside the announced audio_size envelope
@@ -1995,7 +1989,7 @@ pub fn write_audio_data_ajoc_aspx(
         ));
     }
     let n = params.n_fullband_dmx_signals as usize;
-    if dmx_spectra.len() != n || n == 0 || n % 2 != 0 {
+    if dmx_spectra.len() != n || n == 0 || !n.is_multiple_of(2) {
         return Err(Error::invalid(
             "ac4: A-SPX downmix writer covers even fullband signal counts",
         ));
@@ -2282,13 +2276,13 @@ pub fn write_ajoc_toc(
     bw.write_bit(true); // b_single_presentation
     bw.write_bit(false); // b_payload_base
     bw.write_bit(false); // b_program_id
-                         // ---- ac4_presentation_v1_info() (§6.2.1.3) ----
+    // ---- ac4_presentation_v1_info() (§6.2.1.3) ----
     bw.write_bit(true); // b_single_substream_group
     bw.write_bit(false); // presentation_version() = 0
     bw.write_u32(0, 3); // mdcompat
     bw.write_bit(false); // b_presentation_id
     bw.write_bit(false); // frame_rate_multiply_info: b_multiplier = 0
-                         // emdf_info(): version 0, key_id 0, no payloads-substream, no more.
+    // emdf_info(): version 0, key_id 0, no payloads-substream, no more.
     bw.write_u32(0, 2);
     bw.write_u32(0, 3);
     bw.write_bit(false);
@@ -2297,9 +2291,9 @@ pub fn write_ajoc_toc(
     bw.write_u32(0, 3); // ac4_sgi_specifier(): group_index = 0
     bw.write_bit(false); // b_pre_virtualized
     bw.write_bit(false); // b_add_emdf_substreams
-                         // ac4_presentation_substream_info(): b_alternative = 0,
-                         // b_pres_ndot = b_iframe (§6.3.2.11.2 — "no
-                         // dependency over time"), substream_index = 0.
+    // ac4_presentation_substream_info(): b_alternative = 0,
+    // b_pres_ndot = b_iframe (§6.3.2.11.2 — "no
+    // dependency over time"), substream_index = 0.
     bw.write_bit(false);
     bw.write_bit(b_iframe);
     bw.write_u32(0, 2);
@@ -2310,7 +2304,7 @@ pub fn write_ajoc_toc(
     bw.write_bit(false); // b_channel_coded
     bw.write_bit(false); // b_oamd_substream
     bw.write_bit(true); // b_ajoc
-                        // ac4_substream_info_ajoc() (§6.2.1.9):
+    // ac4_substream_info_ajoc() (§6.2.1.9):
     bw.write_bit(params.b_lfe); // b_lfe
     bw.write_bit(params.b_static_dmx); // b_static_dmx
     if !params.b_static_dmx {
@@ -2325,7 +2319,7 @@ pub fn write_ajoc_toc(
     bw.write_bit(b_iframe); // b_audio_ndot = b_iframe (frame_rate_factor = 1)
     bw.write_u32(0, 2); // substream_index
     bw.write_bit(false); // b_content_type
-                         // ---- substream_index_table() ----
+    // ---- substream_index_table() ----
     bw.write_u32(1, 2); // n_substreams = 1
     bw.write_bit(false); // b_size_present = 0 (spans to frame end)
     bw.align_to_byte();
@@ -2529,16 +2523,20 @@ mod tests {
         // Real-valued matrices on the 1-band grid.
         let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
             .map(|o| {
-                vec![(0..num_dmx)
-                    .map(|ch| vec![0.1 * (o as f64 + 1.0) - 0.05 * ch as f64])
-                    .collect()]
+                vec![
+                    (0..num_dmx)
+                        .map(|ch| vec![0.1 * (o as f64 + 1.0) - 0.05 * ch as f64])
+                        .collect(),
+                ]
             })
             .collect();
         let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
             .map(|o| {
-                vec![(0..num_decorr)
-                    .map(|de| vec![0.05 * (o as f64) + 0.02 * de as f64])
-                    .collect()]
+                vec![
+                    (0..num_decorr)
+                        .map(|de| vec![0.05 * (o as f64) + 0.02 * de as f64])
+                        .collect(),
+                ]
             })
             .collect();
         let qmats = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
@@ -2575,10 +2573,11 @@ mod tests {
         // Downmix spectra survive.
         let elem = ajoc.var_element.as_ref().unwrap();
         assert_eq!(elem.fullband_spectra().len(), num_dmx);
-        assert!(elem
-            .fullband_spectra()
-            .iter()
-            .all(|s| s.map(|v| v.iter().any(|&x| x != 0.0)).unwrap_or(false)));
+        assert!(
+            elem.fullband_spectra()
+                .iter()
+                .all(|s| s.map(|v| v.iter().any(|&x| x != 0.0)).unwrap_or(false))
+        );
 
         // OAMD side info round-trips.
         assert_eq!(ajoc.dmx_timing, Some(minimal_oamd_timing()));
@@ -2631,9 +2630,11 @@ mod tests {
         // Selector dry matrix (object o <- channel o % num_dmx); wet 0.
         let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
             .map(|o| {
-                vec![(0..num_dmx)
-                    .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
-                    .collect()]
+                vec![
+                    (0..num_dmx)
+                        .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
+                        .collect(),
+                ]
             })
             .collect();
         let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)

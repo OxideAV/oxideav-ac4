@@ -18,7 +18,7 @@
 //!    the resulting control words).
 //! 4. Determinism.
 
-use oxideav_ac4::aspx::{select_compand_on_from_qmf, ASPX_QMF_PCM_SCALE};
+use oxideav_ac4::aspx::{ASPX_QMF_PCM_SCALE, select_compand_on_from_qmf};
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_acpl3::qmf_slots_to_sb_major;
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;

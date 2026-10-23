@@ -8,7 +8,7 @@ use oxideav_ac4::asf::ChparamInfo;
 use oxideav_ac4::aspx::{AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep};
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::ice::{
-    encode_ice_raw_frame, write_ice_body_aspx_scpl, write_ice_body_scpl_with_sap, IceScplSpectra,
+    IceScplSpectra, encode_ice_raw_frame, write_ice_body_aspx_scpl, write_ice_body_scpl_with_sap,
 };
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
@@ -666,7 +666,7 @@ fn ice_acpl2_9_0_4_front_modules() {
 
 fn minimal_ajcc_data(iframe: bool) -> oxideav_ac4::ajcc::AjccData {
     use oxideav_ac4::acpl::AcplQuantMode;
-    use oxideav_ac4::ajcc::{encode_ajcc_deltas_freq, AjccData, AjccFramingData};
+    use oxideav_ac4::ajcc::{AjccData, AjccFramingData, encode_ajcc_deltas_freq};
     use oxideav_ac4::ajoc::AjocDiffType;
     let nb = 9usize;
     let fine = AcplQuantMode::Fine;
@@ -780,7 +780,7 @@ fn ice_ajcc_companding_applies_per_input_channel() {
 fn ajoc_aspx_downmix_companding_applies_per_channel() {
     use oxideav_ac4::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
     use oxideav_ac4::ajoc_data::new_ajoc_diff_state;
-    use oxideav_ac4::ajoc_substream::{encode_ajoc_raw_frame_aspx, AjocBodyParams};
+    use oxideav_ac4::ajoc_substream::{AjocBodyParams, encode_ajoc_raw_frame_aspx};
     use oxideav_ac4::aspx::CompandingControl;
     use oxideav_ac4::encoder_ajoc::AjocQuantMatrices;
     use oxideav_ac4::oamd::ObjType;
@@ -814,9 +814,11 @@ fn ajoc_aspx_downmix_companding_applies_per_channel() {
     };
     let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
         .map(|o| {
-            vec![(0..num_dmx)
-                .map(|ch| vec![if ch == o { 1.0 } else { 0.0 }])
-                .collect()]
+            vec![
+                (0..num_dmx)
+                    .map(|ch| vec![if ch == o { 1.0 } else { 0.0 }])
+                    .collect(),
+            ]
         })
         .collect();
     let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)

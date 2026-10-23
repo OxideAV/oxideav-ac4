@@ -17,7 +17,11 @@ fuzz_target!(|data: &[u8]| {
     let body = &data[2..];
     let b_static_dmx = a & 1 != 0;
     let b_lfe = a & 2 != 0;
-    let num_dmx: u32 = if b_static_dmx { 5 } else { 1 + u32::from((a >> 2) & 7) };
+    let num_dmx: u32 = if b_static_dmx {
+        5
+    } else {
+        1 + u32::from((a >> 2) & 7)
+    };
     let num_umx: u32 = 1 + u32::from(b & 15);
     let b_iframe = b & 16 != 0;
     let core = b & 32 != 0;

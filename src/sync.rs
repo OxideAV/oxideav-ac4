@@ -67,10 +67,10 @@ pub fn find_sync_frame(data: &[u8]) -> Option<SyncFrame<'_>> {
     let mut i = 0usize;
     while i + 4 <= data.len() {
         let sync = u16::from_be_bytes([data[i], data[i + 1]]);
-        if sync == SYNC_WORD_PLAIN || sync == SYNC_WORD_CRC {
-            if let Ok(frame) = try_parse_frame_at(data, i) {
-                return Some(frame);
-            }
+        if (sync == SYNC_WORD_PLAIN || sync == SYNC_WORD_CRC)
+            && let Ok(frame) = try_parse_frame_at(data, i)
+        {
+            return Some(frame);
         }
         i += 1;
     }
@@ -195,7 +195,7 @@ mod tests {
         data.push(((fs >> 16) & 0xFF) as u8);
         data.push(((fs >> 8) & 0xFF) as u8);
         data.push((fs & 0xFF) as u8);
-        data.extend(std::iter::repeat(0u8).take(fs as usize));
+        data.extend(std::iter::repeat_n(0u8, fs as usize));
         let f = find_sync_frame(&data).expect("should sync");
         assert_eq!(f.payload.len(), fs as usize);
         assert_eq!(f.total_len, fs as usize + 7);

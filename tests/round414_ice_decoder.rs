@@ -16,12 +16,12 @@
 //!   right-module outputs, across an I + P (DIFF_TIME) GOP.
 
 use oxideav_ac4::acpl::AcplQuantMode;
-use oxideav_ac4::ajcc::{encode_ajcc_deltas_freq, AjccData, AjccFramingData};
+use oxideav_ac4::ajcc::{AjccData, AjccFramingData, encode_ajcc_deltas_freq};
 use oxideav_ac4::ajoc::AjocDiffType;
 use oxideav_ac4::aspx::{AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep};
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::ice::{
-    encode_ice_raw_frame, write_ice_body_ajcc, write_ice_body_scpl, IceScplSpectra,
+    IceScplSpectra, encode_ice_raw_frame, write_ice_body_ajcc, write_ice_body_scpl,
 };
 use oxideav_core::bits::BitWriter;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};

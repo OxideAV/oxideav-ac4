@@ -26,8 +26,8 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::huffman::{
-    asf_hcb, ext_decode, huff_decode, split_qspec, CB_DIM, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN,
-    HCB_SNF_CW, HCB_SNF_LEN, UNSIGNED_CB,
+    CB_DIM, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN, HCB_SNF_CW, HCB_SNF_LEN, UNSIGNED_CB, asf_hcb,
+    ext_decode, huff_decode, split_qspec,
 };
 use crate::tables::num_sfb_48;
 
@@ -620,9 +620,9 @@ mod tests {
         let mqi = vec![0u32, 3u32, 0u32];
         let mut bw = BitWriter::new();
         bw.write_u32(120, 8); // reference_scale_factor
-                              // Only sfb=1 has mqi>0 and cb!=0 -> first_scf_found is set,
-                              // no codeword emitted. sfb=0: mqi=0 -> skip. sfb=2: mqi=0 ->
-                              // skip. So no huffman data needed.
+        // Only sfb=1 has mqi>0 and cb!=0 -> first_scf_found is set,
+        // no codeword emitted. sfb=0: mqi=0 -> skip. sfb=2: mqi=0 ->
+        // skip. So no huffman data needed.
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -762,8 +762,8 @@ mod tests {
         let mqi_per_g = vec![vec![3u32, 0u32], vec![3u32, 0u32]];
         let mut bw = BitWriter::new();
         bw.write_u32(120, 8); // reference
-                              // One DPCM codeword for group 1's first active band: idx=60
-                              // -> delta 0 -> stays at 120.
+        // One DPCM codeword for group 1's first active band: idx=60
+        // -> delta 0 -> stays at 120.
         bw.write_u32(
             crate::huffman::HCB_SCALEFAC_CW[60],
             crate::huffman::HCB_SCALEFAC_LEN[60] as u32,

@@ -67,7 +67,7 @@ use oxideav_core::bits::BitWriter;
 
 use crate::asf_data::AsfSections;
 use crate::huffman::{
-    asf_hcb, Hcb, CB_DIM, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN, HCB_SNF_CW, HCB_SNF_LEN, UNSIGNED_CB,
+    CB_DIM, HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN, HCB_SNF_CW, HCB_SNF_LEN, Hcb, UNSIGNED_CB, asf_hcb,
 };
 
 /// Per-codebook quantisation magnitude bound:
@@ -95,11 +95,7 @@ pub fn quantise_coeff(coeff: f32, sf: i32) -> i32 {
     }
     let mag = (coeff.abs() / sf_gain).powf(0.75);
     let q = mag.round() as i32;
-    if coeff < 0.0 {
-        -q
-    } else {
-        q
-    }
+    if coeff < 0.0 { -q } else { q }
 }
 
 /// Pick the smallest scalefactor (most-precision) that keeps every bin's
@@ -453,7 +449,7 @@ pub fn pick_best_codebook_for_band_with(
             None => continue,
         };
         let dim = hcb.dim as usize;
-        if natural_q.len() % dim != 0 {
+        if !natural_q.len().is_multiple_of(dim) {
             continue;
         }
         let q_max_cb = CB_QMAX[cb_id as usize];
@@ -732,11 +728,7 @@ pub fn compute_snf_dpcm_for_zero_quant_bands(
         out[sfb] = idx;
         any_set = true;
     }
-    if any_set {
-        Some(out)
-    } else {
-        None
-    }
+    if any_set { Some(out) } else { None }
 }
 
 /// Emit `asf_snf_data()` per Table 42:
@@ -1345,11 +1337,11 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
     bw.write_u32(0, 1); // spec_frontend_l = ASF
     bw.write_bit(true); // b_long_frame
     bw.write_u32(max_sfb, n_msfb_bits); // max_sfb_l
-                                        // --- Right channel header ---
+    // --- Right channel header ---
     bw.write_u32(0, 1); // spec_frontend_r = ASF
     bw.write_bit(true); // b_long_frame
     bw.write_u32(max_sfb, n_msfb_bits); // max_sfb_r (same width as L in
-                                        // this split-MDCT path)
+    // this split-MDCT path)
 
     // --- Left channel sf_data(ASF) ---
     write_section_data(&mut bw, &sections_l);
@@ -1721,10 +1713,10 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
     // `parse_asf_transform_info()` reads one bit (b_long_frame) at
     // frame_len_base >= 1536 and infers the long-frame transform length.
     bw.write_bit(true); // b_long_frame
-                        // Shared psy_info: asf_psy_info(0, 0). With
-                        // b_dual_maxsfb=false / b_side_limited=false there's a
-                        // single max_sfb field at n_msfb_bits width. No
-                        // scale_factor_grouping bits in long-frame mode.
+    // Shared psy_info: asf_psy_info(0, 0). With
+    // b_dual_maxsfb=false / b_side_limited=false there's a
+    // single max_sfb field at n_msfb_bits width. No
+    // scale_factor_grouping bits in long-frame mode.
     let (n_msfb_bits, _, _) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     bw.write_u32(max_sfb, n_msfb_bits);
@@ -2259,8 +2251,8 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     // is `asf_transform_info() + asf_psy_info() + chparam_info() +
     // sf_data(ASF) + sf_data(ASF)`.
     bw.write_bit(true); // b_long_frame = 1
-                        // asf_psy_info(): max_sfb[0] in n_msfb_bits bits — shared
-                        // between Lb and Rb.
+    // asf_psy_info(): max_sfb[0] in n_msfb_bits bits — shared
+    // between Lb and Rb.
     bw.write_u32(max_sfb_add, n_msfb_bits);
     // chparam_info(): single sap_mode (2 b) for the pair — identity SAP
     // (`sap_mode = 0`) so no follow-on ms_used / sap_data.
@@ -2350,8 +2342,8 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
     pad_target_bytes: usize,
 ) -> Vec<u8> {
     use crate::encoder_acpl3::{
-        write_aspx_config, write_aspx_data_1ch_real_envelope, write_aspx_data_2ch_real_envelope,
-        AspxRealEnvelopeChannel,
+        AspxRealEnvelopeChannel, write_aspx_config, write_aspx_data_1ch_real_envelope,
+        write_aspx_data_2ch_real_envelope,
     };
 
     let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
@@ -2598,8 +2590,9 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
     pad_target_bytes: usize,
 ) -> Vec<u8> {
     use crate::encoder_acpl3::{
-        write_aspx_config, write_aspx_data_1ch_real_envelope_tna_ah_framed,
-        write_aspx_data_2ch_real_envelope_tna_ah_framed, AspxRealEnvelopeChannel,
+        AspxRealEnvelopeChannel, write_aspx_config,
+        write_aspx_data_1ch_real_envelope_tna_ah_framed,
+        write_aspx_data_2ch_real_envelope_tna_ah_framed,
     };
 
     let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
@@ -2988,8 +2981,8 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // is `asf_transform_info() + asf_psy_info() + chparam_info() +
     // sf_data(ASF) + sf_data(ASF)`.
     bw.write_bit(true); // b_long_frame = 1
-                        // asf_psy_info(): max_sfb[0] in n_msfb_bits bits — shared
-                        // between Lb and Rb.
+    // asf_psy_info(): max_sfb[0] in n_msfb_bits bits — shared
+    // between Lb and Rb.
     bw.write_u32(max_sfb_add, n_msfb_bits);
     // chparam_info(): single sap_mode (2 b) for the pair — identity SAP
     // (`sap_mode = 0`) so no follow-on ms_used / sap_data.
@@ -3298,7 +3291,7 @@ mod tests {
         let hcb = asf_hcb(11).unwrap();
         let inline = vec![16i32, 0i32];
         let inline_cost = bit_cost_for_band(hcb, &inline, 5); // skip cb=11 path
-                                                              // Now via cb=11 path: same inline cost + sign bit (16!=0) + 5 escape bits.
+        // Now via cb=11 path: same inline cost + sign bit (16!=0) + 5 escape bits.
         let total = bit_cost_for_band(hcb, &q, 11);
         assert!(
             total >= inline_cost + 5,

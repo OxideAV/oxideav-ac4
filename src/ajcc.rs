@@ -41,7 +41,7 @@
 //! turn these dequantized parameters plus the five core channels into
 //! output QMF channels.
 
-use crate::acpl::{get_acpl_hcb, AcplDataType, AcplHcbType, AcplQuantMode};
+use crate::acpl::{AcplDataType, AcplHcbType, AcplQuantMode, get_acpl_hcb};
 use crate::acpl_synth::{dequantize_alpha_index, dequantize_beta_index};
 use crate::ajoc::AjocDiffType;
 use crate::huffman::huff_decode;
@@ -1208,7 +1208,7 @@ mod tests {
         // A freq row that pushes the dry index past its grid must fail
         // decode_ajcc's range validation.
         let mut data = build_data(false, 3, 0, None); // 7 bands
-                                                      // dry SET 0, fine grid (0..=22): force an escape upward.
+        // dry SET 0, fine grid (0..=22): force an escape upward.
         data.dry[0] = vec![(AjocDiffType::Freq, vec![22, 5, 0, 0, 0, 0, 0])];
         let mut bw = BitWriter::new();
         write_ajcc_data(&mut bw, &data).unwrap();

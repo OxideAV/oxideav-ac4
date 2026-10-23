@@ -67,7 +67,7 @@ fn pick_min_len_cw(len: &[u8], cw: &[u32]) -> (u32, u32) {
     let (idx, min_len) = len
         .iter()
         .enumerate()
-        .min_by_key(|(_, &l)| l)
+        .min_by_key(|&(_, &l)| l)
         .map(|(i, &l)| (i, l))
         .expect("hcb table must be non-empty");
     (cw[idx], min_len as u32)
@@ -691,7 +691,7 @@ fn write_stereo_split_data(
     bw.write_bit(false);
     bw.write_bit(true); // asf_transform_info: b_long_frame = 1
     bw.write_u32(max_sfb, n_msfb_bits); // asf_psy_info: max_sfb[0] in n_msfb_bits
-                                        // R channel: spec_frontend_r = 0 (ASF) + asf_transform_info + asf_psy_info.
+    // R channel: spec_frontend_r = 0 (ASF) + asf_transform_info + asf_psy_info.
     bw.write_bit(false);
     bw.write_bit(true);
     bw.write_u32(max_sfb, n_msfb_bits);
@@ -775,7 +775,7 @@ pub(crate) fn write_aspx_data_2ch_minimal_framed_xover(
     // aspx_delta_dir(0): num_env=1 SIGNAL direction bit + num_noise=1 NOISE bit.
     bw.write_bit(false); // sig_delta_dir[0] = false (FREQ)
     bw.write_bit(false); // noise_delta_dir[0] = false (FREQ)
-                         // aspx_delta_dir(1): same shape.
+    // aspx_delta_dir(1): same shape.
     bw.write_bit(false);
     bw.write_bit(false);
 
@@ -3106,7 +3106,7 @@ fn write_two_channel_data(
     // Shared sf_info(ASF, 0, 0).
     bw.write_bit(true); // asf_transform_info: b_long_frame = 1
     bw.write_u32(max_sfb, n_msfb_bits); // asf_psy_info: max_sfb[0]
-                                        // chparam_info(): sap_mode = 0 (identity SAP, no ms_used / sap_data).
+    // chparam_info(): sap_mode = 0 (identity SAP, no ms_used / sap_data).
     bw.write_u32(0, 2);
 
     // Two sf_data(ASF) bodies, one per channel.
@@ -5562,21 +5562,16 @@ pub fn predict_aspx_patch_delivery_fraction_from_qmf(
                 s.1 += c2 * (a1.0 * z.1 + a1.1 * z.0);
             }
             let mut e = (s.0 as f64) * (s.0 as f64) + (s.1 as f64) * (s.1 as f64);
-            if let Some(gv) = &preflat_gains {
-                if let Some(&g_p) = gv.get(p) {
-                    if g_p != 0.0 {
-                        e /= (g_p as f64) * (g_p as f64);
-                    }
-                }
+            if let Some(gv) = &preflat_gains
+                && let Some(&g_p) = gv.get(p)
+                && g_p != 0.0
+            {
+                e /= (g_p as f64) * (g_p as f64);
             }
             acc += e;
             n_cnt += 1;
         }
-        if n_cnt == 0 {
-            0.0
-        } else {
-            acc / n_cnt as f64
-        }
+        if n_cnt == 0 { 0.0 } else { acc / n_cnt as f64 }
     };
     // Per regenerated subband: target energy + deliverable fraction.
     let sbz = tables.sbz as usize;
@@ -11751,8 +11746,10 @@ mod tests {
         let bytes_sap = bw_sap.finish();
 
         assert_eq!(used_legacy, used_sap);
-        assert_eq!(bytes_legacy, bytes_sap,
-            "SAP-aware writer with chparam_pair = None must be bit-equal to the legacy identity-SAP writer");
+        assert_eq!(
+            bytes_legacy, bytes_sap,
+            "SAP-aware writer with chparam_pair = None must be bit-equal to the legacy identity-SAP writer"
+        );
     }
 
     /// SAP-aware residual layer with a non-identity (M/S) chparam pair
@@ -12478,7 +12475,7 @@ mod tests {
     /// and the parser's `decode_delta` returns the same values.
     #[test]
     fn write_beta_f0_df_round_trips() {
-        use crate::acpl::{get_acpl_hcb, AcplDataType, AcplHcbType, AcplQuantMode};
+        use crate::acpl::{AcplDataType, AcplHcbType, AcplQuantMode, get_acpl_hcb};
         let qm = AcplQuantMode::Fine;
         let beta_seq = [5i32, 5, 3, 0, 0, 0];
         let mut bw = BitWriter::new();
@@ -12544,7 +12541,7 @@ mod tests {
     /// 121 accumulation for a representative signed sequence.
     #[test]
     fn write_beta3_f0_df_round_trips_through_parse_acpl_huff_data() {
-        use crate::acpl::{parse_acpl_huff_data, AcplDataType, AcplQuantMode};
+        use crate::acpl::{AcplDataType, AcplQuantMode, parse_acpl_huff_data};
         let qm = AcplQuantMode::Fine;
         let beta3_seq = [3i32, 3, -2, 0, 8, -8];
         let mut bw = BitWriter::new();

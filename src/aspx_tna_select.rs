@@ -55,8 +55,8 @@
 //! affects bitstream validity — the decoder recovers whatever
 //! `aspx_tna_mode` is written and applies the matching chirp.
 
-use crate::aspx::{derive_patch_tables, AspxFrequencyTables, AspxMasterFreqScale, AspxPatchTables};
-use crate::aspx_tns::{compute_alphas, compute_covariance, Alphas};
+use crate::aspx::{AspxFrequencyTables, AspxMasterFreqScale, AspxPatchTables, derive_patch_tables};
+use crate::aspx_tns::{Alphas, compute_alphas, compute_covariance};
 
 /// Per-noise-subband-group predictor-strength thresholds that partition
 /// the aggregated `|alpha0|^2 + |alpha1|^2` measure into the four
@@ -329,8 +329,8 @@ mod tests {
     #[test]
     fn predictor_strength_orders_modes_and_is_level_independent() {
         use crate::aspx::{
-            derive_aspx_frequency_tables, AspxConfig, AspxFreqResMode, AspxMasterFreqScale,
-            AspxQuantStep,
+            AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep,
+            derive_aspx_frequency_tables,
         };
         use crate::aspx_tns::build_q_low_ext;
 
@@ -378,11 +378,13 @@ mod tests {
 
         let n = tables.counts.num_sbg_noise as usize;
         assert_eq!(m_silence.len(), n);
-        assert!(m_silence
-            .iter()
-            .chain(&m_quiet)
-            .chain(&m_loud)
-            .all(|&m| m <= 3));
+        assert!(
+            m_silence
+                .iter()
+                .chain(&m_quiet)
+                .chain(&m_loud)
+                .all(|&m| m <= 3)
+        );
 
         // Silence selects no inverse filtering anywhere.
         assert!(m_silence.iter().all(|&m| m == 0), "silence -> all None");

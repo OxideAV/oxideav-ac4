@@ -33,14 +33,14 @@
 //! §4.2.12.5 Table 54, §4.2.12.8 Table 57, §5.7.6.3.4 Pseudocode 80 / 81.
 
 use oxideav_ac4::aspx::{
-    delta_decode_noise, delta_decode_sig, derive_aspx_frequency_tables, num_aspx_timeslots,
-    parse_aspx_delta_dir, parse_aspx_ec_data, parse_aspx_framing, parse_aspx_hfgen_iwc_1ch,
-    parse_aspx_hfgen_iwc_2ch, AspxConfig, AspxDataType, AspxFreqResMode, AspxIntClass,
-    AspxMasterFreqScale, AspxQuantStep, AspxStereoMode,
+    AspxConfig, AspxDataType, AspxFreqResMode, AspxIntClass, AspxMasterFreqScale, AspxQuantStep,
+    AspxStereoMode, delta_decode_noise, delta_decode_sig, derive_aspx_frequency_tables,
+    num_aspx_timeslots, parse_aspx_delta_dir, parse_aspx_ec_data, parse_aspx_framing,
+    parse_aspx_hfgen_iwc_1ch, parse_aspx_hfgen_iwc_2ch,
 };
 use oxideav_ac4::encoder_acpl3::{
-    dpcm_encode_qscf_envelopes, write_aspx_data_1ch_multi_envelope,
-    write_aspx_data_2ch_multi_envelope, AspxEncodedEnvelope, AspxMultiEnvelopeChannel,
+    AspxEncodedEnvelope, AspxMultiEnvelopeChannel, dpcm_encode_qscf_envelopes,
+    write_aspx_data_1ch_multi_envelope, write_aspx_data_2ch_multi_envelope,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
 

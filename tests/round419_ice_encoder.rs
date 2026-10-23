@@ -25,7 +25,7 @@
 
 use oxideav_ac4::aspx::ASPX_QMF_PCM_SCALE;
 use oxideav_ac4::aspx::{
-    derive_aspx_frequency_tables, AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep,
+    AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, derive_aspx_frequency_tables,
 };
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_acpl3::qmf_slots_to_sb_major;

@@ -52,8 +52,8 @@
 //! handled — historically only the no-rfu short-circuit was implemented.
 
 use crate::ssf::{SsfBlock, SsfData, SsfGranule, StrideFlag};
-use crate::ssf_ac::{idx_to_reconstruction, SsfRandGenState};
-use crate::ssf_pred_coeff::{ssf_pred_coeff_mat, SSF_PRED_MAT_DIMS};
+use crate::ssf_ac::{SsfRandGenState, idx_to_reconstruction};
+use crate::ssf_pred_coeff::{SSF_PRED_MAT_DIMS, ssf_pred_coeff_mat};
 use crate::ssf_tables::{
     OFFSETS_DB_TO_LIN, OFFSETS_LIN_TO_DB, POST_GAIN_LUT, PRED_GAIN_QUANT_TAB, PRED_RFS_TABLE,
     PRED_RTS_TABLE, SLOPES_DB_TO_LIN, SLOPES_LIN_TO_DB, STEP_SIZES_Q4_15,

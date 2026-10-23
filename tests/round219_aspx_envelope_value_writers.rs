@@ -53,7 +53,7 @@
 //! * No top-level encoder entry point is added.
 
 use oxideav_ac4::aspx::{
-    parse_aspx_huff_data, AspxDataType, AspxHcbType, AspxQuantStep, AspxSbgCounts, AspxStereoMode,
+    AspxDataType, AspxHcbType, AspxQuantStep, AspxSbgCounts, AspxStereoMode, parse_aspx_huff_data,
 };
 use oxideav_ac4::encoder_acpl3::{
     write_aspx_noise_df_value, write_aspx_noise_dt_value, write_aspx_noise_f0_value,

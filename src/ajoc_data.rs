@@ -21,9 +21,9 @@
 //! [`AjocDiffState`].
 
 use crate::ajoc::{
+    AjocCtrlInfo, AjocDequantMatrices, AjocDiffState, AjocDiffType, AjocMatrixKind, AjocQuantMode,
     dequantize_dry, dequantize_wet, differential_decode_dry, differential_decode_wet,
-    parse_ajoc_ctrl_info, AjocCtrlInfo, AjocDequantMatrices, AjocDiffState, AjocDiffType,
-    AjocMatrixKind, AjocQuantMode,
+    parse_ajoc_ctrl_info,
 };
 use crate::ajoc_huffman::{ajoc_huff_data, write_ajoc_huff_data};
 use oxideav_core::bits::{BitReader, BitWriter};
@@ -359,7 +359,7 @@ pub fn write_ajoc_data(bw: &mut BitWriter, ctrl: &AjocCtrlInfo, data: &AjocData)
                     _ => {
                         return Err(Error::invalid(
                             "ac4: A-JOC dry row presence mismatches sparse gating",
-                        ))
+                        ));
                     }
                 }
             }
@@ -377,7 +377,7 @@ pub fn write_ajoc_data(bw: &mut BitWriter, ctrl: &AjocCtrlInfo, data: &AjocData)
                     _ => {
                         return Err(Error::invalid(
                             "ac4: A-JOC wet row presence mismatches sparse gating",
-                        ))
+                        ));
                     }
                 }
             }
@@ -431,7 +431,7 @@ pub fn encode_ajoc_deltas_time(q: &[i32], prev: &[i32]) -> Vec<i32> {
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
-    use crate::ajoc::{ajoc_reconstruct, AjocDataPointInfo, AjocGeometry, AjocReconState, Cplx};
+    use crate::ajoc::{AjocDataPointInfo, AjocGeometry, AjocReconState, Cplx, ajoc_reconstruct};
 
     /// Build a simple non-sparse ctrl-info: every object present, one
     /// data point, given band code / quant mode.
@@ -666,7 +666,7 @@ mod tests {
         // 1 object from 1 downmix channel, no decorrelators, 1 band.
         let quant = AjocQuantMode::Coarse;
         let ctrl = simple_ctrl(1, 0, 7, quant); // 1 band
-                                                // Dry index 35 → dequantizes to (35-25)·0.20019531 ≈ 2.0019531.
+        // Dry index 35 → dequantizes to (35-25)·0.20019531 ≈ 2.0019531.
         let data = freq_data(&ctrl, &[vec![vec![35]]], &[vec![]], quant, true);
 
         let mut bw = BitWriter::new();

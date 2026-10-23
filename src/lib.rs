@@ -645,9 +645,10 @@ mod tests {
         register_codecs(&mut reg);
         assert!(reg.has_decoder(&CodecId::new(CODEC_ID_STR)));
         assert!(reg.has_encoder(&CodecId::new(CODEC_ID_STR)));
-        assert!(reg
-            .encoder_options_schema(&CodecId::new(CODEC_ID_STR))
-            .is_some_and(|s| s.iter().any(|f| f.name == "framing")));
+        assert!(
+            reg.encoder_options_schema(&CodecId::new(CODEC_ID_STR))
+                .is_some_and(|s| s.iter().any(|f| f.name == "framing"))
+        );
     }
 
     #[test]
@@ -655,10 +656,11 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         let hits: Vec<_> = reg.all_tag_registrations().collect();
-        assert!(hits
-            .iter()
-            .any(|(t, id)| matches!(t, CodecTag::Fourcc(v) if v == b"AC-4")
-                && id.as_str() == CODEC_ID_STR));
+        assert!(
+            hits.iter()
+                .any(|(t, id)| matches!(t, CodecTag::Fourcc(v) if v == b"AC-4")
+                    && id.as_str() == CODEC_ID_STR)
+        );
     }
 
     #[test]

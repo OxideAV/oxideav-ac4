@@ -34,7 +34,7 @@
 //! (`aspx_data_2ch()`), §4.3.10.6.1 Table 131 (`aspx_tna_mode`).
 
 use oxideav_ac4::aspx::{
-    derive_aspx_frequency_tables, AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep,
+    AspxConfig, AspxFreqResMode, AspxMasterFreqScale, AspxQuantStep, derive_aspx_frequency_tables,
 };
 use oxideav_ac4::aspx_tna_select::select_tna_mode;
 use oxideav_ac4::aspx_tns::build_q_low_ext;

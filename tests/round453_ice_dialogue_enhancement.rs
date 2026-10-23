@@ -6,9 +6,9 @@
 //! channels in both §4.7 decoding modes while every other channel
 //! passes through.
 
-use oxideav_ac4::de::{DeConfig, DeData, DeMethod, DialogEnhancement, DE_NR_BANDS};
+use oxideav_ac4::de::{DE_NR_BANDS, DeConfig, DeData, DeMethod, DialogEnhancement};
 use oxideav_ac4::decoder::{Ac4Decoder, DecodingMode};
-use oxideav_ac4::ice::{encode_ice_raw_frame_with_metadata, write_ice_body_scpl, IceScplSpectra};
+use oxideav_ac4::ice::{IceScplSpectra, encode_ice_raw_frame_with_metadata, write_ice_body_scpl};
 use oxideav_core::bits::{BitReader, BitWriter};
 use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
 

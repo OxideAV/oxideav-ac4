@@ -1008,7 +1008,7 @@ pub fn write_object_info_block(
             InfoStatus::Default => {
                 return Err(Error::invalid(
                     "ac4: DEFAULT render status on an active dynamic object",
-                ))
+                ));
             }
         }
     }
@@ -1032,7 +1032,7 @@ pub fn write_object_info_block(
             write_add_per_object_md(&mut probe, md, blk.b_object_not_active, b_dynamic_object)?;
             let used = probe.bit_position() as u32;
             let total = used + remain;
-            if total == 0 || total % 8 != 0 || total > 16 * 8 {
+            if total == 0 || !total.is_multiple_of(8) || total > 16 * 8 {
                 return Err(Error::invalid(
                     "ac4: add_table_data payload + filler is not a valid byte envelope",
                 ));
@@ -1153,11 +1153,7 @@ pub fn parse_oamd_dyndata_single(
                 } else {
                     let common = br.read_bit()?;
                     b_common_data = Some(common);
-                    if common {
-                        1
-                    } else {
-                        n_objs
-                    }
+                    if common { 1 } else { n_objs }
                 };
                 for dp in 0..n_data_points {
                     let ot = obj_type[dp.min(n_objs.saturating_sub(1))];
@@ -1317,7 +1313,7 @@ pub fn write_oamd_dyndata_single(
                     write_ext_prec_alt_pos(&mut probe, per_obj, set.b_keep)?;
                     let used = probe.bit_position() as u32;
                     let total = used + remain;
-                    if total == 0 || total % 8 != 0 {
+                    if total == 0 || !total.is_multiple_of(8) {
                         return Err(Error::invalid(
                             "ac4: alt additional-data envelope is not whole bytes",
                         ));
@@ -2087,7 +2083,7 @@ pub fn write_oamd_common_data(
             write_bed_render_info(&mut probe, &a.bed_render_info, bed_has_lfe)?;
             let used = probe.bit_position() as u32;
             let total = used + a.filler_bits;
-            if total == 0 || total % 8 != 0 {
+            if total == 0 || !total.is_multiple_of(8) {
                 return Err(Error::invalid(
                     "ac4: oamd add-data envelope is not whole bytes",
                 ));

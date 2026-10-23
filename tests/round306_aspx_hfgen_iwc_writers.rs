@@ -23,8 +23,8 @@
 
 use oxideav_ac4::aspx::{parse_aspx_hfgen_iwc_1ch, parse_aspx_hfgen_iwc_2ch};
 use oxideav_ac4::encoder_acpl3::{
-    write_aspx_hfgen_iwc_1ch, write_aspx_hfgen_iwc_2ch, AspxHfgenIwc1ChPayload,
-    AspxHfgenIwc2ChPayload,
+    AspxHfgenIwc1ChPayload, AspxHfgenIwc2ChPayload, write_aspx_hfgen_iwc_1ch,
+    write_aspx_hfgen_iwc_2ch,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
 
