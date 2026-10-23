@@ -1,6 +1,6 @@
 [package]
 name = "oxideav-ac4"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
