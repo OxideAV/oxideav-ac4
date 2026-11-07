@@ -65,13 +65,11 @@ fn raw_frames_with_range(
     p.sample_format = Some(SampleFormat::F32);
     let mut enc = Ac4Encoder::with_options(
         &p,
-        Ac4EncoderOptions {
-            framing: Framing::Raw,
-            mode,
-            gop,
-            dynamic_range_db,
-            ..Ac4EncoderOptions::default()
-        },
+        Ac4EncoderOptions::default()
+            .with_framing(Framing::Raw)
+            .with_mode(mode)
+            .with_gop(gop)
+            .with_dynamic_range_db(dynamic_range_db),
     )
     .expect("encoder");
     let total = N * frames;

@@ -88,6 +88,7 @@ use crate::encoder_mdct::EncoderMdctState;
 /// Round 46 lands the Auditor-mode bit layout per ETSI TS 103 190-2
 /// §6.2.1.1 — the audio body itself is all-zero placeholder bits.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Ac4ImsEncoder {
     /// `bitstream_version` value to emit (TS 103 190-2 Table 74).
     /// `0` selects the TS 103 190-1 v0 path (`ac4_presentation_info()`

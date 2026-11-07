@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Ac4EncoderOptions::with_*` setters for every field.
+
+### Changed
+
+- API hygiene: the enums `DecodingMode`, `encoder::{EncodeMode,
+  AcplMode, Framing}` and the records `Ac4EncoderOptions`,
+  `encoder_ims::Ac4ImsEncoder`, `sync::SyncFrame` and
+  `toc::{ChannelModeDesc, Ac4FrameInfo, OamdSubstreamInfoDesc,
+  PresentationInfo, ImmersivePresence, AjocSubstreamInfo,
+  ObjSubstreamInfo}` are now `#[non_exhaustive]`. Build
+  `Ac4EncoderOptions` with `Default` + the `with_*` setters; match the
+  enums with a `_` arm. `toc::BedDynObjAssignment` / `toc::ObjBedStart`
+  stay exhaustive (they mirror the fixed bitstream alternatives).
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.8...v0.0.9) - 2026-10-23
 
 ### Other

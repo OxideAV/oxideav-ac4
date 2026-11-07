@@ -45,6 +45,7 @@ use crate::sync::wrap_sync_frame;
 
 /// Coding-tool family selected on the chosen layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum EncodeMode {
     /// Waveform coding on every channel: SIMPLE / ASF (mono, stereo
     /// with the automatic joint-M/S decision, 5.X, 7.X, 22.2 Simple)
@@ -66,6 +67,7 @@ pub enum EncodeMode {
 
 /// A-CPL codec mode of the parametric 5.X / 7.X routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum AcplMode {
     /// `ASPX_ACPL_2`: fully parametric surround / back pair from the
     /// coded carrier + `(α, β)` (Pseudocode 117 / 120).
@@ -83,6 +85,7 @@ pub enum AcplMode {
 
 /// Sync-frame wrapping of the emitted packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Framing {
     /// Annex G `ac4_syncframe()` with the `0xAC40` sync word.
     #[default]
@@ -97,6 +100,7 @@ pub enum Framing {
 /// Typed options for [`make_encoder`] (schema on
 /// [`CodecOptionsStruct::SCHEMA`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Ac4EncoderOptions {
     /// `frame_rate_index` (TS 103 190-1 Table 83 for 48 kHz, Table 84
     /// for 44,1 kHz). Sets the AC-4 frame length: at 48 kHz index 0 / 1
@@ -126,6 +130,57 @@ pub struct Ac4EncoderOptions {
     /// A-CPL codec mode on the parametric 5.X / 7.X routes
     /// (`acpl_2` / `acpl_1`).
     pub acpl: AcplMode,
+}
+
+impl Ac4EncoderOptions {
+    /// Builder: set [`frame_rate_index`](Self::frame_rate_index).
+    #[must_use]
+    pub fn with_frame_rate_index(mut self, v: u32) -> Self {
+        self.frame_rate_index = v;
+        self
+    }
+
+    /// Builder: set [`framing`](Self::framing).
+    #[must_use]
+    pub fn with_framing(mut self, v: Framing) -> Self {
+        self.framing = v;
+        self
+    }
+
+    /// Builder: set [`mode`](Self::mode).
+    #[must_use]
+    pub fn with_mode(mut self, v: EncodeMode) -> Self {
+        self.mode = v;
+        self
+    }
+
+    /// Builder: set [`bandwidth_hz`](Self::bandwidth_hz).
+    #[must_use]
+    pub fn with_bandwidth_hz(mut self, v: u32) -> Self {
+        self.bandwidth_hz = v;
+        self
+    }
+
+    /// Builder: set [`dynamic_range_db`](Self::dynamic_range_db).
+    #[must_use]
+    pub fn with_dynamic_range_db(mut self, v: u32) -> Self {
+        self.dynamic_range_db = v;
+        self
+    }
+
+    /// Builder: set [`gop`](Self::gop).
+    #[must_use]
+    pub fn with_gop(mut self, v: u32) -> Self {
+        self.gop = v;
+        self
+    }
+
+    /// Builder: set [`acpl`](Self::acpl).
+    #[must_use]
+    pub fn with_acpl(mut self, v: AcplMode) -> Self {
+        self.acpl = v;
+        self
+    }
 }
 
 impl Default for Ac4EncoderOptions {

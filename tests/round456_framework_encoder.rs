@@ -208,6 +208,7 @@ fn run_layout(channels: usize, mode: EncodeMode, chunk: usize) -> Vec<f64> {
     let mode_s = match mode {
         EncodeMode::Waveform => "waveform",
         EncodeMode::Parametric => "parametric",
+        other => panic!("unhandled encode mode {other:?}"),
     };
     let opts = CodecOptions::new().set("mode", mode_s);
     let p = params(channels as u16, SampleFormat::F32, opts);
@@ -493,11 +494,9 @@ fn typed_constructor_and_output_params() {
     let p = params(6, SampleFormat::F32, CodecOptions::new());
     let enc = Ac4Encoder::with_options(
         &p,
-        Ac4EncoderOptions {
-            framing: Framing::Raw,
-            bandwidth_hz: 8_000,
-            ..Ac4EncoderOptions::default()
-        },
+        Ac4EncoderOptions::default()
+            .with_framing(Framing::Raw)
+            .with_bandwidth_hz(8_000),
     )
     .unwrap();
     assert_eq!(enc.frame_len(), N);

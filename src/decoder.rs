@@ -43,6 +43,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 /// full decode already is the core operating point (mono / stereo /
 /// 5.X / 7.X channel substreams) decode identically in both modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum DecodingMode {
     /// §4.7.2 full decoding (default).
     #[default]

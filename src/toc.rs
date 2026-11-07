@@ -132,6 +132,7 @@ pub fn write_variable_bits(bw: &mut oxideav_core::bits::BitWriter, n_bits: u32, 
 /// 190-1 Table 88 / TS 103 190-2 Table 78), the channel count of the
 /// layout, and the number of bits the prefix code consumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelModeDesc {
     /// `ch_mode` variable per the table (0 = mono … 15 = 22.2;
     /// reserved codes land on 11+/16+ depending on the table).
@@ -312,6 +313,7 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
 /// pipeline actually needs: channel count, sample rate, samples-per-
 /// frame, and enough identity bits to tell I-frames from P-frames.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Ac4FrameInfo {
     /// `bitstream_version`, post variable_bits expansion.
     pub bitstream_version: u32,
@@ -378,6 +380,7 @@ pub struct Ac4FrameInfo {
 /// Parsed `oamd_substream_info(b_substreams_present)`
 /// (TS 103 190-2 §6.2.1.13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OamdSubstreamInfoDesc {
     /// `b_oamd_ndot` — true when the OAMD substream decodes
     /// independently from preceding frames (§6.3.2.12.1).
@@ -388,6 +391,7 @@ pub struct OamdSubstreamInfoDesc {
 
 /// Per-presentation information we extract from `ac4_presentation_info()`.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PresentationInfo {
     /// Version (0 / 1 / 2) indicated by the unary `presentation_version()`
     /// prefix.
@@ -1262,6 +1266,7 @@ fn parse_substream_info_chan(
 /// §6.3.2.7.3-5 immersive content-presence fields
 /// (`ac4_substream_info_chan()` channel modes 11..=14 only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImmersivePresence {
     /// Table 79 — whether Lb / Rb carry original content (false =
     /// encoded silence).
@@ -1449,6 +1454,7 @@ pub fn parse_bed_dyn_obj_assignment(
 /// Parsed `ac4_substream_info_ajoc()` (TS 103 190-2 §6.2.1.9) — the
 /// descriptor of an A-JOC-coded object substream.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AjocSubstreamInfo {
     /// `b_lfe` — an LFE channel accompanies the fullband signals.
     pub b_lfe: bool,
@@ -1661,6 +1667,7 @@ pub enum ObjBedStart {
 
 /// Parsed `ac4_substream_info_obj()` (TS 103 190-2 §6.2.1.11).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ObjSubstreamInfo {
     /// 3-bit `n_objects_code`; resolved count via
     /// [`ObjSubstreamInfo::n_objects`].

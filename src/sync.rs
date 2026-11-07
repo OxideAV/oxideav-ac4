@@ -23,6 +23,7 @@ pub const SYNC_WORD_CRC: u16 = 0xAC41;
 
 /// Result of a successful framing scan.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SyncFrame<'a> {
     /// The raw `raw_ac4_frame()` payload.
     pub payload: &'a [u8],
