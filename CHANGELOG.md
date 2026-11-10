@@ -76,6 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The 5.X ASPX_ACPL_3 render delays the LFE by the two QMF round trips
+  L / R / C take (A-SPX + A-CPL); it came out 1 154 samples early.
+  LFE / centre alignment pinned on every 5.1 / 7.1 channel route
+  (tests/round485_lfe_alignment.rs).
 - 7_X coding_config 2: the trailing `mono_data(0)` is the centre
   (Tables 182 / 184), not a back channel; the A-CPL and SIMPLE / ASPX
   renders now pick it up.

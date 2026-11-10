@@ -3525,7 +3525,9 @@ impl Ac4Decoder {
                         Some(crate::mch::SevenXCodecMode::Aspx)
                     )
                 });
-                let pcm_f = if five_x_pair_active || seven_x_pair_active {
+                // ASPX_ACPL_3 (Pseudocode 118) likewise runs the A-SPX
+                // and the A-CPL QMF round trips on L / R / C.
+                let pcm_f = if five_x_pair_active || seven_x_pair_active || five_x_acpl3_active {
                     self.acpl_align[4].delay(&pcm_f, 2 * qmf::QMF_ROUND_TRIP_DELAY)
                 } else if seven_x_aspx {
                     // 7_X ASPX: every other channel took one A-SPX QMF

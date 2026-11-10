@@ -609,10 +609,11 @@ parses back to the authored rows.
   the framework `acpl_3` route use the Pseudocode 118 downmix model.
 - **Decoder output delay** — channels that go through a QMF-domain
   tool come back one round trip (`qmf::QMF_ROUND_TRIP_DELAY` = 577
-  samples) later per pass; the ASPX_ACPL_1 / _2 element renderer
-  lines its residual, waveform-coded L / R and LFE up with them, the
-  other A-SPX routes still emit the LFE undelayed and none applies
-  the §5.6 Table 188 `d_pcm` frame-alignment delay.
+  samples) later per pass; the 5.X / 7.X ASPX_ACPL_1 / _2 / _3 and
+  7_X ASPX renders line their residual, waveform-coded channels and
+  LFE up with them (tests/round485_lfe_alignment.rs), the immersive /
+  22.2 routes still emit the LFE undelayed and none applies the §5.6
+  Table 188 `d_pcm` frame-alignment delay.
 
 ## Specs
 
