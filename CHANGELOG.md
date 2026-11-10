@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.9...v0.0.10) - 2026-11-10
+
+### Other
+
+- 7_X SIMPLE writer: M/S-code the Table 183 additional-channel pairs
+- LFE alignment on the ASPX_ACPL_3 route + pinned on every 5.1 / 7.1 route
+- 7_X SIMPLE / ASPX: every coding_config, Table 183 mix, Table 213 A-SPX
+- 7.X channel layouts: 5/2/0 and 3/2/2 with add_ch_base (Tables 183/185/202)
+- §5.3.3 channel-data matrices: apply the coded chparam_info() quartets
+- 7.X ASPX_ACPL_1: Table 183 quartets from the chparam_info pair (errata A5)
+- API hygiene: non_exhaustive encoder options, mode enums, TOC records
+
 ### Added
 
 - `Ac4EncoderOptions::with_*` setters for every field.
