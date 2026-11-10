@@ -208,8 +208,9 @@ impl Ac4ImsEncoder {
         }
     }
 
-    /// Select the 7.X channel layout of the 7.0 / 7.1 SIMPLE and live
-    /// A-CPL (`encode_frame_pcm_7_{0,1}_acpl1_real_alpha_beta`,
+    /// Select the 7.X channel layout of the 7.0 / 7.1 SIMPLE, the 7.0
+    /// ASPX (`encode_frame_pcm_7_0_aspx_real_aspx`) and the live A-CPL
+    /// (`encode_frame_pcm_7_{0,1}_acpl1_real_alpha_beta`,
     /// `encode_frame_pcm_7_{0,1}_acpl2_real_aspx`) entry points: 3/4/0
     /// (default), 5/2/0 or 3/2/2 with its `add_ch_base`.
     pub fn with_seven_x_layout(mut self, layout: crate::toc::SevenXLayout) -> Self {
@@ -1540,7 +1541,7 @@ impl Ac4ImsEncoder {
         let max_sfb_add = max_sfb_add.min(n_msfb_cap);
 
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1111000;
+        self.channel_mode_value = self.seven_x_channel_mode(false);
         self.channel_mode_bits = 7;
 
         while self.mdct_states_multi.len() < 7 {
@@ -1607,6 +1608,37 @@ impl Ac4ImsEncoder {
         let c_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[2]);
         let lb_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[5]);
         let rb_ah = self.extract_aspx_add_harmonic(&aspx_cfg, frames[6]);
+        // Table 213: for 5/2/0.x the second aspx_data_2ch() covers
+        // (Lw, Rw) and the trailing one (Ls, Rs) — swap the envelope
+        // sets the body writer places in those two positions.
+        let (
+            (ls_sig, ls_noise, rs_sig, rs_noise, surround_tna_mode, ls_ah, rs_ah),
+            (lb_sig, lb_noise, rb_sig, rb_noise, back_tna_mode, lb_ah, rb_ah),
+        ) = {
+            let second = (
+                ls_sig,
+                ls_noise,
+                rs_sig,
+                rs_noise,
+                surround_tna_mode,
+                ls_ah,
+                rs_ah,
+            );
+            let fourth = (
+                lb_sig,
+                lb_noise,
+                rb_sig,
+                rb_noise,
+                back_tna_mode,
+                lb_ah,
+                rb_ah,
+            );
+            if matches!(self.seven_x_layout, crate::toc::SevenXLayout::Wide { .. }) {
+                (fourth, second)
+            } else {
+                (second, fourth)
+            }
+        };
 
         let pad_target_bytes: usize = match max_sfb {
             0..=20 => 4096,

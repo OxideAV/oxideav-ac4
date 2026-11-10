@@ -707,7 +707,7 @@ pub type SapTable181Output = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
 /// `tl` is the transform_length used to derive the sfb offsets; bins
 /// past the SAP-coded extent (sfb >= max_sfb) pass through (high half
 /// keeps `A`/`B`, low half is silent — same convention as the 7_X
-/// SAP application in `dispatch_7x_additional_channel_pair`).
+/// SAP application in `render_7x_simple_aspx_element`).
 ///
 /// All input slices must be at least `n` long where `n = tl`. Outputs
 /// are returned in `(l_spec, r_spec, ls_spec, rs_spec)` order, each
@@ -1748,6 +1748,14 @@ pub struct SubstreamTools {
     pub acpl_pair_aspx_surround: Option<aspx::FiveXAspxTrailer>,
     /// See [`Self::acpl_pair_aspx_front`] — centre `aspx_data_1ch()`.
     pub acpl_pair_aspx_centre: Option<aspx::FiveXAspxTrailer>,
+    /// 7_X `ASPX` (codec mode 1) only: the fourth A-SPX element — the
+    /// trailing `aspx_data_2ch()` of Table 33. With the three elements
+    /// above it carries the Table 213 row for the stream's channel
+    /// mode (`(L, R), (Ls, Rs), C, (Lb, Rb)` for 3/4/0.x, `(L, R),
+    /// (Lw, Rw), C, (Ls, Rs)` for 5/2/0.x, `(L, R), (Ls, Rs), C, (Tfl,
+    /// Tfr)` for 3/2/2.x — `acpl_pair_aspx_front` / `_surround` /
+    /// `_centre` hold the first three in bitstream order).
+    pub seven_x_aspx_additional: Option<aspx::FiveXAspxTrailer>,
     /// `7_X_codec_mode` (§4.3.5.7 Table 98) for 7.X channel-element
     /// substreams. Populated by [`crate::mch::parse_7x_audio_data_outer`].
     /// Note this is a 2-bit field for 7_X (vs 3 bits for 5_X) — only

@@ -2225,7 +2225,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
 ///   two_channel_data()`) emits the immersive pair Lb/Rb per Table 26
 ///   after the inner `five_channel_data()`. With identity SAP
 ///   (`b_use_sap_add_ch = 0`) the decoder's
-///   `dispatch_7x_additional_channel_pair` routes Lb/Rb directly into
+///   `render_7x_simple_aspx_element` routes Lb/Rb directly into
 ///   output slots 5/6 (Table 183 row "3/4/0.x" identity path).
 /// * No trailing `mono_data(0)` for `coding_config = 3` (Cfg3Five) —
 ///   that 7.X gate fires only for Cfg0/Cfg2.
@@ -2371,7 +2371,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
 
     // 7.X SIMPLE/ASPX additional-channel block. b_use_sap_add_ch = 0 →
     // identity SAP, no chparam_info pair follows. The decoder's
-    // `dispatch_7x_additional_channel_pair` then routes Lb/Rb directly
+    // `render_7x_simple_aspx_element` then routes Lb/Rb directly
     // to slots 5/6 (Table 183 row "3/4/0.x" identity path).
     bw.write_bit(false);
 
@@ -2953,7 +2953,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
 ///   additional-channel block emits `b_use_sap_add_ch (1 b) +
 ///   two_channel_data()` carrying the immersive pair Lb/Rb per Table 26.
 ///   With identity SAP (`b_use_sap_add_ch = 0`) the decoder's
-///   `dispatch_7x_additional_channel_pair` consumes those two spectra
+///   `render_7x_simple_aspx_element` consumes those two spectra
 ///   directly into output slots 5/6 (Table 183 row "3/4/0.x" identity
 ///   path).
 /// * The trailing `mono_data(0)` slot is **absent** for `coding_config
@@ -3131,7 +3131,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
 
     // 7.X SIMPLE/ASPX additional-channel block. b_use_sap_add_ch = 0 →
     // identity SAP, no chparam_info pair follows. The decoder's
-    // `dispatch_7x_additional_channel_pair` then routes Lb/Rb directly
+    // `render_7x_simple_aspx_element` then routes Lb/Rb directly
     // to slots 5/6 (Table 183 row "3/4/0.x" identity path).
     bw.write_bit(false);
 

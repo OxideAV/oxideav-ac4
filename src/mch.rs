@@ -1348,6 +1348,25 @@ impl SevenXCodecMode {
     }
 }
 
+/// The `(num_window_groups, max_sfb)` grid of a 7_X element's core
+/// channel-data element (the first one of the coding_config switch),
+/// as `get_max_sfb(g)` per group — the grid the bare
+/// `b_use_sap_add_ch` `chparam_info()` pair is walked on. `None` when
+/// the core element did not parse.
+fn seven_x_core_sf_info_grid(tools: &SubstreamTools, cfg: FiveXCodingConfig) -> Option<Vec<u32>> {
+    let psy = match cfg {
+        FiveXCodingConfig::Cfg0Stereo2plusMono | FiveXCodingConfig::AcplLite2 => {
+            tools.two_channel_data.first()?.psy_info.as_ref()?
+        }
+        FiveXCodingConfig::Cfg1ThreeStereo => {
+            tools.three_channel_data.as_ref()?.psy_info.as_ref()?
+        }
+        FiveXCodingConfig::Cfg2FourMono => tools.four_channel_data.as_ref()?.psy_info.as_ref()?,
+        FiveXCodingConfig::Cfg3Five => tools.five_channel_data.as_ref()?.psy_info.as_ref()?,
+    };
+    Some(shared_sf_info_grid(psy))
+}
+
 /// Parse the outer layers of `7_X_channel_element(channel_mode, b_iframe)`
 /// per §4.2.6.14 Table 33.
 ///
@@ -1569,17 +1588,19 @@ pub fn parse_7x_audio_data_outer(
         };
         tools.seven_x_b_use_sap_add_ch = Some(b_use_sap_add_ch);
         if b_use_sap_add_ch {
-            // Two chparam_info() calls. Use the additional-channel
-            // two_channel_data's max_sfb when we read it below; for now
-            // pass the largest channel-data max_sfb seen so far (the
-            // chparam SAP DPCM walker is bounded by its own
-            // `max_sfb_per_group` argument).
-            let max_sfb_g = largest_tl.and_then(crate::tables::num_sfb_48).unwrap_or(63);
-            let cp0 = match parse_chparam_info(br, &[max_sfb_g]) {
+            // Two bare chparam_info() calls: they parameterise the
+            // Table 183 mix of the core pair with the additional
+            // channels, so they walk the core channel-data element's
+            // sf_info grid (errata A4: every track entering one matrix
+            // shares one time/frequency layout, §5.3.3.0).
+            let Some(grid) = seven_x_core_sf_info_grid(tools, coding_cfg) else {
+                return Ok(());
+            };
+            let cp0 = match parse_chparam_info(br, &grid) {
                 Ok(c) => c,
                 Err(_) => return Ok(()),
             };
-            let cp1 = match parse_chparam_info(br, &[max_sfb_g]) {
+            let cp1 = match parse_chparam_info(br, &grid) {
                 Ok(c) => c,
                 Err(_) => return Ok(()),
             };
@@ -1657,13 +1678,10 @@ pub fn parse_7x_audio_data_outer(
     ) {
         match parse_mono_data(br, false, frame_len_base) {
             Ok(m) => {
-                // Land in the mode-appropriate slot — Cfg0 → centre,
-                // Cfg2 → back. Reuses the existing 5_X plumbing.
-                if matches!(coding_cfg, FiveXCodingConfig::Cfg0Stereo2plusMono) {
-                    tools.cfg0_centre_mono = Some(m);
-                } else {
-                    tools.cfg2_back_mono = Some(m);
-                }
+                // Tables 182 / 184: in the 7_X element this trailing
+                // mono_data(0) is the centre C for both coding_config 0
+                // and 2 (unlike the 5_X Cfg2 layout).
+                tools.cfg0_centre_mono = Some(m);
             }
             Err(_) => return Ok(()),
         }
@@ -1722,32 +1740,46 @@ pub fn parse_7x_audio_data_outer(
         };
         crate::asf::expose_trailer_in_tools(tools, &centre);
         tools.acpl_pair_aspx_centre = Some(centre);
-    } else if !matches!(mode, SevenXCodecMode::Simple) {
-        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
-        {
+    } else if matches!(mode, SevenXCodecMode::Aspx) {
+        // Table 33 `case ASPX`: aspx_data_2ch + aspx_data_2ch +
+        // aspx_data_1ch, then the extra aspx_data_2ch — the Table 213
+        // row of the channel mode, captured in bitstream order (with
+        // the per-element I-frame-sticky xover offsets for P-frames).
+        let cap2 = |br: &mut BitReader<'_>, tools: &mut SubstreamTools| {
+            crate::asf::capture_aspx_data_2ch_trailer(
+                br,
+                tools,
+                &aspx_cfg,
+                b_iframe,
+                frame_len_base,
+            )
+        };
+        let Some(t0) = cap2(br, tools) else {
             return Ok(());
-        }
-        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
-        {
+        };
+        crate::asf::expose_trailer_in_tools(tools, &t0);
+        tools.acpl_pair_aspx_front = Some(t0);
+        let Some(t1) = cap2(br, tools) else {
             return Ok(());
-        }
-        if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
-        {
+        };
+        crate::asf::expose_trailer_in_tools(tools, &t1);
+        tools.acpl_pair_aspx_surround = Some(t1);
+        let Some(tc) = crate::asf::capture_aspx_data_1ch_trailer(
+            br,
+            tools,
+            &aspx_cfg,
+            b_iframe,
+            frame_len_base,
+        ) else {
             return Ok(());
-        }
-    }
-    // `if (7_X_codec_mode == ASPX) { aspx_data_2ch }` — extra 2ch
-    // envelope for the additional-channel pair in pure-ASPX mode (the
-    // ASPX_ACPL_{1,2} paths fold the additional-channel ASPX into the
-    // single aspx_data_1ch above).
-    if matches!(mode, SevenXCodecMode::Aspx)
-        && crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
-    {
-        return Ok(());
+        };
+        crate::asf::expose_trailer_in_tools(tools, &tc);
+        tools.acpl_pair_aspx_centre = Some(tc);
+        let Some(t3) = cap2(br, tools) else {
+            return Ok(());
+        };
+        crate::asf::expose_trailer_in_tools(tools, &t3);
+        tools.seven_x_aspx_additional = Some(t3);
     }
 
     // ACPL pair for ASPX_ACPL_{1,2} — `acpl_data_1ch()×2`, lands in
@@ -3378,8 +3410,10 @@ mod tests {
             Some(FiveXCodingConfig::Cfg2FourMono)
         );
         assert!(tools.four_channel_data.is_some());
-        let back = tools.cfg2_back_mono.as_ref().expect("back mono walked");
-        assert_eq!(back.psy_info.as_ref().unwrap().max_sfb_0, 6);
+        // Table 182: the 7_X Cfg2 trailing mono_data(0) is the centre.
+        let centre = tools.cfg0_centre_mono.as_ref().expect("centre mono walked");
+        assert_eq!(centre.psy_info.as_ref().unwrap().max_sfb_0, 6);
+        assert!(tools.cfg2_back_mono.is_none());
     }
 
     /// 7_X SIMPLE Cfg1 — `three_channel_data + two_channel_data` (no

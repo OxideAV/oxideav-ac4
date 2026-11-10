@@ -57,8 +57,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output's quantisation noise more than doubles; a strong mid
   predicting a weak, unrelated side no longer leaks the mid's noise
   into it (5/2/0 Lw: 7,6 → 23,2 dB).
+- 7_X SIMPLE / ASPX element render for every coding_config and channel
+  layout (§5.3.4.4.1 Tables 182 / 183, §6.2.10 Table 213): was the
+  `five_channel_data()` configuration only, with no A-SPX extension and
+  the additional pair's SAP partner looked up through the 5_X coding
+  config. The core tracks resolve from any coding_config, the
+  `b_use_sap_add_ch` quartets mix the additional pair with `(D, E)`
+  (3/4/0) or `(A, B)` (5/2/0, 3/2/2), and in `ASPX` mode the walker
+  captures all four A-SPX elements (with their per-element sticky
+  xover offsets) and the decoder extends the seven channels in the
+  channel mode's Table 213 order — the additional channels'
+  12–16 kHz band now comes back at −3,8 dB of the input instead of
+  silent; low band ≥ 25 dB waveform SNR on every channel of every
+  layout (tests/round485_7_x_simple_aspx.rs). The 7.0 ASPX writer
+  (`encode_frame_pcm_7_0_aspx_real_aspx`) follows the layout's
+  Table 213 order. The LFE of a 7_X ASPX element is aligned with the
+  A-SPX round trip.
 
 ### Fixed
+
+- 7_X coding_config 2: the trailing `mono_data(0)` is the centre
+  (Tables 182 / 184), not a back channel; the A-CPL and SIMPLE / ASPX
+  renders now pick it up.
+- The bare `b_use_sap_add_ch` `chparam_info()` pair of a 7_X element
+  is walked on the core channel-data element's `sf_info` grid (was:
+  the transform's full band count, which misparsed `ms_used` /
+  `sap_data` lengths).
 
 - `chparam_info()` inside a channel-data element is walked on every
   window group of its `sf_info()` (was: the first group only, which
