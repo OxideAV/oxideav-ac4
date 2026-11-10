@@ -7002,6 +7002,39 @@ fn clamp_acpl1_max_sfb_master(transform_length: u32, max_sfb_master: u32) -> u32
     max_sfb_master.clamp(1, num_sfb_cap.min(n_side_cap))
 }
 
+/// Which Cfg0 pair plays which role in a 7_X ASPX_ACPL_1 / _2 element
+/// for the stream's channel layout ([`crate::toc::SevenXLayout`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SevenXAcplRoles {
+    /// Table 202: the A-CPL coupling carriers `x0 / x1` are the
+    /// `[A, B]` (L / R) pair — 5/2/0.x and 3/2/2.x with
+    /// `add_ch_base == 0` — rather than `[D, E]` (Ls / Rs).
+    pub couple_front: bool,
+    /// Table 183: the additional channels' quartets mix with `[A, B]`
+    /// (5/2/0.x, 3/2/2.x) rather than `[D, E]` (3/4/0.x).
+    pub sap_base_front: bool,
+}
+
+impl SevenXAcplRoles {
+    /// 3/4/0.x: couple on Ls / Rs, Table 183 base Ls / Rs.
+    pub const BACK_SURROUND: Self = Self {
+        couple_front: false,
+        sap_base_front: false,
+    };
+
+    /// Roles for a channel layout.
+    pub fn for_layout(layout: crate::toc::SevenXLayout) -> Self {
+        match layout.add_ch_base() {
+            None => Self::BACK_SURROUND,
+            Some(add_ch_base) => Self {
+                couple_front: !add_ch_base,
+                sap_base_front: true,
+            },
+        }
+    }
+}
+
 /// Wire tracks + `chparam_info()` pair a 7_X ASPX_ACPL_1 element
 /// carries for its Table 183 matrix (see
 /// [`author_7x_acpl1_table183_wire`]).
@@ -7034,8 +7067,9 @@ pub struct SevenXAcpl1Table183Wire {
 /// ([`crate::asf::invert_sap_table_181`] — Table 183's 3/4/0.x rows
 /// are the same 2×2 system): on a SAP-coded band the wire is
 /// `(mid, g·mid − (x0 − x3)/2)`, elsewhere the targets pass through.
-/// Under Reading I the pair stays `sap_mode == 0` and the wire equals
-/// the targets.
+/// Under Reading I — or when `allow_sap` is false (the Table 183 base
+/// pair is not the A-CPL coupling pair, see [`SevenXAcplRoles`]) — the
+/// pair stays `sap_mode == 0` and the wire equals the targets.
 #[doc(hidden)]
 pub fn author_7x_acpl1_table183_wire(
     transform_length: u32,
@@ -7044,6 +7078,7 @@ pub fn author_7x_acpl1_table183_wire(
     x0_r: &[f32],
     x3_l: &[f32],
     x3_r: &[f32],
+    allow_sap: bool,
 ) -> SevenXAcpl1Table183Wire {
     let msm = clamp_acpl1_max_sfb_master(transform_length, max_sfb_master);
     let n = transform_length as usize;
@@ -7054,7 +7089,7 @@ pub fn author_7x_acpl1_table183_wire(
         v
     };
     let (dl, dr, sl, sr) = (pad(x0_l), pad(x0_r), pad(x3_l), pad(x3_r));
-    let chparam = if crate::asf::seven_x_acpl1_sap_authoring() {
+    let chparam = if allow_sap && crate::asf::seven_x_acpl1_sap_authoring() {
         select_acpl1_residual_chparam_pair(&dl, &dr, &sl, &sr, msm, transform_length)
     } else {
         [
@@ -7129,8 +7164,15 @@ fn write_7x_acpl1_surround_and_residual(
     x3_l: &[f32],
     x3_r: &[f32],
 ) {
-    let wire =
-        author_7x_acpl1_table183_wire(transform_length, max_sfb_master, x0_l, x0_r, x3_l, x3_r);
+    let wire = author_7x_acpl1_table183_wire(
+        transform_length,
+        max_sfb_master,
+        x0_l,
+        x0_r,
+        x3_l,
+        x3_r,
+        true,
+    );
     write_two_channel_data(bw, transform_length, max_sfb, &wire.d, &wire.e);
     write_acpl_1_residual_layer_wire(
         bw,
@@ -7381,7 +7423,12 @@ pub fn build_5_x_acpl1_body_from_pcm_spectra_sap(
 ///    DPCM deltas Pseudocode 59 accumulates stay within the
 ///    HCB_SCALEFAC-codable `[-60, +60]` range even on a worst-case
 ///    sign flip between adjacent pairs.
-/// 3. Builds the `SapMode::SapData` row via
+/// 3. Drops the bands whose side is not predictable from the mid
+///    (squared mid/side correlation below 1/2) or where the decoder's
+///    `(1 ± g)` rows would push either output's quantisation noise
+///    past twice its plain-coded level (`(1 ± g)²·E_M + E_R` against
+///    `2·E_out`) — a strong mid predicting a weak side.
+/// 4. Builds the `SapMode::SapData` row via
 ///    [`crate::asf::build_chparam_info_sap_data_from_alpha_q`]
 ///    (`delta_code_time = false` — single group) when at least one
 ///    band raised `sap_coeff_used`; otherwise falls back to the
@@ -7421,6 +7468,49 @@ pub fn select_acpl1_residual_chparam_pair(
         for row in alpha_q.iter_mut() {
             for v in row.iter_mut() {
                 *v = (*v).clamp(-30, 30);
+            }
+        }
+        // Noise gate: the decoder rebuilds `front = (1 + g)·M + R` and
+        // `surround = (1 − g)·M − R`, so the mid's and the residual's
+        // quantisation noise (each proportional to its own energy under
+        // the relative-precision quantiser) lands in both outputs. A
+        // band keeps its SAP row only when the side is predictable
+        // (squared mid/side correlation ≥ 1/2) and neither output's
+        // noise grows past twice its plain-coded level:
+        // `(1 ± g)²·E_M + E_R ≤ 2·E_out`.
+        let mut used = used;
+        if let (Some(row_a), Some(row_u)) = (alpha_q.first_mut(), used.first_mut()) {
+            let mut sfb = 0usize;
+            while sfb < row_u.len() {
+                if row_u[sfb] {
+                    // The pair (sfb, sfb + 1) shares one gain, so the
+                    // gate measures both bands.
+                    let lo = sfbo[sfb] as usize;
+                    let top = (sfb + 2).min(row_u.len());
+                    let hi = (sfbo[top] as usize).min(front.len()).min(surround.len());
+                    let (mut em, mut es, mut x) = (0.0f64, 0.0f64, 0.0f64);
+                    let (mut ef, mut eo) = (0.0f64, 0.0f64);
+                    for k in lo..hi {
+                        let (l, r) = (front[k] as f64, surround[k] as f64);
+                        let (m, sd) = (0.5 * (l + r), 0.5 * (l - r));
+                        em += m * m;
+                        es += sd * sd;
+                        x += m * sd;
+                        ef += l * l;
+                        eo += r * r;
+                    }
+                    let g = row_a[sfb] as f64 * 0.1;
+                    let er = (es - 2.0 * g * x + g * g * em).max(0.0);
+                    let noisy = (1.0 + g).powi(2) * em + er > 2.0 * ef
+                        || (1.0 - g).powi(2) * em + er > 2.0 * eo;
+                    if x * x < 0.5 * em * es || noisy {
+                        for k in sfb..(sfb + 2).min(row_u.len()) {
+                            row_u[k] = false;
+                            row_a[k] = 0;
+                        }
+                    }
+                }
+                sfb += 2;
             }
         }
         let any_used = used.iter().any(|row| row.iter().any(|&b| b));
@@ -10308,6 +10398,85 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     acpl_quant_mode: crate::acpl::AcplQuantMode,
     pad_target_bytes: usize,
 ) -> Vec<u8> {
+    build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
+        transform_length,
+        max_sfb,
+        max_sfb_lfe,
+        b_iframe,
+        coeffs_l,
+        coeffs_r,
+        coeffs_ls,
+        coeffs_rs,
+        side_ls,
+        side_rs,
+        coeffs_c,
+        coeffs_lfe,
+        aspx_cfg,
+        l_sig,
+        l_noise,
+        r_sig,
+        r_noise,
+        ls_sig,
+        ls_noise,
+        rs_sig,
+        rs_noise,
+        c_sig,
+        c_noise,
+        front_tna_mode,
+        surround_tna_mode,
+        c_tna_mode,
+        l_ah,
+        r_ah,
+        ls_ah,
+        rs_ah,
+        c_ah,
+        acpl_num_param_bands_id,
+        acpl_quant_mode,
+        pad_target_bytes,
+        SevenXAcplRoles::BACK_SURROUND,
+    )
+}
+
+/// [`build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna`] for any 7.X channel layout: `roles` names the
+/// Table 202 coupling pair and the Table 183 base pair.
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
+    coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    l_sig: &[i32],
+    l_noise: &[i32],
+    r_sig: &[i32],
+    r_noise: &[i32],
+    ls_sig: &[i32],
+    ls_noise: &[i32],
+    rs_sig: &[i32],
+    rs_noise: &[i32],
+    c_sig: &[i32],
+    c_noise: &[i32],
+    front_tna_mode: &[u8],
+    surround_tna_mode: &[u8],
+    c_tna_mode: &[u8],
+    l_ah: &[bool],
+    r_ah: &[bool],
+    ls_ah: &[bool],
+    rs_ah: &[bool],
+    c_ah: &[bool],
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    pad_target_bytes: usize,
+    roles: SevenXAcplRoles,
+) -> Vec<u8> {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
     let start_band = 0u32;
 
@@ -10315,7 +10484,11 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     // and the back-channel side it must reconstruct — Table 202 /
     // Pseudocode 120 least-squares fit.
     let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
-        coeffs_ls,
+        if roles.couple_front {
+            coeffs_l
+        } else {
+            coeffs_ls
+        },
         side_ls,
         transform_length,
         acpl_num_bands,
@@ -10323,7 +10496,11 @@ pub fn build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         acpl_quant_mode,
     );
     let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
-        coeffs_rs,
+        if roles.couple_front {
+            coeffs_r
+        } else {
+            coeffs_rs
+        },
         side_rs,
         transform_length,
         acpl_num_bands,
@@ -11014,6 +11191,71 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     c_ah: &[bool],
     pad_target_bytes: usize,
 ) -> Vec<u8> {
+    build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
+        transform_length,
+        max_sfb,
+        max_sfb_master,
+        max_sfb_lfe,
+        b_iframe,
+        coeffs_l,
+        coeffs_r,
+        coeffs_ls,
+        coeffs_rs,
+        side_ls,
+        side_rs,
+        coeffs_c,
+        coeffs_lfe,
+        aspx_cfg,
+        acpl_num_param_bands_id,
+        acpl_quant_mode,
+        acpl_qmf_band_minus1,
+        front,
+        surround,
+        c,
+        front_tna_mode,
+        surround_tna_mode,
+        c_tna_mode,
+        front_ah,
+        surround_ah,
+        c_ah,
+        pad_target_bytes,
+        SevenXAcplRoles::BACK_SURROUND,
+    )
+}
+
+/// [`build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna`] for any 7.X channel layout: `roles` names the
+/// Table 202 coupling pair and the Table 183 base pair.
+#[allow(clippy::too_many_arguments)]
+pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    max_sfb_lfe: Option<u32>,
+    b_iframe: bool,
+    coeffs_l: &[f32],
+    coeffs_r: &[f32],
+    coeffs_ls: &[f32],
+    coeffs_rs: &[f32],
+    side_ls: &[f32],
+    side_rs: &[f32],
+    coeffs_c: &[f32],
+    coeffs_lfe: Option<&[f32]>,
+    aspx_cfg: &aspx::AspxConfig,
+    acpl_num_param_bands_id: u8,
+    acpl_quant_mode: crate::acpl::AcplQuantMode,
+    acpl_qmf_band_minus1: u8,
+    front: (AspxRealEnvelopeChannel<'_>, AspxRealEnvelopeChannel<'_>),
+    surround: (AspxRealEnvelopeChannel<'_>, AspxRealEnvelopeChannel<'_>),
+    c: AspxRealEnvelopeChannel<'_>,
+    front_tna_mode: &[u8],
+    surround_tna_mode: &[u8],
+    c_tna_mode: &[u8],
+    front_ah: (&[bool], &[bool]),
+    surround_ah: (&[bool], &[bool]),
+    c_ah: &[bool],
+    pad_target_bytes: usize,
+    roles: SevenXAcplRoles,
+) -> Vec<u8> {
     let acpl_num_bands = crate::acpl::num_param_bands_from_id(acpl_num_param_bands_id as u32);
     let qmf_band = (acpl_qmf_band_minus1 as u32 & 0b111) + 1;
     let start_band = crate::acpl::sb_to_pb(qmf_band, acpl_num_bands);
@@ -11022,7 +11264,11 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     // and the back-channel side it must reconstruct — Table 202 /
     // Pseudocode 120 least-squares fit.
     let (alpha_l_q, beta_l_q) = extract_acpl_pair_alpha_beta_q(
-        coeffs_ls,
+        if roles.couple_front {
+            coeffs_l
+        } else {
+            coeffs_ls
+        },
         side_ls,
         transform_length,
         acpl_num_bands,
@@ -11030,7 +11276,11 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
         acpl_quant_mode,
     );
     let (alpha_r_q, beta_r_q) = extract_acpl_pair_alpha_beta_q(
-        coeffs_rs,
+        if roles.couple_front {
+            coeffs_r
+        } else {
+            coeffs_rs
+        },
         side_rs,
         transform_length,
         acpl_num_bands,
@@ -11065,19 +11315,38 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
 
     bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
     bw.write_bit(false); // b_2ch_mode = 0
-    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
-    // Table 33 ASPX_ACPL_1: the [D, E] carriers + the back-channel
-    // sides [F, G] (Pseudocode 120 x3 / x4) through the Table 183 stage
-    // (errata A5 reading — SAP-predicted where it pays).
-    write_7x_acpl1_surround_and_residual(
-        &mut bw,
+    // Table 33 ASPX_ACPL_1: the [A, B] / [D, E] pairs + the additional
+    // channels' sides [F, G] (Pseudocode 120 x3 / x4) through the
+    // Table 183 stage (errata A5 reading — SAP-predicted where it pays
+    // and where the Table 183 base pair is the coupling pair).
+    let (base_l, base_r) = if roles.sap_base_front {
+        (coeffs_l, coeffs_r)
+    } else {
+        (coeffs_ls, coeffs_rs)
+    };
+    let wire = author_7x_acpl1_table183_wire(
         transform_length,
-        max_sfb,
         max_sfb_master,
-        coeffs_ls,
-        coeffs_rs,
+        base_l,
+        base_r,
         side_ls,
         side_rs,
+        roles.couple_front == roles.sap_base_front,
+    );
+    if roles.sap_base_front {
+        write_two_channel_data(&mut bw, transform_length, max_sfb, &wire.d, &wire.e);
+        write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
+    } else {
+        write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
+        write_two_channel_data(&mut bw, transform_length, max_sfb, &wire.d, &wire.e);
+    }
+    write_acpl_1_residual_layer_wire(
+        &mut bw,
+        transform_length,
+        wire.max_sfb_master,
+        &wire.chparam,
+        &wire.f,
+        &wire.g,
     );
 
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);

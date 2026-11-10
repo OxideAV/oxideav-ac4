@@ -174,6 +174,11 @@ pub struct Ac4ImsEncoder {
     /// `b_de_data_present = 0`. The payload is written with the
     /// keep-flags clear on every frame, so P-frames stay self-contained.
     pub dialogue_enhancement: Option<(crate::de::DeConfig, crate::de::DeData)>,
+    /// 7.X channel layout the 7.0 / 7.1 SIMPLE and live A-CPL entry
+    /// points emit (Table 88 channel_mode family + `add_ch_base`).
+    /// Their `frames` stay in `[L, R, C, Ls, Rs, X1, X2(, LFE)]` order
+    /// with `(X1, X2)` = `(Lb, Rb)` / `(Lw, Rw)` / `(Tfl, Tfr)`.
+    pub seven_x_layout: crate::toc::SevenXLayout,
 }
 
 impl Ac4ImsEncoder {
@@ -199,6 +204,39 @@ impl Ac4ImsEncoder {
             ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState::new(),
             asf_dynamic_range_db: None,
             dialogue_enhancement: None,
+            seven_x_layout: crate::toc::SevenXLayout::BackSurround,
+        }
+    }
+
+    /// Select the 7.X channel layout of the 7.0 / 7.1 SIMPLE and live
+    /// A-CPL (`encode_frame_pcm_7_{0,1}_acpl1_real_alpha_beta`,
+    /// `encode_frame_pcm_7_{0,1}_acpl2_real_aspx`) entry points: 3/4/0
+    /// (default), 5/2/0 or 3/2/2 with its `add_ch_base`.
+    pub fn with_seven_x_layout(mut self, layout: crate::toc::SevenXLayout) -> Self {
+        self.seven_x_layout = layout;
+        self
+    }
+
+    /// Table 88 `channel_mode` prefix (7 bits) of the configured 7.X
+    /// layout: `1111000` / `1111010` / `1111100` (+1 for the `.1`
+    /// modes).
+    fn seven_x_channel_mode(&self, b_lfe: bool) -> u8 {
+        let base = match self.seven_x_layout {
+            crate::toc::SevenXLayout::Wide { .. } => 0b1111010,
+            crate::toc::SevenXLayout::TopFront { .. } => 0b1111100,
+            _ => 0b1111000,
+        };
+        base | u8::from(b_lfe)
+    }
+
+    /// `add_ch_base` of the configured layout when the active
+    /// channel_mode is one of the 5/2/0 / 3/2/2 codes (Table 88
+    /// ch_mode 7..=10), else `None` (the field is absent).
+    fn add_ch_base_bit(&self) -> Option<bool> {
+        if (7..=10).contains(&self.ch_mode()) {
+            Some(self.seven_x_layout.add_ch_base().unwrap_or(false))
+        } else {
+            None
         }
     }
 
@@ -386,6 +424,9 @@ impl Ac4ImsEncoder {
         );
         bw.write_u32(0, 1); // b_sf_multiplier
         bw.write_u32(0, 1); // b_bitrate_info
+        if let Some(acb) = self.add_ch_base_bit() {
+            bw.write_bit(acb); // add_ch_base (§4.3.3.7.6)
+        }
         bw.write_u32(0, 1); // b_content_type
         bw.write_u32(if self.b_iframe_global { 1 } else { 0 }, 1); // b_iframe
         bw.write_u32(0, 2); // substream_index
@@ -468,6 +509,9 @@ impl Ac4ImsEncoder {
             bw.write_u32(0, 1); // b_sf_multiplier
         }
         bw.write_u32(0, 1); // b_bitrate_info
+        if let Some(acb) = self.add_ch_base_bit() {
+            bw.write_bit(acb); // add_ch_base (§6.2.1.8)
+        }
         // frame_rate_factor for {0,1,7,8,9} with
         // b_multiplier=0 is 1; for {2,3,4} also 1; otherwise 1.
         // → 1 b_audio_ndot bit = b_iframe (§6.3.2.x).
@@ -1385,7 +1429,7 @@ impl Ac4ImsEncoder {
         // dispatch routes through `parse_7x_audio_data_outer(b_has_lfe =
         // false)`.
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1111000;
+        self.channel_mode_value = self.seven_x_channel_mode(false);
         self.channel_mode_bits = 7;
 
         // 1. Forward MDCT analysis per channel (separate state for
@@ -1709,7 +1753,7 @@ impl Ac4ImsEncoder {
         // dispatch routes through `parse_7x_audio_data_outer(b_has_lfe =
         // true)`.
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1111001;
+        self.channel_mode_value = self.seven_x_channel_mode(true);
         self.channel_mode_bits = 7;
 
         // 1. Forward MDCT analysis per channel (separate state for
@@ -3888,6 +3932,71 @@ impl Ac4ImsEncoder {
             mix(frames[3], frames[5], -1.0),
             mix(frames[4], frames[6], -1.0),
         ]
+    }
+
+    /// 7.X A-CPL wire channels `[A, B, C, D, E, F, G]` (Table 184) for
+    /// any channel layout from the target `[L, R, C, Ls, Rs, X1, X2]`
+    /// PCM (`X1 / X2` = the layout's additional channels).
+    ///
+    /// Pseudocode 120 scales its outputs per Table 202 mapping: the
+    /// sides `z1 / z3` always carry √2, the coupled `z0 / z2` carry √2
+    /// for 3/4/0.x and `add_ch_base == 1`, the waveform `z6 / z7` carry
+    /// √2 for `add_ch_base == 0`. With `s_c` / `s_w` the coupled /
+    /// waveform output gains the carrier is `x0 = (T0/s_c + X1/√2)/2`,
+    /// the side `x3 = (T0/s_c − X1/√2)/2` and the waveform track
+    /// `T/s_w`, where `T0` is the coupled target (Ls for 3/4/0.x and
+    /// `add_ch_base == 1`, L for `add_ch_base == 0`):
+    ///
+    /// * 3/4/0.x — exactly [`Self::acpl_7x_wire_channels`];
+    /// * `add_ch_base == 0` — `A = (L + X1/√2)/2`, `F = (L − X1/√2)/2`,
+    ///   `D = Ls/√2` (the 5.X carrier model on the front pair);
+    /// * `add_ch_base == 1` — `D = (Ls + X1)/(2√2)`,
+    ///   `F = (Ls − X1)/(2√2)`, `A = L`.
+    ///
+    /// Under the identity Table 183 quartets the preliminaries are the
+    /// wire tracks themselves (`L = A`, `X1 = F`, `Ls = D` for 5/2/0.x
+    /// and 3/2/2.x), so the coupling pair sees exactly these carriers.
+    pub fn acpl_7x_wire_channels_for(
+        layout: crate::toc::SevenXLayout,
+        frames: &[&[f32]; 7],
+    ) -> [Vec<f32>; 7] {
+        let sq2 = std::f32::consts::SQRT_2;
+        let scaled = |x: &[f32], g: f32| -> Vec<f32> { x.iter().map(|v| v * g).collect() };
+        match layout.add_ch_base() {
+            None => Self::acpl_7x_wire_channels(frames),
+            Some(false) => {
+                let mix = |x: &[f32], y: &[f32], sign: f32| -> Vec<f32> {
+                    x.iter()
+                        .zip(y)
+                        .map(|(&a, &b)| 0.5 * (a + sign * b / sq2))
+                        .collect()
+                };
+                [
+                    mix(frames[0], frames[5], 1.0),
+                    mix(frames[1], frames[6], 1.0),
+                    frames[2].to_vec(),
+                    scaled(frames[3], 1.0 / sq2),
+                    scaled(frames[4], 1.0 / sq2),
+                    mix(frames[0], frames[5], -1.0),
+                    mix(frames[1], frames[6], -1.0),
+                ]
+            }
+            Some(true) => {
+                let k = 0.5 / sq2;
+                let mix = |x: &[f32], y: &[f32], sign: f32| -> Vec<f32> {
+                    x.iter().zip(y).map(|(&a, &b)| k * (a + sign * b)).collect()
+                };
+                [
+                    frames[0].to_vec(),
+                    frames[1].to_vec(),
+                    frames[2].to_vec(),
+                    mix(frames[3], frames[5], 1.0),
+                    mix(frames[4], frames[6], 1.0),
+                    mix(frames[3], frames[5], -1.0),
+                    mix(frames[4], frames[6], -1.0),
+                ]
+            }
+        }
     }
 
     /// `acpl_qmf_band_minus1` (Table 59, 3 bits) for an ASPX_ACPL_1
@@ -6085,7 +6194,7 @@ impl Ac4ImsEncoder {
         // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
         // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
         // back-channel sides.
-        let wire = Self::acpl_7x_wire_channels(frames);
+        let wire = Self::acpl_7x_wire_channels_for(self.seven_x_layout, frames);
         let frames: &[&[f32]; 7] = &[
             &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6],
         ];
@@ -6097,7 +6206,7 @@ impl Ac4ImsEncoder {
         // Force 7.0 (3/4/0) channel_mode prefix '1111000', 7 b →
         // channel_mode 5 (Table 85).
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1111000;
+        self.channel_mode_value = self.seven_x_channel_mode(false);
         self.channel_mode_bits = 7;
 
         let n_channels = 7;
@@ -6168,7 +6277,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
                 frame_len,
                 max_sfb,
                 None, // 7.0 — no LFE
@@ -6203,6 +6312,7 @@ impl Ac4ImsEncoder {
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
+                crate::encoder_acpl3::SevenXAcplRoles::for_layout(self.seven_x_layout),
             );
 
         let mut bw = BitWriter::new();
@@ -6502,9 +6612,12 @@ impl Ac4ImsEncoder {
         // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
         // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
         // back-channel sides; the LFE passes through.
-        let wire = Self::acpl_7x_wire_channels(&[
-            frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
-        ]);
+        let wire = Self::acpl_7x_wire_channels_for(
+            self.seven_x_layout,
+            &[
+                frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
+            ],
+        );
         let frames: &[&[f32]; 8] = &[
             &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6], frames[7],
         ];
@@ -6522,7 +6635,7 @@ impl Ac4ImsEncoder {
         // Force 7.1 (3/4/0.1) channel_mode prefix '1111001', 7 b →
         // channel_mode 6 (Table 88).
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1111001;
+        self.channel_mode_value = self.seven_x_channel_mode(true);
         self.channel_mode_bits = 7;
 
         let n_channels = 8;
@@ -6590,7 +6703,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+            crate::encoder_acpl3::build_7_x_acpl2_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
                 frame_len,
                 max_sfb,
                 Some(max_sfb_lfe),
@@ -6625,6 +6738,7 @@ impl Ac4ImsEncoder {
                 acpl_num_param_bands_id,
                 acpl_quant_mode,
                 pad_target_bytes,
+                crate::encoder_acpl3::SevenXAcplRoles::for_layout(self.seven_x_layout),
             );
 
         let mut bw = BitWriter::new();
@@ -6832,7 +6946,7 @@ impl Ac4ImsEncoder {
         // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
         // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
         // back-channel sides.
-        let wire = Self::acpl_7x_wire_channels(frames);
+        let wire = Self::acpl_7x_wire_channels_for(self.seven_x_layout, frames);
         let frames: &[&[f32]; 7] = &[
             &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6],
         ];
@@ -6845,7 +6959,7 @@ impl Ac4ImsEncoder {
         // channel_mode 5 (Table 85). The decoder routes channels == 7
         // through parse_7x_audio_data_outer(b_has_lfe = false).
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1111000;
+        self.channel_mode_value = self.seven_x_channel_mode(false);
         self.channel_mode_bits = 7;
 
         let n_channels = 7;
@@ -6917,7 +7031,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+            crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
                 frame_len,
                 max_sfb,
                 max_sfb_master,
@@ -6966,6 +7080,7 @@ impl Ac4ImsEncoder {
                 (&ls_ah, &rs_ah),
                 &c_ah,
                 pad_target_bytes,
+                crate::encoder_acpl3::SevenXAcplRoles::for_layout(self.seven_x_layout),
             );
 
         let mut bw = BitWriter::new();
@@ -7185,9 +7300,12 @@ impl Ac4ImsEncoder {
         // Table 184 / 202 wire channels (see `acpl_7x_wire_channels`):
         // L / R / C waveform-coded, [D, E] coupling carriers, [F, G]
         // back-channel sides; the LFE passes through.
-        let wire = Self::acpl_7x_wire_channels(&[
-            frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
-        ]);
+        let wire = Self::acpl_7x_wire_channels_for(
+            self.seven_x_layout,
+            &[
+                frames[0], frames[1], frames[2], frames[3], frames[4], frames[5], frames[6],
+            ],
+        );
         let frames: &[&[f32]; 8] = &[
             &wire[0], &wire[1], &wire[2], &wire[3], &wire[4], &wire[5], &wire[6], frames[7],
         ];
@@ -7206,7 +7324,7 @@ impl Ac4ImsEncoder {
         // channel_mode 6 (Table 88). The decoder routes channels == 8
         // through parse_7x_audio_data_outer(b_has_lfe = true).
         let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
-        self.channel_mode_value = 0b1111001;
+        self.channel_mode_value = self.seven_x_channel_mode(true);
         self.channel_mode_bits = 7;
 
         let n_channels = 8;
@@ -7278,7 +7396,7 @@ impl Ac4ImsEncoder {
         };
 
         let body =
-            crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
+            crate::encoder_acpl3::build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna_with_roles(
                 frame_len,
                 max_sfb,
                 max_sfb_master,
@@ -7327,6 +7445,7 @@ impl Ac4ImsEncoder {
                 (&ls_ah, &rs_ah),
                 &c_ah,
                 pad_target_bytes,
+                crate::encoder_acpl3::SevenXAcplRoles::for_layout(self.seven_x_layout),
             );
 
         let mut bw = BitWriter::new();

@@ -35,6 +35,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`encoder_asf::five_channel_ms_wire`); 26–28 dB waveform SNR on every
   channel of correlated and independent 5.0 content
   (tests/round485_channel_data_matrices.rs).
+- 7.X channel layouts beyond 3/4/0: 5/2/0.x (Lw / Rw) and 3/2/2.x
+  (Tfl / Tfr) with both `add_ch_base` values. The TOC surfaces them as
+  `toc::SevenXLayout` (`Ac4FrameInfo::seven_x_layout`,
+  `PresentationInfo::seven_x_layout`; was: `add_ch_base` read and
+  dropped, every 7.X stream decoded as 3/4/0). The ASPX_ACPL_1 / _2
+  render follows Table 183 / 185 (additional channels paired with L / R
+  for 5/2/0 and 3/2/2), Table 202 (coupling pair L / R for
+  `add_ch_base == 0`, Ls / Rs otherwise) and the Pseudocode 120 output
+  gains. Output slots stay `[L, R, C, Ls, Rs, X1, X2(, LFE)]`.
+  Encoder: `Ac4ImsEncoder::with_seven_x_layout` drives the 7.0 / 7.1
+  SIMPLE and live A-CPL entries (channel_mode code + `add_ch_base` in
+  both TOC writers, `acpl_7x_wire_channels_for` carrier model,
+  `encoder_acpl3::SevenXAcplRoles`). Every layout decodes with waveform
+  parity (21–28 dB SNR, 0,99–1,02× RMS) on ASPX_ACPL_1 and inside the
+  parity window on ASPX_ACPL_2 (tests/round485_7_x_layouts.rs); the
+  `acpl_element` fuzz target picks the layout.
+- ASPX_ACPL_1 SAP selection (`select_acpl1_residual_chparam_pair`, 5.X
+  and 7.X): a band pair keeps its SAP row only when the side is
+  predictable from the mid over both bands of the pair and neither
+  output's quantisation noise more than doubles; a strong mid
+  predicting a weak, unrelated side no longer leaks the mid's noise
+  into it (5/2/0 Lw: 7,6 → 23,2 dB).
 
 ### Fixed
 

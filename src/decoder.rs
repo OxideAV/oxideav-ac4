@@ -91,8 +91,13 @@ pub struct Ac4Decoder {
     acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState,
     /// Alignment delay lines for the A-CPL element renderer: `[0]` /
     /// `[1]` = the ASPX_ACPL_1 residual pair (`x3` / `x4`), `[2]` / `[3]`
-    /// = the 7_X waveform-coded L / R, `[4]` = the LFE.
+    /// = the 7_X waveform-coded pair (Table 202 `x6` / `x7`), `[4]` =
+    /// the LFE.
     acpl_align: [AlignDelay; 5],
+    /// 7.X channel layout of the current frame (Table 88 ch_mode +
+    /// `add_ch_base`), driving the Table 183 / 185 / 202 / 213
+    /// mappings of the `7_X_channel_element()` render.
+    seven_x_layout: toc::SevenXLayout,
     /// Per-substream state for the 5_X `ASPX_ACPL_3` multichannel
     /// synthesis pipeline (§5.7.7.6.2 Pseudocode 118). Carries the
     /// D0/D1/D2 + ducker IIR state + differential-decode rolling sums
@@ -312,6 +317,7 @@ impl Ac4Decoder {
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
             acpl_align: Default::default(),
+            seven_x_layout: toc::SevenXLayout::default(),
             acpl_5x_mch_state: acpl_synth::Acpl5xMchPcmState::new(),
             ssf_synth_state: Vec::new(),
             ssf_walker_state: Vec::new(),
@@ -1084,9 +1090,10 @@ impl Ac4Decoder {
         } else {
             tools.five_x_coding_config?
         };
-        // The Table 178 / §5.3.3.2 chparam SAP of the channel-data
-        // elements themselves is treated as identity here, exactly as
-        // the SIMPLE / ASPX dispatchers do (the encoder emits identity).
+        // The channel-data elements' own §5.3.3.2-5 matrices (Tables
+        // 178 / 179) were applied when they were walked
+        // (`mch::parse_*_channel_data`), so their tracks are the
+        // outputs O0..On here.
         match cfg {
             crate::mch::FiveXCodingConfig::AcplLite2 => {
                 let (a, b) = tcd_pair(tools.two_channel_data.first()?)?;
@@ -1225,24 +1232,53 @@ impl Ac4Decoder {
                 tools.acpl_1_residual_max_sfb_master,
             )
         };
-        // The coupling carriers: 5_X = [A, B]; 7_X = [D, E] (Table 202).
-        let (mut x0_spec, mut x1_spec) = if is_7x {
+        // Preliminary spectra by output slot (`[L, R, C, Ls, Rs, X1,
+        // X2]`): 5_X carries `[A, B]` + `C` (Table 181); 7_X carries
+        // `[A, B]` + `C` + `[D, E]` (Table 184), the Table 183 / 185
+        // final mapping placing `A`/`B` on L / R and `D`/`E` on Ls / Rs
+        // for every channel_mode.
+        let mut spec: [Option<Vec<f32>>; 7] = Default::default();
+        spec[0] = Some(carriers.a.clone());
+        spec[1] = Some(carriers.b.clone());
+        spec[2] = carriers.c.clone();
+        if is_7x {
             match (carriers.d.clone(), carriers.e.clone()) {
-                (Some(d), Some(e)) => (d, e),
+                (Some(d), Some(e)) => {
+                    spec[3] = Some(d);
+                    spec[4] = Some(e);
+                }
                 _ => return,
             }
+        }
+        let layout = self.seven_x_layout;
+        // Table 183: the pair the additional channels' quartets mix
+        // with — (D, E) for 3/4/0.x, (A, B) for 5/2/0.x and 3/2/2.x.
+        // 5_X (Table 181): (A, B).
+        let base: (usize, usize) = if is_7x && matches!(layout, toc::SevenXLayout::BackSurround) {
+            (3, 4)
         } else {
-            (carriers.a.clone(), carriers.b.clone())
+            (0, 1)
         };
+        // Where the x3 / x4 preliminaries land: Ls / Rs for 5_X, the
+        // additional channels (Lb / Lw / Tfl …) for 7_X.
+        let side: (usize, usize) = if is_7x { (5, 6) } else { (3, 4) };
+        // Table 202: the A-CPL coupling pair x0 / x1 — Ls / Rs for
+        // 3/4/0.x and add_ch_base = 1, L / R for add_ch_base = 0 (and
+        // for 5_X); the other pair is the waveform x6 / x7.
+        let add_ch_base = layout.add_ch_base();
+        let couple: (usize, usize) = if is_7x && add_ch_base != Some(false) {
+            (3, 4)
+        } else {
+            (0, 1)
+        };
+        let wave: (usize, usize) = if couple.0 == 0 { (3, 4) } else { (0, 1) };
         // ASPX_ACPL_1: the joint-MDCT residual pair enters through the
-        // chparam SAP matrix (Table 181 for 5_X; the Table 183 shape
-        // with the two residual chparam_info() elements for 7_X per
-        // §5.3.4.4.2 read as errata A5 recommends — see
+        // chparam SAP matrix (Table 181 for 5_X; Table 183 with the two
+        // residual chparam_info() elements for 7_X per §5.3.4.4.2 read
+        // as errata A5 recommends — see
         // `asf::SEVEN_X_ACPL1_TABLE183_SOURCE`) and becomes the x3 / x4
-        // preliminaries. Without the
-        // SAP inputs the residual is taken as-is (identity SAP).
-        let mut x3_spec: Option<Vec<f32>> = None;
-        let mut x4_spec: Option<Vec<f32>> = None;
+        // preliminaries. Without the SAP inputs the residual is taken
+        // as-is (identity SAP).
         if matches!(mode, acpl_synth::Acpl5xPairMode::AspxAcpl1) {
             let pad = |v: &[f32]| -> Vec<f32> {
                 let mut out = vec![0.0f32; n];
@@ -1269,59 +1305,66 @@ impl Ac4Decoder {
                         _ => None,
                     }
                 };
+                let empty: Vec<f32> = Vec::new();
+                let (bl, br) = (
+                    spec[base.0].as_deref().unwrap_or(&empty),
+                    spec[base.1].as_deref().unwrap_or(&empty),
+                );
                 let sap = quartets.and_then(|(pair, msm)| {
-                    asf::apply_sap_table_181(&x0_spec, &x1_spec, &s3, &s4, &pair, msm, n as u32)
+                    asf::apply_sap_table_181(bl, br, &s3, &s4, &pair, msm, n as u32)
                 });
                 match sap {
                     Some((p0, p1, p3, p4)) => {
-                        x0_spec = p0;
-                        x1_spec = p1;
-                        x3_spec = Some(p3);
-                        x4_spec = Some(p4);
+                        spec[base.0] = Some(p0);
+                        spec[base.1] = Some(p1);
+                        spec[side.0] = Some(p3);
+                        spec[side.1] = Some(p4);
                     }
                     None => {
-                        x3_spec = Some(s3);
-                        x4_spec = Some(s4);
+                        spec[side.0] = Some(s3);
+                        spec[side.1] = Some(s4);
                     }
                 }
             }
         }
         // IMDCT every track on its own overlap slot, then extend the
-        // Table 213 A-SPX channels with the Table 212 companding.
-        let (slot_x0, slot_x1, slot_x3, slot_x4) = if is_7x {
-            (3usize, 4usize, 5usize, 6usize)
-        } else {
-            (0, 1, 3, 4)
-        };
-        let x0_pcm = self.imdct_channel_f32(slot_x0, &x0_spec, n);
-        let x1_pcm = self.imdct_channel_f32(slot_x1, &x1_spec, n);
-        let c_pcm = carriers
-            .c
-            .as_ref()
-            .map(|c| self.imdct_channel_f32(2, c, n))
-            .unwrap_or_else(|| vec![0.0f32; n]);
-        let x3_pcm = x3_spec.map(|s| self.imdct_channel_f32(slot_x3, &s, n));
-        let x4_pcm = x4_spec.map(|s| self.imdct_channel_f32(slot_x4, &s, n));
-        let front_pcm = if is_7x {
-            Some((
-                self.imdct_channel_f32(0, &carriers.a, n),
-                self.imdct_channel_f32(1, &carriers.b, n),
-            ))
-        } else {
-            None
-        };
+        // Table 213 A-SPX channels — `(L, R)`, `(Ls, Rs)`, `C` for every
+        // 7_X channel_mode, `(L, R)`, `C` for 5_X — with the Table 212
+        // companding.
+        let mut pcm: [Option<Vec<f32>>; 7] = Default::default();
+        for (slot, sp) in spec.iter().enumerate() {
+            if let Some(sp) = sp {
+                pcm[slot] = Some(self.imdct_channel_f32(slot, sp, n));
+            }
+        }
+        let silent = || vec![0.0f32; n];
         let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
+        entries.push((
+            0,
+            pcm[0].take().unwrap_or_else(silent),
+            front_t.as_ref().map(|t| (t, false)),
+        ));
+        entries.push((
+            1,
+            pcm[1].take().unwrap_or_else(silent),
+            front_t.as_ref().map(|t| (t, true)),
+        ));
+        entries.push((
+            2,
+            pcm[2].take().unwrap_or_else(silent),
+            centre_t.as_ref().map(|t| (t, false)),
+        ));
         if is_7x {
-            let (l, r) = front_pcm.unwrap();
-            entries.push((0, l, front_t.as_ref().map(|t| (t, false))));
-            entries.push((1, r, front_t.as_ref().map(|t| (t, true))));
-            entries.push((2, c_pcm, centre_t.as_ref().map(|t| (t, false))));
-            entries.push((3, x0_pcm, surround_t.as_ref().map(|t| (t, false))));
-            entries.push((4, x1_pcm, surround_t.as_ref().map(|t| (t, true))));
-        } else {
-            entries.push((0, x0_pcm, front_t.as_ref().map(|t| (t, false))));
-            entries.push((1, x1_pcm, front_t.as_ref().map(|t| (t, true))));
-            entries.push((2, c_pcm, centre_t.as_ref().map(|t| (t, false))));
+            entries.push((
+                3,
+                pcm[3].take().unwrap_or_else(silent),
+                surround_t.as_ref().map(|t| (t, false)),
+            ));
+            entries.push((
+                4,
+                pcm[4].take().unwrap_or_else(silent),
+                surround_t.as_ref().map(|t| (t, true)),
+            ));
         }
         let extended =
             self.extend_5x_entries_f32(entries, aspx_cfg, companding.as_ref(), num_ts_in_ats);
@@ -1332,11 +1375,7 @@ impl Ac4Decoder {
                 .map(|(_, p)| p.clone())
                 .unwrap_or_else(|| vec![0.0f32; n])
         };
-        let (x0_ext, x1_ext, c_ext) = if is_7x {
-            (take(3), take(4), take(2))
-        } else {
-            (take(0), take(1), take(2))
-        };
+        let (x0_ext, x1_ext, c_ext) = (take(couple.0), take(couple.1), take(2));
         // The extended carriers come back one QMF round trip late
         // (§5.7.1: the synthesis works on delayed data); the residual
         // pair stayed in the time domain and must be delayed by the
@@ -1344,8 +1383,8 @@ impl Ac4Decoder {
         let rt = qmf::QMF_ROUND_TRIP_DELAY;
         let (x3_in, x4_in) = match mode {
             acpl_synth::Acpl5xPairMode::AspxAcpl1 => {
-                let x3 = x3_pcm.unwrap_or_else(|| vec![0.0f32; n]);
-                let x4 = x4_pcm.unwrap_or_else(|| vec![0.0f32; n]);
+                let x3 = pcm[side.0].take().unwrap_or_else(silent);
+                let x4 = pcm[side.1].take().unwrap_or_else(silent);
                 (
                     Some(self.acpl_align[0].delay(&x3, rt)),
                     Some(self.acpl_align[1].delay(&x4, rt)),
@@ -1373,18 +1412,25 @@ impl Ac4Decoder {
             pcm_per_channel.push(None);
         }
         if is_7x {
-            // Pseudocode 120, 3/4/0.x: z0 / z2 carry the extra √2.
+            // Pseudocode 120: z1 / z3 carry √2 (inside the shared
+            // module run); z0 / z2 take a further √2 when add_ch_base
+            // == 1 or for 3/4/0.x; the waveform z6 / z7 take √2 when
+            // add_ch_base == 0. 3/4/0.x carries no add_ch_base, and
+            // its waveform pair (L / R) is passed unscaled.
             let sq2 = std::f32::consts::SQRT_2;
-            let scale = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| x * sq2).collect() };
-            // L / R only saw the A-SPX round trip; the coupled outputs
-            // (and the centre passthrough) took a second one.
-            let l_out = self.acpl_align[2].delay(&take(0), rt);
-            let r_out = self.acpl_align[3].delay(&take(1), rt);
-            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&l_out));
-            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&r_out));
+            let gain = |v: &[f32], g: f32| -> Vec<f32> { v.iter().map(|x| x * g).collect() };
+            let g_couple = if add_ch_base == Some(false) { 1.0 } else { sq2 };
+            let g_wave = if add_ch_base == Some(false) { sq2 } else { 1.0 };
+            // The waveform pair only saw the A-SPX round trip; the
+            // coupled outputs (and the centre passthrough) took a
+            // second one.
+            let w0 = self.acpl_align[2].delay(&take(wave.0), rt);
+            let w1 = self.acpl_align[3].delay(&take(wave.1), rt);
+            pcm_per_channel[wave.0] = Some(Self::pcm_f32_to_i16(&gain(&w0, g_wave)));
+            pcm_per_channel[wave.1] = Some(Self::pcm_f32_to_i16(&gain(&w1, g_wave)));
             pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
-            pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&scale(&out.left)));
-            pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&scale(&out.right)));
+            pcm_per_channel[couple.0] = Some(Self::pcm_f32_to_i16(&gain(&out.left, g_couple)));
+            pcm_per_channel[couple.1] = Some(Self::pcm_f32_to_i16(&gain(&out.right, g_couple)));
             pcm_per_channel[5] = Some(Self::pcm_f32_to_i16(&out.left_surround));
             pcm_per_channel[6] = Some(Self::pcm_f32_to_i16(&out.right_surround));
         } else {
@@ -5107,6 +5153,7 @@ impl Decoder for Ac4Decoder {
             let pts = pkt.pts;
             return self.receive_frame_22_2(&raw_owned, info, pts);
         }
+        self.seven_x_layout = info.seven_x_layout.unwrap_or_default();
         // Resolve shape with fallbacks to the container hint when the
         // TOC carried a reserved / escape value.
         let channels = if info.channels == 0 {

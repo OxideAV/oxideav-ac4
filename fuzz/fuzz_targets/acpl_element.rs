@@ -1,7 +1,8 @@
 //! 5.X / 7.X A-CPL element decode under corruption: the leading bytes
 //! pick the layout (5.0 / 5.1 / 7.0 / 7.1), the codec mode
 //! (ASPX_ACPL_1 / ASPX_ACPL_2, or ASPX_ACPL_3 on 5.X), SAP-predictable
-//! back channels on 7.X ASPX_ACPL_1 (Table 183 quartets), the I / P
+//! back channels on 7.X ASPX_ACPL_1 (Table 183 quartets), the 7.X
+//! channel layout (3/4/0, 5/2/0, 3/2/2 with add_ch_base), the I / P
 //! framing and up to four byte
 //! mutations; the rest is S16 PCM that `Ac4ImsEncoder` turns into two
 //! raw frames (I then I or P). The mutations are applied to the coded
@@ -15,6 +16,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_ac4::decoder::Ac4Decoder;
 use oxideav_ac4::encoder_ims::Ac4ImsEncoder;
+use oxideav_ac4::toc::SevenXLayout;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
 
 const N: usize = 1920;
@@ -67,7 +69,16 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    let mut enc = Ac4ImsEncoder::new();
+    // 7.X channel layout (Table 88 + add_ch_base): 3/4/0, 5/2/0 or
+    // 3/2/2 — drives the Table 183 / 185 / 202 / 213 mappings.
+    let layout = match (ctl[1] >> 5) % 5 {
+        0 => SevenXLayout::BackSurround,
+        1 => SevenXLayout::Wide { add_ch_base: false },
+        2 => SevenXLayout::Wide { add_ch_base: true },
+        3 => SevenXLayout::TopFront { add_ch_base: false },
+        _ => SevenXLayout::TopFront { add_ch_base: true },
+    };
+    let mut enc = Ac4ImsEncoder::new().with_seven_x_layout(layout);
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(2);
     for k in 0..2 {
         enc.b_iframe_global = k == 0 || !second_is_p;

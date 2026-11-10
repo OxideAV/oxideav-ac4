@@ -165,6 +165,58 @@ impl ChannelModeDesc {
     }
 }
 
+/// Channel layout of a `7_X_channel_element()` substream — TS 103
+/// 190-1 Table 88 `ch_mode` 5..=10 plus the §4.3.3.7.6 `add_ch_base`
+/// flag the 5/2/0 and 3/2/2 families carry. Drives the Table 183 /
+/// 185 final channel mapping, the Table 202 A-CPL variable mapping and
+/// the Table 213 A-SPX channel order.
+///
+/// The decoder's output slots for every family are
+/// `[L, R, C, Ls, Rs, X1, X2]` (+ `LFE` for the `.1` modes) where
+/// `(X1, X2)` are the additional channels: `(Lb, Rb)` for 3/4/0.x,
+/// `(Lw, Rw)` for 5/2/0.x, `(Tfl, Tfr)` for 3/2/2.x.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SevenXLayout {
+    /// 3/4/0.x — `L, C, R, Ls, Rs, Lb, Rb` (ch_mode 5 / 6).
+    #[default]
+    BackSurround,
+    /// 5/2/0.x — `L, C, R, Lw, Rw, Ls, Rs` (ch_mode 7 / 8).
+    Wide {
+        /// `add_ch_base`: A-CPL couples Lw / Rw on the L / R pair
+        /// (`false`) or on the Ls / Rs pair (`true`).
+        add_ch_base: bool,
+    },
+    /// 3/2/2.x — `L, C, R, Ls, Rs, Tfl, Tfr` (ch_mode 9 / 10).
+    TopFront {
+        /// `add_ch_base`: A-CPL couples Tfl / Tfr on the L / R pair
+        /// (`false`) or on the Ls / Rs pair (`true`).
+        add_ch_base: bool,
+    },
+}
+
+impl SevenXLayout {
+    /// Layout for a Table 88 `ch_mode` (5..=10) and the substream's
+    /// `add_ch_base` (ignored for 3/4/0.x, which carries none).
+    pub fn from_ch_mode(ch_mode: u32, add_ch_base: bool) -> Option<Self> {
+        match ch_mode {
+            5 | 6 => Some(Self::BackSurround),
+            7 | 8 => Some(Self::Wide { add_ch_base }),
+            9 | 10 => Some(Self::TopFront { add_ch_base }),
+            _ => None,
+        }
+    }
+
+    /// `add_ch_base` of the 5/2/0 / 3/2/2 families (`None` for
+    /// 3/4/0.x).
+    pub fn add_ch_base(&self) -> Option<bool> {
+        match *self {
+            Self::BackSurround => None,
+            Self::Wide { add_ch_base } | Self::TopFront { add_ch_base } => Some(add_ch_base),
+        }
+    }
+}
+
 /// Shared 1/2/4-bit head of both channel_mode prefix tables. Returns
 /// `Some(desc)` when the code resolved within 4 bits, otherwise `None`
 /// (the caller handles the `1111…` group per its table).
@@ -375,6 +427,11 @@ pub struct Ac4FrameInfo {
     /// `first_chan_mode` is one of the 7.0.4 / 7.1.4 / 9.0.4 / 9.1.4
     /// modes.
     pub immersive_presence: Option<ImmersivePresence>,
+    /// 7.X channel layout (Table 88 ch_mode 5..=10 + `add_ch_base`) of
+    /// the first channel-coded substream, for both the v0/v1
+    /// `ac4_substream_info()` and the v2 `ac4_substream_info_chan()`
+    /// paths. `None` when that substream is not a 7.0 / 7.1 one.
+    pub seven_x_layout: Option<SevenXLayout>,
 }
 
 /// Parsed `oamd_substream_info(b_substreams_present)`
@@ -419,6 +476,9 @@ pub struct PresentationInfo {
     /// sf_multiplier — 0 => base rate, 1 => 96 kHz, 2 => 192 kHz
     /// (only set when fs_index == 1).
     pub sf_multiplier: u32,
+    /// 7.X channel layout of the first substream when its
+    /// `channel_mode` is one of the Table 88 7.0 / 7.1 codes.
+    pub seven_x_layout: Option<SevenXLayout>,
 }
 
 /// Parse the raw AC-4 frame element starting at the TOC.
@@ -490,6 +550,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     let mut oamd_substreams = Vec::new();
     let mut first_chan_mode = None;
     let mut immersive_presence = None;
+    let mut seven_x_layout = None;
     if bitstream_version <= 1 {
         for _ in 0..n_presentations {
             let pi = parse_presentation_info(&mut br, fs_index, frame_rate_index)?;
@@ -529,6 +590,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
                 first_group_sf_mul = g.first_sf_multiplier;
                 first_chan_mode = g.first_chan_mode;
                 immersive_presence = g.first_immersive_presence;
+                seven_x_layout = g.first_seven_x_layout;
             }
             ajoc_substreams.extend(g.ajoc);
             obj_substreams.extend(g.objs);
@@ -561,6 +623,9 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         _ => base_sr,
     };
     let channels = presentations.first().map(|p| p.channels).unwrap_or(0);
+    if bitstream_version <= 1 {
+        seven_x_layout = presentations.first().and_then(|p| p.seven_x_layout);
+    }
 
     let (fps_milli, frame_length) = frame_rate_entry(frame_rate_index, fs_index);
 
@@ -586,6 +651,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         oamd_substreams,
         first_chan_mode,
         immersive_presence,
+        seven_x_layout,
     })
 }
 
@@ -731,9 +797,11 @@ fn parse_substream_info(
     // 0b1111101 (ch_mode 7..=10 — the 5/2/0 and 3/2/2 layout family;
     // §4.3.3.7.6). With the ch_mode index now surfaced from the prefix
     // decoder the gate is exact.
+    let mut add_ch_base = false;
     if (7..=10).contains(&mode.ch_mode) {
-        let _add_ch_base = br.read_bit()?;
+        add_ch_base = br.read_bit()?;
     }
+    let seven_x_layout = SevenXLayout::from_ch_mode(mode.ch_mode, add_ch_base);
     let b_content_type = br.read_bit()?;
     if b_content_type {
         parse_content_type(br)?;
@@ -755,6 +823,7 @@ fn parse_substream_info(
         channels: channels as u16,
         sf_multiplier,
         b_iframe,
+        seven_x_layout,
     })
 }
 
@@ -762,6 +831,7 @@ struct SubstreamInfo {
     channels: u16,
     sf_multiplier: u32,
     b_iframe: bool,
+    seven_x_layout: Option<SevenXLayout>,
 }
 
 fn parse_content_type(br: &mut BitReader<'_>) -> Result<()> {
@@ -853,6 +923,7 @@ fn parse_presentation_info(
             info.channels = si.channels;
             info.sf_multiplier = si.sf_multiplier;
             info.b_iframe = si.b_iframe;
+            info.seven_x_layout = si.seven_x_layout;
             info.n_substream_info = 1;
         } else {
             let _b_hsf_ext = br.read_bit()?;
@@ -865,6 +936,7 @@ fn parse_presentation_info(
                     info.channels = first.channels;
                     info.sf_multiplier = first.sf_multiplier;
                     info.b_iframe = first.b_iframe;
+                    info.seven_x_layout = first.seven_x_layout;
                     info.n_substream_info = 1;
                     if b_hsf_ext {
                         parse_hsf_ext_substream_info(br)?;
@@ -878,6 +950,7 @@ fn parse_presentation_info(
                     info.channels = first.channels;
                     info.sf_multiplier = first.sf_multiplier;
                     info.b_iframe = first.b_iframe;
+                    info.seven_x_layout = first.seven_x_layout;
                     info.n_substream_info = 1;
                     if b_hsf_ext {
                         parse_hsf_ext_substream_info(br)?;
@@ -892,6 +965,7 @@ fn parse_presentation_info(
                     info.channels = first.channels;
                     info.sf_multiplier = first.sf_multiplier;
                     info.b_iframe = first.b_iframe;
+                    info.seven_x_layout = first.seven_x_layout;
                     info.n_substream_info = 1;
                     if b_hsf_ext {
                         parse_hsf_ext_substream_info(br)?;
@@ -1131,6 +1205,7 @@ fn parse_substream_group_info(
                 summary.first_sf_multiplier = chan.sf_multiplier;
                 summary.first_chan_mode = Some(chan.mode);
                 summary.first_immersive_presence = chan.immersive_presence;
+                summary.first_seven_x_layout = chan.seven_x_layout;
             }
             if b_hsf_ext && b_substreams_present {
                 let si = br.read_u32(2)?;
@@ -1237,8 +1312,9 @@ fn parse_substream_info_chan(
     }
     // §6.2.1.8: `add_ch_base` for channel_mode codes 0b1111010 ..
     // 0b1111101 (ch_mode 7..=10), same gate as part-1 Table 9.
+    let mut add_ch_base = false;
     if (7..=10).contains(&mode.ch_mode) {
-        let _add_ch_base = br.read_bit()?;
+        add_ch_base = br.read_bit()?;
     }
     let factor = frame_rate_factor(frame_rate_index, false, 0);
     let mut b_audio_ndot = false;
@@ -1260,6 +1336,7 @@ fn parse_substream_info_chan(
         sf_multiplier,
         immersive_presence,
         b_audio_ndot,
+        seven_x_layout: SevenXLayout::from_ch_mode(mode.ch_mode, add_ch_base),
     })
 }
 
@@ -1285,6 +1362,7 @@ struct SubstreamInfoChan {
     sf_multiplier: u32,
     immersive_presence: Option<ImmersivePresence>,
     b_audio_ndot: bool,
+    seven_x_layout: Option<SevenXLayout>,
 }
 
 impl Default for SubstreamInfoChan {
@@ -1299,6 +1377,7 @@ impl Default for SubstreamInfoChan {
             sf_multiplier: 0,
             immersive_presence: None,
             b_audio_ndot: false,
+            seven_x_layout: None,
         }
     }
 }
@@ -1309,6 +1388,7 @@ struct SubstreamGroupSummary {
     first_sf_multiplier: u32,
     first_chan_mode: Option<ChannelModeDesc>,
     first_immersive_presence: Option<ImmersivePresence>,
+    first_seven_x_layout: Option<SevenXLayout>,
     ajoc: Vec<AjocSubstreamInfo>,
     objs: Vec<ObjSubstreamInfo>,
     oamd: Vec<OamdSubstreamInfoDesc>,

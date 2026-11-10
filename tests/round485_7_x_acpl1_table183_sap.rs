@@ -250,7 +250,7 @@ fn sap_wire_side_is_smaller_than_identity_side() {
     let e = spec(&mix(&pcm[4], &pcm[6], 1.0));
     let f = spec(&mix(&pcm[3], &pcm[5], -1.0));
     let g = spec(&mix(&pcm[4], &pcm[6], -1.0));
-    let wire = author_7x_acpl1_table183_wire(N as u32, 20, &d, &e, &f, &g);
+    let wire = author_7x_acpl1_table183_wire(N as u32, 20, &d, &e, &f, &g, true);
     assert_eq!(wire.chparam[0].sap_mode, 3);
     assert_eq!(wire.chparam[1].sap_mode, 3);
     let energy = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();

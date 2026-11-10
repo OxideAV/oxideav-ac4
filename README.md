@@ -451,9 +451,15 @@ parses back to the authored rows.
   on both sides). The live 7.X ACPL_1 writers predict the back-channel
   side from the surround carrier per band (least squares on the
   `alpha_q · 0,1` grid) and transmit the Table 183 inverse; on
-  predictable back channels the side residual drops 5–70× and the
+  predictable back channels the side residual drops 5–40× and the
   decode keeps 26–27 dB waveform SNR on every channel below
   `acpl_qmf_band` (tests/round485_7_x_acpl1_table183_sap.rs).
+- **7.X channel layouts** (round 485): 3/4/0 (Lb / Rb), 5/2/0 (Lw /
+  Rw) and 3/2/2 (Tfl / Tfr) with either `add_ch_base`
+  (`with_seven_x_layout`, `toc::SevenXLayout`) on the 7.0 / 7.1 SIMPLE
+  and live A-CPL entries; the decoder follows Tables 183 / 185 / 202
+  and the Pseudocode 120 gains. ASPX_ACPL_1 keeps 21–28 dB waveform
+  SNR on every channel of every layout.
 - **5.X ASPX_ACPL_3 with decoded-PCM parity** (round 461):
   `encode_frame_pcm_5_{0,1}_acpl3_real_aspx{,_with_max_sfb,_multi_env}`
   code the Pseudocode 118 downmix `x0 = (L + C/√2 + Ls/√2)/(1+√2)`,
