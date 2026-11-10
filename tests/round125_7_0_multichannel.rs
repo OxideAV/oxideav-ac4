@@ -175,7 +175,7 @@ fn round125_7_0_substream_walker_skips_lfe_and_sees_additional_pair() {
     //     b_has_lfe-only),
     //   * populate `five_channel_data` (Cfg3Five) with five SCEs each
     //     carrying a non-empty `scaled_spec`,
-    //   * record `seven_x_b_use_sap_add_ch = false` and populate
+    //   * record `seven_x_b_use_sap_add_ch` and populate
     //     `seven_x_additional_channel_data` with two `scaled_spec`
     //     entries for the Lb/Rb pair.
     let mut enc = Ac4ImsEncoder::new();
@@ -222,11 +222,18 @@ fn round125_7_0_substream_walker_skips_lfe_and_sees_additional_pair() {
             "non-additional channel {ch} scaled spectrum missing"
         );
     }
-    // Additional pair walked, identity-SAP path.
+    // Additional pair walked. The encoder M/S-codes the Table 183
+    // pairs on the bands where that compacts the energy (round 485),
+    // so `b_use_sap_add_ch` is signalled either way and, when set,
+    // carries the two quartet rows.
+    let use_sap = sub_info
+        .tools
+        .seven_x_b_use_sap_add_ch
+        .expect("b_use_sap_add_ch walked");
     assert_eq!(
-        sub_info.tools.seven_x_b_use_sap_add_ch,
-        Some(false),
-        "encoder emits identity SAP (b_use_sap_add_ch = 0)"
+        use_sap,
+        sub_info.tools.seven_x_add_chparam_info.is_some(),
+        "b_use_sap_add_ch gates the chparam_info pair"
     );
     let add = sub_info
         .tools

@@ -1477,6 +1477,7 @@ impl Ac4ImsEncoder {
                     &coeffs_per_channel[5],
                     &coeffs_per_channel[6],
                 ],
+                !matches!(self.seven_x_layout, crate::toc::SevenXLayout::BackSurround),
                 pad_target_bytes,
             )
         });
@@ -1834,6 +1835,7 @@ impl Ac4ImsEncoder {
                     &coeffs_per_channel[6],
                     &coeffs_per_channel[7],
                 ],
+                !matches!(self.seven_x_layout, crate::toc::SevenXLayout::BackSurround),
                 pad_target_bytes,
             )
         });

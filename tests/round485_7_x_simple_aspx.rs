@@ -190,3 +190,61 @@ fn aspx_regenerates_the_additional_channels_high_band() {
         }
     }
 }
+
+/// Additional channels correlated with their Table 183 base pair: the
+/// SIMPLE writer codes them M/S (`b_use_sap_add_ch = 1`, `ms_used`
+/// rows) and the decoder's Table 183 mix restores every channel — for
+/// the (D, E) base of 3/4/0 and the (A, B) base of 5/2/0 / 3/2/2.
+#[test]
+fn simple_table_183_ms_pairs_decode_with_parity() {
+    for layout in LAYOUTS {
+        let base: [usize; 2] = if matches!(layout, SevenXLayout::BackSurround) {
+            [3, 4]
+        } else {
+            [0, 1]
+        };
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut enc = Ac4ImsEncoder::new().with_seven_x_layout(layout);
+        let mut dec = Ac4Decoder::new(&params);
+        let mut inp = vec![Vec::new(); 7];
+        let mut out = vec![Vec::new(); 7];
+        let mut sap_seen = false;
+        for frame in 0..FRAMES {
+            let mut pcm = content(frame, false);
+            for i in 0..2 {
+                let own = tones(&[700.0 + 90.0 * i as f32], frame, 0.02);
+                pcm[5 + i] = pcm[base[i]]
+                    .iter()
+                    .zip(&own)
+                    .map(|(p, o)| 0.8 * p + o)
+                    .collect();
+            }
+            let f: [&[f32]; 7] = std::array::from_fn(|c| pcm[c].as_slice());
+            let bytes = enc.encode_frame_pcm_7_0(&f);
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), bytes);
+            dec.send_packet(&pkt).expect("send_packet");
+            let Frame::Audio(af) = dec.receive_frame().expect("receive_frame") else {
+                panic!("audio frame expected");
+            };
+            let tools = &dec.last_substream.as_ref().expect("substream").tools;
+            sap_seen |= tools.seven_x_b_use_sap_add_ch == Some(true)
+                && tools
+                    .seven_x_add_chparam_info
+                    .as_ref()
+                    .is_some_and(|cp| cp.iter().all(|c| c.sap_mode != 0));
+            for (i, c) in af.data[0].as_chunks::<2>().0.iter().enumerate() {
+                out[i % 7].push(i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0);
+            }
+            for c in 0..7 {
+                inp[c].extend_from_slice(&pcm[c]);
+            }
+        }
+        assert!(sap_seen, "{layout:?}: Table 183 pairs must be M/S-coded");
+        let start = SETTLE * N;
+        for c in 0..7 {
+            let s = snr_db(&inp[c][start - N..inp[c].len() - N], &out[c][start..]);
+            eprintln!("{layout:?} SIMPLE M/S ch {c}: SNR {s:.1} dB");
+            assert!(s > 20.0, "{layout:?} SIMPLE M/S ch {c}: SNR {s:.1} dB");
+        }
+    }
+}

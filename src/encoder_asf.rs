@@ -2208,6 +2208,106 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
     finish_substream_body(bw)
 }
 
+/// Core + additional wire tracks and the `b_use_sap_add_ch`
+/// `chparam_info()` pair of a 7_X SIMPLE / ASPX element (see
+/// [`seven_x_add_ch_ms_wire`]).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SevenXAddChWire {
+    /// The five core tracks `[A, B, C, D, E]` before the core element's
+    /// own §5.3.3 matrix.
+    pub core: [Vec<f32>; 5],
+    /// The additional `[F, G]` tracks.
+    pub add: [Vec<f32>; 2],
+    /// `Some` when at least one band is M/S-coded (`b_use_sap_add_ch =
+    /// 1`): the two quartet rows on the core `sf_info` grid.
+    pub chparam: Option<[crate::asf::ChparamInfo; 2]>,
+}
+
+/// Per-band M/S decision for the Table 183 pairs of a 7_X SIMPLE / ASPX
+/// element (TS 103 190-1 §5.3.4.4.1): the additional channels `X1` /
+/// `X2` pair with `D` / `E` (3/4/0.x, `base_front == false`) or with
+/// `A` / `B` (5/2/0.x, 3/2/2.x). A band coded M/S carries the quartet
+/// `(1, 1, 1, −1)` (`ms_used = 1`) with the wire `P' = (P + X)/2`,
+/// `X' = (P − X)/2`, which Table 183 maps back to `(P, X)`. Same
+/// energy-compaction rule as [`five_channel_ms_wire`]
+/// (`8·E_M·E_S < E_P·E_X`), only on bands both elements code
+/// (`sfb < min(max_sfb, max_sfb_add)`); the rows are walked on the core
+/// grid (`max_sfb`), as the decoder reads them.
+#[doc(hidden)]
+pub fn seven_x_add_ch_ms_wire(
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_add: u32,
+    tracks: [&[f32]; 7],
+    base_front: bool,
+) -> SevenXAddChWire {
+    let mut core: [Vec<f32>; 5] = std::array::from_fn(|i| tracks[i].to_vec());
+    let mut add: [Vec<f32>; 2] = std::array::from_fn(|i| tracks[5 + i].to_vec());
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+        return SevenXAddChWire {
+            core,
+            add,
+            chparam: None,
+        };
+    };
+    let grid = (max_sfb as usize).min(sfbo.len().saturating_sub(1));
+    let shared = grid.min(max_sfb_add as usize);
+    let base = if base_front { [0usize, 1] } else { [3, 4] };
+    let mut rows = [vec![false; grid], vec![false; grid]];
+    for i in 0..2 {
+        for sfb in 0..shared {
+            let lo = sfbo[sfb] as usize;
+            let hi = (sfbo[sfb + 1] as usize)
+                .min(core[base[i]].len())
+                .min(add[i].len());
+            if hi <= lo {
+                continue;
+            }
+            let (p, x) = (&mut core[base[i]][lo..hi], &mut add[i][lo..hi]);
+            let (mut ep, mut ex, mut em, mut es) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (&a, &b) in p.iter().zip(x.iter()) {
+                let (a, b) = (a as f64, b as f64);
+                ep += a * a;
+                ex += b * b;
+                em += 0.25 * (a + b) * (a + b);
+                es += 0.25 * (a - b) * (a - b);
+            }
+            if ep > 0.0 && ex > 0.0 && 8.0 * em * es < ep * ex {
+                rows[i][sfb] = true;
+                for (a, b) in p.iter_mut().zip(x.iter_mut()) {
+                    let (av, bv) = (*a, *b);
+                    *a = 0.5 * (av + bv);
+                    *b = 0.5 * (av - bv);
+                }
+            }
+        }
+    }
+    let chparam = if rows.iter().any(|r| r.iter().any(|&u| u)) {
+        let [r0, r1] = rows;
+        Some([
+            crate::asf::build_chparam_info_ms_used(vec![r0]),
+            crate::asf::build_chparam_info_ms_used(vec![r1]),
+        ])
+    } else {
+        None
+    };
+    SevenXAddChWire { core, add, chparam }
+}
+
+/// The 7_X SIMPLE / ASPX `b_use_sap_add_ch` flag + optional quartet
+/// pair (Table 33).
+fn write_seven_x_add_ch_sap(bw: &mut BitWriter, wire: &SevenXAddChWire, max_sfb: u32) {
+    match &wire.chparam {
+        Some(cp) => {
+            bw.write_bit(true);
+            write_chparam_info(bw, &cp[0], &[max_sfb]);
+            write_chparam_info(bw, &cp[1], &[max_sfb]);
+        }
+        None => bw.write_bit(false),
+    }
+}
+
 /// Build a 7.0 (3/4/0) SIMPLE/Cfg3Five substream body per ETSI TS 103
 /// 190-1 §4.2.6.14 Table 33 — the immersive `7_X_channel_element` shell
 /// without LFE. Symmetric counterpart of
@@ -2247,6 +2347,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     max_sfb: u32,
     max_sfb_add: u32,
     coeffs_per_channel: &[&[f32]; 7],
+    add_base_front: bool,
     pad_target_bytes: usize,
 ) -> Vec<u8> {
     let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
@@ -2291,15 +2392,33 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     // Five front/surround (L/R/C/Ls/Rs) at the shared max_sfb.
     // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
     // (Ls, Rs) pairs where it compacts the energy.
-    let five_wire = five_channel_ms_wire(
+    // §5.3.4.4.1 Table 183: per-band M/S of the additional channels
+    // with their base pair first (the core element's matrix then runs
+    // on the resulting core tracks).
+    let add_wire = seven_x_add_ch_ms_wire(
         transform_length,
         max_sfb,
+        max_sfb_add,
         [
             coeffs_per_channel[0],
             coeffs_per_channel[1],
             coeffs_per_channel[2],
             coeffs_per_channel[3],
             coeffs_per_channel[4],
+            coeffs_per_channel[5],
+            coeffs_per_channel[6],
+        ],
+        add_base_front,
+    );
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            &add_wire.core[0],
+            &add_wire.core[1],
+            &add_wire.core[2],
+            &add_wire.core[3],
+            &add_wire.core[4],
         ],
     );
     let analyses_five: [SevenZeroChannelAnalysis; 5] = [
@@ -2311,8 +2430,8 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     ];
     // Additional pair (Lb/Rb) at its own max_sfb_add.
     let analyses_add: [SevenZeroChannelAnalysis; 2] = [
-        prepare_channel(coeffs_per_channel[5], max_sfb_add),
-        prepare_channel(coeffs_per_channel[6], max_sfb_add),
+        prepare_channel(&add_wire.add[0], max_sfb_add),
+        prepare_channel(&add_wire.add[1], max_sfb_add),
     ];
 
     let mut bw = BitWriter::new();
@@ -2369,11 +2488,9 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
         );
     }
 
-    // 7.X SIMPLE/ASPX additional-channel block. b_use_sap_add_ch = 0 →
-    // identity SAP, no chparam_info pair follows. The decoder's
-    // `render_7x_simple_aspx_element` then routes Lb/Rb directly
-    // to slots 5/6 (Table 183 row "3/4/0.x" identity path).
-    bw.write_bit(false);
+    // 7.X SIMPLE/ASPX additional-channel block: b_use_sap_add_ch + the
+    // Table 183 quartet pair when any band is M/S-coded.
+    write_seven_x_add_ch_sap(&mut bw, &add_wire, max_sfb);
 
     // Additional `two_channel_data()` for Lb/Rb per Table 26. The shape
     // is `asf_transform_info() + asf_psy_info() + chparam_info() +
@@ -2975,6 +3092,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     max_sfb_add: u32,
     max_sfb_lfe: u32,
     coeffs_per_channel: &[&[f32]; 8],
+    add_base_front: bool,
     pad_target_bytes: usize,
 ) -> Vec<u8> {
     let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
@@ -3020,15 +3138,33 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // Five front/surround (L/R/C/Ls/Rs) at the shared max_sfb.
     // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
     // (Ls, Rs) pairs where it compacts the energy.
-    let five_wire = five_channel_ms_wire(
+    // §5.3.4.4.1 Table 183: per-band M/S of the additional channels
+    // with their base pair first (the core element's matrix then runs
+    // on the resulting core tracks).
+    let add_wire = seven_x_add_ch_ms_wire(
         transform_length,
         max_sfb,
+        max_sfb_add,
         [
             coeffs_per_channel[0],
             coeffs_per_channel[1],
             coeffs_per_channel[2],
             coeffs_per_channel[3],
             coeffs_per_channel[4],
+            coeffs_per_channel[5],
+            coeffs_per_channel[6],
+        ],
+        add_base_front,
+    );
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            &add_wire.core[0],
+            &add_wire.core[1],
+            &add_wire.core[2],
+            &add_wire.core[3],
+            &add_wire.core[4],
         ],
     );
     let analyses_five: [SevenOneChannelAnalysis; 5] = [
@@ -3040,8 +3176,8 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     ];
     // Additional pair (Lb/Rb) at its own max_sfb_add.
     let analyses_add: [SevenOneChannelAnalysis; 2] = [
-        prepare_channel(coeffs_per_channel[5], max_sfb_add),
-        prepare_channel(coeffs_per_channel[6], max_sfb_add),
+        prepare_channel(&add_wire.add[0], max_sfb_add),
+        prepare_channel(&add_wire.add[1], max_sfb_add),
     ];
     // LFE analysis at max_sfb_lfe.
     let lfe_analysis = prepare_channel(coeffs_per_channel[7], max_sfb_lfe);
@@ -3129,11 +3265,9 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
         );
     }
 
-    // 7.X SIMPLE/ASPX additional-channel block. b_use_sap_add_ch = 0 →
-    // identity SAP, no chparam_info pair follows. The decoder's
-    // `render_7x_simple_aspx_element` then routes Lb/Rb directly
-    // to slots 5/6 (Table 183 row "3/4/0.x" identity path).
-    bw.write_bit(false);
+    // 7.X SIMPLE/ASPX additional-channel block: b_use_sap_add_ch + the
+    // Table 183 quartet pair when any band is M/S-coded.
+    write_seven_x_add_ch_sap(&mut bw, &add_wire, max_sfb);
 
     // Additional `two_channel_data()` for Lb/Rb per Table 26. The shape
     // is `asf_transform_info() + asf_psy_info() + chparam_info() +

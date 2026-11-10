@@ -460,8 +460,10 @@ parses back to the authored rows.
   and live A-CPL entries; the decoder follows Tables 183 / 185 / 202
   and the Pseudocode 120 gains. ASPX_ACPL_1 keeps 21–28 dB waveform
   SNR on every channel of every layout. 7_X SIMPLE / ASPX render every
-  coding_config with the Table 183 additional-pair mix and, in ASPX
-  mode, all four A-SPX elements in the layout's Table 213 order.
+  coding_config with the Table 183 additional-pair mix (the SIMPLE
+  writer M/S-codes correlated additional channels against their base
+  pair) and, in ASPX mode, all four A-SPX elements in the layout's
+  Table 213 order.
 - **5.X ASPX_ACPL_3 with decoded-PCM parity** (round 461):
   `encode_frame_pcm_5_{0,1}_acpl3_real_aspx{,_with_max_sfb,_multi_env}`
   code the Pseudocode 118 downmix `x0 = (L + C/√2 + Ls/√2)/(1+√2)`,

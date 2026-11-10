@@ -73,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`encode_frame_pcm_7_0_aspx_real_aspx`) follows the layout's
   Table 213 order. The LFE of a 7_X ASPX element is aligned with the
   A-SPX round trip.
+- 7_X SIMPLE writers author the Table 183 additional-channel pairs:
+  bands where the additional channel compacts against its base pair
+  (`(D, E)` for 3/4/0, `(A, B)` for 5/2/0 / 3/2/2) are coded M/S with
+  `b_use_sap_add_ch = 1` and `ms_used` quartet rows on the core grid
+  (`encoder_asf::seven_x_add_ch_ms_wire`); correlated additional
+  channels decode at 25–27 dB waveform SNR on every layout.
 
 ### Fixed
 
