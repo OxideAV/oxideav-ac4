@@ -24,6 +24,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `acpl_qmf_band`, I + 3×P GOPs included
   (tests/round485_7_x_acpl1_table183_sap.rs). The `acpl_element` fuzz
   target drives SAP-coded 7.X ASPX_ACPL_1 elements under corruption.
+- §5.3.3 channel-data element matrices: the decoder applies the
+  `two_channel_data()` quartet (§5.3.3.2), the Table 178
+  `three_channel_data()` and Table 179 `five_channel_data()` matrices
+  (by `chel_matsel`) and the §5.3.3.4 four-track matrix to the decoded
+  tracks when it walks the element (was: identity regardless of the
+  coded `chparam_info()`), per window group and scale-factor band. The
+  SIMPLE / ASPX 5.X / 7.X writers code `(L, R)` / `(Ls, Rs)` as per-band
+  M/S where `4·E_M·E_S` is under half of `E_L·E_R`
+  (`encoder_asf::five_channel_ms_wire`); 26–28 dB waveform SNR on every
+  channel of correlated and independent 5.0 content
+  (tests/round485_channel_data_matrices.rs).
+
+### Fixed
+
+- `chparam_info()` inside a channel-data element is walked on every
+  window group of its `sf_info()` (was: the first group only, which
+  misparsed `ms_used` / `sap_data` on grouped short-block frames).
 
 ### Changed
 

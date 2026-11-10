@@ -96,6 +96,15 @@ an S16 `AudioFrame`:
   via the Pseudocode-89 high-band walk) — and wires it into the live 5_X
   ASPX_ACPL_3 frame path (`aspx_tna_select` + the `_tna` body writers),
   replacing the all-zero inverse-filtering scaffold.
+- **Channel-data matrices** (§5.3.3.2 – §5.3.3.5): every
+  `two/three/four/five_channel_data()` element's tracks go through the
+  matrix its own `chparam_info()` quartets select — the `chel_matsel`
+  Tables 178 / 179 for three / five tracks, the four-track product
+  matrix — per window group and scale-factor band, so M/S and
+  SAP-coded multichannel bodies decode to the right channels. The
+  SIMPLE / ASPX 5.X / 7.X writers code the `(L, R)` / `(Ls, Rs)` pairs
+  of their `five_channel_data()` as per-band M/S where the energy
+  compacts (`encoder_asf::five_channel_ms_wire`).
 - **A-CPL** channel-pair coupling — ASPX_ACPL_1 / _2 (Pseudocode 117)
   and ASPX_ACPL_3 (Pseudocode 118) synthesis producing 5-channel
   L/R/C/Ls/Rs PCM, plus the 7.X (7.0 / 7.1) walker.

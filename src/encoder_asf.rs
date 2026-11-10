@@ -1754,6 +1754,107 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
     finish_substream_body(bw)
 }
 
+/// `five_channel_data()` wire tracks + `five_channel_info()` an
+/// encoder emits for the `[L, R, C, Ls, Rs]` order (see
+/// [`five_channel_ms_wire`]).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct FiveChannelWire {
+    /// The five `sf_data(ASF)` tracks `I0..I4` in bitstream order.
+    pub tracks: [Vec<f32>; 5],
+    /// `chel_matsel` (Table 179 row).
+    pub chel_matsel: u8,
+    /// The five `chparam_info()` elements.
+    pub chparam: [crate::asf::ChparamInfo; 5],
+}
+
+/// Per-band M/S decision for the `(L, R)` and `(Ls, Rs)` pairs of a
+/// `five_channel_data()` element (TS 103 190-1 §5.3.3.5).
+///
+/// `chel_matsel = 0` with identity quartets 1, 3 and 4 reduces Table
+/// 179 to two independent 2×2 stages: quartet 0 on `(I0, I1)` →
+/// `(O0, O1)` and quartet 2 on `(I3, I4)` → `(O3, O4)`, `O2 = I2`.
+/// A band takes the M/S quartet `(1, 1, 1, −1)` (Pseudocode 59,
+/// `ms_used = 1`) with wire `I0 = (L + R)/2`, `I1 = (L − R)/2` when
+/// that compacts the pair's energy: the decoder's `O = I0 ± I1` doubles
+/// the wire quantisation noise, so M/S pays when
+/// `4·E_M·E_S < E_L·E_R` — the encoder requires a 2× margin on top.
+/// Bands without a win stay L/R (`ms_used = 0`); a pair with no M/S
+/// band keeps `sap_mode = 0`, all-M/S pairs use `sap_mode = 2`.
+#[doc(hidden)]
+pub fn five_channel_ms_wire(
+    transform_length: u32,
+    max_sfb: u32,
+    coeffs: [&[f32]; 5],
+) -> FiveChannelWire {
+    let none = crate::asf::build_chparam_info_none;
+    let mut tracks: [Vec<f32>; 5] = std::array::from_fn(|i| coeffs[i].to_vec());
+    let mut chparam: [crate::asf::ChparamInfo; 5] = std::array::from_fn(|_| none());
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+        return FiveChannelWire {
+            tracks,
+            chel_matsel: 0,
+            chparam,
+        };
+    };
+    let max_sfb = (max_sfb as usize).min(sfbo.len().saturating_sub(1));
+    for (slot, (x, y)) in [(0usize, (0usize, 1usize)), (2, (3, 4))] {
+        let mut used = vec![false; max_sfb];
+        for (sfb, flag) in used.iter_mut().enumerate() {
+            let lo = sfbo[sfb] as usize;
+            let hi = (sfbo[sfb + 1] as usize)
+                .min(tracks[x].len())
+                .min(tracks[y].len());
+            if hi <= lo {
+                continue;
+            }
+            let (head, tail) = tracks.split_at_mut(y);
+            let (bl, br) = (&mut head[x][lo..hi], &mut tail[0][lo..hi]);
+            let (mut el, mut er, mut em, mut es) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (&l, &r) in bl.iter().zip(br.iter()) {
+                let (l, r) = (l as f64, r as f64);
+                el += l * l;
+                er += r * r;
+                em += 0.25 * (l + r) * (l + r);
+                es += 0.25 * (l - r) * (l - r);
+            }
+            if el > 0.0 && er > 0.0 && 8.0 * em * es < el * er {
+                *flag = true;
+                for (l, r) in bl.iter_mut().zip(br.iter_mut()) {
+                    let (lv, rv) = (*l, *r);
+                    *l = 0.5 * (lv + rv);
+                    *r = 0.5 * (lv - rv);
+                }
+            }
+        }
+        chparam[slot] = if used.iter().all(|&u| u) && max_sfb > 0 {
+            crate::asf::ChparamInfo {
+                sap_mode: 2,
+                ms_used: vec![],
+                sap_data: None,
+            }
+        } else if used.iter().any(|&u| u) {
+            crate::asf::build_chparam_info_ms_used(vec![used])
+        } else {
+            none()
+        };
+    }
+    FiveChannelWire {
+        tracks,
+        chel_matsel: 0,
+        chparam,
+    }
+}
+
+/// `five_channel_info()` per Table 32 for an authored
+/// [`FiveChannelWire`] on a single-window-group `sf_info`.
+fn write_five_channel_info(bw: &mut BitWriter, wire: &FiveChannelWire, max_sfb: u32) {
+    bw.write_u32(wire.chel_matsel as u32, 4);
+    for cp in &wire.chparam {
+        write_chparam_info(bw, cp, &[max_sfb]);
+    }
+}
+
 /// Build the full 5.0 SIMPLE/ASF substream body for the long-frame
 /// single-window-group case in **5_X_codec_mode = SIMPLE / coding_config =
 /// Cfg3Five** form per ETSI TS 103 190-1 §4.2.6.6 Table 25 row `case SIMPLE:
@@ -1849,12 +1950,25 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
 
+    // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
+    // (Ls, Rs) pairs where it compacts the energy.
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            coeffs_per_channel[0],
+            coeffs_per_channel[1],
+            coeffs_per_channel[2],
+            coeffs_per_channel[3],
+            coeffs_per_channel[4],
+        ],
+    );
     let analyses: [FiveZeroChannelAnalysis; 5] = [
-        prepare_channel(coeffs_per_channel[0]),
-        prepare_channel(coeffs_per_channel[1]),
-        prepare_channel(coeffs_per_channel[2]),
-        prepare_channel(coeffs_per_channel[3]),
-        prepare_channel(coeffs_per_channel[4]),
+        prepare_channel(&five_wire.tracks[0]),
+        prepare_channel(&five_wire.tracks[1]),
+        prepare_channel(&five_wire.tracks[2]),
+        prepare_channel(&five_wire.tracks[3]),
+        prepare_channel(&five_wire.tracks[4]),
     ];
 
     let mut bw = BitWriter::new();
@@ -1882,15 +1996,9 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     bw.write_u32(max_sfb, n_msfb_bits);
 
-    // five_channel_info() per Table 32: 4-bit chel_matsel + 5x chparam_info().
-    // chel_matsel = 0 — no channel-element matrix mixing (each channel is
-    // its own independent SCE).
-    bw.write_u32(0, 4);
-    // 5x chparam_info() with sap_mode = 0 each: no ms_used follow-on, no
-    // sap_data follow-on. Each chparam_info emits just the 2-bit sap_mode.
-    for _ in 0..5 {
-        bw.write_u32(0, 2);
-    }
+    // five_channel_info() per Table 32: chel_matsel = 0 + the per-band
+    // M/S chparam_info() rows of `five_wire`.
+    write_five_channel_info(&mut bw, &five_wire, max_sfb);
 
     // 5x sf_data(ASF) bodies — one per output channel in L/R/C/Ls/Rs order.
     for analysis in &analyses {
@@ -1988,12 +2096,25 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
     };
 
     // Five non-LFE channel analyses (L/R/C/Ls/Rs) at the shared max_sfb.
+    // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
+    // (Ls, Rs) pairs where it compacts the energy.
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            coeffs_per_channel[0],
+            coeffs_per_channel[1],
+            coeffs_per_channel[2],
+            coeffs_per_channel[3],
+            coeffs_per_channel[4],
+        ],
+    );
     let analyses: [FiveOneChannelAnalysis; 5] = [
-        prepare_channel(coeffs_per_channel[0], max_sfb),
-        prepare_channel(coeffs_per_channel[1], max_sfb),
-        prepare_channel(coeffs_per_channel[2], max_sfb),
-        prepare_channel(coeffs_per_channel[3], max_sfb),
-        prepare_channel(coeffs_per_channel[4], max_sfb),
+        prepare_channel(&five_wire.tracks[0], max_sfb),
+        prepare_channel(&five_wire.tracks[1], max_sfb),
+        prepare_channel(&five_wire.tracks[2], max_sfb),
+        prepare_channel(&five_wire.tracks[3], max_sfb),
+        prepare_channel(&five_wire.tracks[4], max_sfb),
     ];
     // LFE analysis at max_sfb_lfe — Table 106 column 4 caps this to a
     // smaller range than the regular max_sfb.
@@ -2061,10 +2182,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
     bw.write_u32(max_sfb, n_msfb_bits);
 
     // five_channel_info() per Table 32: 4-bit chel_matsel + 5x chparam_info().
-    bw.write_u32(0, 4);
-    for _ in 0..5 {
-        bw.write_u32(0, 2);
-    }
+    write_five_channel_info(&mut bw, &five_wire, max_sfb);
 
     // 5x sf_data(ASF) bodies — one per non-LFE output channel.
     for analysis in &analyses {
@@ -2171,12 +2289,25 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     };
 
     // Five front/surround (L/R/C/Ls/Rs) at the shared max_sfb.
+    // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
+    // (Ls, Rs) pairs where it compacts the energy.
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            coeffs_per_channel[0],
+            coeffs_per_channel[1],
+            coeffs_per_channel[2],
+            coeffs_per_channel[3],
+            coeffs_per_channel[4],
+        ],
+    );
     let analyses_five: [SevenZeroChannelAnalysis; 5] = [
-        prepare_channel(coeffs_per_channel[0], max_sfb),
-        prepare_channel(coeffs_per_channel[1], max_sfb),
-        prepare_channel(coeffs_per_channel[2], max_sfb),
-        prepare_channel(coeffs_per_channel[3], max_sfb),
-        prepare_channel(coeffs_per_channel[4], max_sfb),
+        prepare_channel(&five_wire.tracks[0], max_sfb),
+        prepare_channel(&five_wire.tracks[1], max_sfb),
+        prepare_channel(&five_wire.tracks[2], max_sfb),
+        prepare_channel(&five_wire.tracks[3], max_sfb),
+        prepare_channel(&five_wire.tracks[4], max_sfb),
     ];
     // Additional pair (Lb/Rb) at its own max_sfb_add.
     let analyses_add: [SevenZeroChannelAnalysis; 2] = [
@@ -2214,12 +2345,9 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     // asf_psy_info(ASF, b_dual_maxsfb=0, b_side_limited=0):
     //   max_sfb[0] in n_msfb_bits bits — shared across all 5 SCEs.
     bw.write_u32(max_sfb, n_msfb_bits);
-    // five_channel_info() per Table 32: 4-bit chel_matsel + 5x
-    // chparam_info(sap_mode=0). Identity SAP → no joint-MDCT mixing.
-    bw.write_u32(0, 4);
-    for _ in 0..5 {
-        bw.write_u32(0, 2);
-    }
+    // five_channel_info() per Table 32: chel_matsel = 0 + the per-band
+    // M/S chparam_info() rows of `five_wire`.
+    write_five_channel_info(&mut bw, &five_wire, max_sfb);
     // 5x sf_data(ASF) bodies — one per L/R/C/Ls/Rs SCE.
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
@@ -2383,12 +2511,25 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
 
+    // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
+    // (Ls, Rs) pairs where it compacts the energy.
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            coeffs_per_channel[0],
+            coeffs_per_channel[1],
+            coeffs_per_channel[2],
+            coeffs_per_channel[3],
+            coeffs_per_channel[4],
+        ],
+    );
     let analyses_five: [SevenZeroChannelAnalysis; 5] = [
-        prepare_channel(coeffs_per_channel[0], max_sfb),
-        prepare_channel(coeffs_per_channel[1], max_sfb),
-        prepare_channel(coeffs_per_channel[2], max_sfb),
-        prepare_channel(coeffs_per_channel[3], max_sfb),
-        prepare_channel(coeffs_per_channel[4], max_sfb),
+        prepare_channel(&five_wire.tracks[0], max_sfb),
+        prepare_channel(&five_wire.tracks[1], max_sfb),
+        prepare_channel(&five_wire.tracks[2], max_sfb),
+        prepare_channel(&five_wire.tracks[3], max_sfb),
+        prepare_channel(&five_wire.tracks[4], max_sfb),
     ];
     let analyses_add: [SevenZeroChannelAnalysis; 2] = [
         prepare_channel(coeffs_per_channel[5], max_sfb_add),
@@ -2419,10 +2560,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
     // five_channel_data() per Table 29.
     bw.write_bit(true);
     bw.write_u32(max_sfb, n_msfb_bits);
-    bw.write_u32(0, 4);
-    for _ in 0..5 {
-        bw.write_u32(0, 2);
-    }
+    write_five_channel_info(&mut bw, &five_wire, max_sfb);
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
         write_section_data(&mut bw, sections);
@@ -2632,12 +2770,25 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
 
+    // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
+    // (Ls, Rs) pairs where it compacts the energy.
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            coeffs_per_channel[0],
+            coeffs_per_channel[1],
+            coeffs_per_channel[2],
+            coeffs_per_channel[3],
+            coeffs_per_channel[4],
+        ],
+    );
     let analyses_five: [SevenZeroChannelAnalysis; 5] = [
-        prepare_channel(coeffs_per_channel[0], max_sfb),
-        prepare_channel(coeffs_per_channel[1], max_sfb),
-        prepare_channel(coeffs_per_channel[2], max_sfb),
-        prepare_channel(coeffs_per_channel[3], max_sfb),
-        prepare_channel(coeffs_per_channel[4], max_sfb),
+        prepare_channel(&five_wire.tracks[0], max_sfb),
+        prepare_channel(&five_wire.tracks[1], max_sfb),
+        prepare_channel(&five_wire.tracks[2], max_sfb),
+        prepare_channel(&five_wire.tracks[3], max_sfb),
+        prepare_channel(&five_wire.tracks[4], max_sfb),
     ];
     let analyses_add: [SevenZeroChannelAnalysis; 2] = [
         prepare_channel(coeffs_per_channel[5], max_sfb_add),
@@ -2668,10 +2819,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
     // five_channel_data() per Table 29.
     bw.write_bit(true);
     bw.write_u32(max_sfb, n_msfb_bits);
-    bw.write_u32(0, 4);
-    for _ in 0..5 {
-        bw.write_u32(0, 2);
-    }
+    write_five_channel_info(&mut bw, &five_wire, max_sfb);
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
         write_section_data(&mut bw, sections);
@@ -2870,12 +3018,25 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     };
 
     // Five front/surround (L/R/C/Ls/Rs) at the shared max_sfb.
+    // §5.3.3.5 five_channel_data(): per-band M/S on the (L, R) /
+    // (Ls, Rs) pairs where it compacts the energy.
+    let five_wire = five_channel_ms_wire(
+        transform_length,
+        max_sfb,
+        [
+            coeffs_per_channel[0],
+            coeffs_per_channel[1],
+            coeffs_per_channel[2],
+            coeffs_per_channel[3],
+            coeffs_per_channel[4],
+        ],
+    );
     let analyses_five: [SevenOneChannelAnalysis; 5] = [
-        prepare_channel(coeffs_per_channel[0], max_sfb),
-        prepare_channel(coeffs_per_channel[1], max_sfb),
-        prepare_channel(coeffs_per_channel[2], max_sfb),
-        prepare_channel(coeffs_per_channel[3], max_sfb),
-        prepare_channel(coeffs_per_channel[4], max_sfb),
+        prepare_channel(&five_wire.tracks[0], max_sfb),
+        prepare_channel(&five_wire.tracks[1], max_sfb),
+        prepare_channel(&five_wire.tracks[2], max_sfb),
+        prepare_channel(&five_wire.tracks[3], max_sfb),
+        prepare_channel(&five_wire.tracks[4], max_sfb),
     ];
     // Additional pair (Lb/Rb) at its own max_sfb_add.
     let analyses_add: [SevenOneChannelAnalysis; 2] = [
@@ -2944,12 +3105,9 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // asf_psy_info(ASF, b_dual_maxsfb=0, b_side_limited=0):
     //   max_sfb[0] in n_msfb_bits bits — shared across all 5 SCEs.
     bw.write_u32(max_sfb, n_msfb_bits);
-    // five_channel_info() per Table 32: 4-bit chel_matsel + 5x
-    // chparam_info(sap_mode=0). Identity SAP → no joint-MDCT mixing.
-    bw.write_u32(0, 4);
-    for _ in 0..5 {
-        bw.write_u32(0, 2);
-    }
+    // five_channel_info() per Table 32: chel_matsel = 0 + the per-band
+    // M/S chparam_info() rows of `five_wire`.
+    write_five_channel_info(&mut bw, &five_wire, max_sfb);
     // 5x sf_data(ASF) bodies — one per L/R/C/Ls/Rs SCE.
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;

@@ -341,9 +341,9 @@ pub fn parse_two_channel_data(
 ) -> Result<TwoChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let chparam = parse_chparam_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+    let chparam = parse_chparam_info(br, &shared_sf_info_grid(&psy))?;
+    let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+    apply_channel_data_matrix(&mut scaled, &ti, &psy, ChannelDataMatrix::Two(&chparam));
     Ok(TwoChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
@@ -409,9 +409,14 @@ pub fn parse_three_channel_data(
 ) -> Result<ThreeChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_three_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 3);
+    let info = parse_three_channel_info(br, &shared_sf_info_grid(&psy))?;
+    let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 3);
+    apply_channel_data_matrix(
+        &mut scaled,
+        &ti,
+        &psy,
+        ChannelDataMatrix::Three(info.chel_matsel, &info.chparam),
+    );
     Ok(ThreeChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
@@ -427,9 +432,14 @@ pub fn parse_four_channel_data(
 ) -> Result<FourChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_four_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 4);
+    let info = parse_four_channel_info(br, &shared_sf_info_grid(&psy))?;
+    let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 4);
+    apply_channel_data_matrix(
+        &mut scaled,
+        &ti,
+        &psy,
+        ChannelDataMatrix::Four(&info.chparam),
+    );
     Ok(FourChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
@@ -445,9 +455,14 @@ pub fn parse_five_channel_data(
 ) -> Result<FiveChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_five_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 5);
+    let info = parse_five_channel_info(br, &shared_sf_info_grid(&psy))?;
+    let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 5);
+    apply_channel_data_matrix(
+        &mut scaled,
+        &ti,
+        &psy,
+        ChannelDataMatrix::Five(info.chel_matsel, &info.chparam),
+    );
     Ok(FiveChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
@@ -520,6 +535,266 @@ pub(crate) fn decode_mch_sf_data_channels(
         }
     }
     out
+}
+
+// =====================================================================
+// §5.3.3 channel-data element matrices
+// =====================================================================
+
+/// The `get_max_sfb(g)` grid a channel-data element's `chparam_info()`
+/// elements are walked on (Table 47's per-window-group loop): every
+/// channel-data element invokes `sf_info(ASF, 0, 0)`, so Pseudocode 5
+/// returns `max_sfb[0]` for each of the `num_window_groups` groups.
+fn shared_sf_info_grid(psy: &AsfPsyInfo) -> Vec<u32> {
+    vec![psy.max_sfb_0; psy.num_window_groups.max(1) as usize]
+}
+
+/// Per-(g, sfb) SAP quartet `(a, b, c, d)` of one `chparam_info()`.
+type Quartet = (f32, f32, f32, f32);
+
+/// TS 103 190-1 §5.3.3.3 **Table 178** — the `three_channel_data()`
+/// transform matrix for `chel_matsel` 0..=11 built from the quartets
+/// `p0 = (a0, b0, c0, d0)` and `p1 = (a1, b1, c1, d1)`. `None` for the
+/// codes 12..=15 Table 178 does not define.
+#[doc(hidden)]
+pub fn table_178_matrix(chel_matsel: u8, p0: Quartet, p1: Quartet) -> Option<[[f32; 3]; 3]> {
+    let (a0, b0, c0, d0) = p0;
+    let (a1, b1, c1, d1) = p1;
+    Some(match chel_matsel {
+        0 => [
+            [a0 * a1, b0 * a1, b1],
+            [c0, d0, 0.0],
+            [a0 * c1, b0 * c1, d1],
+        ],
+        1 => [
+            [d0, c0, 0.0],
+            [b0 * a1, a0 * a1, b1],
+            [b0 * c1, a0 * c1, d1],
+        ],
+        2 => [
+            [a0 * a1, b1, b0 * a1],
+            [a0 * c1, d1, b0 * c1],
+            [c0, 0.0, d0],
+        ],
+        3 => [
+            [a1, c0 * b1, d0 * b1],
+            [0.0, a0, b0],
+            [c1, c0 * d1, d0 * d1],
+        ],
+        4 => [
+            [a0, 0.0, b0],
+            [c0 * b1, a1, d0 * b1],
+            [c0 * d1, c1, d0 * d1],
+        ],
+        5 => [
+            [a1, d0 * b1, c0 * b1],
+            [c1, d0 * d1, c0 * d1],
+            [0.0, b0, a0],
+        ],
+        6 => [
+            [d0 * d1, c0 * d1, c1],
+            [b0, a0, 0.0],
+            [d0 * b1, c0 * b1, a1],
+        ],
+        7 => [
+            [a0, b0, 0.0],
+            [c0 * d1, d0 * d1, c1],
+            [c0 * b1, d0 * b1, a1],
+        ],
+        8 => [
+            [d0 * d1, c1, c0 * d1],
+            [d0 * b1, a1, c0 * b1],
+            [b0, 0.0, a0],
+        ],
+        9 => [
+            [d1, b0 * c1, a0 * c1],
+            [0.0, d0, c0],
+            [b1, b0 * a1, a0 * a1],
+        ],
+        10 => [
+            [d0, 0.0, c0],
+            [b0 * c1, d1, a0 * c1],
+            [b0 * a1, b1, a0 * a1],
+        ],
+        11 => [
+            [d1, a0 * c1, b0 * c1],
+            [b1, a0 * a1, b0 * a1],
+            [0.0, c0, d0],
+        ],
+        _ => return None,
+    })
+}
+
+/// TS 103 190-1 §5.3.3.5 **Table 179** — the `five_channel_data()`
+/// transform matrix. Every Table 179 entry factors as the Table 178
+/// matrix of the same `chel_matsel` on `(I0, I1, I2)` (quartets 0 and
+/// 1) whose rows 0 / 1 are then paired by quartets 3 / 4 with the two
+/// outputs of quartet 2 applied to `(I3, I4)`:
+///
+/// ```text
+///   row 0 = a3·R0 | a2·b3  b2·b3        row 3 = c3·R0 | a2·d3  b2·d3
+///   row 1 = a4·R1 | c2·b4  d2·b4        row 4 = c4·R1 | c2·d4  d2·d4
+///   row 2 =    R2 |   0      0
+/// ```
+///
+/// (`R0..R2` = the Table 178 rows). The factorisation is checked
+/// entry-by-entry against literal Table 179 transcriptions in the
+/// unit tests.
+#[doc(hidden)]
+pub fn table_179_matrix(chel_matsel: u8, p: &[Quartet; 5]) -> Option<[[f32; 5]; 5]> {
+    let r = table_178_matrix(chel_matsel, p[0], p[1])?;
+    let (a2, b2, c2, d2) = p[2];
+    let (a3, b3, c3, d3) = p[3];
+    let (a4, b4, c4, d4) = p[4];
+    Some([
+        [a3 * r[0][0], a3 * r[0][1], a3 * r[0][2], a2 * b3, b2 * b3],
+        [a4 * r[1][0], a4 * r[1][1], a4 * r[1][2], c2 * b4, d2 * b4],
+        [r[2][0], r[2][1], r[2][2], 0.0, 0.0],
+        [c3 * r[0][0], c3 * r[0][1], c3 * r[0][2], a2 * d3, b2 * d3],
+        [c4 * r[1][0], c4 * r[1][1], c4 * r[1][2], c2 * d4, d2 * d4],
+    ])
+}
+
+/// TS 103 190-1 §5.3.3.4 — the `four_channel_data()` transform matrix
+/// from the four quartets.
+#[doc(hidden)]
+pub fn four_channel_matrix(p: &[Quartet; 4]) -> [[f32; 4]; 4] {
+    let (a0, b0, c0, d0) = p[0];
+    let (a1, b1, c1, d1) = p[1];
+    let (a2, b2, c2, d2) = p[2];
+    let (a3, b3, c3, d3) = p[3];
+    [
+        [a0 * a2, b0 * a2, a1 * b2, b1 * b2],
+        [c0 * a3, d0 * a3, c1 * b3, d1 * b3],
+        [a0 * c2, b0 * c2, a1 * d2, b1 * d2],
+        [c0 * c3, d0 * c3, c1 * d3, d1 * d3],
+    ]
+}
+
+/// Which §5.3.3 matrix a channel-data element applies.
+#[derive(Clone, Copy)]
+enum ChannelDataMatrix<'a> {
+    Two(&'a ChparamInfo),
+    Three(u8, &'a [ChparamInfo; 2]),
+    Four(&'a [ChparamInfo; 4]),
+    Five(u8, &'a [ChparamInfo; 5]),
+}
+
+/// Apply the §5.3.3.2 – §5.3.3.5 channel-data matrix in place: the
+/// decoded tracks `I0..In` become the outputs `O0..On`, per window
+/// group and scale-factor band, with the quartets each
+/// `chparam_info()` resolves to (§5.3.2 Pseudocode 59). The tracks
+/// share one `sf_info` (§5.3.3.0), so every quartet is keyed on the
+/// same `(num_window_groups, max_sfb)` grid; the spectra are the
+/// group-major concatenation [`decode_mch_sf_data_channels`] produces.
+///
+/// A track that failed to decode leaves the element untouched (the
+/// matrix needs every input), as does a `chel_matsel` outside
+/// Tables 178 / 179.
+fn apply_channel_data_matrix(
+    tracks: &mut [Option<Vec<f32>>],
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+    which: ChannelDataMatrix<'_>,
+) {
+    let n = tracks.len();
+    if n < 2 || tracks.iter().any(|t| t.is_none()) {
+        return;
+    }
+    let groups = psy.num_window_groups.max(1) as usize;
+    let tl = ti.transform_length_0;
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else {
+        return;
+    };
+    let Some(cap) = crate::tables::num_sfb_48(tl) else {
+        return;
+    };
+    let max_sfb = psy.max_sfb_0.min(cap) as usize;
+    if max_sfb == 0 {
+        return;
+    }
+    let per_group = sfbo[max_sfb] as usize;
+    if tracks
+        .iter()
+        .any(|t| t.as_ref().map(|v| v.len()).unwrap_or(0) < per_group * groups)
+    {
+        return;
+    }
+    let grid = vec![max_sfb as u32; groups];
+    let quartets = |cp: &ChparamInfo| crate::asf::extract_sap_abcd(cp, &grid).abcd;
+    let rows: Vec<Vec<Vec<Quartet>>> = match which {
+        ChannelDataMatrix::Two(cp) => vec![quartets(cp)],
+        ChannelDataMatrix::Three(_, cps) => cps.iter().map(quartets).collect(),
+        ChannelDataMatrix::Four(cps) => cps.iter().map(quartets).collect(),
+        ChannelDataMatrix::Five(_, cps) => cps.iter().map(quartets).collect(),
+    };
+    let identity: Quartet = (1.0, 0.0, 0.0, 1.0);
+    let q = |i: usize, g: usize, sfb: usize| -> Quartet {
+        rows.get(i)
+            .and_then(|r| r.get(g))
+            .and_then(|r| r.get(sfb))
+            .copied()
+            .unwrap_or(identity)
+    };
+    let mut x = [0.0f32; 5];
+    for g in 0..groups {
+        for sfb in 0..max_sfb {
+            // Build this tile's matrix (row-major, n × n).
+            let mut m = [[0.0f32; 5]; 5];
+            match which {
+                ChannelDataMatrix::Two(_) => {
+                    let (a, b, c, d) = q(0, g, sfb);
+                    m[0][..2].copy_from_slice(&[a, b]);
+                    m[1][..2].copy_from_slice(&[c, d]);
+                }
+                ChannelDataMatrix::Three(sel, _) => {
+                    let Some(t) = table_178_matrix(sel, q(0, g, sfb), q(1, g, sfb)) else {
+                        return;
+                    };
+                    for (dst, src) in m.iter_mut().zip(t.iter()) {
+                        dst[..3].copy_from_slice(src);
+                    }
+                }
+                ChannelDataMatrix::Four(_) => {
+                    let t = four_channel_matrix(&[
+                        q(0, g, sfb),
+                        q(1, g, sfb),
+                        q(2, g, sfb),
+                        q(3, g, sfb),
+                    ]);
+                    for (dst, src) in m.iter_mut().zip(t.iter()) {
+                        dst[..4].copy_from_slice(src);
+                    }
+                }
+                ChannelDataMatrix::Five(sel, _) => {
+                    let p = [
+                        q(0, g, sfb),
+                        q(1, g, sfb),
+                        q(2, g, sfb),
+                        q(3, g, sfb),
+                        q(4, g, sfb),
+                    ];
+                    let Some(t) = table_179_matrix(sel, &p) else {
+                        return;
+                    };
+                    m = t;
+                }
+            }
+            let lo = g * per_group + sfbo[sfb] as usize;
+            let hi = g * per_group + sfbo[sfb + 1] as usize;
+            for k in lo..hi {
+                for (i, t) in tracks.iter().enumerate() {
+                    x[i] = t.as_ref().map(|v| v[k]).unwrap_or(0.0);
+                }
+                for (o, t) in tracks.iter_mut().enumerate() {
+                    let y: f32 = (0..n).map(|i| m[o][i] * x[i]).sum();
+                    if let Some(v) = t.as_mut() {
+                        v[k] = y;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Walk one `sf_data(ASF)` body for the grouped / short-frame case
@@ -3452,5 +3727,175 @@ mod tests {
         // I-frame-only fields (15-bit aspx_config + 3 × 3-bit xover) —
         // every payload's envelope band count followed its own offset.
         assert_eq!(i_bits - br.bit_position(), 15 + 9, "P-frame bit budget");
+    }
+
+    // ---------------------------------------------------------------
+    // §5.3.3 channel-data matrices (Tables 178 / 179, §5.3.3.4)
+    // ---------------------------------------------------------------
+
+    /// Deterministic pseudo-random quartets for the matrix checks.
+    fn quartets(seed: u32) -> [(f32, f32, f32, f32); 5] {
+        let mut x = seed.wrapping_mul(2_654_435_761).max(1);
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x % 2000) as f32 / 1000.0 - 1.0
+        };
+        std::array::from_fn(|_| (next(), next(), next(), next()))
+    }
+
+    fn det3(m: &[[f32; 3]; 3]) -> f32 {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    }
+
+    /// Identity quartets make every Table 178 matrix the identity —
+    /// the transcription keeps each output on its own input track
+    /// when no SAP is coded.
+    #[test]
+    fn table_178_identity_quartets_give_identity() {
+        let id = (1.0, 0.0, 0.0, 1.0);
+        for sel in 0..12u8 {
+            let m = table_178_matrix(sel, id, id).unwrap();
+            for (r, row) in m.iter().enumerate() {
+                for (c, &v) in row.iter().enumerate() {
+                    let want = if r == c { 1.0 } else { 0.0 };
+                    assert_eq!(v, want, "chel_matsel {sel} [{r}][{c}]");
+                }
+            }
+        }
+        assert!(table_178_matrix(12, id, id).is_none());
+        assert!(table_178_matrix(15, id, id).is_none());
+    }
+
+    /// Each Table 178 matrix is two cascaded 2×2 stages, so its
+    /// determinant is ± det(p0)·det(p1) — a check that catches a
+    /// mistranscribed entry.
+    #[test]
+    fn table_178_determinant_factors_into_the_two_stages() {
+        for seed in 1..20u32 {
+            let p = quartets(seed);
+            let det = |q: (f32, f32, f32, f32)| q.0 * q.3 - q.1 * q.2;
+            let want = (det(p[0]) * det(p[1])).abs();
+            for sel in 0..12u8 {
+                let m = table_178_matrix(sel, p[0], p[1]).unwrap();
+                let got = det3(&m).abs();
+                assert!(
+                    (got - want).abs() <= 1e-4 * want.max(1.0),
+                    "chel_matsel {sel} seed {seed}: |det| {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// Table 179 rows for chel_matsel 0, 6 and 11 transcribed literally
+    /// against the structured builder.
+    #[test]
+    fn table_179_matches_literal_rows() {
+        let p = quartets(7);
+        let (a0, b0, c0, d0) = p[0];
+        let (a1, b1, c1, d1) = p[1];
+        let (a2, b2, c2, d2) = p[2];
+        let (a3, b3, c3, d3) = p[3];
+        let (a4, b4, c4, d4) = p[4];
+        let lit0 = [
+            [a0 * a1 * a3, b0 * a1 * a3, b1 * a3, a2 * b3, b2 * b3],
+            [c0 * a4, d0 * a4, 0.0, c2 * b4, d2 * b4],
+            [a0 * c1, b0 * c1, d1, 0.0, 0.0],
+            [a0 * a1 * c3, b0 * a1 * c3, b1 * c3, a2 * d3, b2 * d3],
+            [c0 * c4, d0 * c4, 0.0, c2 * d4, d2 * d4],
+        ];
+        let lit6 = [
+            [d0 * d1 * a3, c0 * d1 * a3, c1 * a3, a2 * b3, b2 * b3],
+            [b0 * a4, a0 * a4, 0.0, c2 * b4, d2 * b4],
+            [d0 * b1, c0 * b1, a1, 0.0, 0.0],
+            [d0 * d1 * c3, c0 * d1 * c3, c1 * c3, a2 * d3, b2 * d3],
+            [b0 * c4, a0 * c4, 0.0, c2 * d4, d2 * d4],
+        ];
+        let lit11 = [
+            [d1 * a3, a0 * c1 * a3, b0 * c1 * a3, a2 * b3, b2 * b3],
+            [b1 * a4, a0 * a1 * a4, b0 * a1 * a4, c2 * b4, d2 * b4],
+            [0.0, c0, d0, 0.0, 0.0],
+            [d1 * c3, a0 * c1 * c3, b0 * c1 * c3, a2 * d3, b2 * d3],
+            [b1 * c4, a0 * a1 * c4, b0 * a1 * c4, c2 * d4, d2 * d4],
+        ];
+        for (sel, lit) in [(0u8, lit0), (6, lit6), (11, lit11)] {
+            let m = table_179_matrix(sel, &p).unwrap();
+            for r in 0..5 {
+                for c in 0..5 {
+                    assert!(
+                        (m[r][c] - lit[r][c]).abs() < 1e-6,
+                        "chel_matsel {sel} [{r}][{c}]: {} vs {}",
+                        m[r][c],
+                        lit[r][c]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A two_channel_data() element with `sap_mode == 2` (M/S in every
+    /// band) decodes its tracks `(M, S)` to `(M + S, M − S)` — the
+    /// §5.3.3.2 matrix is applied at parse time.
+    #[test]
+    fn two_channel_data_applies_ms_all_matrix() {
+        let tl = 1920u32;
+        let max_sfb = 12u32;
+        let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
+        let n = sfbo[max_sfb as usize] as usize;
+        let m: Vec<f32> = (0..n).map(|k| ((k % 7) as f32 - 3.0) * 0.01).collect();
+        let sd: Vec<f32> = (0..n).map(|k| ((k % 5) as f32 - 2.0) * 0.004).collect();
+        let decode = |sap_mode: u32| {
+            let mut tracks = vec![Some(m.clone()), Some(sd.clone())];
+            let ti = AsfTransformInfo {
+                b_long_frame: true,
+                transf_length: [0, 0],
+                transform_length_0: tl,
+                transform_length_1: tl,
+            };
+            let psy = AsfPsyInfo {
+                max_sfb_0: max_sfb,
+                num_windows: 1,
+                num_window_groups: 1,
+                ..Default::default()
+            };
+            let cp = ChparamInfo {
+                sap_mode,
+                ms_used: vec![],
+                sap_data: None,
+            };
+            apply_channel_data_matrix(&mut tracks, &ti, &psy, ChannelDataMatrix::Two(&cp));
+            tracks
+        };
+        let out = decode(2);
+        let (o0, o1) = (out[0].as_ref().unwrap(), out[1].as_ref().unwrap());
+        for k in 0..n {
+            assert!((o0[k] - (m[k] + sd[k])).abs() < 1e-7);
+            assert!((o1[k] - (m[k] - sd[k])).abs() < 1e-7);
+        }
+        let out = decode(0);
+        assert_eq!(out[0].as_ref().unwrap(), &m);
+        assert_eq!(out[1].as_ref().unwrap(), &sd);
+    }
+
+    /// The §5.3.3.4 matrix with identity quartets is the identity and
+    /// with M/S quartets everywhere it is the 4-point butterfly.
+    #[test]
+    fn four_channel_matrix_identity_and_butterfly() {
+        let id = (1.0, 0.0, 0.0, 1.0);
+        let m = four_channel_matrix(&[id; 4]);
+        for (r, row) in m.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                assert_eq!(v, if r == c { 1.0 } else { 0.0 });
+            }
+        }
+        let ms = (1.0, 1.0, 1.0, -1.0);
+        let m = four_channel_matrix(&[ms; 4]);
+        assert_eq!(m[0], [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(m[1], [1.0, -1.0, 1.0, -1.0]);
+        assert_eq!(m[2], [1.0, 1.0, -1.0, -1.0]);
+        assert_eq!(m[3], [1.0, -1.0, -1.0, 1.0]);
     }
 }
