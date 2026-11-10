@@ -6991,6 +6991,157 @@ fn write_acpl_1_residual_layer_sap(
     max_sfb_master
 }
 
+/// The `max_sfb_master` value the ASPX_ACPL_1 residual-layer writers
+/// actually emit: at least 1 (the decoder bails on 0), at most the
+/// `n_side_bits` field width and the transform's band count.
+fn clamp_acpl1_max_sfb_master(transform_length: u32, max_sfb_master: u32) -> u32 {
+    let (_n_msfb, n_side, _n_msfbl) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    let num_sfb_cap = crate::tables::num_sfb_48(transform_length).expect("encoder: bad tl");
+    let n_side_cap = (1u32 << n_side) - 1;
+    max_sfb_master.clamp(1, num_sfb_cap.min(n_side_cap))
+}
+
+/// Wire tracks + `chparam_info()` pair a 7_X ASPX_ACPL_1 element
+/// carries for its Table 183 matrix (see
+/// [`author_7x_acpl1_table183_wire`]).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct SevenXAcpl1Table183Wire {
+    /// Wire `D` / `E` (the second `two_channel_data()` of Cfg0).
+    pub d: Vec<f32>,
+    pub e: Vec<f32>,
+    /// Wire `F` / `G` (the two bare `sf_data(ASF)` residual tracks).
+    pub f: Vec<f32>,
+    pub g: Vec<f32>,
+    /// The two `chparam_info()` elements after `max_sfb_master`.
+    pub chparam: [crate::asf::ChparamInfo; 2],
+    /// The `max_sfb_master` the residual layer announces.
+    pub max_sfb_master: u32,
+}
+
+/// Author the 7_X ASPX_ACPL_1 Table 183 stage (TS 103 190-1
+/// §5.3.4.4.2) from the preliminary tracks the A-CPL modules must see.
+///
+/// `x0_l` / `x0_r` are the desired Pseudocode 120 coupling carriers
+/// (`D`, `E` after Table 183 — Ls / Rs for 3/4/0.x) and `x3_l` /
+/// `x3_r` the desired back-channel sides (`F`, `G` after Table 183 —
+/// Lb / Rb residual). Under the errata-A5 reading in force
+/// ([`crate::asf::seven_x_acpl1_sap_authoring`]) the per-band SAP
+/// prediction gains are chosen by least squares
+/// ([`select_acpl1_residual_chparam_pair`], the same selector as the
+/// 5_X ASPX_ACPL_1 path) and the wire tracks are the Table 183 inverse
+/// ([`crate::asf::invert_sap_table_181`] — Table 183's 3/4/0.x rows
+/// are the same 2×2 system): on a SAP-coded band the wire is
+/// `(mid, g·mid − (x0 − x3)/2)`, elsewhere the targets pass through.
+/// Under Reading I the pair stays `sap_mode == 0` and the wire equals
+/// the targets.
+#[doc(hidden)]
+pub fn author_7x_acpl1_table183_wire(
+    transform_length: u32,
+    max_sfb_master: u32,
+    x0_l: &[f32],
+    x0_r: &[f32],
+    x3_l: &[f32],
+    x3_r: &[f32],
+) -> SevenXAcpl1Table183Wire {
+    let msm = clamp_acpl1_max_sfb_master(transform_length, max_sfb_master);
+    let n = transform_length as usize;
+    let pad = |src: &[f32]| -> Vec<f32> {
+        let mut v = vec![0.0f32; n];
+        let take = src.len().min(n);
+        v[..take].copy_from_slice(&src[..take]);
+        v
+    };
+    let (dl, dr, sl, sr) = (pad(x0_l), pad(x0_r), pad(x3_l), pad(x3_r));
+    let chparam = if crate::asf::seven_x_acpl1_sap_authoring() {
+        select_acpl1_residual_chparam_pair(&dl, &dr, &sl, &sr, msm, transform_length)
+    } else {
+        [
+            crate::asf::build_chparam_info_none(),
+            crate::asf::build_chparam_info_none(),
+        ]
+    };
+    let identity = chparam.iter().all(|c| c.sap_mode == 0);
+    let (d, e, f, g) = if identity {
+        (dl, dr, sl, sr)
+    } else {
+        match crate::asf::invert_sap_table_181(&dl, &dr, &sl, &sr, &chparam, msm, transform_length)
+        {
+            Some(w) => w,
+            None => (dl, dr, sl, sr),
+        }
+    };
+    // Above max_sfb_master the residual tracks are not coded at all
+    // (the sf_data bodies stop there); the decoder's fill is the
+    // identity quartet with a silent side.
+    SevenXAcpl1Table183Wire {
+        d,
+        e,
+        f,
+        g,
+        chparam,
+        max_sfb_master: msm,
+    }
+}
+
+/// Write the ASPX_ACPL_1 joint-MDCT residual layer of Table 25 / 33
+/// from already-authored wire tracks: `max_sfb_master`, the two
+/// `chparam_info()` elements, then the two `sf_data(ASF)` bodies.
+fn write_acpl_1_residual_layer_wire(
+    bw: &mut BitWriter,
+    transform_length: u32,
+    max_sfb_master: u32,
+    chparam: &[crate::asf::ChparamInfo; 2],
+    s3: &[f32],
+    s4: &[f32],
+) {
+    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+        .expect("encoder: unsupported transform_length");
+    let (_n_msfb, n_side, _n_msfbl) =
+        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    let msm = clamp_acpl1_max_sfb_master(transform_length, max_sfb_master);
+    bw.write_u32(msm, n_side);
+    let max_sfb_per_group = [msm];
+    crate::encoder_asf::write_chparam_info(bw, &chparam[0], &max_sfb_per_group);
+    crate::encoder_asf::write_chparam_info(bw, &chparam[1], &max_sfb_per_group);
+    for coeffs in [s3, s4] {
+        let (qspec, sf, max_q, sections, snf) = prepare_stereo_channel(coeffs, sfbo, msm);
+        write_section_data(bw, &sections);
+        write_spectral_data_sections(bw, &qspec, sfbo, &sections);
+        write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, msm);
+        write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, msm);
+    }
+}
+
+/// The 7_X ASPX_ACPL_1 Cfg0 surround pair + residual layer: the second
+/// `two_channel_data()` carries the authored wire `D` / `E`, the
+/// residual layer the wire `F` / `G` with the Table 183
+/// `chparam_info()` pair ([`author_7x_acpl1_table183_wire`]).
+#[allow(clippy::too_many_arguments)]
+fn write_7x_acpl1_surround_and_residual(
+    bw: &mut BitWriter,
+    transform_length: u32,
+    max_sfb: u32,
+    max_sfb_master: u32,
+    x0_l: &[f32],
+    x0_r: &[f32],
+    x3_l: &[f32],
+    x3_r: &[f32],
+) {
+    let wire =
+        author_7x_acpl1_table183_wire(transform_length, max_sfb_master, x0_l, x0_r, x3_l, x3_r);
+    write_two_channel_data(bw, transform_length, max_sfb, &wire.d, &wire.e);
+    write_acpl_1_residual_layer_wire(
+        bw,
+        transform_length,
+        wire.max_sfb_master,
+        &wire.chparam,
+        &wire.f,
+        &wire.g,
+    );
+}
+
 /// Build a 5_X SIMPLE/ASPX_ACPL_1 substream body per §4.2.6.6 Table 25
 /// row `case ASPX_ACPL_1:` that the decoder's
 /// [`crate::mch::parse_5x_audio_data_outer`] (with `mode = AspxAcpl1`)
@@ -10747,13 +10898,19 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta(
     // Cfg0: b_2ch_mode (1 b) + two_channel_data (L/R) + two_channel_data (Ls/Rs).
     bw.write_bit(false); // b_2ch_mode = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
-    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
-
-    // ASPX_ACPL_1-only joint-MDCT residual layer: Ls/Rs surround residual.
-    // Table 33 ASPX_ACPL_1 residual layer: the back-channel sides
-    // [F, G] (Pseudocode 120 x3 / x4), mid/side-combined with the
-    // [D, E] carriers below acpl_qmf_band (identity chparam SAP).
-    write_acpl_1_residual_layer(&mut bw, transform_length, max_sfb_master, side_ls, side_rs);
+    // Table 33 ASPX_ACPL_1: the [D, E] carriers + the back-channel
+    // sides [F, G] (Pseudocode 120 x3 / x4) through the Table 183 stage
+    // (errata A5 reading — SAP-predicted where it pays).
+    write_7x_acpl1_surround_and_residual(
+        &mut bw,
+        transform_length,
+        max_sfb,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+        side_ls,
+        side_rs,
+    );
 
     // Trailing Cfg0 mono_data(0) — centre carrier.
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
@@ -10909,12 +11066,19 @@ pub fn build_7_x_acpl1_body_from_pcm_spectra_real_alpha_beta_real_aspx_tna(
     bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
     bw.write_bit(false); // b_2ch_mode = 0
     write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_l, coeffs_r);
-    write_two_channel_data(&mut bw, transform_length, max_sfb, coeffs_ls, coeffs_rs);
-
-    // Table 33 ASPX_ACPL_1 residual layer: the back-channel sides
-    // [F, G] (Pseudocode 120 x3 / x4), mid/side-combined with the
-    // [D, E] carriers below acpl_qmf_band (identity chparam SAP).
-    write_acpl_1_residual_layer(&mut bw, transform_length, max_sfb_master, side_ls, side_rs);
+    // Table 33 ASPX_ACPL_1: the [D, E] carriers + the back-channel
+    // sides [F, G] (Pseudocode 120 x3 / x4) through the Table 183 stage
+    // (errata A5 reading — SAP-predicted where it pays).
+    write_7x_acpl1_surround_and_residual(
+        &mut bw,
+        transform_length,
+        max_sfb,
+        max_sfb_master,
+        coeffs_ls,
+        coeffs_rs,
+        side_ls,
+        side_rs,
+    );
 
     write_mono_data_centre(&mut bw, transform_length, max_sfb, coeffs_c);
 

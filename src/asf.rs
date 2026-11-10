@@ -890,6 +890,80 @@ pub fn invert_sap_table_181(
 }
 
 // ====================================================================
+// 7_X ASPX_ACPL_1 — where Table 183's (a, b, c, d) come from
+// ====================================================================
+
+/// Source of the Table 183 `(a_i, b_i, c_i, d_i)` quartets for a
+/// `7_X_channel_element()` with `7_X_codec_mode == ASPX_ACPL_1`.
+///
+/// TS 103 190-1 §5.3.4.4.2 says the ACPL_1 case is processed
+/// "analogously to … SIMPLE and b_use_sap_add_ch is false, with the
+/// difference that the output channels F and G are derived from two
+/// sf_data elements and their associated chparam_info elements". The
+/// in-repo errata entry **A5** (`docs/audio/ac4/ac4-errata.md`) records
+/// the two readings:
+///
+/// * [`Self::ChparamQuartets`] (Reading C, the recommended reading):
+///   the quartets are extracted (§5.3.2 Pseudocode 59, bounded by
+///   `max_sfb_master` per §4.3.5.13) from the two `chparam_info()`
+///   elements that follow `max_sfb_master` in Table 33 — exactly as
+///   §5.3.4.3.2 defines the byte-identical 5_X ASPX_ACPL_1 fragment.
+/// * [`Self::Identity`] (Reading I): `a = d = 1, b = c = 0`; the two
+///   `chparam_info()` elements are parsed but have no effect.
+///
+/// The readings coincide whenever both elements carry `sap_mode == 0`.
+/// The status is empirically not determined (no public 7.X ASPX_ACPL_1
+/// stream exists), so the choice lives in exactly one place —
+/// [`SEVEN_X_ACPL1_TABLE183_SOURCE`] — read by both the decoder
+/// ([`seven_x_acpl1_table183_pair`]) and the encoder
+/// ([`seven_x_acpl1_sap_authoring`]). A future ruling flip is a
+/// one-line edit of that constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SevenXAcpl1Table183Source {
+    /// Reading C (errata A5 recommended reading): quartets from the
+    /// two `chparam_info()` elements of the ASPX_ACPL_1 branch.
+    ChparamQuartets,
+    /// Reading I: identity quartets, the `chparam_info()` elements
+    /// are parsed and ignored.
+    Identity,
+}
+
+/// The reading in force for 7_X ASPX_ACPL_1 — errata A5 recommends
+/// Reading C ([`SevenXAcpl1Table183Source::ChparamQuartets`]).
+pub const SEVEN_X_ACPL1_TABLE183_SOURCE: SevenXAcpl1Table183Source =
+    SevenXAcpl1Table183Source::ChparamQuartets;
+
+/// Decoder side of errata A5: the `chparam_info()` pair that feeds the
+/// Table 183 matrix of a 7_X ASPX_ACPL_1 element, or `None` when the
+/// identity quartets apply (Reading I, a missing element, or
+/// `max_sfb_master == 0`).
+pub fn seven_x_acpl1_table183_pair(
+    parsed: &[Option<ChparamInfo>; 2],
+    max_sfb_master: Option<u32>,
+) -> Option<([ChparamInfo; 2], u32)> {
+    match SEVEN_X_ACPL1_TABLE183_SOURCE {
+        SevenXAcpl1Table183Source::Identity => None,
+        SevenXAcpl1Table183Source::ChparamQuartets => match (parsed, max_sfb_master) {
+            ([Some(cp0), Some(cp1)], Some(msm)) if msm > 0 => {
+                Some(([cp0.clone(), cp1.clone()], msm))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Encoder side of errata A5: whether a 7_X ASPX_ACPL_1 writer may
+/// author non-identity `chparam_info()` quartets (they only have an
+/// effect under Reading C; under Reading I the writer must keep
+/// `sap_mode == 0` so the stream decodes identically either way).
+pub fn seven_x_acpl1_sap_authoring() -> bool {
+    matches!(
+        SEVEN_X_ACPL1_TABLE183_SOURCE,
+        SevenXAcpl1Table183Source::ChparamQuartets
+    )
+}
+
+// ====================================================================
 // Encoder-side ChparamInfo builders — duals of extract_sap_abcd
 // ====================================================================
 //

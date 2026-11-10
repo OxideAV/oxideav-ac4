@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `Ac4EncoderOptions::with_*` setters for every field.
+- 7_X ASPX_ACPL_1 Table 183 quartets from the two `chparam_info()`
+  elements (TS 103 190-1 §5.3.4.4.2 read as the in-repo errata A5
+  recommends). The reading lives in one place,
+  `asf::SEVEN_X_ACPL1_TABLE183_SOURCE`, read by the decoder
+  (`asf::seven_x_acpl1_table183_pair`) and the encoder
+  (`asf::seven_x_acpl1_sap_authoring`). The live 7.0 / 7.1 ASPX_ACPL_1
+  writers now author SAP-coded quartets (per-band least-squares
+  prediction of the back-channel side from the surround carrier,
+  `encoder_acpl3::author_7x_acpl1_table183_wire`) and transmit the
+  Table 183 inverse; decoded-PCM parity on predictable back channels:
+  every channel 0,99–1,01× input RMS and 26–27 dB waveform SNR below
+  `acpl_qmf_band`, I + 3×P GOPs included
+  (tests/round485_7_x_acpl1_table183_sap.rs). The `acpl_element` fuzz
+  target drives SAP-coded 7.X ASPX_ACPL_1 elements under corruption.
 
 ### Changed
 

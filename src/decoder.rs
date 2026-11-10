@@ -1237,7 +1237,9 @@ impl Ac4Decoder {
         // ASPX_ACPL_1: the joint-MDCT residual pair enters through the
         // chparam SAP matrix (Table 181 for 5_X; the Table 183 shape
         // with the two residual chparam_info() elements for 7_X per
-        // §5.3.4.4.2) and becomes the x3 / x4 preliminaries. Without the
+        // §5.3.4.4.2 read as errata A5 recommends — see
+        // `asf::SEVEN_X_ACPL1_TABLE183_SOURCE`) and becomes the x3 / x4
+        // preliminaries. Without the
         // SAP inputs the residual is taken as-is (identity SAP).
         let mut x3_spec: Option<Vec<f32>> = None;
         let mut x4_spec: Option<Vec<f32>> = None;
@@ -1254,18 +1256,22 @@ impl Ac4Decoder {
             {
                 let s3 = pad(s3);
                 let s4 = pad(s4);
-                let sap = match (&chparam, msm) {
-                    ([Some(cp0), Some(cp1)], Some(msm)) if msm > 0 => asf::apply_sap_table_181(
-                        &x0_spec,
-                        &x1_spec,
-                        &s3,
-                        &s4,
-                        &[cp0.clone(), cp1.clone()],
-                        msm,
-                        n as u32,
-                    ),
-                    _ => None,
+                // 5_X: §5.3.4.3.2 names the two chparam_info() elements
+                // explicitly. 7_X: Table 183's quartet source is the
+                // errata-A5 reading, resolved in one place.
+                let quartets = if is_7x {
+                    asf::seven_x_acpl1_table183_pair(&chparam, msm)
+                } else {
+                    match (&chparam, msm) {
+                        ([Some(cp0), Some(cp1)], Some(msm)) if msm > 0 => {
+                            Some(([cp0.clone(), cp1.clone()], msm))
+                        }
+                        _ => None,
+                    }
                 };
+                let sap = quartets.and_then(|(pair, msm)| {
+                    asf::apply_sap_table_181(&x0_spec, &x1_spec, &s3, &s4, &pair, msm, n as u32)
+                });
                 match sap {
                     Some((p0, p1, p3, p4)) => {
                         x0_spec = p0;

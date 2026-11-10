@@ -1,6 +1,7 @@
 //! 5.X / 7.X A-CPL element decode under corruption: the leading bytes
 //! pick the layout (5.0 / 5.1 / 7.0 / 7.1), the codec mode
-//! (ASPX_ACPL_1 / ASPX_ACPL_2, or ASPX_ACPL_3 on 5.X), the I / P
+//! (ASPX_ACPL_1 / ASPX_ACPL_2, or ASPX_ACPL_3 on 5.X), SAP-predictable
+//! back channels on 7.X ASPX_ACPL_1 (Table 183 quartets), the I / P
 //! framing and up to four byte
 //! mutations; the rest is S16 PCM that `Ac4ImsEncoder` turns into two
 //! raw frames (I then I or P). The mutations are applied to the coded
@@ -52,6 +53,19 @@ fuzz_target!(|data: &[u8]| {
             v[i] = 0.5 * (v[i] + x);
         }
         chans.push(v);
+    }
+    // 7.X ASPX_ACPL_1 with back channels predictable from the
+    // surrounds: the encoder then authors SAP-coded Table 183
+    // `chparam_info()` rows (errata A5 reading), so the decoder's
+    // quartet extraction + Table 183 mix runs on corrupted SAP data.
+    if channels >= 7 && acpl1 && ctl[0] & 32 != 0 {
+        let k = (f32::from(ctl[9]) - 127.5) / 64.0;
+        for (back, surround) in [(5usize, 3usize), (6, 4)] {
+            let src = chans[surround].clone();
+            for (b, s) in chans[back].iter_mut().zip(&src) {
+                *b = k * s + 0.1 * *b;
+            }
+        }
     }
     let mut enc = Ac4ImsEncoder::new();
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(2);

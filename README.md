@@ -422,7 +422,7 @@ parses back to the authored rows.
   codes L / R / C as waveforms, `D = (Ls + Lb)/(2√2)` /
   `E = (Rs + Rb)/(2√2)` as the Table 202 coupling carriers and
   `(Ls − Lb)/(2√2)` as the side. ASPX_ACPL_1 carries the sides on the
-  joint-MDCT residual layer (identity chparam SAP) with `acpl_qmf_band`
+  joint-MDCT residual layer with `acpl_qmf_band`
   derived from the residual budget (`acpl1_qmf_band_minus1`), so the
   band below it is mid/side waveform-exact. Real A-SPX envelopes on
   every Table 213 carrier, `companding_control` off (the encoder does
@@ -434,6 +434,17 @@ parses back to the authored rows.
   The older scaffold entries (`encode_frame_pcm_5_0_acpl1{,_sap,
   _real_alpha,_real_alpha_beta}`, `..._acpl2{,_real_alpha_beta}`)
   emit the same carrier model with minimum-bit-cost A-SPX / α.
+- **7.X ASPX_ACPL_1 Table 183 SAP** (round 485): the two
+  `chparam_info()` elements after `max_sfb_master` carry the Table 183
+  quartets (TS 103 190-1 §5.3.4.4.2 as the in-repo errata A5
+  recommends; the reading is the single constant
+  `asf::SEVEN_X_ACPL1_TABLE183_SOURCE`, so a ruling flip is one edit
+  on both sides). The live 7.X ACPL_1 writers predict the back-channel
+  side from the surround carrier per band (least squares on the
+  `alpha_q · 0,1` grid) and transmit the Table 183 inverse; on
+  predictable back channels the side residual drops 5–70× and the
+  decode keeps 26–27 dB waveform SNR on every channel below
+  `acpl_qmf_band` (tests/round485_7_x_acpl1_table183_sap.rs).
 - **5.X ASPX_ACPL_3 with decoded-PCM parity** (round 461):
   `encode_frame_pcm_5_{0,1}_acpl3_real_aspx{,_with_max_sfb,_multi_env}`
   code the Pseudocode 118 downmix `x0 = (L + C/√2 + Ls/√2)/(1+√2)`,
