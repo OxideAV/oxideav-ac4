@@ -359,6 +359,25 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
     Ok((d.channels, d.bits))
 }
 
+/// Largest `sequence_counter` an encoder may write (TS 103 190-1
+/// §4.3.3.2.2); the value after it is 1 — 0 is left to splicers.
+pub const SEQUENCE_COUNTER_MAX: u16 = 1020;
+
+/// The `sequence_counter` of the frame after one that carried `c`:
+/// `c + 1`, wrapping from 1 020 to 1 (§4.3.3.2.2).
+pub fn next_sequence_counter(c: u16) -> u16 {
+    if c >= SEQUENCE_COUNTER_MAX { 1 } else { c + 1 }
+}
+
+/// §4.3.3.2.2 "normal operation": may a decoder that saw `prev` in the
+/// previous frame continue undisturbed on a frame carrying `cur`? True
+/// for a counter increase, the 1 020 → 1 wrap, and any non-zero value
+/// after a splice marker (`prev = 0`); otherwise a source change was
+/// detected.
+pub fn sequence_counter_continues(prev: u32, cur: u32) -> bool {
+    cur == prev + 1 || (cur == 1 && prev == SEQUENCE_COUNTER_MAX as u32) || (cur != 0 && prev == 0)
+}
+
 /// Parsed AC-4 frame information — the result of running
 /// [`parse_ac4_toc`] over a raw AC-4 payload (post-sync, pre-substream
 /// data). The fields we expose are the ones a containerised decoder

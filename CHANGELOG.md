@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sequence-counter splice detection and error concealment**
+  (TS 103 190-1 §4.3.3.2.2): the decoder checks every frame's
+  `sequence_counter` against the previous one — increase, the
+  1 020 → 1 wrap, or any non-zero value after a splice marker 0 —
+  and counts the rest as source changes
+  (`Ac4Decoder::source_changes`, `last_frame_was_source_change`;
+  `toc::sequence_counter_continues`). With
+  `set_error_concealment(true)` / decoder option `concealment = on`,
+  a frame with a bad 0xAC41 CRC or table of contents becomes a silent
+  frame of the stream's shape instead of an error, and after it — as
+  after a source change — every inter-frame state is dropped and
+  output stays concealed until the next I-frame
+  (`concealed_frames`). Default behaviour is unchanged (errors are
+  returned, discontinuities only reported)
+  (tests/round492_splice_concealment.rs).
+
 - **Rate control** (framework option `bitrate` in bit/s,
   `Ac4EncoderOptions::with_bitrate`; 0 keeps the constant quantiser).
   Each frame is coded at the finest *noise-allocation level* whose
@@ -100,6 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The encoder's `sequence_counter` runs 1..=1020 and wraps to 1
+  (§4.3.3.2.2: values above 1 020 shall not be written, 0 is the
+  splicer's marker); it counted to 1 023 and wrapped to 0.
 - LFE time alignment on the immersive (7.X.4 / 9.X.4, every
   Table 95 mode but SCPL), 22.2 A-SPX and 5.X ASPX routes: the
   time-domain LFE left the decoder one QMF round trip (577 samples)

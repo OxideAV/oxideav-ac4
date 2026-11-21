@@ -380,7 +380,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -465,7 +465,7 @@ impl Ac4ImsEncoder {
             frame.extend(vec![0u8; body_padding_bytes]);
         }
         // sequence_counter is 10 bits — wrap modulo 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         frame
     }
 
@@ -927,8 +927,8 @@ impl Ac4ImsEncoder {
         // sees a complete payload.
         let body = build_mono_simple_asf_tone_body(1920, 10, tone_cb_idx, tone_pair_idx, 420);
         frame.extend(body);
-        // sequence_counter wraps at 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         frame
@@ -1025,8 +1025,8 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        // sequence_counter wraps at 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -1233,8 +1233,8 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        // sequence_counter wraps at 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -1369,8 +1369,8 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        // sequence_counter wraps at 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -1500,8 +1500,8 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        // sequence_counter wraps at 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -1639,8 +1639,8 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        // sequence_counter wraps at 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -1847,7 +1847,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -1997,8 +1997,8 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        // sequence_counter wraps at 1024.
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -2173,14 +2173,14 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        // sequence_counter wraps at 1024.
+        // sequence_counter runs 1..=1020 (§4.3.3.2.2).
         // Legacy ACPL_3 body: it advances the decoder's cross-frame ASPX
         // envelope + ACPL q_prev references without tracking the rows, so
         // reset the encoder-side P-frame reference states (next non-I
         // frame stays FREQ / always-decodable).
         self.acpl3_env_prev = None;
         self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         // Restore caller's channel_mode setting.
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
@@ -2341,7 +2341,7 @@ impl Ac4ImsEncoder {
         // frame stays FREQ / always-decodable).
         self.acpl3_env_prev = None;
         self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -2520,7 +2520,7 @@ impl Ac4ImsEncoder {
         // frame stays FREQ / always-decodable).
         self.acpl3_env_prev = None;
         self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -2707,7 +2707,7 @@ impl Ac4ImsEncoder {
         // frame stays FREQ / always-decodable).
         self.acpl3_env_prev = None;
         self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -2920,7 +2920,7 @@ impl Ac4ImsEncoder {
         // frame stays FREQ / always-decodable).
         self.acpl3_env_prev = None;
         self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -3113,7 +3113,7 @@ impl Ac4ImsEncoder {
         // frame stays FREQ / always-decodable).
         self.acpl3_env_prev = None;
         self.acpl3_param_prev = crate::encoder_acpl3::Acpl3ParamPrevRows::default();
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -3501,7 +3501,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -4030,7 +4030,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -4293,7 +4293,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -4443,7 +4443,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -4656,7 +4656,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -4819,7 +4819,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -5100,7 +5100,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -5233,7 +5233,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -5358,7 +5358,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -5547,7 +5547,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -5745,7 +5745,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -5883,7 +5883,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -6032,7 +6032,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -6180,7 +6180,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -6326,7 +6326,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -6505,7 +6505,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -6727,7 +6727,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -6931,7 +6931,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -7078,7 +7078,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -7273,7 +7273,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -7419,7 +7419,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -7638,7 +7638,7 @@ impl Ac4ImsEncoder {
         let mut out = bw.finish();
         out.extend(body);
         out.extend(self.trailing_metadata());
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         self.channel_mode_value = saved_mode.0;
         self.channel_mode_bits = saved_mode.1;
         out
@@ -8108,7 +8108,7 @@ impl Ac4ImsEncoder {
             &meta,
         )
         .expect("encoder: ice frame assembly");
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         out
     }
 
@@ -8354,7 +8354,7 @@ impl Ac4ImsEncoder {
             &meta,
         )
         .expect("encoder: ice frame assembly");
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         out
     }
 
@@ -8623,7 +8623,7 @@ impl Ac4ImsEncoder {
             &meta,
         )
         .expect("encoder: ice frame assembly");
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         out
     }
 
@@ -8923,7 +8923,7 @@ impl Ac4ImsEncoder {
             &meta,
         )
         .expect("encoder: ice frame assembly");
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         out
     }
 
@@ -9173,7 +9173,7 @@ impl Ac4ImsEncoder {
             &meta,
         )
         .expect("encoder: ice frame assembly");
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         out
     }
 
@@ -9418,7 +9418,7 @@ impl Ac4ImsEncoder {
             &meta,
         )
         .expect("encoder: ice frame assembly");
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         out
     }
 
@@ -9555,7 +9555,7 @@ impl Ac4ImsEncoder {
         let out =
             crate::ice::encode_22_2_raw_frame_with_header(&self.raw_frame_header(), body, &meta)
                 .expect("encoder: 22_2 frame assembly");
-        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.sequence_counter = crate::toc::next_sequence_counter(self.sequence_counter);
         out
     }
 

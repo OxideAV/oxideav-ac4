@@ -173,6 +173,22 @@ pub struct Ac4Decoder {
     latency_frame: usize,
     /// Frame-rate index of the last decoded frame (Table 188 lookup).
     last_frame_rate_index: u32,
+    /// `sequence_counter` of the previous frame (§4.3.3.2.2).
+    seq_prev: Option<u32>,
+    /// Source changes detected from the sequence counter so far.
+    source_changes: u64,
+    /// Did the frame last decoded follow a detected source change?
+    last_was_source_change: bool,
+    /// Error concealment enabled (see [`Self::set_error_concealment`]).
+    concealment: bool,
+    /// Concealing until the next I-frame (after a damaged frame or a
+    /// source change, when concealment is enabled).
+    await_iframe: bool,
+    /// Frames replaced by concealment output so far.
+    concealed_frames: u64,
+    /// `(channels, samples)` of the last frame returned — the shape a
+    /// concealment frame takes.
+    last_shape: Option<(usize, u32)>,
     /// Per-channel A-SPX persistent state — noise generator
     /// `noise_idx_prev` (§5.7.6.4.3 Pseudocode 103), tone generator
     /// `sine_idx_prev` (§5.7.6.4.4 Pseudocode 105), and the
@@ -424,6 +440,13 @@ impl Ac4Decoder {
             latency_emitted: 0,
             latency_frame: 0,
             last_frame_rate_index: 1,
+            seq_prev: None,
+            source_changes: 0,
+            last_was_source_change: false,
+            concealment: matches!(params.options.get("concealment"), Some("on" | "true" | "1")),
+            await_iframe: false,
+            concealed_frames: 0,
+            last_shape: None,
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
@@ -469,6 +492,84 @@ impl Ac4Decoder {
     /// `dialog_enhancement()` payload.
     pub fn set_dialogue_enhancement_gain_db(&mut self, gain_db: f32) {
         self.de_gain_db = gain_db;
+    }
+
+    /// Enable error concealment (decoder option `concealment = on`).
+    ///
+    /// Off (the default): a frame whose 0xAC41 CRC or table of
+    /// contents is bad is an error for the caller to handle, and a
+    /// sequence-counter discontinuity is only reported
+    /// ([`Self::source_changes`]).
+    ///
+    /// On: such a frame is replaced by a silent frame of the stream's
+    /// last shape, and — as after a detected source change
+    /// (TS 103 190-1 §4.3.3.2.2) — every inter-frame state (transform
+    /// overlap, filterbanks, the sticky I-frame configurations, the
+    /// differential parameter chains) is dropped and output stays
+    /// concealed until the next independently decodable frame, so
+    /// nothing is predicted from the wrong side of the gap.
+    pub fn set_error_concealment(&mut self, on: bool) {
+        self.concealment = on;
+    }
+
+    /// Source changes detected so far: frames whose `sequence_counter`
+    /// is neither the previous one plus one, nor the 1 020 → 1 wrap,
+    /// nor any non-zero value after a splice marker 0 (§4.3.3.2.2).
+    pub fn source_changes(&self) -> u64 {
+        self.source_changes
+    }
+
+    /// Did the frame last submitted follow a detected source change?
+    pub fn last_frame_was_source_change(&self) -> bool {
+        self.last_was_source_change
+    }
+
+    /// Frames replaced by concealment output so far.
+    pub fn concealed_frames(&self) -> u64 {
+        self.concealed_frames
+    }
+
+    /// Drop every inter-frame state, keeping the user's settings, the
+    /// counters and the latency stage.
+    fn reset_stream_state(&mut self) {
+        let mut params = CodecParameters::audio(self.codec_id.clone());
+        params.channels = Some(self.hint_channels);
+        params.sample_rate = Some(self.hint_sample_rate);
+        let mut fresh = Ac4Decoder::new(&params);
+        fresh.decoding_mode = self.decoding_mode;
+        fresh.de_gain_db = self.de_gain_db;
+        fresh.eof = self.eof;
+        fresh.latency_mode = self.latency_mode;
+        fresh.latency_fifo = std::mem::take(&mut self.latency_fifo);
+        fresh.latency_channels = self.latency_channels;
+        fresh.latency_applied = self.latency_applied;
+        fresh.latency_skip = self.latency_skip;
+        fresh.latency_clock = self.latency_clock;
+        fresh.latency_emitted = self.latency_emitted;
+        fresh.latency_frame = self.latency_frame;
+        fresh.last_frame_rate_index = self.last_frame_rate_index;
+        fresh.route_delay = self.route_delay;
+        fresh.seq_prev = self.seq_prev;
+        fresh.source_changes = self.source_changes;
+        fresh.last_was_source_change = self.last_was_source_change;
+        fresh.concealment = self.concealment;
+        fresh.await_iframe = self.await_iframe;
+        fresh.concealed_frames = self.concealed_frames;
+        fresh.last_shape = self.last_shape;
+        fresh.last_info = self.last_info.take();
+        *self = fresh;
+    }
+
+    /// A silent frame of the stream's last shape, or `None` before any
+    /// frame was decoded.
+    fn concealment_frame(&mut self, pts: Option<i64>) -> Option<Frame> {
+        let (channels, samples) = self.last_shape?;
+        self.concealed_frames += 1;
+        Some(Frame::Audio(AudioFrame {
+            samples,
+            pts,
+            data: vec![vec![0u8; channels * samples as usize * 2]],
+        }))
     }
 
     /// Select how the decoder presents its algorithmic delay (see
@@ -5467,8 +5568,63 @@ impl Decoder for Ac4Decoder {
 }
 
 impl Ac4Decoder {
-    /// Decode one packet to the frame its tool chain delivers.
+    /// Decode one packet to the frame its tool chain delivers, with
+    /// the §4.3.3.2.2 source-change check and — when enabled — error
+    /// concealment around it.
     fn decode_pending(&mut self, pkt: Packet) -> Result<Frame> {
+        self.last_was_source_change = false;
+        // Sequence counter: peek at the TOC of an intact frame.
+        let toc = self
+            .extract_raw_frame(&pkt)
+            .ok()
+            .and_then(|(raw, _)| toc::parse_ac4_toc(raw).ok())
+            .map(|i| (i.sequence_counter, i.b_iframe_global));
+        if let Some((seq, _)) = toc {
+            if let Some(prev) = self.seq_prev
+                && !toc::sequence_counter_continues(prev, seq)
+            {
+                self.source_changes += 1;
+                self.last_was_source_change = true;
+                if self.concealment {
+                    self.reset_stream_state();
+                    self.await_iframe = true;
+                }
+            }
+            self.seq_prev = Some(seq);
+        }
+        if self.concealment {
+            match toc {
+                // Damaged frame: conceal it and wait for an I-frame.
+                None if !pkt.data.is_empty() => {
+                    self.reset_stream_state();
+                    self.await_iframe = true;
+                    self.seq_prev = None;
+                    if let Some(f) = self.concealment_frame(pkt.pts) {
+                        return Ok(f);
+                    }
+                }
+                Some((_, b_iframe)) if self.await_iframe => {
+                    if b_iframe {
+                        self.await_iframe = false;
+                    } else if let Some(f) = self.concealment_frame(pkt.pts) {
+                        return Ok(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let frame = self.decode_frame(pkt)?;
+        if let Frame::Audio(af) = &frame
+            && af.samples > 0
+            && let Some(bytes) = af.data.first()
+        {
+            self.last_shape = Some((bytes.len() / 2 / af.samples as usize, af.samples));
+        }
+        Ok(frame)
+    }
+
+    /// Decode one packet to the frame its tool chain delivers.
+    fn decode_frame(&mut self, pkt: Packet) -> Result<Frame> {
         if pkt.data.is_empty() {
             // Empty packet — emit a 0-sample frame so the pipeline
             // continues rather than erroring.
