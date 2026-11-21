@@ -101,7 +101,7 @@ fn main() {
     oxideav_ac4::register_codecs(&mut reg);
     let len = ((seconds * 48_000.0) as usize / 1920).max(4) * 1920;
     let dur = len as f64 / 48_000.0;
-    println!("layout mode        kbit/s  enc xRT  dec xRT  identical");
+    println!("layout mode        kbit/s  enc xRT  dec xRT  identical  pcm hash");
     for &(name, nch) in &[("stereo", 2u16), ("5.1", 6), ("7.1.4", 12)] {
         let chans: Vec<Vec<f32>> = (0..nch as usize).map(|c| signal(c, len)).collect();
         for mode in ["waveform", "parametric"] {
@@ -113,8 +113,13 @@ fn main() {
             let (pcm_other, _) = decode(&reg, nch, &pkts);
             oxideav_ac4::mdct::set_direct_transforms(false);
             let bytes: usize = pkts.iter().map(|p| p.data.len()).sum();
+            // FNV-1a over the decoded S16 bytes: equal hashes across
+            // builds mean bit-identical decoder output.
+            let hash = pcm.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+            });
             println!(
-                "{name:6} {mode:10} {:8.1} {:8.2} {:8.2}  {}",
+                "{name:6} {mode:10} {:8.1} {:8.2} {:8.2}  {:9}  {hash:016x}",
                 bytes as f64 * 8.0 / dur / 1000.0,
                 dur / te,
                 dur / td,

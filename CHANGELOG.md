@@ -162,6 +162,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- QMF analysis / synthesis read their Pseudocode 65 / 66 modulation
+  phases from tables built once instead of evaluating 16 384 cosine /
+  sine pairs per slot; sums run in the same order on the same values,
+  so the output is bit-identical. 5.1 parametric encode 4,8 → 32×
+  realtime, decode 2,9 → 15×; 7.1.4 parametric encode 3,8 → 20×,
+  decode 1,8 → 7,3×.
+- Huffman decoding walks a per-codebook binary tree (one step per
+  bit, built once per thread and static codebook) instead of scanning
+  the whole table after every bit; `huffman::huff_decode_scan` keeps
+  the scan as the reference the tree is tested against on every ASF
+  codebook. Decoded output bit-identical. Stereo decode 61 → 465×
+  realtime, 5.1 waveform 23 → 178×, 7.1.4 waveform 13 → 88×, 5.1 /
+  7.1.4 parametric 15 → 23× / 7,3 → 13,8×.
 - MDCT / IMDCT run on a shared mixed-radix FFT plan (`fft`, radix
   2 / 3 / 4 / 5 stages covering every `2^a·3^b·5^c` AC-4 transform
   length): the §5.5.2.2 IMDCT is the N/2-point complex IFFT the

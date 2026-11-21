@@ -239,19 +239,55 @@ pub fn qmf_analysis_slot(qmf_filt: &[f32; NUM_QMF_WIN_COEF]) -> [(f32, f32); NUM
     // Q[sb][ts] = sum_{n=0..128} u[n] * exp(j * pi/128 * (sb+0.5) * (2n-1))
     // (the n=0 branch in Pseudocode 65 collapses to (2*0 - 1) = -1 which is
     // identical to the general formula).
-    use core::f64::consts::PI;
+    let t = analysis_phases();
     let mut out = [(0.0f32, 0.0f32); NUM_QMF_SUBBANDS];
     for (sb, slot) in out.iter_mut().enumerate() {
+        let row = &t[sb * 128..(sb + 1) * 128];
         let mut re = 0.0f64;
         let mut im = 0.0f64;
-        for n in 0..128 {
-            let phase = PI / 128.0 * (sb as f64 + 0.5) * ((2 * n) as f64 - 1.0);
-            re += u[n] * phase.cos();
-            im += u[n] * phase.sin();
+        for (un, (c, s)) in u.iter().zip(row) {
+            re += un * c;
+            im += un * s;
         }
         *slot = (re as f32, im as f32);
     }
     out
+}
+
+/// `(cos φ, sin φ)` of the Pseudocode 65 analysis modulation,
+/// `φ = π/128 · (sb + ½) · (2n − 1)`, row-major by subband — computed
+/// once (the per-slot loops evaluated the same 16 384 values every
+/// time).
+fn analysis_phases() -> &'static [(f64, f64)] {
+    static T: std::sync::OnceLock<Vec<(f64, f64)>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        use core::f64::consts::PI;
+        let mut t = Vec::with_capacity(NUM_QMF_SUBBANDS * 128);
+        for sb in 0..NUM_QMF_SUBBANDS {
+            for n in 0..128 {
+                let phase = PI / 128.0 * (sb as f64 + 0.5) * ((2 * n) as f64 - 1.0);
+                t.push((phase.cos(), phase.sin()));
+            }
+        }
+        t
+    })
+}
+
+/// `(cos φ, sin φ)` of the Pseudocode 66 synthesis modulation,
+/// `φ = π/128 · (sb + ½) · (2n − 255)`, row-major by tap `n`.
+fn synthesis_phases() -> &'static [(f64, f64)] {
+    static T: std::sync::OnceLock<Vec<(f64, f64)>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        use core::f64::consts::PI;
+        let mut t = Vec::with_capacity(128 * NUM_QMF_SUBBANDS);
+        for n in 0..128 {
+            for sb in 0..NUM_QMF_SUBBANDS {
+                let phi = PI / 128.0 * (sb as f64 + 0.5) * ((2 * n) as f64 - 255.0);
+                t.push((phi.cos(), phi.sin()));
+            }
+        }
+        t
+    })
 }
 
 /// One-slot QMF synthesis transform per ETSI TS 103 190-1 §5.7.4.2
@@ -305,26 +341,25 @@ pub fn qmf_synthesis_slot(
     qsyn_filt: &mut [f64; 1280],
     q: &[(f32, f32); NUM_QMF_SUBBANDS],
 ) -> [f32; NUM_QMF_SUBBANDS] {
-    use core::f64::consts::PI;
     // Shift the delay line by 128.
-    for n in (128..1280).rev() {
-        qsyn_filt[n] = qsyn_filt[n - 128];
-    }
+    qsyn_filt.copy_within(0..1280 - 128, 128);
     // Modulate the new 128 taps from the Q[sb][ts] column.
     //   qsyn_filt[n] = sum_{sb=0..64} real( Q[sb][ts]/64 * exp(j*phi) )
     // with phi = (pi/128) * (sb + 0.5) * (2n - 255).
-    for n in 0..128 {
+    let mut scaled = [(0.0f64, 0.0f64); NUM_QMF_SUBBANDS];
+    for (d, &(re, im)) in scaled.iter_mut().zip(q.iter()) {
+        *d = ((re as f64) / 64.0, (im as f64) / 64.0);
+    }
+    let t = synthesis_phases();
+    for (n, tap) in qsyn_filt.iter_mut().take(128).enumerate() {
+        let row = &t[n * NUM_QMF_SUBBANDS..(n + 1) * NUM_QMF_SUBBANDS];
         let mut acc = 0.0f64;
-        for sb in 0..NUM_QMF_SUBBANDS {
-            let (re, im) = q[sb];
-            let re = (re as f64) / 64.0;
-            let im = (im as f64) / 64.0;
-            let phi = PI / 128.0 * (sb as f64 + 0.5) * ((2 * n) as f64 - 255.0);
+        for ((re, im), (c, sn)) in scaled.iter().zip(row) {
             // Re{ (re + j*im) * (cos(phi) + j*sin(phi)) }
             //   = re * cos(phi) - im * sin(phi)
-            acc += re * phi.cos() - im * phi.sin();
+            acc += re * c - im * sn;
         }
-        qsyn_filt[n] = acc;
+        *tap = acc;
     }
     qmf_synthesis_tap_sum(qsyn_filt)
 }

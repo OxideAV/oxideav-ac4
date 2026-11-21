@@ -35,18 +35,111 @@ pub struct Hcb {
     pub unsigned: bool,
 }
 
+/// Binary decode tree of one `(lens, cws)` codebook: `nodes[n][bit]`
+/// is `0` for "no codeword continues here", a positive node index, or
+/// `−(index + 1)` for the codeword `index` ending on that bit.
+struct HuffTree {
+    nodes: Vec<[i32; 2]>,
+}
+
+impl HuffTree {
+    fn build(lens: &[u8], cws: &[u32]) -> Self {
+        let mut nodes: Vec<[i32; 2]> = vec![[0, 0]];
+        for (i, (&l, &cw)) in lens.iter().zip(cws).enumerate() {
+            if l == 0 || l > 32 {
+                continue;
+            }
+            let mut n = 0usize;
+            for depth in (0..l).rev() {
+                let bit = ((cw >> depth) & 1) as usize;
+                let slot = nodes[n][bit];
+                if depth == 0 {
+                    // The shortest match wins, and among equal
+                    // codewords the first entry: a leaf already here
+                    // stays; a longer codeword routed through here
+                    // gives way.
+                    if slot >= 0 {
+                        nodes[n][bit] = -(i as i32 + 1);
+                    }
+                } else if slot < 0 {
+                    // A shorter codeword ends on this prefix.
+                    break;
+                } else if slot == 0 {
+                    nodes.push([0, 0]);
+                    let next = nodes.len() - 1;
+                    nodes[n][bit] = next as i32;
+                    n = next;
+                } else {
+                    n = slot as usize;
+                }
+            }
+        }
+        Self { nodes }
+    }
+}
+
+thread_local! {
+    /// Decode trees by codebook identity (the address of its static
+    /// codeword table), built on first use.
+    static TREES: std::cell::RefCell<Vec<(HuffKey, std::rc::Rc<HuffTree>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Identity of a static codebook: the addresses of its codeword and
+/// length tables and their length.
+type HuffKey = (usize, usize, usize);
+
+fn tree_for(lens: &'static [u8], cws: &'static [u32]) -> std::rc::Rc<HuffTree> {
+    let key: HuffKey = (cws.as_ptr() as usize, lens.as_ptr() as usize, cws.len());
+    TREES.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some((_, tree)) = t.iter().find(|(k, _)| *k == key) {
+            return tree.clone();
+        }
+        let tree = std::rc::Rc::new(HuffTree::build(lens, cws));
+        t.push((key, tree.clone()));
+        tree
+    })
+}
+
 /// Decode the shortest matching codeword from `br` against `(lens, cws)`.
 ///
 /// Reference algorithm (Pseudocode 19 of §5.1.2.2): accumulate bits
-/// MSB-first, and after each bit check whether any entry of length
-/// equal to the accumulator width matches. Returns the index `i` of
-/// the first matching entry.
-pub fn huff_decode(br: &mut BitReader<'_>, lens: &[u8], cws: &[u32]) -> Result<u32> {
+/// MSB-first until an entry of the accumulated length matches; returns
+/// the index of that entry. The search walks a per-codebook binary
+/// tree (one step per bit) instead of scanning the table after every
+/// bit; the codebooks are static tables, so a tree is built once per
+/// thread and codebook.
+pub fn huff_decode(
+    br: &mut BitReader<'_>,
+    lens: &'static [u8],
+    cws: &'static [u32],
+) -> Result<u32> {
     debug_assert_eq!(lens.len(), cws.len());
+    let tree = tree_for(lens, cws);
+    let mut n = 0usize;
+    // Max Huffman length across all AC-4 tables is 17 (SCALEFAC); the
+    // tree is at most 32 deep.
+    for _ in 0..32 {
+        let b = br.read_u32(1)? as usize;
+        let slot = tree.nodes[n][b];
+        if slot < 0 {
+            return Ok((-slot - 1) as u32);
+        }
+        if slot == 0 {
+            break;
+        }
+        n = slot as usize;
+    }
+    Err(Error::invalid("ac4: no matching Huffman codeword"))
+}
+
+/// Table-scan form of [`huff_decode`] — the reference the tree walk is
+/// tested against.
+#[doc(hidden)]
+pub fn huff_decode_scan(br: &mut BitReader<'_>, lens: &[u8], cws: &[u32]) -> Result<u32> {
     let mut code: u32 = 0;
     let mut width: u8 = 0;
-    // Max Huffman length across all AC-4 ASF tables is 17 (SCALEFAC);
-    // we cap at 32 defensively.
     while width < 32 {
         let b = br.read_u32(1)?;
         code = (code << 1) | b;
@@ -289,6 +382,43 @@ mod tests {
                 got as usize, last,
                 "{name}: decoded {got}, expected {last} (cw=0x{cw:x}, len={l})"
             );
+        }
+    }
+
+    #[test]
+    fn tree_decode_matches_the_table_scan_on_every_asf_codebook() {
+        let mut books: Vec<(&'static [u8], &'static [u32])> = vec![
+            (HCB_SCALEFAC_LEN, HCB_SCALEFAC_CW),
+            (HCB_SNF_LEN, HCB_SNF_CW),
+        ];
+        for cb in 1..=11 {
+            let h = asf_hcb(cb).unwrap();
+            books.push((h.len, h.cw));
+        }
+        for (lens, cws) in books {
+            // Every codeword decodes to its own index …
+            for (i, (&l, &cw)) in lens.iter().zip(cws).enumerate() {
+                let mut bw = BitWriter::new();
+                bw.write_u32(cw, l as u32);
+                bw.write_u32(0, 24);
+                bw.align_to_byte();
+                let bytes = bw.finish();
+                let a = huff_decode(&mut BitReader::new(&bytes), lens, cws).unwrap();
+                let b = huff_decode_scan(&mut BitReader::new(&bytes), lens, cws).unwrap();
+                assert_eq!(a, b);
+                assert_eq!(a as usize, i);
+            }
+            // … and arbitrary bit patterns agree, errors included.
+            let mut seed = 0x2545_F491u32;
+            for _ in 0..2000 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let bytes = seed.to_be_bytes();
+                let mut ra = BitReader::new(&bytes);
+                let mut rb = BitReader::new(&bytes);
+                let a = huff_decode(&mut ra, lens, cws).ok();
+                let b = huff_decode_scan(&mut rb, lens, cws).ok();
+                assert_eq!(a, b, "pattern {seed:08x}");
+            }
         }
     }
 }
