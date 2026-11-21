@@ -24,8 +24,10 @@ the A-JOC object forms.
 - **Sync framing** (`sync`) — `0xAC40` plain / `0xAC41` CRC-protected,
   16-bit `frame_size()` with 24-bit escape. The Annex G.4.2 `crc_word`
   is verified on every 0xAC41 frame (protected payload = `frame_size` +
-  `raw_ac4_frame`); the decoder rejects mismatching frames, and
-  `wrap_sync_frame` emits both framing forms.
+  `raw_ac4_frame`); the decoder rejects mismatching frames — or, with
+  error concealment enabled, replaces them with a silent frame and
+  waits for the next I-frame — and `wrap_sync_frame` emits both
+  framing forms.
 - **Table of contents** (`toc`) — the full `ac4_toc()` walker:
   bitstream_version, sequence_counter, fs_index, frame_rate_index,
   `b_iframe_global`, payload_base, per-presentation
@@ -71,10 +73,31 @@ an S16 `AudioFrame`:
 - **ASF coefficient pipeline** — `asf_section_data()`,
   `asf_spectral_data()` (HCB 1..11 + the codebook-11 escape),
   `asf_scalefac_data()`, and `asf_snf_data()` for mono, stereo (split +
-  joint M/S MDCT), and the multichannel layouts (Tables 26–29), with
-  long-frame and grouped short-frame window handling. Dequantise +
-  scale (`rec_spec = sign(q)·|q|^(4/3)`) feeds the reference KBD-window
-  IMDCT (`mdct`) with overlap-add.
+  joint M/S MDCT per Table 23), and the multichannel layouts
+  (Tables 26–29). The window / group layout of
+  every `sf_info()` — full blocks, the Table 187 partial-block
+  arrangements, `b_different_framing`, frame lengths below 1536 — is
+  resolved by `asf_blocks` (Pseudocodes 2–5), bodies with multi-window
+  groups are decoded and ungrouped to window order (Pseudocode 25),
+  and spectral noise fill follows §5.1.4.2 (Pseudocodes 22–24) on
+  every body. Dequantise + scale (`rec_spec = sign(q)·|q|^(4/3)`)
+  feeds the FFT-based IMDCT (`mdct`) and the block-switched
+  overlap/add of §5.5.2.2 (Pseudocodes 63 / 64, `mdct::BlockOverlap`)
+  on the mono, channel-pair and 5.X SIMPLE / ASPX routes.
+- **Delay handling** — `Ac4Decoder::tool_delay_samples()` reports the
+  tool-chain delay of the frame just decoded (0 in the time domain,
+  577 samples per QMF analysis / synthesis pass), and every channel of
+  a route shares it, LFE included. `LatencyMode::Aligned` pads every
+  route to the constant `d_pcm + 2 × 577` (the §5.6 Table 188
+  frame-alignment delay plus the deepest regular tool chain);
+  `LatencyMode::Trimmed` removes the route's delay and restamps from
+  the first packet; `Raw` (default) keeps one frame per packet.
+- **Splices and damaged frames** — every frame's `sequence_counter`
+  is checked against §4.3.3.2.2 (increase, the 1 020 → 1 wrap, any
+  non-zero value after a splice marker 0) and the rest counted as
+  source changes; with `set_error_concealment(true)` a frame with a
+  bad CRC or TOC becomes a silent frame and inter-frame state is
+  dropped until the next I-frame.
 - **A-SPX** bandwidth extension — `aspx_config()` / `companding_control`
   parse, the FIXFIX / FIXVAR / VARFIX / VARVAR ATSG border derivation,
   envelope / noise / tone payload decode, QMF analysis/synthesis, the
@@ -382,20 +405,30 @@ round-456 test tones it takes mono from ≈1 140 to ≈80 bytes/frame
 with the decoded parity unchanged (3–7 % settled relative RMS error);
 `dynamic_range = 0` restores the ungated quantiser.
 
-**Frame-rate matrix**: the TOC writers now emit
-`frame_rate_multiply_info()` / `frame_rate_fractions_info()` per
-`frame_rate_index` (TS 103 190-1 §4.2.3.4, TS 103 190-2 §6.2.1.3-4 —
-one `b_multiplier` bit for indices 0..=4 / 7..=9, one
-`b_frame_rate_fraction` bit for 5..=12, nothing otherwise) and the
-immersive / 22.2 raw-frame writers take a `RawFrameHeader` (sample-
-rate / frame-rate indices) instead of hard-coding 48 kHz / 24 fps. Every
-long-frame index (48 kHz 0..=4 and 13 → 1920 / 2048 / 1536 samples;
-44,1 kHz 13 → 2048) round-trips on every layout in both tool families
-at the waveform parity floor; the framework encoder rejects the
-short-frame indices 5..=12 (< 1536 samples) because the body writers
-emit only the `b_long_frame` form of `asf_transform_info()`, not the
-Table 103 `transf_length` code + grouped psy layout those frame lengths
-require (§4.3.6.1).
+**Frame rates**: every `frame_rate_index` of Tables 83 / 84 — 23,976
+to 120 fps at 48 kHz (1920 / 2048 / 1536 / 960 / 1024 / 768 / 512 /
+384-sample frames) and index 13 at 44,1 kHz — round-trips on every
+layout in both tool families at the waveform parity floor. The TOC
+writers emit `frame_rate_multiply_info()` /
+`frame_rate_fractions_info()` per index; frames below 1536 samples
+signal their full block with the 2-bit `transf_length` (Table 103).
+
+**Block switching** (`block_switching`, default on; waveform mono /
+stereo / 5.0 / 5.1): an attack detector decides per frame half; the
+half that holds an attack is coded as four short blocks whose scale
+factors group before / from the attack, a quiet half stays one
+half-length block, a quiet frame one full block. The encoder looks
+half a frame ahead (timestamps unchanged).
+
+**Rate control** (`bitrate` in bit/s; 0 = constant quantiser): each
+frame is coded at the finest masking-driven noise level that fits its
+budget plus a one-frame bit reservoir, and the stream is announced as
+average bit rate (`wait_frames`, Table 81). Works on every layout and
+both tool families.
+
+**7.0 / 7.1 layouts** (`layout_7x` = `back` / `wide` / `wide_surround`
+/ `top` / `top_surround`): the Table 88 families 3/4/0, 5/2/0 and
+3/2/2 with `add_ch_base`.
 
 **Dialogue-enhancement authoring** (`de_author::DeAuthor`, §4.3.14 /
 §5.7.8.7 channel-independent method): from a dialogue stem and the
@@ -562,13 +595,122 @@ parses back to the authored rows.
   measurably smaller than an identity encode and decodes back within
   the ASF quantisation floor.
 
+## Measurements
+
+Release build, Apple silicon, 48 kHz; speeds are medians of three runs
+of `examples/ac4_speed.rs` on a shared machine. "Before" is the state
+at the start of the round the tables were taken in.
+
+### Speed (× realtime)
+
+| layout / route | encode before → after | decode before → after |
+| --- | --- | --- |
+| stereo, waveform | 1,06 → 165 | 4,98 → 479 |
+| 5.1, waveform | 0,34 → 70 | 1,59 → 181 |
+| 5.1, parametric (A-CPL) | 0,31 → 33 | 1,22 → 24 |
+| 7.1.4, waveform | 0,16 → 47 | 0,69 → 88 |
+| 7.1.4, parametric (A-SPX) | 0,15 → 20 | 0,49 → 14 |
+
+Three changes, each with bit-identical decoded output (the example
+prints a hash of the decoded PCM and cross-checks the FFT transforms
+against the direct summations): MDCT / IMDCT on a shared mixed-radix
+FFT plan, QMF modulation phases from tables, and a per-codebook tree
+walk in place of the per-bit table scan in Huffman decoding.
+
+### Rate and quality (`examples/ac4_quality.rs`, 8 s of programme-like content)
+
+SNR is the waveform signal-to-noise ratio through this crate's
+decoder; NMR is the mean noise-to-mask ratio over scale-factor bands
+against a Bark-spread masking threshold (27 / 12 dB per Bark, 12 dB
+below the masker) — a frequency-only model, so short blocks around
+attacks read slightly worse than they sound.
+
+| layout | setting | bitrate | SNR | NMR |
+| --- | --- | --- | --- | --- |
+| stereo | constant quantiser (before) | 366 kbit/s | 26,3 dB | −2,0 dB |
+| stereo | constant quantiser + block switching | 317 kbit/s | 25,9 dB | 2,0 dB |
+| stereo | `bitrate = 64000` | 64,0 kbit/s | 21,6 dB | 7,9 dB |
+| stereo | `bitrate = 96000` | 95,9 kbit/s | 26,4 dB | 5,9 dB |
+| stereo | `bitrate = 128000` | 128,0 kbit/s | 28,7 dB | 4,6 dB |
+| stereo | `bitrate = 192000` | 192,0 kbit/s | 32,7 dB | 2,2 dB |
+| 5.1 | constant quantiser (before) | 733 kbit/s | 26,2 dB | 2,4 dB |
+| 5.1 | `bitrate = 256000` | 255,8 kbit/s | 27,0 dB | 6,0 dB |
+| 5.1 | `bitrate = 384000` | 383,8 kbit/s | 30,4 dB | 3,8 dB |
+| 7.1.4 | constant quantiser (before) | 1 221 kbit/s | 25,4 dB | 5,1 dB |
+| 7.1.4 | `bitrate = 512000` | 511,6 kbit/s | 26,3 dB | 6,6 dB |
+| 7.1.4 | `bitrate = 768000` | 767,9 kbit/s | 28,8 dB | 5,8 dB |
+
+The rate-controlled encoder reaches the constant quantiser's SNR at
+roughly a quarter to two fifths of its bitrate; its NMR at that rate
+is higher, i.e. by this model the constant quantiser's noise is
+better hidden per band — it simply spends three times the bits. The
+parametric routes meet their targets too (5.1 at 128 – 192 kbit/s,
+7.1.4 at 256 – 384 kbit/s); waveform measures do not apply to their
+regenerated bands.
+
+### Pre-echo (tests/round492_block_switching.rs)
+
+Decaying bursts over a quiet tone; quantisation noise between a
+quarter and three quarters of a frame ahead of the onset, relative to
+the burst energy.
+
+| frame length | block switching off → on | stream size |
+| --- | --- | --- |
+| 1920 (mono) | −40,3 → −52,9 dB | 14 687 → 5 524 bytes |
+| 1920 (5.1) | −40,2 → −53,1 dB | 69 954 → 24 795 bytes |
+| 960 (mono) | −38,1 → −52,0 dB | 8 051 → 4 458 bytes |
+| 384 (mono) | −36,7 → −52,3 dB | 3 772 → 3 051 bytes |
+
+Overall SNR moves by less than 1,5 dB.
+
+### Decoder delay per route (tests/round492_latency.rs)
+
+| route | tool delay |
+| --- | --- |
+| mono / stereo / 5.X / 7.X / immersive SCPL / 22.2 Simple (waveform) | 0 |
+| A-SPX, immersive A-SPX / A-CPL / A-JCC, 22.2 A-SPX, A-JOC full decoding | 577 |
+| 5.X / 7.X ASPX_ACPL_1 / _2 / _3 | 1 154 |
+| dialogue enhancement active | + 577 |
+
+`aligned` latency = `d_pcm` (Table 188: 288 samples at 24 fps, 96 at
+30, 960 at 48, …) + 1 154.
+
+### Bitstream corrections made alongside
+
+These were conformance defects on both the write and the read side,
+invisible while the crate only decoded its own streams: 5-bit section
+lengths on long frames (Table 39 with Pseudocode 2), the
+`stereo_data()` layout with MDCT stereo processing (Table 23), sign
+bits before codebook-11 escapes (Table 40), the §5.1.4.2 noise-fill
+levels and generator, no transform-info bit in the LFE's
+`sf_info_lfe()` (Table 35), multi-window groups and
+`b_different_framing` window counts (Pseudocodes 3 / 4), the
+`sequence_counter` range 1..=1020, and the `audio_size` escape on
+immersive frames. **No AC-4 stream from another encoder is staged in
+`docs/`, so none of this is verified against foreign material** —
+the fixes follow the specification text, checked by round trips.
+
 ## Not yet supported
 
-- **Short-frame ASF syntax** — frame lengths below 1536 samples
-  (`frame_rate_index` 5..=12: 47,95 – 120 fps) need the Table 103
-  `transf_length` code and the grouped `asf_psy_info()` / spectral
-  layout in place of `b_long_frame`; no body writer emits them, so the
-  framework encoder rejects those indices.
+- **Block switching beyond the waveform mono / stereo / 5.X routes** —
+  the encoder switches blocks on mono, stereo, 5.0 and 5.1 SIMPLE
+  only; the decoder transforms partial blocks on the mono,
+  channel-pair and 5.X SIMPLE / ASPX routes. The 7.X, A-CPL,
+  immersive, 22.2 and A-JOC routes code and render full blocks (their
+  SAP / matrix stages address bands of one full block).
+- **Delay handling remainders** — the tool delay of A-JOC core
+  decoding is reported as 0 without having been characterised and the
+  A-JOC LFE is not lined up; the §5.7.2 hold of QMF-tool control data
+  by `d_ctrl` frames is not implemented as such (`aligned` delays the
+  output, which is equivalent in timing only if the control data
+  stays aligned with its signal, as it does for this crate's own
+  streams).
+- **Concealment is silence** — a damaged or unpredictable frame is
+  replaced by a silent frame, not by a faded repetition.
+- **Rate control scope** — the search drives the ASF band quantiser
+  only (the A-SPX / A-CPL parameter layers are not rate-adapted), and
+  the noise allocation is a per-band masker-energy law without
+  inter-band spreading or a tonality estimate.
 - **Dialogue-enhancement authoring remainders** — only the parametric
   channel-independent method is authored; the cross-channel methods
   (`de_mix_coef` rendering vectors), the M/S form, the hybrid
@@ -609,13 +751,6 @@ parses back to the authored rows.
   `spec_carriers`) keep the L / R-carrier extractors; the live
   `encode_frame_pcm_5_{0,1}_acpl3_real_aspx{,_multi_env}` entries and
   the framework `acpl_3` route use the Pseudocode 118 downmix model.
-- **Decoder output delay** — channels that go through a QMF-domain
-  tool come back one round trip (`qmf::QMF_ROUND_TRIP_DELAY` = 577
-  samples) later per pass; the 5.X / 7.X ASPX_ACPL_1 / _2 / _3 and
-  7_X ASPX renders line their residual, waveform-coded channels and
-  LFE up with them (tests/round485_lfe_alignment.rs), the immersive /
-  22.2 routes still emit the LFE undelayed and none applies the §5.6
-  Table 188 `d_pcm` frame-alignment delay.
 
 ## Specs
 
