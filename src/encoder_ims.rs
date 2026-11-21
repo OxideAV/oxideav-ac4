@@ -167,6 +167,20 @@ pub struct Ac4ImsEncoder {
     /// [`crate::encoder_asf::with_asf_quant`] on the SIMPLE / ASF,
     /// SCPL and 22.2 bodies.
     pub asf_dynamic_range_db: Option<f32>,
+    /// Transient-switched block lengths (TS 103 190-1 §5.5.3) on the
+    /// mono, stereo and 5.0 / 5.1 SIMPLE entry points: a frame span
+    /// with an attack is coded as short blocks (see
+    /// [`crate::encoder_blocks`]). Off by default.
+    pub block_switching: bool,
+    /// Attack detector of the block-switching paths.
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
+    pub transient: crate::encoder_blocks::TransientDetector,
+    /// The first half of the *next* frame per channel, in the channel
+    /// order of the entry point about to be called — set through
+    /// [`Self::set_lookahead`], consumed by the next block-switching
+    /// encode call.
+    #[doc(hidden)] // internal cross-frame state; not part of the stable API
+    pub lookahead: Vec<Vec<f32>>,
     /// Dialogue-enhancement metadata to carry in the closing
     /// `metadata()` element of every frame: the `de_config()` and the
     /// frame's `de_data()` (author the latter per frame with
@@ -203,6 +217,9 @@ impl Ac4ImsEncoder {
             ice_env_ana: Vec::new(),
             ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState::new(),
             asf_dynamic_range_db: None,
+            block_switching: false,
+            transient: crate::encoder_blocks::TransientDetector::new(),
+            lookahead: Vec::new(),
             dialogue_enhancement: None,
             seven_x_layout: crate::toc::SevenXLayout::BackSurround,
         }
@@ -256,6 +273,101 @@ impl Ac4ImsEncoder {
             gate: peak * 10f32.powf(-db.max(0.0) / 20.0),
             ..AsfQuant::LEGACY
         }
+    }
+
+    /// Hand the block-switching paths the first half of the next
+    /// frame (`frame_len / 2` samples per channel, in the channel
+    /// order of the encode call that follows). Without it the detector
+    /// sees only the part of the next frame's span that the current
+    /// frame already holds, and an attack in the unseen half is coded
+    /// with a full block.
+    pub fn set_lookahead(&mut self, next: &[&[f32]]) {
+        self.lookahead = next.iter().map(|c| c.to_vec()).collect();
+    }
+
+    /// Block-switching encode shared by the mono / stereo / 5.0 / 5.1
+    /// SIMPLE entry points: `chans` are the full-band channels (1, 2
+    /// or 5 — `[L, R, C, Ls, Rs]`), `lfe` the LFE channel with its band
+    /// count. Decides this frame's block arrangement (and the next
+    /// frame's, for the closing window slope), runs the block-switched
+    /// analysis and emits the frame.
+    fn encode_switched(
+        &mut self,
+        chans: &[&[f32]],
+        lfe: Option<(&[f32], u32)>,
+        max_sfb: u32,
+    ) -> Vec<u8> {
+        let (_fps_milli, frame_len) =
+            crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
+        let frame_len = if frame_len == 0 { 1920 } else { frame_len };
+        for (ch, f) in chans.iter().enumerate() {
+            assert_eq!(
+                f.len(),
+                frame_len as usize,
+                "encode: channel {ch} input length must match frame_len = {frame_len}"
+            );
+        }
+        let (n_msfb_bits, _, _) =
+            crate::tables::n_msfb_bits_48(frame_len).expect("encoder: bad tl");
+        let max_sfb = max_sfb.min((1u32 << n_msfb_bits) - 1);
+        let saved_mode = (self.channel_mode_value, self.channel_mode_bits);
+        (self.channel_mode_value, self.channel_mode_bits) = match (chans.len(), lfe.is_some()) {
+            (1, _) => (0b0, 1),
+            (2, _) => (0b10, 2),
+            (_, false) => (0b1101, 4),
+            (_, true) => (0b1110, 4),
+        };
+        // Block decisions for this frame and the next.
+        let la = std::mem::take(&mut self.lookahead);
+        let la_refs: Vec<&[f32]> = if la.len() >= chans.len() {
+            la.iter().take(chans.len()).map(|c| c.as_slice()).collect()
+        } else {
+            Vec::new()
+        };
+        let (cur, next) = self.transient.advance(chans, &la_refs);
+        let plan = crate::encoder_blocks::plan_for(cur, frame_len, max_sfb);
+        let next_first = crate::encoder_blocks::plan_for(next, frame_len, max_sfb).windows()[0];
+        let windows = plan.windows();
+        // Analysis: full-band channels on the shared arrangement, the
+        // LFE always as one full block.
+        let n_states = chans.len() + usize::from(lfe.is_some());
+        while self.mdct_states_multi.len() < n_states {
+            self.mdct_states_multi
+                .push(EncoderMdctState::new(frame_len));
+        }
+        for state in self.mdct_states_multi.iter_mut() {
+            if state.n != frame_len {
+                *state = EncoderMdctState::new(frame_len);
+            }
+        }
+        let specs: Vec<Vec<f32>> = chans
+            .iter()
+            .enumerate()
+            .map(|(ch, f)| self.mdct_states_multi[ch].analyse_blocks(f, &windows, next_first))
+            .collect();
+        let lfe_spec = lfe.map(|(f, m)| (self.mdct_states_multi[chans.len()].analyse_frame(f), m));
+        let quant = self.frame_quant(specs.iter().map(|c| c.as_slice()));
+        let body = with_asf_quant(quant, || match chans.len() {
+            1 => crate::encoder_asf::build_mono_simple_asf_body_on_plan(&plan, &specs[0]),
+            2 => crate::encoder_asf::build_stereo_simple_asf_body_on_plan(
+                &plan, &specs[0], &specs[1],
+            ),
+            _ => crate::encoder_asf::build_5_x_simple_asf_body_on_plan(
+                &plan,
+                &[&specs[0], &specs[1], &specs[2], &specs[3], &specs[4]],
+                lfe_spec.as_ref().map(|(s, m)| (s.as_slice(), *m)),
+            ),
+        });
+        let mut bw = BitWriter::new();
+        self.write_toc(&mut bw);
+        bw.align_to_byte();
+        let mut out = bw.finish();
+        out.extend(body);
+        out.extend(self.trailing_metadata());
+        self.sequence_counter = (self.sequence_counter.wrapping_add(1)) & 0x3FF;
+        self.channel_mode_value = saved_mode.0;
+        self.channel_mode_bits = saved_mode.1;
+        out
     }
 
     /// Switch to a TS 103 190-1 v0 frame layout. The decoder in this
@@ -836,6 +948,9 @@ impl Ac4ImsEncoder {
     /// tl=1920). The pad budget scales with max_sfb so the announced
     /// `audio_size` reliably exceeds the actual emission length.
     pub fn encode_frame_pcm_with_max_sfb(&mut self, frame: &[f32], max_sfb: u32) -> Vec<u8> {
+        if self.block_switching {
+            return self.encode_switched(&[frame], None, max_sfb);
+        }
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };
@@ -1006,6 +1121,9 @@ impl Ac4ImsEncoder {
         max_sfb: u32,
         force_joint: Option<bool>,
     ) -> Vec<u8> {
+        if self.block_switching && force_joint.is_none() {
+            return self.encode_switched(&[frame_l, frame_r], None, max_sfb);
+        }
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };
@@ -1147,6 +1265,9 @@ impl Ac4ImsEncoder {
         frames: &[&[f32]; 5],
         max_sfb: u32,
     ) -> Vec<u8> {
+        if self.block_switching {
+            return self.encode_switched(&frames[..], None, max_sfb);
+        }
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };
@@ -1268,6 +1389,9 @@ impl Ac4ImsEncoder {
         max_sfb: u32,
         max_sfb_lfe: u32,
     ) -> Vec<u8> {
+        if self.block_switching {
+            return self.encode_switched(&frames[..5], Some((frames[5], max_sfb_lfe)), max_sfb);
+        }
         let (_fps_milli, frame_len) =
             crate::toc::frame_rate_entry(self.frame_rate_index as u32, self.fs_index as u32);
         let frame_len = if frame_len == 0 { 1920 } else { frame_len };

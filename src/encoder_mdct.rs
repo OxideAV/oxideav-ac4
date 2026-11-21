@@ -72,6 +72,10 @@ pub struct EncoderMdctState {
     pub n: u32,
     /// Last `N` input PCM samples for the next-frame overlap.
     pub history: Vec<f32>,
+    /// Length of the last block of the previous frame (0 = `n`): the
+    /// left window slope of this frame's first block follows the
+    /// shorter of the two (§5.5.2.2).
+    pub last_block: u32,
 }
 
 impl EncoderMdctState {
@@ -82,7 +86,79 @@ impl EncoderMdctState {
         Self {
             n,
             history: vec![0.0_f32; n as usize],
+            last_block: 0,
         }
+    }
+
+    /// Block-switched analysis of one `N`-sample frame: `windows` are
+    /// the block lengths of this frame in time order (summing to `N`),
+    /// `next_first` the length of the first block of the following
+    /// frame. Returns the window-order spectrum — every block's lines
+    /// concatenated, `N` in total.
+    ///
+    /// Mirror of the decoder's Pseudocodes 63 / 64: block `k` (length
+    /// `n`) whose output span starts `pos` samples into the frame has
+    /// its two halves meet at `pos + n/2 + N/2` of the
+    /// `[previous frame | this frame]` buffer; each half is shaped by
+    /// the KBD slope of the shorter of the block and its neighbour,
+    /// centred on the longer one (ones / zeros outside the slope).
+    pub fn analyse_blocks(
+        &mut self,
+        frame: &[f32],
+        windows: &[usize],
+        next_first: usize,
+    ) -> Vec<f32> {
+        let n_full = self.n as usize;
+        assert_eq!(
+            frame.len(),
+            n_full,
+            "encoder: frame must be exactly N samples"
+        );
+        debug_assert_eq!(windows.iter().sum::<usize>(), n_full);
+        let mut buf = Vec::with_capacity(2 * n_full);
+        buf.extend_from_slice(&self.history);
+        buf.extend_from_slice(frame);
+        let mut out = Vec::with_capacity(n_full);
+        let mut prev = if self.last_block == 0 {
+            n_full
+        } else {
+            self.last_block as usize
+        };
+        let mut pos = 0usize;
+        let mut seg: Vec<f32> = Vec::new();
+        for (b, &n) in windows.iter().enumerate() {
+            let next = windows.get(b + 1).copied().unwrap_or(next_first.max(1));
+            let centre = pos + n / 2 + n_full / 2;
+            seg.clear();
+            seg.extend_from_slice(&buf[centre - n..centre + n]);
+            // Left half.
+            let nwl = n.min(prev);
+            let wl = crate::mdct::kbd_window_shared(nwl as u32);
+            let ls = (n - nwl) / 2;
+            for v in &mut seg[..ls] {
+                *v = 0.0;
+            }
+            for (v, w) in seg[ls..ls + nwl].iter_mut().zip(&wl[..nwl]) {
+                *v *= *w;
+            }
+            // Right half.
+            let nwr = n.min(next);
+            let wr = crate::mdct::kbd_window_shared(nwr as u32);
+            let rs = (n - nwr) / 2;
+            for (v, w) in seg[n + rs..n + rs + nwr].iter_mut().zip(&wr[nwr..]) {
+                *v *= *w;
+            }
+            for v in &mut seg[n + rs + nwr..] {
+                *v = 0.0;
+            }
+            out.extend(crate::mdct::mdct_forward(&seg));
+            prev = n;
+            pos += n;
+        }
+        self.last_block = prev as u32;
+        self.history.clear();
+        self.history.extend_from_slice(frame);
+        out
     }
 
     /// Push a fresh `N`-sample frame of input PCM through the windowed
@@ -92,6 +168,11 @@ impl EncoderMdctState {
     pub fn analyse_frame(&mut self, frame: &[f32]) -> Vec<f32> {
         let n = self.n as usize;
         assert_eq!(frame.len(), n, "encoder: frame must be exactly N samples");
+        if self.last_block != 0 && self.last_block != self.n {
+            // The previous frame ended on a partial block: this full
+            // block's left slope follows it.
+            return self.analyse_blocks(frame, &[n], n);
+        }
         // Build the 2N-sample MDCT input: previous N + new N.
         let mut buf = Vec::with_capacity(2 * n);
         buf.extend_from_slice(&self.history);
@@ -105,6 +186,7 @@ impl EncoderMdctState {
         // for the next call's leading half.
         self.history.clear();
         self.history.extend_from_slice(frame);
+        self.last_block = self.n;
         spec
     }
 }

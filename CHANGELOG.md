@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Transient-switched block lengths in the encoder** (§5.5.3;
+  framework option `block_switching`, default on;
+  `Ac4ImsEncoder::block_switching` + `set_lookahead`) on the waveform
+  mono / stereo / 5.0 / 5.1 routes and every frame length. An attack
+  detector (`encoder_blocks`: first-difference energy in sixteen
+  sub-blocks of the span a frame's partial blocks cover, against the
+  recent past and the long-term level) decides per frame half; the
+  half with an attack is coded as four short blocks whose scale
+  factors group before / from the attack, a quiet half stays one
+  half-length block (`b_different_framing`), a quiet frame stays one
+  full block. `EncoderMdctState::analyse_blocks` mirrors the
+  decoder's Pseudocode 63 / 64 window slopes, the body writers take
+  any arrangement through `asf_blocks::BlockPlan` (`sf_info()`
+  writer + layout) and `encoder_asf::code_sf_data` /
+  `build_{mono,stereo,5_x}_simple_asf_body_on_plan`; the framework
+  encoder buffers the half frame of lookahead (timestamps unchanged).
+  On decaying bursts over a quiet tone the quantisation noise a full
+  block spreads ahead of the onset falls from −40 dB to −53 dB re the
+  burst at 1920-sample frames (−37 → −52 dB at 384), overall SNR
+  within 1 dB, and the stream shrinks to 35 – 80 % of the full-block
+  size (tests/round492_block_switching.rs).
+- Framework option `layout_7x` (`back` / `wide` / `wide_surround` /
+  `top` / `top_surround` — the Table 88 7.0 / 7.1 families 3/4/0,
+  5/2/0 and 3/2/2 with `add_ch_base`; `Ac4EncoderOptions::
+  with_layout_7x`). Every layout round-trips on 7.0 and 7.1: each
+  channel 0,9 – 1,1× its input level on the waveform route and
+  0,62 – 1,21× on the ASPX_ACPL_1 / _2 routes, with the layout
+  announced in the TOC (tests/round492_7x_framework_layouts.rs).
 - **Frame rates 47,95 – 120 fps** (`frame_rate_index` 5..=12, frame
   lengths 960 / 1024 / 768 / 512 / 384) through the framework encoder
   on every layout and tool family: each frame is one full block

@@ -559,6 +559,8 @@ pub mod encoder_ajcc;
 pub mod encoder_ajoc;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_asf;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod encoder_blocks;
 pub mod encoder_ims;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_mdct;

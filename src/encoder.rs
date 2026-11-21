@@ -106,9 +106,8 @@ pub struct Ac4EncoderOptions {
     /// for 44,1 kHz). Sets the AC-4 frame length: at 48 kHz index 0 / 1
     /// (23,976 / 24 fps) is 1920 samples, 2 (25 fps) 2048, 3 / 4
     /// (29,97 / 30 fps) 1536, 13 (23,44 fps) 2048; at 44,1 kHz only
-    /// index 13 (2048 samples) exists. Indices 5..=12 (frame lengths
-    /// below 1536 samples) are rejected until the short-frame ASF
-    /// syntax is written.
+    /// index 13 (2048 samples) exists. Indices 5..=12 (47,95 – 120
+    /// fps) use the 960 / 1024 / 768 / 512 / 384-sample frames.
     pub frame_rate_index: u32,
     /// Packet framing (`sync` / `sync_crc` / `raw`).
     pub framing: Framing,
@@ -130,6 +129,58 @@ pub struct Ac4EncoderOptions {
     /// A-CPL codec mode on the parametric 5.X / 7.X routes
     /// (`acpl_2` / `acpl_1`).
     pub acpl: AcplMode,
+    /// Transient-switched block lengths on the waveform mono / stereo
+    /// / 5.0 / 5.1 routes (TS 103 190-1 §5.5.3): a frame span that
+    /// holds an attack is coded as short blocks. The encoder then
+    /// looks half a frame ahead (packets appear half a frame later;
+    /// timestamps are unaffected).
+    pub block_switching: bool,
+    /// Target bitrate in bit/s (`0` = no rate control: constant
+    /// quantiser quality, variable rate). When set, every frame's
+    /// quantiser is searched so the stream averages the target with a
+    /// bit reservoir of one frame's budget (see `rate` in the module
+    /// docs).
+    pub bitrate: u32,
+    /// Speaker layout of the 7-channel (7.0 / 7.1) streams: where the
+    /// two additional channels sit (TS 103 190-1 Table 88).
+    pub layout_7x: SevenXChoice,
+}
+
+/// The 7.0 / 7.1 speaker layouts (`layout_7x`): TS 103 190-1 Table 88
+/// channel modes 5..=10 with the §4.3.3.7.6 `add_ch_base` flag of the
+/// 5/2/0 and 3/2/2 families. Input channel 6 / 7 (after `L R C [LFE]
+/// Ls Rs`) carry the additional pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SevenXChoice {
+    /// 3/4/0.x — additional pair `Lb / Rb` (`back`).
+    #[default]
+    Back,
+    /// 5/2/0.x — additional pair `Lw / Rw`, coupled on `L / R`
+    /// (`wide`).
+    Wide,
+    /// 5/2/0.x with `add_ch_base = 1` — coupled on `Ls / Rs`
+    /// (`wide_surround`).
+    WideSurround,
+    /// 3/2/2.x — additional pair `Tfl / Tfr`, coupled on `L / R`
+    /// (`top`).
+    Top,
+    /// 3/2/2.x with `add_ch_base = 1` — coupled on `Ls / Rs`
+    /// (`top_surround`).
+    TopSurround,
+}
+
+impl SevenXChoice {
+    fn to_layout(self) -> crate::toc::SevenXLayout {
+        use crate::toc::SevenXLayout as L;
+        match self {
+            Self::Back => L::BackSurround,
+            Self::Wide => L::Wide { add_ch_base: false },
+            Self::WideSurround => L::Wide { add_ch_base: true },
+            Self::Top => L::TopFront { add_ch_base: false },
+            Self::TopSurround => L::TopFront { add_ch_base: true },
+        }
+    }
 }
 
 impl Ac4EncoderOptions {
@@ -181,6 +232,27 @@ impl Ac4EncoderOptions {
         self.acpl = v;
         self
     }
+
+    /// Builder: set [`block_switching`](Self::block_switching).
+    #[must_use]
+    pub fn with_block_switching(mut self, v: bool) -> Self {
+        self.block_switching = v;
+        self
+    }
+
+    /// Builder: set [`bitrate`](Self::bitrate) in bit/s.
+    #[must_use]
+    pub fn with_bitrate(mut self, v: u32) -> Self {
+        self.bitrate = v;
+        self
+    }
+
+    /// Builder: set [`layout_7x`](Self::layout_7x).
+    #[must_use]
+    pub fn with_layout_7x(mut self, v: SevenXChoice) -> Self {
+        self.layout_7x = v;
+        self
+    }
 }
 
 impl Default for Ac4EncoderOptions {
@@ -193,6 +265,9 @@ impl Default for Ac4EncoderOptions {
             dynamic_range_db: 60,
             gop: 1,
             acpl: AcplMode::Acpl2,
+            block_switching: true,
+            bitrate: 0,
+            layout_7x: SevenXChoice::Back,
         }
     }
 }
@@ -241,6 +316,24 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
             default: OptionValue::String(String::new()),
             help: "A-CPL codec mode of the parametric 5.X / 7.X routes: acpl_2 (fully parametric pair), acpl_1 (waveform side below acpl_qmf_band) or acpl_3 (5.X only: one stereo downmix for all five channels)",
         },
+        OptionField {
+            name: "block_switching",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "transient-switched short blocks on the waveform mono / stereo / 5.0 / 5.1 routes (half a frame of encoder lookahead)",
+        },
+        OptionField {
+            name: "bitrate",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "target bitrate in bit/s (0 = constant quality, variable rate)",
+        },
+        OptionField {
+            name: "layout_7x",
+            kind: OptionKind::Enum(&["back", "wide", "wide_surround", "top", "top_surround"]),
+            default: OptionValue::String(String::new()),
+            help: "7.0 / 7.1 speaker layout: back (3/4/0, Lb Rb), wide (5/2/0, Lw Rw) or top (3/2/2, Tfl Tfr); the _surround forms set add_ch_base (additional pair coupled on Ls / Rs)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -271,6 +364,20 @@ impl CodecOptionsStruct for Ac4EncoderOptions {
                     "acpl_3" => AcplMode::Acpl3,
                     other => {
                         return Err(Error::invalid(format!("ac4: unknown acpl mode '{other}'")));
+                    }
+                }
+            }
+            "block_switching" => self.block_switching = value.as_bool()?,
+            "bitrate" => self.bitrate = value.as_u32()?,
+            "layout_7x" => {
+                self.layout_7x = match value.as_str()? {
+                    "back" => SevenXChoice::Back,
+                    "wide" => SevenXChoice::Wide,
+                    "wide_surround" => SevenXChoice::WideSurround,
+                    "top" => SevenXChoice::Top,
+                    "top_surround" => SevenXChoice::TopSurround,
+                    other => {
+                        return Err(Error::invalid(format!("ac4: unknown layout_7x '{other}'")));
                     }
                 }
             }
@@ -383,6 +490,9 @@ pub struct Ac4Encoder {
     max_sfb_lfe: u32,
     ready: std::collections::VecDeque<Packet>,
     flushed: bool,
+    /// Samples of the next frame the inner encoder wants to see before
+    /// a frame is coded (block-switching lookahead; 0 = none).
+    lookahead: usize,
 }
 
 impl Ac4Encoder {
@@ -448,6 +558,16 @@ impl Ac4Encoder {
         inner.frame_rate_index = opts.frame_rate_index as u8;
         inner.asf_dynamic_range_db =
             (opts.dynamic_range_db > 0).then_some(opts.dynamic_range_db as f32);
+        inner.seven_x_layout = opts.layout_7x.to_layout();
+        // Block switching applies where the body writers take a block
+        // plan: the waveform mono / stereo / 5.0 / 5.1 routes.
+        let switched = opts.block_switching
+            && opts.mode == EncodeMode::Waveform
+            && matches!(
+                layout,
+                Layout::Mono | Layout::Stereo | Layout::S5_0 | Layout::S5_1
+            );
+        inner.block_switching = switched;
 
         let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
         out_params.sample_rate = Some(sample_rate);
@@ -471,6 +591,7 @@ impl Ac4Encoder {
             max_sfb_lfe,
             ready: std::collections::VecDeque::new(),
             flushed: false,
+            lookahead: if switched { frame_len as usize / 2 } else { 0 },
         })
     }
 
@@ -531,10 +652,33 @@ impl Ac4Encoder {
         Ok(())
     }
 
-    /// Encode as many complete frames as the FIFO holds.
+    /// Encode as many complete frames as the FIFO holds. With block
+    /// switching a frame is coded once the first half of the following
+    /// frame is buffered too (the attack detector's lookahead); after
+    /// `flush` the missing lookahead is silence.
     fn drain_frames(&mut self) {
-        while self.fifo[0].len() >= self.frame_len {
+        loop {
+            let have = self.fifo[0].len();
             let n = self.frame_len;
+            if have < n || (!self.flushed && have < n + self.lookahead) {
+                break;
+            }
+            if self.lookahead > 0 {
+                let la = self.lookahead;
+                let next: Vec<Vec<f32>> = self
+                    .fifo
+                    .iter()
+                    .map(|f| {
+                        let mut v: Vec<f32> = f[n..].iter().take(la).copied().collect();
+                        v.resize(la, 0.0);
+                        v
+                    })
+                    .collect();
+                // The inner 5.1 entry reads the lookahead of its five
+                // full-band channels: slots 0..5 either way.
+                let refs: Vec<&[f32]> = next.iter().map(|v| v.as_slice()).collect();
+                self.inner.set_lookahead(&refs);
+            }
             let chans: Vec<Vec<f32>> = self
                 .fifo
                 .iter_mut()
@@ -847,7 +991,7 @@ impl Encoder for Ac4Encoder {
         self.flushed = true;
         let pending = self.fifo[0].len();
         if pending > 0 {
-            let pad = self.frame_len - pending;
+            let pad = (self.frame_len - pending % self.frame_len) % self.frame_len;
             for f in &mut self.fifo {
                 f.resize(f.len() + pad, 0.0);
             }

@@ -1648,6 +1648,94 @@ pub fn average_per_sfb_correlation(
     (acc / weight_total) as f32
 }
 
+/// The two tracks and the `chparam_info()` of a channel pair coded
+/// with MDCT stereo processing on `layout`: per window group and
+/// scale-factor band the pair is carried either directly or as
+/// `M = (L + R)/2`, `S = (L − R)/2` — whichever costs fewer spectral
+/// bits under the active quantiser policy. The decoder's §5.3.3.2
+/// quartet for an `ms_used` band is `(1, 1, 1, −1)`: `O0 = I0 + I1`,
+/// `O1 = I0 − I1`. `l` / `r` are window-order spectra.
+pub fn joint_stereo_tracks(
+    layout: &crate::asf_blocks::AsfLayout,
+    l: &[f32],
+    r: &[f32],
+) -> (Vec<f32>, Vec<f32>, crate::asf::ChparamInfo) {
+    let n = layout.out_len();
+    let line = |c: &[f32], k: usize| c.get(k).copied().unwrap_or(0.0);
+    let mut t0: Vec<f32> = (0..n).map(|k| line(l, k)).collect();
+    let mut t1: Vec<f32> = (0..n).map(|k| line(r, k)).collect();
+    let mut ms_used: Vec<Vec<bool>> = Vec::with_capacity(layout.groups.len());
+    for (g, grp) in layout.groups.iter().enumerate() {
+        let mut row = vec![false; grp.max_sfb as usize];
+        for (sfb, used) in row.iter_mut().enumerate() {
+            let idx: Vec<usize> = layout.band_ranges(g, sfb).flatten().collect();
+            let band_l: Vec<f32> = idx.iter().map(|&k| line(l, k)).collect();
+            let band_r: Vec<f32> = idx.iter().map(|&k| line(r, k)).collect();
+            let band_m: Vec<f32> = band_l
+                .iter()
+                .zip(&band_r)
+                .map(|(a, b)| 0.5 * (a + b))
+                .collect();
+            let band_s: Vec<f32> = band_l
+                .iter()
+                .zip(&band_r)
+                .map(|(a, b)| 0.5 * (a - b))
+                .collect();
+            let cost = |x: &[f32]| pick_best_codebook_for_band(x).3;
+            if cost(&band_m).saturating_add(cost(&band_s))
+                < cost(&band_l).saturating_add(cost(&band_r))
+            {
+                *used = true;
+                for (i, &k) in idx.iter().enumerate() {
+                    t0[k] = band_m[i];
+                    t1[k] = band_s[i];
+                }
+            }
+        }
+        ms_used.push(row);
+    }
+    let cp = if ms_used.iter().flatten().any(|&m| m) {
+        crate::asf::build_chparam_info_ms_used(ms_used)
+    } else {
+        crate::asf::build_chparam_info_none()
+    };
+    (t0, t1, cp)
+}
+
+/// Quantise the two tracks of [`joint_stereo_tracks`]. When every band
+/// is M/S coded and the frame's side energy is far below its mid
+/// energy, the bits the near-silent second track saves go into a
+/// finer first track: its peak-quant target rises by up to a third as
+/// the side share falls from 15 % to 0.
+fn code_joint_tracks(
+    layout: &crate::asf_blocks::AsfLayout,
+    t0: &[f32],
+    t1: &[f32],
+    cp: &crate::asf::ChparamInfo,
+) -> (SfDataCoded, SfDataCoded) {
+    let energy = |t: &[f32]| t.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
+    let (e0, e1) = (energy(t0), energy(t1));
+    let side_share = if e0 > 1e-20 {
+        (e1 / (e0 + e1)) as f32
+    } else {
+        1.0
+    };
+    let base = active_asf_quant();
+    let boost = 1.0 + (1.0 - (side_share / 0.15).min(1.0)) / 3.0;
+    let all_ms = cp.sap_mode == 1 && cp.ms_used.iter().flatten().all(|&m| m);
+    let q0 = AsfQuant {
+        q_target: if all_ms {
+            base.q_target * boost
+        } else {
+            base.q_target
+        },
+        ..base
+    };
+    let c0 = with_asf_quant(q0, || code_sf_data(layout, t0));
+    let c1 = code_sf_data(layout, t1);
+    (c0, c1)
+}
+
 /// Build the full stereo SIMPLE/ASF substream body for the long-frame
 /// single-window-group case in **joint-MDCT (Path B: M/S CPE)** form per
 /// ETSI TS 103 190-1 §5.3 + §4.2.6.3 Table 22 (`stereo_data()` with
@@ -1702,93 +1790,111 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
     coeffs_r: &[f32],
     pad_target_bytes: usize,
 ) -> Vec<u8> {
-    let layout = crate::asf_blocks::AsfLayout::full_block(transform_length, max_sfb)
-        .expect("encoder: unsupported transform_length");
-    let sfbo = layout.groups[0].sfbo;
-    let end_bin = sfbo[max_sfb as usize] as usize;
-    let line = |c: &[f32], k: usize| c.get(k).copied().unwrap_or(0.0);
+    let _ = pad_target_bytes;
+    build_stereo_simple_asf_body_on_plan(
+        &crate::asf_blocks::BlockPlan::full_block(transform_length, max_sfb),
+        coeffs_l,
+        coeffs_r,
+    )
+}
 
-    // Per band: code (L, R) directly or as M = (L + R)/2, S = (L − R)/2
-    // — whichever costs fewer spectral bits. The decoder's §5.3.3.2
-    // quartet for an `ms_used` band is (1, 1, 1, −1): O0 = I0 + I1,
-    // O1 = I0 − I1.
-    let mut t0 = vec![0.0f32; end_bin];
-    let mut t1 = vec![0.0f32; end_bin];
-    let mut ms_used = vec![false; max_sfb as usize];
-    for sfb in 0..max_sfb as usize {
-        let (a, b) = (sfbo[sfb] as usize, sfbo[sfb + 1] as usize);
-        let band_l: Vec<f32> = (a..b).map(|k| line(coeffs_l, k)).collect();
-        let band_r: Vec<f32> = (a..b).map(|k| line(coeffs_r, k)).collect();
-        let band_m: Vec<f32> = band_l
-            .iter()
-            .zip(&band_r)
-            .map(|(l, r)| 0.5 * (l + r))
-            .collect();
-        let band_s: Vec<f32> = band_l
-            .iter()
-            .zip(&band_r)
-            .map(|(l, r)| 0.5 * (l - r))
-            .collect();
-        let cost = |x: &[f32]| pick_best_codebook_for_band(x).3;
-        let use_ms = cost(&band_m).saturating_add(cost(&band_s))
-            < cost(&band_l).saturating_add(cost(&band_r));
-        ms_used[sfb] = use_ms;
-        let (x0, x1) = if use_ms {
-            (band_m, band_s)
-        } else {
-            (band_l, band_r)
-        };
-        t0[a..b].copy_from_slice(&x0);
-        t1[a..b].copy_from_slice(&x1);
-    }
-    let cp = if ms_used.iter().any(|&m| m) {
-        crate::asf::build_chparam_info_ms_used(vec![ms_used])
-    } else {
-        crate::asf::build_chparam_info_none()
-    };
-    // When the frame's side energy is far below its mid energy, the
-    // bits the near-silent second track saves go into a finer first
-    // track: its peak-quant target rises from the active policy's
-    // value by up to a third as the side share falls from 15 % to 0.
-    let energy = |t: &[f32]| t.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
-    let (e0, e1) = (energy(&t0), energy(&t1));
-    let side_share = if e0 > 1e-20 {
-        (e1 / (e0 + e1)) as f32
-    } else {
-        1.0
-    };
-    let base = active_asf_quant();
-    let boost = 1.0 + (1.0 - (side_share / 0.15).min(1.0)) / 3.0;
-    let all_ms = cp.sap_mode == 1 && cp.ms_used.iter().flatten().all(|&m| m);
-    let q0 = AsfQuant {
-        q_target: if all_ms {
-            base.q_target * boost
-        } else {
-            base.q_target
-        },
-        ..base
-    };
-    let c0 = with_asf_quant(q0, || code_sf_data(&layout, &t0));
-    let c1 = code_sf_data(&layout, &t1);
-
-    // Table 22 / 23: stereo_codec_mode = SIMPLE, then stereo_data()
-    // with b_enable_mdct_stereo_proc = 1 — sf_info(ASF, 0, 0),
-    // chparam_info(), sf_data(ASF) × 2.
+/// Open an `ac4_substream()` body: the 15-bit `audio_size_value` +
+/// `b_more_bits` placeholder [`finish_substream_body`] back-patches.
+fn open_substream_body() -> BitWriter {
     let mut bw = BitWriter::new();
-    let audio_size = pad_target_bytes as u32;
-    bw.write_u32(audio_size & 0x7FFF, 15);
+    bw.write_u32(0, 15);
     bw.write_bit(false);
     bw.align_to_byte();
+    bw
+}
+
+/// Mono SIMPLE substream body on any block arrangement:
+/// `mono_codec_mode = SIMPLE`, then `mono_data(0)` — `spec_frontend =
+/// ASF`, `sf_info(ASF, 0, 0)`, `sf_data(ASF)`. `spec` is the
+/// window-order spectrum of `plan`.
+pub fn build_mono_simple_asf_body_on_plan(
+    plan: &crate::asf_blocks::BlockPlan,
+    spec: &[f32],
+) -> Vec<u8> {
+    let layout = plan.layout().expect("encoder: block plan has no layout");
+    let coded = code_sf_data(&layout, spec);
+    let mut bw = open_substream_body();
+    bw.write_u32(0, 1); // mono_codec_mode = SIMPLE
+    bw.write_u32(0, 1); // spec_frontend = ASF
+    plan.write_sf_info(&mut bw);
+    write_sf_data(&mut bw, &coded);
+    finish_substream_body(bw)
+}
+
+/// Stereo SIMPLE substream body on any block arrangement (Tables 22 /
+/// 23): `stereo_codec_mode = SIMPLE`, `stereo_data()` with
+/// `b_enable_mdct_stereo_proc = 1` — one shared `sf_info(ASF, 0, 0)`,
+/// `chparam_info()`, `sf_data(ASF)` × 2.
+pub fn build_stereo_simple_asf_body_on_plan(
+    plan: &crate::asf_blocks::BlockPlan,
+    l: &[f32],
+    r: &[f32],
+) -> Vec<u8> {
+    let layout = plan.layout().expect("encoder: block plan has no layout");
+    let (t0, t1, cp) = joint_stereo_tracks(&layout, l, r);
+    let (c0, c1) = code_joint_tracks(&layout, &t0, &t1, &cp);
+    let mut bw = open_substream_body();
     bw.write_u32(0, 2); // stereo_codec_mode = SIMPLE
     bw.write_bit(true); // b_enable_mdct_stereo_proc
-    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
-    let (n_msfb_bits, _, _) =
-        crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
-    bw.write_u32(max_sfb, n_msfb_bits);
+    plan.write_sf_info(&mut bw);
     write_chparam_info(&mut bw, &cp, &layout.grid());
     write_sf_data(&mut bw, &c0);
     write_sf_data(&mut bw, &c1);
+    finish_substream_body(bw)
+}
 
+/// 5.0 / 5.1 SIMPLE substream body on any block arrangement (Table 25
+/// with `coding_config = 3`): `5_X_codec_mode = SIMPLE`, the LFE's
+/// `mono_data(1)` when `lfe = (spectrum, max_sfb_lfe)` is given (always
+/// one full block, Table 35), then `five_channel_data()` — one shared
+/// `sf_info(ASF, 0, 0)`, `five_channel_info()` with `chel_matsel = 0`
+/// and the `(L, R)` / `(Ls, Rs)` pairs M/S coded per band where that is
+/// cheaper, and five `sf_data(ASF)` bodies in Table 180 order
+/// `[L, R, C, Ls, Rs]`.
+pub fn build_5_x_simple_asf_body_on_plan(
+    plan: &crate::asf_blocks::BlockPlan,
+    five: &[&[f32]; 5],
+    lfe: Option<(&[f32], u32)>,
+) -> Vec<u8> {
+    let layout = plan.layout().expect("encoder: block plan has no layout");
+    let mut bw = open_substream_body();
+    bw.write_u32(0, 3); // 5_X_codec_mode = SIMPLE
+    if let Some((spec, max_sfb_lfe)) = lfe {
+        let tl = plan.frame_len;
+        let (_, _, n_msfbl_bits) = crate::tables::n_msfb_bits_48(tl).expect("encoder: bad tl");
+        let cap = (1u32 << n_msfbl_bits) - 1;
+        let max_sfb_lfe = max_sfb_lfe.min(cap);
+        let lfe_layout =
+            crate::asf_blocks::AsfLayout::full_block(tl, max_sfb_lfe).expect("encoder: LFE layout");
+        bw.write_u32(max_sfb_lfe, n_msfbl_bits);
+        write_sf_data(&mut bw, &code_sf_data(&lfe_layout, spec));
+    }
+    bw.write_u32(3, 2); // coding_config = 3: five_channel_data()
+    plan.write_sf_info(&mut bw);
+    // Table 179 with chel_matsel = 0 and identity quartets 0 / 1 / 2:
+    // quartet 3 maps tracks (0, 3) to (L, Ls), quartet 4 maps tracks
+    // (1, 4) to (R, Rs). The (L, R) and (Ls, Rs) pairs are M/S coded
+    // through quartets 0 and 2 of the same table.
+    let (a, b, cp_front) = joint_stereo_tracks(&layout, five[0], five[1]);
+    let (d, e, cp_back) = joint_stereo_tracks(&layout, five[3], five[4]);
+    let grid = layout.grid();
+    bw.write_u32(0, 4); // chel_matsel
+    let none = crate::asf::build_chparam_info_none();
+    for cp in [&cp_front, &none, &cp_back, &none, &none] {
+        write_chparam_info(&mut bw, cp, &grid);
+    }
+    let n = layout.out_len();
+    let centre: Vec<f32> = (0..n)
+        .map(|k| five[2].get(k).copied().unwrap_or(0.0))
+        .collect();
+    for track in [&a, &b, &centre, &d, &e] {
+        write_sf_data(&mut bw, &code_sf_data(&layout, track));
+    }
     finish_substream_body(bw)
 }
 

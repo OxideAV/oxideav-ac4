@@ -292,6 +292,144 @@ impl AsfLayout {
     }
 }
 
+/// An encoder-side description of one `sf_info(ASF, 0, 0)` element:
+/// the block arrangement of a frame, its window grouping and the
+/// per-half band counts. [`BlockPlan::write_sf_info`] emits it,
+/// [`BlockPlan::layout`] resolves the layout the bodies are coded on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPlan {
+    /// `frame_len_base`.
+    pub frame_len: u32,
+    /// `b_long_frame` (only meaningful for `frame_len ≥ 1536`).
+    pub long: bool,
+    /// `transf_length[0]` / `transf_length[1]` (equal below 1536).
+    pub transf_length: [u32; 2],
+    /// The transmitted `scale_factor_grouping` bits (`n_grp_bits` of
+    /// them, Tables 109 / 110).
+    pub grouping: Vec<u8>,
+    /// `max_sfb[0]` / `max_sfb[1]`.
+    pub max_sfb: [u32; 2],
+}
+
+impl BlockPlan {
+    /// One full block of `frame_len` lines.
+    pub fn full_block(frame_len: u32, max_sfb: u32) -> Self {
+        let code = full_block_tl_code(frame_len);
+        Self {
+            frame_len,
+            long: code == LONG_FRAME_TL_CODE,
+            transf_length: if code == LONG_FRAME_TL_CODE {
+                [0; 2]
+            } else {
+                [code; 2]
+            },
+            grouping: Vec::new(),
+            max_sfb: [max_sfb; 2],
+        }
+    }
+
+    /// The `asf_transform_info()` this plan describes.
+    pub fn transform_info(&self) -> AsfTransformInfo {
+        let len = |code: u32| {
+            if self.long {
+                self.frame_len
+            } else {
+                crate::asf::resolve_transf_length(self.frame_len, false, code)
+            }
+        };
+        AsfTransformInfo {
+            b_long_frame: self.long,
+            transf_length: self.transf_length,
+            transform_length_0: len(self.transf_length[0]),
+            transform_length_1: len(self.transf_length[1]),
+        }
+    }
+
+    /// `true` when the two frame halves use different transform lengths.
+    pub fn different_framing(&self) -> bool {
+        !self.long && self.frame_len >= 1536 && self.transf_length[0] != self.transf_length[1]
+    }
+
+    /// `n_grp_bits` (Tables 109 / 110).
+    pub fn n_grp_bits(&self) -> u32 {
+        if self.long {
+            0
+        } else if self.frame_len >= 1536 {
+            crate::asf::n_grp_bits_ge_1536(self.transf_length[0], self.transf_length[1])
+        } else {
+            crate::asf::n_grp_bits_lt_1536(self.frame_len, self.transf_length[0])
+        }
+    }
+
+    /// The `asf_psy_info()` this plan describes.
+    pub fn psy_info(&self) -> AsfPsyInfo {
+        let diff = self.different_framing();
+        let n_grp = self.n_grp_bits();
+        let mut grouping = self.grouping.clone();
+        grouping.resize(n_grp as usize, 1);
+        let single = self.long || (self.frame_len < 1536 && n_grp == 0);
+        AsfPsyInfo {
+            b_different_framing: diff,
+            max_sfb_0: self.max_sfb[0],
+            max_sfb_1: self.max_sfb[1],
+            num_windows: if single {
+                1
+            } else {
+                n_grp + 1 + u32::from(diff)
+            },
+            num_window_groups: if single {
+                1
+            } else {
+                1 + grouping.iter().filter(|&&b| b == 0).count() as u32 + u32::from(diff)
+            },
+            scale_factor_grouping: grouping,
+            frame_len_base: self.frame_len,
+            ..AsfPsyInfo::default()
+        }
+    }
+
+    /// The layout the frame's `sf_data(ASF)` bodies are coded on.
+    pub fn layout(&self) -> Option<AsfLayout> {
+        AsfLayout::new(
+            &self.transform_info(),
+            &self.psy_info(),
+            self.max_sfb[0],
+            self.max_sfb[1],
+        )
+    }
+
+    /// The block lengths of the frame in time order.
+    pub fn windows(&self) -> Vec<usize> {
+        self.transform_info()
+            .windows(self.frame_len)
+            .unwrap_or_else(|| vec![self.frame_len as usize])
+    }
+
+    /// Emit `sf_info(ASF, 0, 0)`: `asf_transform_info()` (Table 37)
+    /// then `asf_psy_info(0, 0)` (Table 38).
+    pub fn write_sf_info(&self, bw: &mut oxideav_core::bits::BitWriter) {
+        let ti = self.transform_info();
+        if self.frame_len >= 1536 {
+            bw.write_bit(self.long);
+            if !self.long {
+                bw.write_u32(self.transf_length[0], 2);
+                bw.write_u32(self.transf_length[1], 2);
+            }
+        } else {
+            bw.write_u32(self.transf_length[0], 2);
+        }
+        let bits = |tl: u32| crate::tables::n_msfb_bits_48(tl).map(|b| b.0).unwrap_or(6);
+        bw.write_u32(self.max_sfb[0], bits(ti.transform_length_0));
+        if self.different_framing() {
+            bw.write_u32(self.max_sfb[1], bits(ti.transform_length_1));
+        }
+        let n_grp = self.n_grp_bits() as usize;
+        for i in 0..n_grp {
+            bw.write_u32(self.grouping.get(i).copied().unwrap_or(1) as u32, 1);
+        }
+    }
+}
+
 thread_local! {
     static SNF_RNG: RefCell<SsfRandGenState> = RefCell::new(snf_state_for(0));
 }
@@ -565,5 +703,70 @@ mod tests {
         let s = snf_state_for(256 + 3);
         let r = snf_state_for(3);
         assert_eq!((s.state_idx, s.current_idx), (r.state_idx, r.current_idx));
+    }
+
+    #[test]
+    fn block_plan_sf_info_round_trips_through_the_parser() {
+        use oxideav_core::bits::BitWriter;
+        // 1920-sample frame: four 240-line blocks (two groups) then one
+        // 960-line block.
+        let plan = BlockPlan {
+            frame_len: 1920,
+            long: false,
+            transf_length: [1, 3],
+            grouping: vec![1, 0, 1],
+            max_sfb: [12, 30],
+        };
+        let mut bw = BitWriter::new();
+        plan.write_sf_info(&mut bw);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let ti = crate::asf::parse_asf_transform_info(&mut br, 1920).unwrap();
+        let psy = crate::asf::parse_asf_psy_info(&mut br, &ti, 1920, false, false).unwrap();
+        assert_eq!(ti.transf_length, [1, 3]);
+        assert_eq!((psy.max_sfb_0, psy.max_sfb_1), (12, 30));
+        assert_eq!(psy.num_windows, 5);
+        assert_eq!(psy.num_window_groups, 3);
+        let a = AsfLayout::new(&ti, &psy, psy.max_sfb_0, psy.max_sfb_1).unwrap();
+        let b = plan.layout().unwrap();
+        assert_eq!(a.windows, vec![240, 240, 240, 240, 960]);
+        assert_eq!(a.windows, b.windows);
+        assert_eq!(
+            a.groups
+                .iter()
+                .map(|g| (g.first_win, g.num_win, g.max_sfb))
+                .collect::<Vec<_>>(),
+            b.groups
+                .iter()
+                .map(|g| (g.first_win, g.num_win, g.max_sfb))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            a.groups.iter().map(|g| g.num_win).collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+        // Below 1536 samples: 960-sample frame as four 240-line blocks.
+        let plan = BlockPlan {
+            frame_len: 960,
+            long: false,
+            transf_length: [1, 1],
+            grouping: vec![0, 1, 1],
+            max_sfb: [10, 10],
+        };
+        let mut bw = BitWriter::new();
+        plan.write_sf_info(&mut bw);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let ti = crate::asf::parse_asf_transform_info(&mut br, 960).unwrap();
+        let psy = crate::asf::parse_asf_psy_info(&mut br, &ti, 960, false, false).unwrap();
+        let a = AsfLayout::new(&ti, &psy, psy.max_sfb_0, psy.max_sfb_1).unwrap();
+        assert_eq!(a.windows, vec![240; 4]);
+        assert_eq!(
+            a.groups.iter().map(|g| g.num_win).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(a.windows, plan.layout().unwrap().windows);
     }
 }
