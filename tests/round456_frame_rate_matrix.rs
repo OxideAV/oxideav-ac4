@@ -17,7 +17,7 @@
 
 use oxideav_ac4::toc::{frame_rate_entry, parse_ac4_toc};
 use oxideav_core::{
-    AudioFrame, CodecId, CodecOptions, CodecParameters, CodecRegistry, Frame, SampleFormat,
+    AudioFrame, CodecId, CodecOptions, CodecParameters, CodecRegistry, Decoder, Frame, SampleFormat,
 };
 
 const FRAMES: usize = 5;
@@ -217,6 +217,18 @@ fn every_short_frame_48k_index_round_trips() {
     }
 }
 
+/// 22.2 below 1536 samples: the two LFE bodies announce a band count
+/// that fits Table 106's narrower `n_msfbl_bits` field there.
+#[test]
+fn selected_short_frame_indices_on_22_2() {
+    for fri in [5u32, 10] {
+        for mode in ["waveform", "parametric"] {
+            let e = run(24, 48_000, fri, mode);
+            assert!(e < 0.12, "24ch {mode} idx {fri}: settled rel err {e:.4}");
+        }
+    }
+}
+
 #[test]
 fn selected_short_frame_indices_on_the_immersive_routes() {
     for fri in [6u32, 7, 9, 10, 12] {
@@ -241,4 +253,74 @@ fn the_44_1_khz_frame_rate_index_13() {
             "{ch}ch {mode} 44.1 kHz idx 13: settled rel err {e:.4}"
         );
     }
+}
+
+/// A 22.2 frame of dense full-band content with the band gate off
+/// carries more than 32 767 bytes of `audio_data()`: the substream's
+/// `audio_size` then takes the `b_more_bits` + `variable_bits(7)`
+/// escape (TS 103 190-1 §4.3.4.1), and the stream still decodes.
+#[test]
+fn an_audio_data_past_32767_bytes_uses_the_size_escape() {
+    let reg = registry();
+    let n = 2048usize;
+    let mut p = CodecParameters::audio(CodecId::new("ac4"));
+    p.sample_rate = Some(48_000);
+    p.channels = Some(24);
+    p.sample_format = Some(SampleFormat::F32);
+    p.options = CodecOptions::new()
+        .set("framing", "raw")
+        .set("bandwidth", "24000")
+        .set("frame_rate_index", "13")
+        .set("mode", "parametric")
+        .set("dynamic_range", "0");
+    let mut enc = reg.first_encoder(&p).expect("encoder");
+    // Two one-LSB samples at the very start of every channel, then
+    // silence (the shape a fuzzer found): the block that straddles
+    // them has a flat-magnitude spectrum on all 22 full-band channels
+    // — every line of every band near the band's peak, the costliest
+    // content for the spectral entropy coder.
+    let total = n * 3;
+    let mut data = Vec::with_capacity(total * 24 * 4);
+    for i in 0..total {
+        for _ in 0..24usize {
+            let v: f32 = if i < 2 { -1.0 / 32768.0 } else { 0.0 };
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: total as u32,
+        pts: Some(0),
+        data: vec![data],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut pkts = Vec::new();
+    while let Ok(pk) = enc.receive_packet() {
+        pkts.push(pk);
+    }
+    assert_eq!(pkts.len(), 3);
+    let largest = pkts.iter().map(|p| p.data.len()).max().unwrap();
+    assert!(
+        largest > 32_767 + 64,
+        "a frame is large enough to need the escape: {largest} bytes"
+    );
+    let mut dec = oxideav_ac4::decoder::Ac4Decoder::new(&p);
+    let mut escaped = 0;
+    for pk in &pkts {
+        dec.send_packet(pk).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().expect("decode") else {
+            panic!("audio frame expected")
+        };
+        assert_eq!(af.samples as usize, n);
+        assert_eq!(af.data[0].len(), n * 24 * 2);
+        // The decoder read the announced size back and walked the
+        // whole 22.2 element inside it.
+        let sub = dec.last_substream.as_ref().expect("substream walked");
+        assert!(sub.tools.el_22_2.is_some(), "22.2 element parsed");
+        assert!((sub.audio_size as usize) < pk.data.len());
+        if sub.audio_size > 32_767 {
+            escaped += 1;
+        }
+    }
+    assert!(escaped >= 1, "at least one frame took the size escape");
 }

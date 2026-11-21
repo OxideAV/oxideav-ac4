@@ -116,6 +116,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Immersive / 22.2 frames whose `audio_data()` reaches 32 768 bytes
+  are written with the `b_more_bits` + `variable_bits(7)` size escape
+  (§4.3.4.1) instead of failing the encode, and the 22.2 LFE bodies
+  announce a band count that fits Table 106's narrower `n_msfbl_bits`
+  field on frames below 1536 samples. Both surfaced under the
+  `encode_stream` fuzz target once the short frame rates became
+  reachable.
 - The encoder's `sequence_counter` runs 1..=1020 and wraps to 1
   (§4.3.3.2.2: values above 1 020 shall not be written, 0 is the
   splicer's marker); it counted to 1 023 and wrapped to 0.

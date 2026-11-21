@@ -2164,12 +2164,16 @@ fn encode_chan_raw_frame(
     body.align_to_byte();
     let body_bytes = body.into_bytes();
     let audio_size = body_bytes.len() as u32;
-    if audio_size >= 1 << 15 {
-        return Err(Error::invalid("ac4: ice audio_data too large"));
-    }
+    // audio_size_value (15 bits), then — past 32 767 bytes — the
+    // b_more_bits escape with the high part in variable_bits(7).
     let mut sw = BitWriter::new();
-    sw.write_u32(audio_size, 15);
-    sw.write_bit(false); // b_more_bits
+    sw.write_u32(audio_size & 0x7FFF, 15);
+    if audio_size < 1 << 15 {
+        sw.write_bit(false); // b_more_bits
+    } else {
+        sw.write_bit(true);
+        crate::toc::write_variable_bits(&mut sw, 7, audio_size >> 15);
+    }
     sw.align_to_byte();
     frame.extend_from_slice(&sw.into_bytes());
     frame.extend_from_slice(&body_bytes);

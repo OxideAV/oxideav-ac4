@@ -9505,7 +9505,12 @@ impl Ac4ImsEncoder {
         let mut body = BitWriter::new();
         let pairs: [[&[f32]; 2]; 11] =
             std::array::from_fn(|p| [coeffs[2 * p].as_slice(), coeffs[2 * p + 1].as_slice()]);
-        let lfe = [(coeffs[22].as_slice(), 7u32), (coeffs[23].as_slice(), 7u32)];
+        // Table 106: the LFE `max_sfb` field narrows below 1536 lines.
+        let lfe_sfb = Self::lfe_max_sfb(frame_len);
+        let lfe = [
+            (coeffs[22].as_slice(), lfe_sfb),
+            (coeffs[23].as_slice(), lfe_sfb),
+        ];
         let quant_22 = self.frame_quant(coeffs.iter().map(|c| c.as_slice()));
         if aspx {
             let mut aspx_cfg = Self::ice_live_aspx_cfg();
