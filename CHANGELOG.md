@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-ac4/compare/v0.0.9...v0.0.10) - 2026-11-21
+
+### Other
+
+- block switching, rate control, frame rates, delay handling; before / after tables
+- Immersive / 22.2 frames: audio_size escape past 32767 bytes, LFE band count by frame length
+- QMF modulation tables and tree-walk Huffman decode
+- Counter-wrap unit test follows the 1020 -> 1 rule
+- Sequence-counter splice detection, opt-in error concealment, counter range 1..=1020
+- Rate control: per-frame noise-allocation search with a one-frame bit reservoir
+- Decoder delay handling: Table 188 d_pcm, route tool delay, aligned / trimmed output
+- Encoder block switching with a transient detector; 7.X layouts as a framework option
+- Frame rates 47.95-120 fps, block-switched IMDCT, LFE sf_info_lfe
+- ASF spectral frontend per Tables 23 / 39-42 and section 5.1.4
+- MDCT / IMDCT on a shared mixed-radix FFT plan
+- clippy 1.100: iterator forms for the indexed test loops
+- 7_X SIMPLE writer: M/S-code the Table 183 additional-channel pairs
+- LFE alignment on the ASPX_ACPL_3 route + pinned on every 5.1 / 7.1 route
+- 7_X SIMPLE / ASPX: every coding_config, Table 183 mix, Table 213 A-SPX
+- 7.X channel layouts: 5/2/0 and 3/2/2 with add_ch_base (Tables 183/185/202)
+- §5.3.3 channel-data matrices: apply the coded chparam_info() quartets
+- 7.X ASPX_ACPL_1: Table 183 quartets from the chparam_info pair (errata A5)
+- API hygiene: non_exhaustive encoder options, mode enums, TOC records
+
 ### Added
 
 - **Sequence-counter splice detection and error concealment**
