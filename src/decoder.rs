@@ -52,6 +52,73 @@ pub enum DecodingMode {
     Core,
 }
 
+/// How [`Ac4Decoder`] presents its algorithmic delay.
+///
+/// A frame's PCM leaves the IMDCT and then one of several tool chains:
+/// the time-domain routes add nothing, each QMF analysis / synthesis
+/// pass adds [`qmf::QMF_ROUND_TRIP_DELAY`] samples (one pass for A-SPX,
+/// the immersive and 22.2 elements and A-JOC, two on the 5.X / 7.X
+/// A-CPL elements, one more when dialogue enhancement is active).
+/// Within a frame every channel shares that delay; between streams
+/// (or coding modes of one stream) it differs.
+///
+/// Select with [`Ac4Decoder::set_latency_mode`] or the decoder option
+/// `latency` (`raw` / `aligned` / `trimmed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum LatencyMode {
+    /// Output as the tool chain delivers it: one frame per packet, the
+    /// route's own delay ([`Ac4Decoder::latency_samples`]) left in.
+    #[default]
+    Raw,
+    /// Constant latency on every route: the TS 103 190-1 §5.6 frame
+    /// alignment delay `d_pcm` (Table 188) plus the deepest regular
+    /// tool chain ([`ALIGNED_TOOL_DELAY`]); shallower routes are
+    /// padded up to it. One frame per packet. A stream that changes
+    /// coding mode keeps its timing.
+    Aligned,
+    /// The route's tool delay is removed: the first output sample is
+    /// the first sample the stream's first frame carries, and
+    /// timestamps count from the first packet's `pts`. The decoder
+    /// answers `NeedMore` until a whole frame is available and
+    /// returns the (shorter) remainder after `flush`.
+    Trimmed,
+}
+
+/// Tool-chain delay every route is padded to in
+/// [`LatencyMode::Aligned`]: two QMF round trips (the A-SPX + A-CPL
+/// chain of the 5.X / 7.X elements).
+pub const ALIGNED_TOOL_DELAY: usize = 2 * qmf::QMF_ROUND_TRIP_DELAY;
+
+impl LatencyMode {
+    fn from_options(params: &CodecParameters) -> Self {
+        match params.options.get("latency") {
+            Some("aligned") => Self::Aligned,
+            Some("trimmed") => Self::Trimmed,
+            _ => Self::Raw,
+        }
+    }
+}
+
+/// TS 103 190-1 §5.6 **Table 188**: the frame-alignment PCM delay
+/// `d_pcm` in samples and the control-data delay `d_ctrl` in frames
+/// for a `frame_rate_index` (Table 83 order; index 13 is the 2048-
+/// sample music rate at either base sampling frequency).
+pub fn frame_alignment_delay(frame_rate_index: u32) -> Option<(u32, u32)> {
+    Some(match frame_rate_index {
+        0 | 1 => (288, 1),
+        2 => (352, 1),
+        3 | 4 => (96, 1),
+        5 | 6 => (960, 2),
+        7 => (1056, 2),
+        8 | 9 => (672, 2),
+        10 => (1312, 4),
+        11 | 12 => (864, 4),
+        13 => (352, 1),
+        _ => return None,
+    })
+}
+
 pub struct Ac4Decoder {
     codec_id: CodecId,
     /// Channel count hint supplied by the container (CodecParameters).
@@ -78,6 +145,34 @@ pub struct Ac4Decoder {
     /// Block layout queued per output slot for the next IMDCT on that
     /// slot (see [`Self::queue_blocks`]); empty = one full block.
     slot_blocks: Vec<Option<Vec<usize>>>,
+    /// Tool-chain delay, in samples, of the frame last rendered: how
+    /// far every output channel of that frame lags the IMDCT output
+    /// (0 on the time-domain routes, one QMF round trip per
+    /// analysis / synthesis pass on the QMF-domain routes).
+    route_delay: usize,
+    /// Delay lines lining the immersive / 22.2 LFE channels up with
+    /// the QMF-routed full-band channels.
+    lfe_align: [AlignDelay; 2],
+    /// Output latency handling (see [`LatencyMode`]).
+    latency_mode: LatencyMode,
+    /// Interleaved S16 samples held by the latency stage.
+    latency_fifo: std::collections::VecDeque<i16>,
+    /// Channel count the latency stage is primed for.
+    latency_channels: usize,
+    /// Extra delay (samples per channel) the stage currently applies
+    /// (`Aligned`), or the tool delay already removed (`Trimmed`).
+    latency_applied: Option<usize>,
+    /// Sample frames still to drop from the head of the stream
+    /// (`Trimmed`).
+    latency_skip: usize,
+    /// Timestamp bookkeeping of the trimmed stream: the first packet's
+    /// `pts`, the time base, the sample rate and the frames emitted.
+    latency_clock: Option<(i64, oxideav_core::TimeBase, u32)>,
+    latency_emitted: u64,
+    /// Frame length of the last packet (for the drain after `flush`).
+    latency_frame: usize,
+    /// Frame-rate index of the last decoded frame (Table 188 lookup).
+    last_frame_rate_index: u32,
     /// Per-channel A-SPX persistent state — noise generator
     /// `noise_idx_prev` (§5.7.6.4.3 Pseudocode 103), tone generator
     /// `sine_idx_prev` (§5.7.6.4.4 Pseudocode 105), and the
@@ -318,6 +413,17 @@ impl Ac4Decoder {
             overlap: Vec::new(),
             prev_transform_length: 0,
             slot_blocks: Vec::new(),
+            route_delay: 0,
+            lfe_align: Default::default(),
+            latency_mode: LatencyMode::from_options(params),
+            latency_fifo: std::collections::VecDeque::new(),
+            latency_channels: 0,
+            latency_applied: None,
+            latency_skip: 0,
+            latency_clock: None,
+            latency_emitted: 0,
+            latency_frame: 0,
+            last_frame_rate_index: 1,
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
@@ -363,6 +469,207 @@ impl Ac4Decoder {
     /// `dialog_enhancement()` payload.
     pub fn set_dialogue_enhancement_gain_db(&mut self, gain_db: f32) {
         self.de_gain_db = gain_db;
+    }
+
+    /// Select how the decoder presents its algorithmic delay (see
+    /// [`LatencyMode`]). Switch before feeding packets.
+    pub fn set_latency_mode(&mut self, mode: LatencyMode) {
+        self.latency_mode = mode;
+        self.latency_fifo.clear();
+        self.latency_applied = None;
+        self.latency_skip = 0;
+        self.latency_clock = None;
+        self.latency_emitted = 0;
+    }
+
+    /// The selected [`LatencyMode`].
+    pub fn latency_mode(&self) -> LatencyMode {
+        self.latency_mode
+    }
+
+    /// Tool-chain delay of the frame last decoded, in samples: 0 on
+    /// the time-domain routes, [`qmf::QMF_ROUND_TRIP_DELAY`] per QMF
+    /// analysis / synthesis pass otherwise. Every output channel of
+    /// the frame shares it.
+    pub fn tool_delay_samples(&self) -> u32 {
+        self.route_delay as u32
+    }
+
+    /// The §5.6 frame-alignment delay `d_pcm` (Table 188) for the
+    /// frame rate last decoded.
+    pub fn frame_alignment_delay_samples(&self) -> u32 {
+        frame_alignment_delay(self.last_frame_rate_index)
+            .map(|d| d.0)
+            .unwrap_or(0)
+    }
+
+    /// Delay, in samples, between the IMDCT output of a frame and the
+    /// samples the decoder returns for it in the selected
+    /// [`LatencyMode`]: the route's tool delay (`Raw`),
+    /// `d_pcm + max(ALIGNED_TOOL_DELAY, tool delay)` (`Aligned`), or 0
+    /// (`Trimmed`). The transform's own overlap — a frame's block
+    /// completes with the following frame — is a property of the
+    /// stream, not of the decoder, and is not included.
+    pub fn latency_samples(&self) -> u32 {
+        match self.latency_mode {
+            LatencyMode::Raw => self.route_delay as u32,
+            LatencyMode::Aligned => {
+                self.frame_alignment_delay_samples()
+                    + self.route_delay.max(ALIGNED_TOOL_DELAY) as u32
+            }
+            LatencyMode::Trimmed => 0,
+        }
+    }
+
+    /// Tool delay of the channel-element routes from the modes of the
+    /// substream just rendered.
+    fn channel_route_delay(&self) -> usize {
+        let rt = qmf::QMF_ROUND_TRIP_DELAY;
+        let Some(sub) = self.last_substream.as_ref() else {
+            return 0;
+        };
+        let t = &sub.tools;
+        use crate::mch::{FiveXCodecMode as F, SevenXCodecMode as S};
+        if let Some(m) = t.five_x_mode {
+            return match m {
+                F::Simple => 0,
+                F::Aspx => rt,
+                F::AspxAcpl1 | F::AspxAcpl2 | F::AspxAcpl3 => 2 * rt,
+                F::Reserved(_) => 0,
+            };
+        }
+        if let Some(m) = t.seven_x_mode {
+            return match m {
+                S::Simple => 0,
+                S::Aspx => rt,
+                _ => 2 * rt,
+            };
+        }
+        if let Some(m) = t.stereo_mode {
+            return match m {
+                asf::StereoCodecMode::Simple => 0,
+                asf::StereoCodecMode::Aspx => rt,
+                _ => 2 * rt,
+            };
+        }
+        match t.mono_mode {
+            Some(asf::MonoCodecMode::Aspx) => rt,
+            _ => 0,
+        }
+    }
+
+    /// Latency stage: turn one raw decoded frame into the frame the
+    /// selected [`LatencyMode`] presents.
+    fn latency_stage(&mut self, af: AudioFrame, pkt_tb: oxideav_core::TimeBase) -> Result<Frame> {
+        let n = af.samples as usize;
+        let Some(bytes) = af.data.first() else {
+            return Ok(Frame::Audio(af));
+        };
+        if n == 0 {
+            return Ok(Frame::Audio(af));
+        }
+        let channels = bytes.len() / 2 / n;
+        if channels == 0 {
+            return Ok(Frame::Audio(af));
+        }
+        if channels != self.latency_channels {
+            self.latency_fifo.clear();
+            self.latency_applied = None;
+            self.latency_channels = channels;
+        }
+        self.latency_frame = n;
+        let rate = self.last_info.as_ref().map(|i| i.sample_rate).unwrap_or(0);
+        match self.latency_mode {
+            LatencyMode::Raw => Ok(Frame::Audio(af)),
+            LatencyMode::Aligned => {
+                let want = self.frame_alignment_delay_samples() as usize
+                    + ALIGNED_TOOL_DELAY.saturating_sub(self.route_delay);
+                if self.latency_applied != Some(want) {
+                    // First frame, or the route changed: (re)prime the
+                    // line with the padding this route needs.
+                    self.latency_fifo.clear();
+                    self.latency_fifo
+                        .extend(std::iter::repeat_n(0i16, want * channels));
+                    self.latency_applied = Some(want);
+                }
+                self.latency_fifo.extend(
+                    bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| i16::from_le_bytes(*b)),
+                );
+                let mut out = Vec::with_capacity(n * channels * 2);
+                for _ in 0..n * channels {
+                    let v = self.latency_fifo.pop_front().unwrap_or(0);
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                Ok(Frame::Audio(AudioFrame {
+                    samples: af.samples,
+                    pts: af.pts,
+                    data: vec![out],
+                }))
+            }
+            LatencyMode::Trimmed => {
+                if self.latency_clock.is_none() {
+                    self.latency_clock = Some((af.pts.unwrap_or(0), pkt_tb, rate));
+                }
+                match self.latency_applied {
+                    None => self.latency_skip = self.route_delay,
+                    Some(prev) if self.route_delay > prev => {
+                        self.latency_skip += self.route_delay - prev;
+                    }
+                    Some(prev) if self.route_delay < prev => {
+                        // A shallower route: its samples arrive early
+                        // by the difference.
+                        self.latency_fifo.extend(std::iter::repeat_n(
+                            0i16,
+                            (prev - self.route_delay) * channels,
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                self.latency_applied = Some(self.route_delay);
+                for b in bytes.as_chunks::<2>().0 {
+                    self.latency_fifo.push_back(i16::from_le_bytes(*b));
+                }
+                let drop = (self.latency_skip * channels).min(self.latency_fifo.len());
+                self.latency_fifo.drain(..drop);
+                self.latency_skip -= drop / channels;
+                if self.latency_fifo.len() < n * channels {
+                    return Err(Error::NeedMore);
+                }
+                Ok(self.latency_emit(n))
+            }
+        }
+    }
+
+    /// Pop `n` sample frames of the trimmed stream with their
+    /// timestamp.
+    fn latency_emit(&mut self, n: usize) -> Frame {
+        let channels = self.latency_channels.max(1);
+        let mut out = Vec::with_capacity(n * channels * 2);
+        for _ in 0..n * channels {
+            let v = self.latency_fifo.pop_front().unwrap_or(0);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let pts = self.latency_clock.map(|(base, tb, rate)| {
+            let r = tb.0;
+            // Samples → ticks of `num / den` seconds.
+            let ticks = if rate > 0 && r.num > 0 {
+                (self.latency_emitted as i128 * r.den as i128 / (r.num as i128 * rate as i128))
+                    as i64
+            } else {
+                self.latency_emitted as i64
+            };
+            base + ticks
+        });
+        self.latency_emitted += n as u64;
+        Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts,
+            data: vec![out],
+        })
     }
 
     /// Streaming counterpart of [`Self::ice_plain_qmf`] — analyse one
@@ -3592,11 +3899,17 @@ impl Ac4Decoder {
                 });
                 // ASPX_ACPL_3 (Pseudocode 118) likewise runs the A-SPX
                 // and the A-CPL QMF round trips on L / R / C.
+                let five_x_aspx = self.last_substream.as_ref().is_some_and(|sub| {
+                    matches!(
+                        sub.tools.five_x_mode,
+                        Some(crate::mch::FiveXCodecMode::Aspx)
+                    )
+                });
                 let pcm_f = if five_x_pair_active || seven_x_pair_active || five_x_acpl3_active {
                     self.acpl_align[4].delay(&pcm_f, 2 * qmf::QMF_ROUND_TRIP_DELAY)
-                } else if seven_x_aspx {
-                    // 7_X ASPX: every other channel took one A-SPX QMF
-                    // round trip.
+                } else if seven_x_aspx || five_x_aspx {
+                    // 5_X / 7_X ASPX: every other channel took one
+                    // A-SPX QMF round trip.
                     self.acpl_align[4].delay(&pcm_f, qmf::QMF_ROUND_TRIP_DELAY)
                 } else {
                     pcm_f
@@ -3697,6 +4010,14 @@ impl Ac4Decoder {
         // Output layout mirrors the rendered signal set: decoded LFE
         // slot first when signalled, then the fullband objects (full
         // decoding) or downmix signals (core decoding).
+        // Full decoding reconstructs the objects in one QMF analysis /
+        // synthesis pass; the LFE (coded directly) and the core-mode
+        // downmix set are not characterised here and report no delay.
+        self.route_delay = if core_mode {
+            0
+        } else {
+            qmf::QMF_ROUND_TRIP_DELAY
+        };
         let channels_out = if core_mode {
             num_dmx + usize::from(desc.b_lfe)
         } else {
@@ -4368,6 +4689,22 @@ impl Ac4Decoder {
                 )?;
             }
         }
+        // Every Table 95 mode but SCPL runs the full-band channels
+        // through one QMF analysis / synthesis pass; the time-domain
+        // LFE waits for them.
+        let ice_qmf = sub
+            .tools
+            .ice
+            .as_deref()
+            .is_some_and(|el| el.mode != crate::ice::IceCodecMode::Scpl);
+        let mut route_delay = if ice_qmf {
+            qmf::QMF_ROUND_TRIP_DELAY
+        } else {
+            0
+        };
+        if let Some(lfe) = lfe_pcm.as_mut() {
+            *lfe = self.lfe_align[0].delay(lfe, route_delay);
+        }
         // §4.8.3.15 dialogue enhancement: the substream continues past
         // audio_size with metadata(…, sus_ver = 1); parse its
         // dialog_enhancement() (sticky de_config across P-frames) and
@@ -4449,7 +4786,9 @@ impl Ac4Decoder {
                 let q = self.ice_de_qmf[slot].0.process_block(&pcm);
                 *lfe = self.ice_de_qmf[slot].1.process_block(&q);
             }
+            route_delay += qmf::QMF_ROUND_TRIP_DELAY;
         }
+        self.route_delay = route_delay;
         // Interleave to S16.
         let mut buf = vec![0u8; n * channels_out * 2];
         let lfe_slots = usize::from(b_lfe);
@@ -5034,6 +5373,23 @@ impl Ac4Decoder {
                 }
             }
         }
+        // A-SPX mode: the 22 full-band channels took one QMF round
+        // trip; the two time-domain LFEs wait for them.
+        let aspx_22_2 = sub
+            .tools
+            .el_22_2
+            .as_deref()
+            .is_some_and(|el| el.aspx_mode && sub_aspx_cfg.is_some());
+        self.route_delay = if aspx_22_2 {
+            qmf::QMF_ROUND_TRIP_DELAY
+        } else {
+            0
+        };
+        for (i, pcm) in lfe_pcm.iter_mut().enumerate() {
+            if !pcm.is_empty() {
+                *pcm = self.lfe_align[i].delay(pcm, self.route_delay);
+            }
+        }
         // Interleave to S16: LFE, LFE2, then the 22 fullband channels.
         let mut buf = vec![0u8; n * channels_out * 2];
         let write_channel = |buf: &mut [u8], c: usize, pcm: &[f32]| {
@@ -5078,12 +5434,41 @@ impl Decoder for Ac4Decoder {
 
     fn receive_frame(&mut self) -> Result<Frame> {
         let Some(pkt) = self.pending.take() else {
-            return if self.eof {
-                Err(Error::Eof)
-            } else {
-                Err(Error::NeedMore)
-            };
+            if !self.eof {
+                return Err(Error::NeedMore);
+            }
+            // After flush: the trimmed stream still holds the samples
+            // that were waiting for a full frame.
+            if self.latency_mode == LatencyMode::Trimmed && !self.latency_fifo.is_empty() {
+                let channels = self.latency_channels.max(1);
+                let left = self.latency_fifo.len() / channels;
+                if left > 0 {
+                    return Ok(self.latency_emit(left.min(self.latency_frame.max(1))));
+                }
+                self.latency_fifo.clear();
+            }
+            return Err(Error::Eof);
         };
+        let tb = pkt.time_base;
+        let frame = self.decode_pending(pkt)?;
+        if self.latency_mode == LatencyMode::Raw {
+            return Ok(frame);
+        }
+        match frame {
+            Frame::Audio(af) => self.latency_stage(af, tb),
+            other => Ok(other),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
+impl Ac4Decoder {
+    /// Decode one packet to the frame its tool chain delivers.
+    fn decode_pending(&mut self, pkt: Packet) -> Result<Frame> {
         if pkt.data.is_empty() {
             // Empty packet — emit a 0-sample frame so the pipeline
             // continues rather than erroring.
@@ -5099,6 +5484,7 @@ impl Decoder for Ac4Decoder {
         // §5.1.4.2: the spectral-noise-fill generator restarts from the
         // frame's sequence_counter (Pseudocode 24).
         crate::asf_blocks::reset_snf_rng(info.sequence_counter as u32);
+        self.last_frame_rate_index = info.frame_rate_index;
         // A-JOC object substream (TS 103 190-2 §6.2.3.4): route to the
         // dedicated object decode chain and emit the reconstructed
         // objects as output channels.
@@ -5208,6 +5594,7 @@ impl Decoder for Ac4Decoder {
             .ok()
         });
         let pcm_per_channel = self.render_channel_substream(channels, samples, info.frame_length);
+        self.route_delay = self.channel_route_delay();
         self.last_info = Some(info);
         let byte_count = (samples as usize) * (channels as usize) * 2; // S16 interleaved.
         let any_decoded = pcm_per_channel.iter().any(|p| p.is_some());
@@ -5243,11 +5630,6 @@ impl Decoder for Ac4Decoder {
             pts: pkt.pts,
             data,
         }))
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.eof = true;
-        Ok(())
     }
 }
 

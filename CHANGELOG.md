@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Decoder delay handling** (`decoder::LatencyMode`,
+  `Ac4Decoder::set_latency_mode`, decoder option `latency` = `raw` /
+  `aligned` / `trimmed`): `Ac4Decoder::tool_delay_samples()` reports
+  the tool-chain delay of the frame just decoded (0 on the time-domain
+  routes, one QMF round trip — 577 samples — on A-SPX, the immersive
+  and 22.2 A-SPX / A-CPL / A-JCC elements and A-JOC, two on the 5.X /
+  7.X A-CPL elements, one more with dialogue enhancement active);
+  `frame_alignment_delay()` is TS 103 190-1 §5.6 Table 188 (`d_pcm`,
+  `d_ctrl` per `frame_rate_index`); `latency_samples()` is the delay
+  the selected mode leaves in. `aligned` gives every route the
+  constant latency `d_pcm + 2 × 577` (the frame-alignment delay plus
+  the deepest regular tool chain), so a stream that changes coding
+  mode keeps its timing; `trimmed` removes the route's delay — first
+  output sample = first sample of the stream, timestamps counted from
+  the first packet, the remainder returned after `flush`. `raw` (the
+  default) keeps one frame per packet at the route's own delay.
+  Measured with per-channel bursts on eleven framework routes
+  (tests/round492_latency.rs).
+
 - **Transient-switched block lengths in the encoder** (§5.5.3;
   framework option `block_switching`, default on;
   `Ac4ImsEncoder::block_switching` + `set_lookahead`) on the waveform
@@ -55,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- LFE time alignment on the immersive (7.X.4 / 9.X.4, every
+  Table 95 mode but SCPL), 22.2 A-SPX and 5.X ASPX routes: the
+  time-domain LFE left the decoder one QMF round trip (577 samples)
+  ahead of the full-band channels; it now waits for them.
 - The LFE's `sf_info_lfe()` (Table 35) has no transform-info bits:
   `b_long_frame = 1` is an assignment, the element reads `max_sfb[0]`
   only. Decoder and all four LFE writers consumed / emitted a
