@@ -752,7 +752,7 @@ impl AjocSubstreamDecoder {
         let copy = scaled.len().min(n);
         x[..copy].copy_from_slice(&scaled[..copy]);
         let y = crate::mdct::imdct(&x);
-        let window = crate::mdct::kbd_window(n as u32);
+        let window = crate::mdct::kbd_window_shared(n as u32);
         crate::mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
     }
 

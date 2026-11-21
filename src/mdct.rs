@@ -95,6 +95,136 @@ pub fn kbd_window(n: u32) -> Vec<f32> {
     w
 }
 
+/// Per-length transform constants: the §5.5.2.2 `xcos1` / `xsin1`
+/// phase tables, the shared `N/2`-point FFT plan and the KBD window.
+struct MdctTables {
+    xcos: Vec<f64>,
+    xsin: Vec<f64>,
+    plan: std::rc::Rc<crate::fft::FftPlan>,
+    window: std::rc::Rc<Vec<f32>>,
+}
+
+#[derive(Default)]
+struct MdctScratch {
+    re: Vec<f64>,
+    im: Vec<f64>,
+    fold: Vec<f64>,
+    fft: crate::fft::FftScratch,
+}
+
+thread_local! {
+    static DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TABLES: std::cell::RefCell<std::collections::HashMap<usize, std::rc::Rc<MdctTables>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static SCRATCH: std::cell::RefCell<MdctScratch> = std::cell::RefCell::new(MdctScratch::default());
+}
+
+fn tables(big_n: usize) -> std::rc::Rc<MdctTables> {
+    TABLES.with(|t| {
+        t.borrow_mut()
+            .entry(big_n)
+            .or_insert_with(|| {
+                let fp_n = big_n as f64;
+                let half = big_n / 2;
+                let mut xcos = Vec::with_capacity(half);
+                let mut xsin = Vec::with_capacity(half);
+                for k in 0..half {
+                    let a = 2.0 * std::f64::consts::PI * (8 * k + 1) as f64 / (16.0 * fp_n);
+                    xcos.push(-a.cos());
+                    xsin.push(-a.sin());
+                }
+                std::rc::Rc::new(MdctTables {
+                    xcos,
+                    xsin,
+                    plan: crate::fft::plan(half),
+                    window: std::rc::Rc::new(kbd_window(big_n as u32)),
+                })
+            })
+            .clone()
+    })
+}
+
+/// Route [`imdct`] / [`mdct_forward`] on this thread through the
+/// direct O(N²) summations instead of the FFT plans — the reference
+/// the fast paths are measured and compared against.
+#[doc(hidden)]
+pub fn set_direct_transforms(on: bool) {
+    DIRECT.with(|d| d.set(on));
+}
+
+fn direct_transforms() -> bool {
+    DIRECT.with(|d| d.get())
+}
+
+/// The `2N`-sample KBD window for transform length `n`, computed once
+/// per thread and shared (same values as [`kbd_window`]).
+pub fn kbd_window_shared(n: u32) -> std::rc::Rc<Vec<f32>> {
+    tables(n as usize).window.clone()
+}
+
+/// Forward MDCT of `2N` windowed samples into `N` coefficients:
+/// `X[k] = 2·Σ_n x[n]·cos(π/N·(n + 1/2 + N/2)·(k + 1/2))` — the exact
+/// transpose pair of [`imdct`] — evaluated by folding the `2N` input
+/// to an `N`-point DCT-IV and running that through one `N/2`-point
+/// complex FFT with pre / post phase rotations.
+pub fn mdct_forward(x: &[f32]) -> Vec<f32> {
+    let two_n = x.len();
+    let n = two_n / 2;
+    let mut out = vec![0.0_f32; n];
+    if n < 4 || !n.is_multiple_of(4) || direct_transforms() {
+        let nf = n as f64;
+        for (k, o) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f64;
+            for (i, &v) in x.iter().enumerate() {
+                let th = std::f64::consts::PI / nf * (i as f64 + 0.5 + nf * 0.5) * (k as f64 + 0.5);
+                acc += v as f64 * th.cos();
+            }
+            *o = (2.0 * acc) as f32;
+        }
+        return out;
+    }
+    let half = n / 2;
+    let t = tables(n);
+    SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let sc = &mut *guard;
+        // Fold: with x = [a b c d] in N/2 quarters the transform is the
+        // DCT-IV of u = (−c_r − d, a − b_r) (`_r` = time reversal).
+        sc.fold.clear();
+        for i in 0..half {
+            sc.fold
+                .push(-(x[3 * half - 1 - i] as f64) - x[3 * half + i] as f64);
+        }
+        for i in 0..half {
+            sc.fold.push(x[i] as f64 - x[n - 1 - i] as f64);
+        }
+        let u = &sc.fold;
+        // DCT-IV, X[k] = 2·Σ u[i]·cos(π/N·(i + 1/2)(k + 1/2)): pair
+        // t[i] = u[2i] + j·u[N−1−2i], rotate by e^{−jθ_i} with
+        // θ_i = π(8i + 1)/(8N) before and after an N/2-point DFT;
+        // X[2k] = 2·Re, X[N−1−2k] = −2·Im. θ is the IMDCT phase, so
+        // cos θ = −xcos1 and sin θ = −xsin1.
+        sc.re.clear();
+        sc.im.clear();
+        for i in 0..half {
+            let (ur, ui) = (u[2 * i], u[n - 1 - 2 * i]);
+            let (c, s) = (-t.xcos[i], -t.xsin[i]);
+            sc.re.push(ur * c + ui * s);
+            sc.im.push(ui * c - ur * s);
+        }
+        t.plan.forward(&mut sc.re, &mut sc.im, &mut sc.fft);
+        for k in 0..half {
+            let (c, s) = (-t.xcos[k], -t.xsin[k]);
+            let (zr, zi) = (sc.re[k], sc.im[k]);
+            let yr = zr * c + zi * s;
+            let yi = zi * c - zr * s;
+            out[2 * k] = (2.0 * yr) as f32;
+            out[n - 1 - 2 * k] = (-2.0 * yi) as f32;
+        }
+    });
+    out
+}
+
 /// Naive IMDCT: transforms `N` spectral coefficients to `2N` time-domain
 /// samples via the direct DFT formulation of Pseudocodes 60-62. No
 /// window is applied here; [`imdct_apply_window_and_olap`] does that.
@@ -102,6 +232,58 @@ pub fn kbd_window(n: u32) -> Vec<f32> {
 /// The output has length `2N` and uses the AC-4 sign convention (§5.5.2,
 /// Step 5 pseudocode).
 pub fn imdct(x: &[f32]) -> Vec<f32> {
+    let big_n = x.len();
+    let half_n = big_n / 2;
+    if big_n < 4 || !big_n.is_multiple_of(4) || direct_transforms() {
+        return imdct_direct(x);
+    }
+    let t = tables(big_n);
+    let fp_n = big_n as f64;
+    SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let sc = &mut *guard;
+        sc.re.clear();
+        sc.im.clear();
+        // Step 2: pre-IFFT complex multiply (Pseudocode 60).
+        for k in 0..half_n {
+            let (xc, xs) = (t.xcos[k], t.xsin[k]);
+            let a = x[big_n - 2 * k - 1] as f64;
+            let b = x[2 * k] as f64;
+            sc.re.push(a * xc - b * xs);
+            sc.im.push(b * xc + a * xs);
+        }
+        // Step 3: N/2-point complex IFFT (Pseudocode 61).
+        t.plan.inverse(&mut sc.re, &mut sc.im, &mut sc.fft);
+        // Step 4: post-IFFT complex multiply (Pseudocode 62).
+        for n in 0..half_n {
+            let (xc, xs) = (t.xcos[n], t.xsin[n]);
+            let (zr, zi) = (sc.re[n], sc.im[n]);
+            sc.re[n] = (zr * xc - zi * xs) / fp_n;
+            sc.im[n] = (zi * xc + zr * xs) / fp_n;
+        }
+        let (yr, yi) = (&sc.re, &sc.im);
+        // Step 5 (unfolding / de-interleave, Pseudocode 63 without the
+        // window factors).
+        let mut out = vec![0.0_f32; 2 * big_n];
+        let quarter = big_n / 4;
+        for n in 0..quarter {
+            out[2 * n] = yi[quarter + n] as f32;
+            out[2 * n + 1] = (-yr[quarter - n - 1]) as f32;
+            out[big_n / 2 + 2 * n] = yr[n] as f32;
+            out[big_n / 2 + 2 * n + 1] = (-yi[big_n / 2 - n - 1]) as f32;
+            out[big_n + 2 * n] = yr[quarter + n] as f32;
+            out[big_n + 2 * n + 1] = (-yi[quarter - n - 1]) as f32;
+            out[3 * big_n / 2 + 2 * n] = (-yi[n]) as f32;
+            out[3 * big_n / 2 + 2 * n + 1] = yr[big_n / 2 - n - 1] as f32;
+        }
+        out
+    })
+}
+
+/// Direct-summation form of [`imdct`] (Pseudocodes 60-62 as written,
+/// O(N²)) — the reference the FFT path is tested against, and the
+/// fallback for lengths that are not a multiple of four.
+pub fn imdct_direct(x: &[f32]) -> Vec<f32> {
     let big_n = x.len();
     let half_n = big_n / 2;
     let fp_n = big_n as f64;
@@ -252,5 +434,48 @@ mod tests {
         // response).
         assert!(e1.is_finite() && e2.is_finite());
         assert!(e2 > 0.0);
+    }
+
+    fn test_signal(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fft_imdct_matches_the_direct_pseudocode_for_every_transform_length() {
+        for &n in &[
+            96usize, 120, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024, 1536, 1920, 2048,
+        ] {
+            let x = test_signal(n, n as u32);
+            let fast = imdct(&x);
+            let slow = imdct_direct(&x);
+            let peak = slow.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for (i, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 2e-6 * peak.max(1e-3),
+                    "n {n} i {i}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fft_mdct_matches_the_direct_cosine_sum() {
+        for &n in &[
+            96usize, 120, 128, 240, 384, 480, 512, 960, 1024, 1536, 1920, 2048,
+        ] {
+            let x = test_signal(2 * n, 7 + n as u32);
+            let fast = mdct_forward(&x);
+            let slow = crate::encoder_mdct::mdct_naive(&x);
+            let peak = slow.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for (k, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+                assert!((a - b).abs() <= 2e-5 * peak, "n {n} k {k}: {a} vs {b}");
+            }
+        }
     }
 }

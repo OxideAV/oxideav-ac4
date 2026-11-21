@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- MDCT / IMDCT run on a shared mixed-radix FFT plan (`fft`, radix
+  2 / 3 / 4 / 5 stages covering every `2^a·3^b·5^c` AC-4 transform
+  length): the §5.5.2.2 IMDCT is the N/2-point complex IFFT the
+  clause describes with cached `xcos1` / `xsin1` tables, the encoder's
+  forward transform folds to a DCT-IV on the same plan, and the KBD
+  windows are computed once per length. Decoded S16 output is
+  byte-identical to the direct O(N²) summations on every layout
+  (`examples/ac4_speed.rs` cross-checks both forms);
+  `mdct::set_direct_transforms` keeps the reference summations
+  reachable. Release build, 4 s of 48 kHz programme: stereo encode
+  1,06 → 224× realtime, decode 4,98 → 49×; 5.1 waveform encode
+  0,34 → 88×, decode 1,59 → 20×; 7.1.4 waveform encode 0,16 → 40×,
+  decode 0,69 → 12×.
+
 ### Added
 
 - `Ac4EncoderOptions::with_*` setters for every field.

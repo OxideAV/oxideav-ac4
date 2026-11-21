@@ -834,7 +834,7 @@ impl Ac4Decoder {
         let copy = scaled.len().min(n);
         x[..copy].copy_from_slice(&scaled[..copy]);
         let y = mdct::imdct(&x);
-        let window = mdct::kbd_window(n as u32);
+        let window = mdct::kbd_window_shared(n as u32);
         mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
     }
 

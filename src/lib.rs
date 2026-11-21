@@ -560,6 +560,7 @@ pub mod encoder_asf;
 pub mod encoder_ims;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod encoder_mdct;
+mod fft;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod huffman;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API

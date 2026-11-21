@@ -19,7 +19,6 @@
 //! KBD overlap-add over 3 consecutive frames of a constant signal) lives
 //! in `tests/` to lock the sign convention to the decoder.
 
-use crate::mdct::kbd_window;
 use core::f64::consts::PI;
 
 /// Apply the KBD analysis window of length `2N` to `2N` time-domain
@@ -98,10 +97,10 @@ impl EncoderMdctState {
         buf.extend_from_slice(&self.history);
         buf.extend_from_slice(frame);
         // KBD window per §5.5.3 — same window as synthesis (Princen-Bradley).
-        let window = kbd_window(self.n);
+        let window = crate::mdct::kbd_window_shared(self.n);
         apply_kbd_window(&mut buf, &window);
-        // Forward MDCT.
-        let spec = mdct_naive(&buf);
+        // Forward MDCT (FFT form of `mdct_naive`).
+        let spec = crate::mdct::mdct_forward(&buf);
         // Slide history forward — drop the old N, keep this frame's N
         // for the next call's leading half.
         self.history.clear();
