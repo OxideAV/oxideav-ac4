@@ -320,16 +320,12 @@ mod tests {
         let mut state = ToneGenState::new();
         let out = generate_qmf_sine(&sine_lev, &atsg_sig, 1, 64, 8, 4, &mut state);
         // Zero outside the A-SPX range.
-        for sb in 0..8 {
-            for ts in 0..2 {
-                assert_eq!(out.qmf_sine[sb][ts], (0.0, 0.0));
-            }
+        for row in &out.qmf_sine[..8] {
+            assert!(row[..2].iter().all(|&v| v == (0.0, 0.0)));
         }
         // sb=9, 10 have zero level -> zero output.
-        for sb in 9..=10 {
-            for ts in 0..2 {
-                assert_eq!(out.qmf_sine[sb][ts], (0.0, 0.0));
-            }
+        for row in &out.qmf_sine[9..=10] {
+            assert!(row[..2].iter().all(|&v| v == (0.0, 0.0)));
         }
         // sb=8: first_frame -> idx(ts=0)=1 -> (0,1); idx(ts=1)=2 -> (-1,0).
         // sb=8 is even => sign = +1 for IM.

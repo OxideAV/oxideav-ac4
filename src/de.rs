@@ -794,8 +794,8 @@ mod tests {
         assert!(data.ms_proc_flag);
         assert_eq!(data.de_par.len(), 1, "ms_proc strips one channel");
         assert_eq!(data.de_par[0][0], 5);
-        for b in 1..DE_NR_BANDS {
-            assert_eq!(data.de_par[0][b], 5, "ramp via 0-deltas");
+        for &par in &data.de_par[0][1..DE_NR_BANDS] {
+            assert_eq!(par, 5, "ramp via 0-deltas");
         }
         assert_eq!(data.signal_contribution, Some(20));
     }

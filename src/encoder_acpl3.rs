@@ -12452,8 +12452,11 @@ mod tests {
         assert_eq!(pair[0].sap_mode, 3, "correlated pair must be SAP-coded");
         assert_eq!(pair[1].sap_mode, 0, "silent pair must fall back to None");
         let coeffs = crate::asf::extract_sap_abcd(&pair[0], &[max_sfb_master]);
-        for sfb in 0..max_sfb_master as usize {
-            let (a, b, c, d) = coeffs.abcd[0][sfb];
+        for (sfb, &(a, b, c, d)) in coeffs.abcd[0]
+            .iter()
+            .enumerate()
+            .take(max_sfb_master as usize)
+        {
             assert!(
                 (a - 1.7).abs() < 1e-6 && (b - 1.0).abs() < 1e-6,
                 "sfb {sfb}: expected a = 1.7, b = 1, got ({a}, {b})"

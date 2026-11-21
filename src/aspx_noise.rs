@@ -839,15 +839,12 @@ mod tests {
         // Shape: 64 rows × 4 slots. Only sb in 8..12 should be non-zero.
         assert_eq!(out.qmf_noise.len(), 64);
         assert_eq!(out.qmf_noise[0].len(), 4);
-        for sb in 0..8 {
-            for ts in 0..4 {
-                assert_eq!(out.qmf_noise[sb][ts], (0.0, 0.0));
-            }
+        for row in &out.qmf_noise[..8] {
+            assert!(row[..4].iter().all(|&v| v == (0.0, 0.0)));
         }
         let mut any_nz = false;
-        for sb in 8..12 {
-            for ts in 0..4 {
-                let (re, im) = out.qmf_noise[sb][ts];
+        for (sb, row) in out.qmf_noise.iter().enumerate().take(12).skip(8) {
+            for (ts, &(re, im)) in row.iter().enumerate().take(4) {
                 if re.abs() > 1e-6 || im.abs() > 1e-6 {
                     any_nz = true;
                 }
@@ -859,10 +856,8 @@ mod tests {
             }
         }
         assert!(any_nz);
-        for sb in 12..64 {
-            for ts in 0..4 {
-                assert_eq!(out.qmf_noise[sb][ts], (0.0, 0.0));
-            }
+        for row in &out.qmf_noise[12..64] {
+            assert!(row[..4].iter().all(|&v| v == (0.0, 0.0)));
         }
         assert!(state.prev.is_some());
     }
@@ -884,9 +879,8 @@ mod tests {
             2,
             &mut state,
         );
-        for sb in 4..6 {
-            for ts in 0..2 {
-                let (re, im) = out.qmf_noise[sb][ts];
+        for (sb, row) in out.qmf_noise.iter().enumerate().take(6).skip(4) {
+            for (ts, &(re, im)) in row.iter().enumerate().take(2) {
                 let idx = noise_idx(sb as u32, ts as u32, 0, 1, 2, None);
                 let (exp_re, exp_im) = ASPX_NOISE_TABLE[idx as usize];
                 assert!((re - 2.0 * exp_re).abs() < 1e-5);
@@ -917,17 +911,15 @@ mod tests {
             &mut state,
         );
         // First two slots should use level 1.0, last two should use 3.0.
-        for ts in 0..2 {
-            for sb in 4..6 {
-                let (re, _im) = out.qmf_noise[sb][ts];
+        for (sb, row) in out.qmf_noise.iter().enumerate().take(6).skip(4) {
+            for (ts, &(re, _im)) in row.iter().enumerate().take(2) {
                 let idx = noise_idx(sb as u32, ts as u32, 0, 1, 2, None);
                 let (exp_re, _) = ASPX_NOISE_TABLE[idx as usize];
                 assert!((re - 1.0 * exp_re).abs() < 1e-5);
             }
         }
-        for ts in 2..4 {
-            for sb in 4..6 {
-                let (re, _im) = out.qmf_noise[sb][ts];
+        for (sb, row) in out.qmf_noise.iter().enumerate().take(6).skip(4) {
+            for (ts, &(re, _im)) in row.iter().enumerate().take(4).skip(2) {
                 let idx = noise_idx(sb as u32, ts as u32, 0, 1, 2, None);
                 let (exp_re, _) = ASPX_NOISE_TABLE[idx as usize];
                 assert!((re - 3.0 * exp_re).abs() < 1e-5);
