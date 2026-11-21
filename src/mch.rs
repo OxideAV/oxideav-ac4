@@ -301,19 +301,10 @@ pub fn parse_mono_data(
     // applies, just with `max_sfb_0` already capped by the
     // `n_msfbl_bits` bit-width.
     if !b_lfe && out.spec_frontend_bit == 0 {
-        if ti.b_long_frame && psy.num_window_groups == 1 {
-            if let Some(scaled) = decode_asf_long_mono_body_with_max_sfb(br, &ti, psy.max_sfb_0) {
-                out.scaled_spec = Some(scaled);
-            }
-        } else if psy.num_window_groups > 0
-            && let Some(scaled) = decode_asf_grouped_mono_body_with_max_sfb(
-                br,
-                &ti,
-                psy.max_sfb_0,
-                psy.num_window_groups,
-            )
+        if let Some(layout) =
+            crate::asf_blocks::AsfLayout::new(&ti, &psy, psy.max_sfb_0, psy.max_sfb_1)
         {
-            out.scaled_spec = Some(scaled);
+            out.scaled_spec = crate::asf_blocks::decode_sf_data(br, &layout);
         }
     } else if b_lfe {
         // LFE: `sf_info_lfe()` forces long-frame, single window group;
@@ -341,7 +332,7 @@ pub fn parse_two_channel_data(
 ) -> Result<TwoChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let chparam = parse_chparam_info(br, &shared_sf_info_grid(&psy))?;
+    let chparam = parse_chparam_info(br, &shared_sf_info_grid(&ti, &psy))?;
     let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 2);
     apply_channel_data_matrix(&mut scaled, &ti, &psy, ChannelDataMatrix::Two(&chparam));
     Ok(TwoChannelData {
@@ -409,7 +400,7 @@ pub fn parse_three_channel_data(
 ) -> Result<ThreeChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let info = parse_three_channel_info(br, &shared_sf_info_grid(&psy))?;
+    let info = parse_three_channel_info(br, &shared_sf_info_grid(&ti, &psy))?;
     let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 3);
     apply_channel_data_matrix(
         &mut scaled,
@@ -432,7 +423,7 @@ pub fn parse_four_channel_data(
 ) -> Result<FourChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let info = parse_four_channel_info(br, &shared_sf_info_grid(&psy))?;
+    let info = parse_four_channel_info(br, &shared_sf_info_grid(&ti, &psy))?;
     let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 4);
     apply_channel_data_matrix(
         &mut scaled,
@@ -455,7 +446,7 @@ pub fn parse_five_channel_data(
 ) -> Result<FiveChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let info = parse_five_channel_info(br, &shared_sf_info_grid(&psy))?;
+    let info = parse_five_channel_info(br, &shared_sf_info_grid(&ti, &psy))?;
     let mut scaled = decode_mch_sf_data_channels(br, &ti, &psy, 5);
     apply_channel_data_matrix(
         &mut scaled,
@@ -509,27 +500,12 @@ pub(crate) fn decode_mch_sf_data_channels(
     n_channels: usize,
 ) -> Vec<Option<Vec<f32>>> {
     let mut out = vec![None; n_channels];
-    if ti.b_long_frame && psy.num_window_groups == 1 {
-        // Long-frame, 1 window group — walk one body chain per channel.
-        for slot in out.iter_mut() {
-            match decode_asf_long_mono_body_with_max_sfb(br, ti, psy.max_sfb_0) {
-                Some(v) => *slot = Some(v),
-                None => break,
-            }
-        }
+    let Some(layout) = crate::asf_blocks::AsfLayout::new(ti, psy, psy.max_sfb_0, psy.max_sfb_1)
+    else {
         return out;
-    }
-    if psy.num_window_groups == 0 {
-        return out;
-    }
-    // Short / grouped frame walker.
+    };
     for slot in out.iter_mut() {
-        match decode_asf_grouped_mono_body_with_max_sfb(
-            br,
-            ti,
-            psy.max_sfb_0,
-            psy.num_window_groups,
-        ) {
+        match crate::asf_blocks::decode_sf_data(br, &layout) {
             Some(v) => *slot = Some(v),
             None => break,
         }
@@ -545,8 +521,11 @@ pub(crate) fn decode_mch_sf_data_channels(
 /// elements are walked on (Table 47's per-window-group loop): every
 /// channel-data element invokes `sf_info(ASF, 0, 0)`, so Pseudocode 5
 /// returns `max_sfb[0]` for each of the `num_window_groups` groups.
-fn shared_sf_info_grid(psy: &AsfPsyInfo) -> Vec<u32> {
-    vec![psy.max_sfb_0; psy.num_window_groups.max(1) as usize]
+fn shared_sf_info_grid(ti: &AsfTransformInfo, psy: &AsfPsyInfo) -> Vec<u32> {
+    match crate::asf_blocks::AsfLayout::new(ti, psy, psy.max_sfb_0, psy.max_sfb_1) {
+        Some(l) => l.grid(),
+        None => vec![psy.max_sfb_0; psy.num_window_groups.max(1) as usize],
+    }
 }
 
 /// Per-(g, sfb) SAP quartet `(a, b, c, d)` of one `chparam_info()`.
@@ -701,26 +680,19 @@ fn apply_channel_data_matrix(
     if n < 2 || tracks.iter().any(|t| t.is_none()) {
         return;
     }
-    let groups = psy.num_window_groups.max(1) as usize;
-    let tl = ti.transform_length_0;
-    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else {
+    let Some(layout) = crate::asf_blocks::AsfLayout::new(ti, psy, psy.max_sfb_0, psy.max_sfb_1)
+    else {
         return;
     };
-    let Some(cap) = crate::tables::num_sfb_48(tl) else {
-        return;
-    };
-    let max_sfb = psy.max_sfb_0.min(cap) as usize;
-    if max_sfb == 0 {
-        return;
-    }
-    let per_group = sfbo[max_sfb] as usize;
+    let need = layout.out_len();
     if tracks
         .iter()
-        .any(|t| t.as_ref().map(|v| v.len()).unwrap_or(0) < per_group * groups)
+        .any(|t| t.as_ref().map(|v| v.len()).unwrap_or(0) < need)
     {
         return;
     }
-    let grid = vec![max_sfb as u32; groups];
+    let grid = layout.grid();
+    let groups = layout.groups.len();
     let quartets = |cp: &ChparamInfo| crate::asf::extract_sap_abcd(cp, &grid).abcd;
     let rows: Vec<Vec<Vec<Quartet>>> = match which {
         ChannelDataMatrix::Two(cp) => vec![quartets(cp)],
@@ -738,7 +710,7 @@ fn apply_channel_data_matrix(
     };
     let mut x = [0.0f32; 5];
     for g in 0..groups {
-        for sfb in 0..max_sfb {
+        for sfb in 0..layout.groups[g].max_sfb as usize {
             // Build this tile's matrix (row-major, n × n).
             let mut m = [[0.0f32; 5]; 5];
             match which {
@@ -780,9 +752,7 @@ fn apply_channel_data_matrix(
                     m = t;
                 }
             }
-            let lo = g * per_group + sfbo[sfb] as usize;
-            let hi = g * per_group + sfbo[sfb + 1] as usize;
-            for k in lo..hi {
+            for k in layout.band_ranges(g, sfb).flatten() {
                 for (i, t) in tracks.iter().enumerate() {
                     x[i] = t.as_ref().map(|v| v[k]).unwrap_or(0.0);
                 }
@@ -795,47 +765,6 @@ fn apply_channel_data_matrix(
             }
         }
     }
-}
-
-/// Walk one `sf_data(ASF)` body for the grouped / short-frame case
-/// where `num_window_groups > 1`. Per spec §4.2.8 (Tables 39-42) and
-/// §5.4.4.4 the body fires `num_window_groups` independent
-/// `(section + spectral + scalefac + snf)` cycles back-to-back; the
-/// per-group spectrum is `sfb_offset[max_sfb]` long at the per-window
-/// transform length. The returned vector concatenates the
-/// `num_window_groups` per-group spectra (group-major).
-///
-/// Returns `None` on the first Huffman / bit-stream miss; partial
-/// per-group output is dropped because the bitreader position is
-/// indeterminate after a mid-body miss.
-fn decode_asf_grouped_mono_body_with_max_sfb(
-    br: &mut BitReader<'_>,
-    ti: &AsfTransformInfo,
-    max_sfb_in: u32,
-    num_window_groups: u32,
-) -> Option<Vec<f32>> {
-    let tl = ti.transform_length_0;
-    let tl_idx = ti.transf_length[0];
-    let max_sfb_cap = crate::tables::num_sfb_48(tl)?;
-    let max_sfb = max_sfb_in.min(max_sfb_cap);
-    if max_sfb == 0 {
-        return None;
-    }
-    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
-    let per_group_len = sfbo[max_sfb as usize] as usize;
-    let total_len = per_group_len.checked_mul(num_window_groups as usize)?;
-    let mut out = Vec::with_capacity(total_len);
-    for _g in 0..num_window_groups {
-        let sections = crate::asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
-        let (qspec, mqi) =
-            crate::asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
-        let sf_gain =
-            crate::asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-        let _snf = crate::asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-        let scaled = crate::asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
-        out.extend_from_slice(&scaled);
-    }
-    Some(out)
 }
 
 // =====================================================================
@@ -1354,17 +1283,25 @@ impl SevenXCodecMode {
 /// `b_use_sap_add_ch` `chparam_info()` pair is walked on. `None` when
 /// the core element did not parse.
 fn seven_x_core_sf_info_grid(tools: &SubstreamTools, cfg: FiveXCodingConfig) -> Option<Vec<u32>> {
-    let psy = match cfg {
+    let (ti, psy) = match cfg {
         FiveXCodingConfig::Cfg0Stereo2plusMono | FiveXCodingConfig::AcplLite2 => {
-            tools.two_channel_data.first()?.psy_info.as_ref()?
+            let d = tools.two_channel_data.first()?;
+            (d.transform_info.as_ref()?, d.psy_info.as_ref()?)
         }
         FiveXCodingConfig::Cfg1ThreeStereo => {
-            tools.three_channel_data.as_ref()?.psy_info.as_ref()?
+            let d = tools.three_channel_data.as_ref()?;
+            (d.transform_info.as_ref()?, d.psy_info.as_ref()?)
         }
-        FiveXCodingConfig::Cfg2FourMono => tools.four_channel_data.as_ref()?.psy_info.as_ref()?,
-        FiveXCodingConfig::Cfg3Five => tools.five_channel_data.as_ref()?.psy_info.as_ref()?,
+        FiveXCodingConfig::Cfg2FourMono => {
+            let d = tools.four_channel_data.as_ref()?;
+            (d.transform_info.as_ref()?, d.psy_info.as_ref()?)
+        }
+        FiveXCodingConfig::Cfg3Five => {
+            let d = tools.five_channel_data.as_ref()?;
+            (d.transform_info.as_ref()?, d.psy_info.as_ref()?)
+        }
     };
-    Some(shared_sf_info_grid(psy))
+    Some(shared_sf_info_grid(ti, psy))
 }
 
 /// Parse the outer layers of `7_X_channel_element(channel_mode, b_iframe)`
@@ -1842,8 +1779,9 @@ mod tests {
     ///
     ///   * `asf_section_data`: one section with `sect_cb = 0` covering
     ///     all `max_sfb` bands (4 bits sect_cb + N bits sect_len_incr,
-    ///     where N = 3 for `transf_length_idx <= 2`, with 7-escape
-    ///     accumulation when `max_sfb > 7`).
+    ///     where N = 3 with 7-escapes for `get_transf_length(g)` codes
+    ///     0..=2 and N = 5 with 31-escapes for code 3 and for a long
+    ///     frame, code 4 — Table 39 / Pseudocode 2).
     ///   * `asf_spectral_data`: empty (cb=0 emits no bits).
     ///   * `asf_scalefac_data`: 8 bits `reference_scale_factor` only —
     ///     all bands have `cb == 0`, so no DPCM codewords.
@@ -1872,6 +1810,35 @@ mod tests {
         // since no bands have non-zero quants).
         bw.write_u32(120, 8);
         // asf_snf_data: b_snf_data_exists = 0.
+        bw.write_bit(false);
+    }
+
+    /// Block-switched counterpart of [`write_zero_sf_data_body`]: an
+    /// all-zero `sf_data(ASF)` body over `groups` window groups —
+    /// Table 39's per-group section data, then the single
+    /// `reference_scale_factor` and `b_snf_data_exists` of Tables 41 /
+    /// 42.
+    fn write_zero_grouped_sf_data_body(
+        bw: &mut BitWriter,
+        max_sfb: u32,
+        transf_length_idx: u32,
+        groups: usize,
+    ) {
+        let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
+            (3, 7)
+        } else {
+            (5, 31)
+        };
+        for _ in 0..groups {
+            bw.write_u32(0, 4);
+            let mut remaining = max_sfb.saturating_sub(1);
+            while remaining >= sect_esc_val {
+                bw.write_u32(sect_esc_val, n_sect_bits);
+                remaining -= sect_esc_val;
+            }
+            bw.write_u32(remaining, n_sect_bits);
+        }
+        bw.write_u32(120, 8);
         bw.write_bit(false);
     }
 
@@ -1957,7 +1924,7 @@ mod tests {
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -1991,7 +1958,7 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_bit(true); // b_long_frame
         bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 @ tl=1920
-        write_zero_sf_data_body(&mut bw, 5, 0);
+        write_zero_sf_data_body(&mut bw, 5, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2092,7 +2059,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 12, 0);
+            write_zero_sf_data_body(&mut bw, 12, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2121,7 +2088,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 20, 0);
+            write_zero_sf_data_body(&mut bw, 20, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2155,7 +2122,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 15, 0);
+            write_zero_sf_data_body(&mut bw, 15, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2184,7 +2151,7 @@ mod tests {
         // LFE mono_data(1):
         bw.write_bit(true); // b_long_frame
         bw.write_u32(4, 3); // max_sfb[0] -- n_msfbl_bits = 3 for tl=1920
-        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+        write_zero_sf_data_body(&mut bw, 4, 4); // round 38: LFE body
         // coding_config = 3, then five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true);
@@ -2194,7 +2161,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2222,8 +2189,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(20, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 20, 0);
-        write_zero_sf_data_body(&mut bw, 20, 0);
+        write_zero_sf_data_body(&mut bw, 20, 4);
+        write_zero_sf_data_body(&mut bw, 20, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2252,14 +2219,14 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #1
-        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #2
+        write_zero_sf_data_body(&mut bw, 10, 4); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 10, 4); // sf_data #2
         // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #1
-        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #2
+        write_zero_sf_data_body(&mut bw, 12, 4); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 12, 4); // sf_data #2
         // mono_data(0): spec_frontend bit + transform + psy.
         bw.write_bit(false); // spec_frontend = 0 (ASF)
         bw.write_bit(true); // b_long_frame
@@ -2312,14 +2279,14 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 14, 0);
+            write_zero_sf_data_body(&mut bw, 14, 4);
         }
         // two_channel_data: long-frame, max_sfb=18, chparam=0.
         bw.write_bit(true);
         bw.write_u32(18, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 18, 0);
-        write_zero_sf_data_body(&mut bw, 18, 0);
+        write_zero_sf_data_body(&mut bw, 18, 4);
+        write_zero_sf_data_body(&mut bw, 18, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2356,7 +2323,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 22, 0);
+            write_zero_sf_data_body(&mut bw, 22, 4);
         }
         // mono_data(0): spec_frontend + transform + psy.
         bw.write_bit(false);
@@ -2423,8 +2390,8 @@ mod tests {
     fn decode_mch_sf_data_long_frame_all_zero_two_channels() {
         let mut bw = BitWriter::new();
         // Two stacked sf_data bodies for max_sfb=8 at tl=1920.
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 4);
+        write_zero_sf_data_body(&mut bw, 8, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2494,7 +2461,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2524,7 +2491,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 8, 0);
+            write_zero_sf_data_body(&mut bw, 8, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2548,7 +2515,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 6, 0);
+            write_zero_sf_data_body(&mut bw, 6, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2573,7 +2540,7 @@ mod tests {
         bw.write_u32(2, 4);
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2604,8 +2571,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(15, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam_info sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 15, 0);
-        write_zero_sf_data_body(&mut bw, 15, 0);
+        write_zero_sf_data_body(&mut bw, 15, 4);
+        write_zero_sf_data_body(&mut bw, 15, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2623,26 +2590,18 @@ mod tests {
     // Round 24: grouped multichannel sf_data(ASF) walker (num_window_groups > 1)
     // =================================================================
 
-    /// `decode_mch_sf_data_channels` for a grouped short frame
-    /// (`num_window_groups == 2`, `b_long_frame == 0`) walks
-    /// `num_window_groups` consecutive `section / spectral / scalefac /
-    /// snf` chains per channel and returns a per-channel spectrum of
-    /// length `num_window_groups * sfb_offset[max_sfb]` (all-zero for
-    /// the synthetic input). Pins r24 §5.4.4.4 grouped path.
+    /// `decode_mch_sf_data_channels` on a block-switched frame: 1920
+    /// samples as four 480-line blocks in two window groups. Each
+    /// channel is one `sf_data(ASF)` body whose sections run per group
+    /// and whose spectrum comes back in window order (`frame_length`
+    /// lines; all-zero for the synthetic input).
     #[test]
     fn decode_mch_sf_data_grouped_short_frame_two_groups_two_channels() {
-        // Two channels x two window groups x sf_data body each. tl=480
-        // is at frame_len_base=1920 with transf_length=2 (the third
-        // short-frame index — `n_sect_bits = 3`, esc = 7).
         let max_sfb = 8u32;
-        let tl_idx = 2u32; // matches transf_length=2 (tl=480 short-frame).
+        let tl_idx = 2u32; // transf_length = 2 → 480 lines, 3-bit sections.
         let mut bw = BitWriter::new();
-        // Channel 0: two grouped bodies.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        // Channel 1: two grouped bodies.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        write_zero_grouped_sf_data_body(&mut bw, max_sfb, tl_idx, 2);
+        write_zero_grouped_sf_data_body(&mut bw, max_sfb, tl_idx, 2);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2654,34 +2613,29 @@ mod tests {
         };
         let psy = AsfPsyInfo {
             max_sfb_0: max_sfb,
-            num_windows: 2,
+            num_windows: 4,
             num_window_groups: 2,
-            scale_factor_grouping: vec![0],
+            scale_factor_grouping: vec![1, 0, 1],
+            frame_len_base: 1920,
             ..Default::default()
         };
         let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
         assert_eq!(out.len(), 2);
-        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let per_group_len = sfbo[max_sfb as usize] as usize;
-        let expected_total = per_group_len * 2; // num_window_groups
         for slot in &out {
             let v = slot.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
+            assert_eq!(v.len(), 1920);
             assert!(v.iter().all(|&s| s == 0.0));
         }
     }
 
-    /// Three-window-group case at the same short-frame transform
-    /// length. Verifies the walker scales linearly with
-    /// `num_window_groups`.
+    /// Three window groups (1 + 2 + 1 blocks) at the same transform
+    /// length.
     #[test]
     fn decode_mch_sf_data_grouped_three_groups_one_channel() {
         let max_sfb = 6u32;
         let tl_idx = 2u32;
         let mut bw = BitWriter::new();
-        for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        }
+        write_zero_grouped_sf_data_body(&mut bw, max_sfb, tl_idx, 3);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2693,22 +2647,22 @@ mod tests {
         };
         let psy = AsfPsyInfo {
             max_sfb_0: max_sfb,
-            num_windows: 3,
+            num_windows: 4,
             num_window_groups: 3,
-            scale_factor_grouping: vec![0, 0],
+            scale_factor_grouping: vec![0, 1, 0],
+            frame_len_base: 1920,
             ..Default::default()
         };
         let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
         assert_eq!(out.len(), 1);
         let v = out[0].as_ref().expect("decode succeeds");
-        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        assert_eq!(v.len(), 3 * sfbo[max_sfb as usize] as usize);
+        assert_eq!(v.len(), 1920);
     }
 
     /// `parse_three_channel_data` correctly drives the grouped path
     /// when the head `sf_info(ASF, 0, 0)` reports
     /// `num_window_groups > 1`. Each channel's `scaled_spec_per_channel`
-    /// slot carries the concatenated per-group spectra.
+    /// slot carries the window-order spectrum.
     #[test]
     fn parse_three_channel_data_grouped_short_frame_walks_per_group() {
         // sf_info(ASF, 0, 0) at frame_len_base=1920 with
@@ -2735,11 +2689,9 @@ mod tests {
         bw.write_u32(0, 4);
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        // Three channels x two window groups of sf_data(ASF) bodies.
+        // Three sf_data(ASF) bodies of two window groups each.
         for _ in 0..3 {
-            for _ in 0..2 {
-                write_zero_sf_data_body(&mut bw, max_sfb, 2);
-            }
+            write_zero_grouped_sf_data_body(&mut bw, max_sfb, 2, 2);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2749,18 +2701,16 @@ mod tests {
         assert_eq!(psy.num_window_groups, 2);
         assert!(!d.transform_info.as_ref().unwrap().b_long_frame);
         assert_eq!(d.scaled_spec_per_channel.len(), 3);
-        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let expected_total = (sfbo[max_sfb as usize] as usize) * 2;
         for ch in &d.scaled_spec_per_channel {
             let v = ch.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
+            assert_eq!(v.len(), 1920);
             assert!(v.iter().all(|&s| s == 0.0));
         }
     }
 
     /// `parse_two_channel_data` mirrors the grouped walk for the
     /// `5_X_channel_element` Cfg0 / Cfg1 paths — every per-channel slot
-    /// carries the concatenated grouped spectrum.
+    /// carries the window-order spectrum.
     #[test]
     fn parse_two_channel_data_grouped_short_frame_walks_per_group() {
         let mut bw = BitWriter::new();
@@ -2775,11 +2725,9 @@ mod tests {
         bw.write_u32(0, 1);
         // chparam_info: sap_mode=0.
         bw.write_u32(0, 2);
-        // 2 channels x 4 window groups of bodies.
+        // Two sf_data(ASF) bodies of four window groups each.
         for _ in 0..2 {
-            for _ in 0..4 {
-                write_zero_sf_data_body(&mut bw, max_sfb, 2);
-            }
+            write_zero_grouped_sf_data_body(&mut bw, max_sfb, 2, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2788,11 +2736,9 @@ mod tests {
         let psy = d.psy_info.as_ref().unwrap();
         assert_eq!(psy.num_window_groups, 4);
         assert_eq!(d.scaled_spec_per_channel.len(), 2);
-        let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let expected_total = (sfbo[max_sfb as usize] as usize) * 4;
         for ch in &d.scaled_spec_per_channel {
             let v = ch.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
+            assert_eq!(v.len(), 1920);
         }
     }
 
@@ -2948,8 +2894,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 4);
+        write_zero_sf_data_body(&mut bw, 8, 4);
         // mono_data(0): spec_frontend bit + asf_transform_info long +
         // sf_info(ASF, 0, 0).
         bw.write_bit(false); // spec_frontend = ASF
@@ -2988,15 +2934,15 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         // Joint-MDCT residual layer (ASPX_ACPL_1 only): max_sfb_master
         // is read with n_side_bits=5 @ tl=1920 (Table 106).
         bw.write_u32(8, 5); // max_sfb_master = 8
         bw.write_u32(0, 2); // chparam_info residual ch0 (sap_mode=0)
         bw.write_u32(0, 2); // chparam_info residual ch1
-        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch0 sf_data
-        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch1 sf_data
+        write_zero_sf_data_body(&mut bw, 8, 4); // residual ch0 sf_data
+        write_zero_sf_data_body(&mut bw, 8, 4); // residual ch1 sf_data
         // Pad to be safe.
         bw.align_to_byte();
         while bw.byte_len() < 64 {
@@ -3054,7 +3000,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         // Pad with zeros for downstream aspx/acpl walkers (which are
         // try-and-bail).
@@ -3097,15 +3043,15 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(12, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 4);
+        write_zero_sf_data_body(&mut bw, 12, 4);
         // Joint-MDCT residual layer (ASPX_ACPL_1):
         // max_sfb_master uses n_side_bits = 5 @ tl=1920.
         bw.write_u32(6, 5); // max_sfb_master = 6
         bw.write_u32(0, 2); // chparam residual ch0
         bw.write_u32(0, 2); // chparam residual ch1
-        write_zero_sf_data_body(&mut bw, 6, 0);
-        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 4);
+        write_zero_sf_data_body(&mut bw, 6, 4);
         // Cfg0 trailer: mono_data(0) for the centre channel.
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
@@ -3188,7 +3134,7 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         // max_sfb_master = 0 (n_side_bits = 5 @ tl=1920).
         bw.write_u32(0, 5);
@@ -3248,7 +3194,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 15, 0);
+            write_zero_sf_data_body(&mut bw, 15, 4);
         }
         // SIMPLE additional-channel block: b_use_sap_add_ch = 0.
         bw.write_bit(false);
@@ -3256,8 +3202,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 4);
+        write_zero_sf_data_body(&mut bw, 10, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3289,7 +3235,7 @@ mod tests {
         // LFE mono_data(1):
         bw.write_bit(true); // b_long_frame
         bw.write_u32(4, 3); // max_sfb[0] (n_msfbl_bits=3 @ tl=1920)
-        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+        write_zero_sf_data_body(&mut bw, 4, 4); // round 38: LFE body
         // coding_config = 3 -> five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true); // b_long_frame
@@ -3299,15 +3245,15 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 4);
+        write_zero_sf_data_body(&mut bw, 8, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3336,22 +3282,22 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 4);
+        write_zero_sf_data_body(&mut bw, 12, 4);
         // two_channel_data #1:
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 4);
+        write_zero_sf_data_body(&mut bw, 12, 4);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
         // additional two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 4);
+        write_zero_sf_data_body(&mut bw, 10, 4);
         // Trailing mono_data(0) for Cfg0 (centre).
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
@@ -3387,15 +3333,15 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 11, 0);
+            write_zero_sf_data_body(&mut bw, 11, 4);
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
         bw.write_bit(true);
         bw.write_u32(9, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 9, 0);
-        write_zero_sf_data_body(&mut bw, 9, 0);
+        write_zero_sf_data_body(&mut bw, 9, 4);
+        write_zero_sf_data_body(&mut bw, 9, 4);
         // Trailing mono_data(0) for Cfg2 (back surround).
         bw.write_bit(false);
         bw.write_bit(true);
@@ -3432,21 +3378,21 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         // two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 4);
+        write_zero_sf_data_body(&mut bw, 10, 4);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 4);
+        write_zero_sf_data_body(&mut bw, 8, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3479,7 +3425,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 12, 0);
+            write_zero_sf_data_body(&mut bw, 12, 4);
         }
         // SIMPLE additional-channel block with SAP.
         bw.write_bit(true); // b_use_sap_add_ch = 1
@@ -3489,8 +3435,8 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 4);
+        write_zero_sf_data_body(&mut bw, 8, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3523,14 +3469,14 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         // two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 4);
+        write_zero_sf_data_body(&mut bw, 10, 4);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3569,20 +3515,20 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 4);
+        write_zero_sf_data_body(&mut bw, 12, 4);
         // two_channel_data #1:
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 4);
+        write_zero_sf_data_body(&mut bw, 12, 4);
         // ASPX_ACPL_1 joint-MDCT residual layer (n_side_bits=5 @ tl=1920).
         bw.write_u32(6, 5); // max_sfb_master = 6
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 6, 0);
-        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 4);
+        write_zero_sf_data_body(&mut bw, 6, 4);
         // Cfg0 trailer: mono_data(0) for the centre.
         bw.write_bit(false);
         bw.write_bit(true);
@@ -3629,14 +3575,14 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 4);
         }
         // two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 4);
+        write_zero_sf_data_body(&mut bw, 10, 4);
         // max_sfb_master = 0 (n_side_bits=5).
         bw.write_u32(0, 5);
         bw.align_to_byte();

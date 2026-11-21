@@ -158,32 +158,37 @@ pub fn parse_asf_spectral_data(
             asf_hcb(cb).ok_or_else(|| Error::invalid("ac4: asf_spectral_data: bad codebook"))?;
         let dim = CB_DIM[cb as usize];
         let unsig = UNSIGNED_CB[cb as usize];
-        let sect_start_line = sfb_offset[sections.sect_start[i] as usize] as usize;
-        let sect_end_line = sfb_offset[sections.sect_end[i] as usize] as usize;
+        // A section may announce bands past `max_sfb` (a malformed or
+        // straddling length): the coded lines stop at the last band.
+        let last = max_sfb as usize;
+        let sect_start_line = sfb_offset[(sections.sect_start[i] as usize).min(last)] as usize;
+        let sect_end_line = sfb_offset[(sections.sect_end[i] as usize).min(last)] as usize;
         let mut k = sect_start_line;
         let mut tmp = [0i32; 4];
         while k < sect_end_line {
             let cb_idx = huff_decode(br, hcb.len, hcb.cw)?;
             split_qspec(hcb, cb_idx, &mut tmp);
             let step = dim as usize;
-            for t in 0..step {
-                let mut q = tmp[t];
-                if unsig && q != 0 {
-                    let s = br.read_u32(1)?;
-                    if s == 1 {
-                        q = -q;
+            // Table 40: the sign bits of the whole tuple come first
+            // (`quad_sign_bits` / `pair_sign_bits`, one per non-zero
+            // line of an unsigned codebook), then — codebook 11 only —
+            // one `ext_code` per line whose magnitude decoded to 16.
+            if unsig {
+                for q in tmp.iter_mut().take(step) {
+                    if *q != 0 && br.read_u32(1)? == 1 {
+                        *q = -*q;
                     }
                 }
-                if cb == 11 && q.unsigned_abs() == 16 {
-                    let ext = ext_decode(br)?;
-                    // sign was already applied if unsigned; re-apply
-                    // sign via sign of q.
-                    q = if q.is_negative() {
-                        -(ext as i32)
-                    } else {
-                        ext as i32
-                    };
+            }
+            if cb == 11 {
+                for q in tmp.iter_mut().take(step) {
+                    if q.unsigned_abs() == 16 {
+                        let ext = ext_decode(br)? as i32;
+                        *q = if q.is_negative() { -ext } else { ext };
+                    }
                 }
+            }
+            for (t, &q) in tmp.iter().enumerate().take(step) {
                 if k + t < quant_spec.len() {
                     quant_spec[k + t] = q;
                 }

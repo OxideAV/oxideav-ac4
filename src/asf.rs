@@ -33,10 +33,8 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::asf_data;
 use crate::aspx;
 use crate::huffman::{HCB_SCALEFAC_CW, HCB_SCALEFAC_LEN, huff_decode};
-use crate::sfb_offset;
 use crate::tables;
 use crate::toc::variable_bits;
 
@@ -105,6 +103,47 @@ pub struct AsfTransformInfo {
     pub transform_length_1: u32,
 }
 
+impl AsfTransformInfo {
+    /// Transform length of every block of the frame in time order
+    /// (§4.3.6.1, Tables 99 / 100 / 103): one full block for a long
+    /// frame; for `frame_len_base ≥ 1536` the `1 << (3 − transf_length[i])`
+    /// partial blocks of each frame half; below that the
+    /// `frame_len_base / transform_length` equal blocks. `None` when
+    /// the lengths do not tile the frame.
+    pub fn windows(&self, frame_len_base: u32) -> Option<Vec<usize>> {
+        if self.b_long_frame {
+            return (self.transform_length_0 > 0).then(|| vec![self.transform_length_0 as usize]);
+        }
+        let (t0, t1) = (self.transform_length_0, self.transform_length_1);
+        if t0 == 0 || t1 == 0 {
+            return None;
+        }
+        let mut w = Vec::new();
+        if frame_len_base >= 1536 {
+            let n0 = 1usize << (3 - (self.transf_length[0] & 3));
+            let n1 = 1usize << (3 - (self.transf_length[1] & 3));
+            w.extend(std::iter::repeat_n(t0 as usize, n0));
+            w.extend(std::iter::repeat_n(t1 as usize, n1));
+        } else {
+            if !frame_len_base.is_multiple_of(t0) {
+                return None;
+            }
+            w.extend(std::iter::repeat_n(
+                t0 as usize,
+                (frame_len_base / t0) as usize,
+            ));
+        }
+        (w.iter().sum::<usize>() == frame_len_base as usize).then_some(w)
+    }
+
+    /// `true` when the frame is a single full block of `frame_len`
+    /// lines.
+    pub fn is_single_block(&self, frame_len: u32) -> bool {
+        self.transform_length_0 == frame_len
+            && (self.b_long_frame || self.transform_length_1 == frame_len)
+    }
+}
+
 /// Parsed `asf_psy_info()` (ETSI TS 103 190-1 §4.2.8.2 + §4.3.6.2) —
 /// the scale-factor-band organisation for one or two transform-length
 /// windows.
@@ -128,6 +167,10 @@ pub struct AsfPsyInfo {
     pub num_windows: u32,
     /// Derived: `num_window_groups`.
     pub num_window_groups: u32,
+    /// `frame_len_base` the element was parsed under (0 when the
+    /// record was built by hand; the layout then assumes equal
+    /// blocks).
+    pub frame_len_base: u32,
 }
 
 /// Table 109 row lookup — `n_grp_bits` for `frame_len_base ≥ 1536` and
@@ -241,27 +284,22 @@ pub fn parse_asf_psy_info(
     }
     info.scale_factor_grouping = grouping;
 
-    // Derive num_windows / num_window_groups per Pseudocode 3 —
-    // simplified: for long frames it's 1/1; for non-long with equal
-    // transform lengths, num_windows = n_grp_bits + 1.
+    // Derive num_windows / num_window_groups per Pseudocode 3: one
+    // window more than grouping bits, plus the forced group boundary
+    // (and its extra window) between two different transform lengths.
+    info.frame_len_base = frame_len_base;
     if transform_info.b_long_frame {
         info.num_windows = 1;
         info.num_window_groups = 1;
     } else {
-        info.num_windows = n_grp_bits + 1;
-        info.num_window_groups = 1;
-        // For the equal-transform-length case each grouping==0 bit
-        // starts a new group. For b_different_framing the pseudocode
-        // inserts an unconditional boundary at the half-frame mark.
-        for &b in &info.scale_factor_grouping {
-            if b == 0 {
-                info.num_window_groups += 1;
-            }
-        }
-        // Safety cap — malformed streams shouldn't explode.
-        if info.num_windows == 0 {
-            info.num_windows = 1;
-        }
+        info.num_windows = n_grp_bits + 1 + u32::from(b_different_framing);
+        info.num_window_groups = 1
+            + info
+                .scale_factor_grouping
+                .iter()
+                .filter(|&&b| b == 0)
+                .count() as u32
+            + u32::from(b_different_framing);
     }
 
     Ok(info)
@@ -298,6 +336,7 @@ pub fn parse_asf_psy_info_lfe(
         b_different_framing: false,
         num_windows: 1,
         num_window_groups: 1,
+        frame_len_base: transform_info.transform_length_0,
         ..AsfPsyInfo::default()
     };
 
@@ -2013,20 +2052,9 @@ pub fn parse_mono_audio_data_outer_stateful(
             // spectral coefficients.
             let mut body_ok = false;
             let psy_ref = tools.psy_info_primary.as_ref().unwrap().clone();
-            if ti.b_long_frame && psy_ref.num_window_groups == 1 {
-                if let Some(scaled) = decode_asf_long_mono_body(br, &ti, &psy_ref) {
-                    tools.scaled_spec_primary = Some(scaled);
-                    body_ok = true;
-                }
-            } else if psy_ref.num_window_groups > 1 {
-                // Short-frame / grouped mono walker — Tables 39-42 with
-                // the spec's outer `for (g = 0; ...)` loop in each
-                // `asf_*_data()` body. Returns the per-group spectra
-                // concatenated group-major.
-                if let Some(scaled) = decode_asf_grouped_mono_body(br, &ti, &psy_ref) {
-                    tools.scaled_spec_primary = Some(scaled);
-                    body_ok = true;
-                }
+            if let Some(scaled) = decode_asf_mono_body_dispatch(br, &ti, &psy_ref) {
+                tools.scaled_spec_primary = Some(scaled);
+                body_ok = true;
             }
             // §4.2.6.1: for the ASPX path, aspx_data_1ch() follows
             // mono_data(0). Parse its leading xover-subband-offset +
@@ -2576,107 +2604,9 @@ pub(crate) fn capture_aspx_data_1ch_trailer(
     trailer
 }
 
-/// Derive per-window-group `(transf_length_idx, transform_length, max_sfb)`
-/// arrays from a parsed `(ti, psy)` pair, per Pseudocodes 2 and 5 +
-/// Pseudocode 3 (`window_to_group[]`) — for the **non-side-channel /
-/// non-side-limited** path. `b_dual_maxsfb` and `b_side_channel`
-/// callers (joint-MDCT side residual) should pass an explicit
-/// `max_sfb_in` and use [`derive_per_group_with_max_sfb`] instead.
-///
-/// Returns `(transf_length_idx_per_group, transform_length_per_group,
-/// max_sfb_per_group)`. All three vectors have length
-/// `psy.num_window_groups`.
-///
-/// For the equal-transform-length (no `b_different_framing`) case all
-/// three vectors collapse to the single transform / max_sfb value
-/// repeated `num_window_groups` times. For `b_different_framing` the
-/// first half-frame's groups use `transf_length[0]` / `max_sfb_0` and
-/// the second half's use `transf_length[1]` / `max_sfb_1`.
-fn derive_per_group(ti: &AsfTransformInfo, psy: &AsfPsyInfo) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    derive_per_group_with_max_sfb(ti, psy, psy.max_sfb_0, psy.max_sfb_1)
-}
-
-/// Derive per-group `(transf_length_idx, transform_length, max_sfb)`
-/// arrays with explicit per-half-frame `max_sfb_a` / `max_sfb_b`
-/// overrides. Used by joint-MDCT side-channel decoders that want
-/// `max_sfb_side[0/1]` instead of `max_sfb[0/1]`.
-fn derive_per_group_with_max_sfb(
-    ti: &AsfTransformInfo,
-    psy: &AsfPsyInfo,
-    max_sfb_a: u32,
-    max_sfb_b: u32,
-) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    let n = psy.num_window_groups.max(1) as usize;
-    let mut tl_idx = Vec::with_capacity(n);
-    let mut tl = Vec::with_capacity(n);
-    let mut msfb = Vec::with_capacity(n);
-    if !psy.b_different_framing {
-        // All groups share `transf_length[0]` / `max_sfb_0`.
-        for _ in 0..n {
-            tl_idx.push(ti.transf_length[0]);
-            tl.push(ti.transform_length_0);
-            msfb.push(max_sfb_a);
-        }
-        return (tl_idx, tl, msfb);
-    }
-    // Pseudocode 2 / 3: groups < window_to_group[num_windows_0] use
-    // transf_length[0]; the rest use transf_length[1]. We don't carry
-    // `window_to_group[]` on AsfPsyInfo today; derive it from the
-    // `scale_factor_grouping` bits (Pseudocode 3).
-    let num_windows_0 = 1u32 << (3u32.saturating_sub(ti.transf_length[0]));
-    // Walk Pseudocode 3 to find which group index the first second-half
-    // window lands in. The pseudocode shifts the grouping bits and
-    // injects a 0 (group boundary) at index `num_windows_0 - 1`, so
-    // window `num_windows_0` is always the start of a new group.
-    // window_to_group[w] increments by 1 each time scale_factor_grouping[i]==0.
-    let mut wtg = Vec::with_capacity(psy.num_windows as usize);
-    wtg.push(0u32);
-    let mut g = 0u32;
-    let mut grouping = psy.scale_factor_grouping.clone();
-    // Inject the spec's b_different_framing boundary at num_windows_0-1.
-    if (num_windows_0 as usize) <= grouping.len() {
-        // Shift grouping bits of 2nd half by 1, drop the last entry.
-        for i in (num_windows_0 as usize..grouping.len()).rev() {
-            grouping[i] = grouping[i - 1];
-        }
-        grouping[(num_windows_0 - 1) as usize] = 0;
-    }
-    for &b in &grouping {
-        if b == 0 {
-            g += 1;
-        }
-        wtg.push(g);
-    }
-    let split_group = if (num_windows_0 as usize) < wtg.len() {
-        wtg[num_windows_0 as usize]
-    } else {
-        psy.num_window_groups
-    };
-    for grp in 0..n as u32 {
-        if grp < split_group {
-            tl_idx.push(ti.transf_length[0]);
-            tl.push(ti.transform_length_0);
-            msfb.push(max_sfb_a);
-        } else {
-            tl_idx.push(ti.transf_length[1]);
-            tl.push(ti.transform_length_1);
-            msfb.push(max_sfb_b);
-        }
-    }
-    (tl_idx, tl, msfb)
-}
-
-/// Decode the `sf_data(ASF)` body for a mono, **short-frame / grouped**
-/// (`num_window_groups > 1`) ASF substream. Tables 39-42 (§4.2.8.3-6):
-/// the four `asf_*_data()` calls each carry their own outer
-/// `for (g = 0; g < num_window_groups; g++)` loop, with a *single*
-/// `reference_scale_factor` (8 bits) and *single* `b_snf_data_exists`
-/// (1 bit). Returns the per-group dequantised spectra concatenated
-/// group-major (each group of length `sfb_offset[max_sfb]` at the
-/// per-group transform length).
-///
-/// On any Huffman / bitstream error returns `None`. The caller falls
-/// back to silence.
+/// Decode one `sf_data(ASF)` body on the layout `ti` / `psy` describe
+/// (any block arrangement) with explicit `max_sfb[0]` / `max_sfb[1]`.
+/// Returns the window-order spectrum — see [`crate::asf_blocks`].
 pub(crate) fn decode_asf_grouped_mono_body_with_max_sfb(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
@@ -2684,52 +2614,8 @@ pub(crate) fn decode_asf_grouped_mono_body_with_max_sfb(
     max_sfb_a: u32,
     max_sfb_b: u32,
 ) -> Option<Vec<f32>> {
-    if psy.num_window_groups <= 1 {
-        return None;
-    }
-    let (tl_idx_per_g, tl_per_g, max_sfb_per_g) =
-        derive_per_group_with_max_sfb(ti, psy, max_sfb_a, max_sfb_b);
-    // Resolve sfb_offset table per group.
-    let mut sfbo_per_g: Vec<&'static [u16]> = Vec::with_capacity(tl_per_g.len());
-    let mut max_sfb_capped: Vec<u32> = Vec::with_capacity(tl_per_g.len());
-    for g in 0..tl_per_g.len() {
-        let tl = tl_per_g[g];
-        let cap = tables::num_sfb_48(tl)?;
-        let m = max_sfb_per_g[g].min(cap);
-        if m == 0 {
-            return None;
-        }
-        max_sfb_capped.push(m);
-        sfbo_per_g.push(sfb_offset::sfb_offset_48(tl)?);
-    }
-    let sections =
-        asf_data::parse_asf_section_data_grouped(br, &tl_idx_per_g, &tl_per_g, &max_sfb_capped)
-            .ok()?;
-    let (qspec_per_g, mqi_per_g) =
-        asf_data::parse_asf_spectral_data_grouped(br, &sections, &sfbo_per_g, &max_sfb_capped)
-            .ok()?;
-    let sf_gain_per_g = asf_data::parse_asf_scalefac_data_grouped(
-        br,
-        &sections,
-        &mqi_per_g,
-        &max_sfb_capped,
-        &tl_per_g,
-    )
-    .ok()?;
-    let _snf =
-        asf_data::parse_asf_snf_data_grouped(br, &sections, &mqi_per_g, &max_sfb_capped, &tl_per_g)
-            .ok()?;
-    let mut out: Vec<f32> = Vec::new();
-    for g in 0..tl_per_g.len() {
-        let scaled = asf_data::dequantise_and_scale(
-            &qspec_per_g[g],
-            &sf_gain_per_g[g],
-            sfbo_per_g[g],
-            max_sfb_capped[g],
-        );
-        out.extend_from_slice(&scaled);
-    }
-    Some(out)
+    let layout = crate::asf_blocks::AsfLayout::new(ti, psy, max_sfb_a, max_sfb_b)?;
+    crate::asf_blocks::decode_sf_data(br, &layout)
 }
 
 /// Mono short-frame `sf_data(ASF)` walker — convenience wrapper that
@@ -2743,161 +2629,13 @@ fn decode_asf_grouped_mono_body(
     decode_asf_grouped_mono_body_with_max_sfb(br, ti, psy, psy.max_sfb_0, psy.max_sfb_1)
 }
 
-/// Decode the `sf_data(ASF)` body for a **stereo joint-MDCT short-frame**
-/// (`num_window_groups > 1`, `b_enable_mdct_stereo_proc == 1`) ASF
-/// substream. Mirrors [`decode_asf_long_stereo_joint_body`] but walks
-/// the per-group spec layout: shared `asf_section_data()` (one outer
-/// g-loop), two `asf_spectral_data()` bodies (L/M then R/S, each with
-/// their own outer g-loop), shared `asf_scalefac_data()` (single
-/// `reference_scale_factor`, per-group DPCM), per-group `ms_used[g][sfb]`
-/// flag arrays, then `asf_snf_data()`.
-///
-/// Returns `(left_per_group_concatenated, right_per_group_concatenated,
-/// ms_used_per_group_concatenated)` on success.
-fn decode_asf_grouped_stereo_joint_body(
-    br: &mut BitReader<'_>,
-    ti: &AsfTransformInfo,
-    psy: &AsfPsyInfo,
-) -> Option<(Vec<f32>, Vec<f32>, Vec<bool>)> {
-    if psy.num_window_groups <= 1 {
-        return None;
-    }
-    let (tl_idx_per_g, tl_per_g, max_sfb_per_g) = derive_per_group(ti, psy);
-    let mut sfbo_per_g: Vec<&'static [u16]> = Vec::with_capacity(tl_per_g.len());
-    let mut max_sfb_capped: Vec<u32> = Vec::with_capacity(tl_per_g.len());
-    for g in 0..tl_per_g.len() {
-        let tl = tl_per_g[g];
-        let cap = tables::num_sfb_48(tl)?;
-        let m = max_sfb_per_g[g].min(cap);
-        if m == 0 {
-            return None;
-        }
-        max_sfb_capped.push(m);
-        sfbo_per_g.push(sfb_offset::sfb_offset_48(tl)?);
-    }
-    let sections =
-        asf_data::parse_asf_section_data_grouped(br, &tl_idx_per_g, &tl_per_g, &max_sfb_capped)
-            .ok()?;
-    let (q_l_per_g, mqi_l_per_g) =
-        asf_data::parse_asf_spectral_data_grouped(br, &sections, &sfbo_per_g, &max_sfb_capped)
-            .ok()?;
-    let (q_r_per_g, mqi_r_per_g) =
-        asf_data::parse_asf_spectral_data_grouped(br, &sections, &sfbo_per_g, &max_sfb_capped)
-            .ok()?;
-    // Shared scale-factor DPCM uses the band-wise max over both
-    // channels so `first_scf_found` and the per-band gate (cb != 0 &&
-    // mqi > 0) track bands carrying any energy at all.
-    let mut mqi_per_g: Vec<Vec<u32>> = Vec::with_capacity(tl_per_g.len());
-    for g in 0..tl_per_g.len() {
-        let v: Vec<u32> = mqi_l_per_g[g]
-            .iter()
-            .zip(mqi_r_per_g[g].iter())
-            .map(|(a, b)| (*a).max(*b))
-            .collect();
-        mqi_per_g.push(v);
-    }
-    let sf_gain_per_g = asf_data::parse_asf_scalefac_data_grouped(
-        br,
-        &sections,
-        &mqi_per_g,
-        &max_sfb_capped,
-        &tl_per_g,
-    )
-    .ok()?;
-    // Per-group, per-sfb ms_used flag. Only active bands (cb != 0 &&
-    // mqi > 0) carry a bit per §7.5 Pseudocode 77.
-    let mut ms_used_per_g: Vec<Vec<bool>> = Vec::with_capacity(tl_per_g.len());
-    for g in 0..tl_per_g.len() {
-        let max_sfb = max_sfb_capped[g];
-        let mut ms = vec![false; max_sfb as usize];
-        for sfb in 0..max_sfb as usize {
-            let cb = sections[g].sfb_cb[sfb];
-            if cb == 0 || mqi_per_g[g][sfb] == 0 {
-                continue;
-            }
-            ms[sfb] = br.read_bit().ok()?;
-        }
-        ms_used_per_g.push(ms);
-    }
-    let _snf =
-        asf_data::parse_asf_snf_data_grouped(br, &sections, &mqi_per_g, &max_sfb_capped, &tl_per_g)
-            .ok()?;
-    // Dequantise + scale + apply inverse M/S per group, concatenate.
-    let mut scaled_l: Vec<f32> = Vec::new();
-    let mut scaled_r: Vec<f32> = Vec::new();
-    let mut ms_concat: Vec<bool> = Vec::new();
-    for g in 0..tl_per_g.len() {
-        let mut l = asf_data::dequantise_and_scale(
-            &q_l_per_g[g],
-            &sf_gain_per_g[g],
-            sfbo_per_g[g],
-            max_sfb_capped[g],
-        );
-        let mut r = asf_data::dequantise_and_scale(
-            &q_r_per_g[g],
-            &sf_gain_per_g[g],
-            sfbo_per_g[g],
-            max_sfb_capped[g],
-        );
-        for (sfb, &used) in ms_used_per_g[g].iter().enumerate() {
-            if !used {
-                continue;
-            }
-            let a = sfbo_per_g[g][sfb] as usize;
-            let b = sfbo_per_g[g][sfb + 1] as usize;
-            let bmax = b.min(l.len()).min(r.len());
-            for k in a..bmax {
-                let m = l[k];
-                let s = r[k];
-                l[k] = m + s;
-                r[k] = m - s;
-            }
-        }
-        scaled_l.extend_from_slice(&l);
-        scaled_r.extend_from_slice(&r);
-        ms_concat.extend_from_slice(&ms_used_per_g[g]);
-    }
-    Some((scaled_l, scaled_r, ms_concat))
-}
-
-/// Decode the `sf_data` body for a mono, long-frame, single-window-
-/// group ASF substream. Returns the dequantised + scaled spectral
-/// coefficients for the frame.
-///
-/// On any Huffman / bitstream error we return `None` — the caller
-/// falls back to silence. Uses the decoder's own max_sfb (from
-/// psy_info) rather than num_sfb_48 since the latter is only a cap.
+/// Decode the `sf_data` body of a mono long-frame ASF channel.
 fn decode_asf_long_mono_body(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
     psy: &AsfPsyInfo,
 ) -> Option<Vec<f32>> {
-    let tl = ti.transform_length_0;
-    let tl_idx = ti.transf_length[0];
-    let max_sfb_cap = tables::num_sfb_48(tl)?;
-    let max_sfb = psy.max_sfb_0.min(max_sfb_cap);
-    if max_sfb == 0 {
-        return None;
-    }
-    let sfbo = sfb_offset::sfb_offset_48(tl)?;
-    // asf_section_data.
-    let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
-    // asf_spectral_data.
-    let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
-    // asf_scalefac_data.
-    let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-    // asf_snf_data — §5.1.4 spectral noise fill. If present, inject
-    // shaped noise into zero-energy bins. The RNG state is initialised
-    // fresh per frame (I-frame reset per §5.1.4) — cross-frame RNG
-    // continuity is a future refinement.
-    let snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-    // Dequantise + scale.
-    let mut scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
-    if let Some(snf_data) = snf {
-        let mut rng: u32 = 0x1234_5678; // per-frame seed
-        asf_data::inject_snf_noise(&mut scaled, &snf_data, sfbo, max_sfb, &mut rng);
-    }
-    Some(scaled)
+    decode_asf_long_mono_body_with_max_sfb(br, ti, psy.max_sfb_0)
 }
 
 /// Walk the `ASPX_ACPL_2` MDCT body (§4.2.6.3 case `ASPX_ACPL_2`):
@@ -2938,24 +2676,12 @@ fn parse_aspx_acpl2_mdct_body(
         Err(_) => return false,
     };
     tools.psy_info_primary = Some(psy.clone());
-    if ti.b_long_frame && psy.num_window_groups == 1 {
-        match decode_asf_long_mono_body(br, &ti, &psy) {
-            Some(s) => {
-                tools.scaled_spec_primary = Some(s);
-                true
-            }
-            None => false,
+    match decode_asf_mono_body_dispatch(br, &ti, &psy) {
+        Some(s) => {
+            tools.scaled_spec_primary = Some(s);
+            true
         }
-    } else if psy.num_window_groups > 1 {
-        match decode_asf_grouped_mono_body(br, &ti, &psy) {
-            Some(s) => {
-                tools.scaled_spec_primary = Some(s);
-                true
-            }
-            None => false,
-        }
-    } else {
-        false
+        None => false,
     }
 }
 
@@ -3170,73 +2896,38 @@ fn parse_aspx_acpl1_mdct_body_stateful(
     }
 }
 
-/// Long-frame / short-frame dispatch for the mono `sf_data(ASF)` body.
-/// Picks the long-frame walker when `num_window_groups == 1` and the
-/// grouped walker otherwise. Returns `None` on any Huffman /
-/// bitstream miss.
+/// Decode one `sf_data(ASF)` body for whatever block arrangement
+/// `ti` / `psy` describe.
 fn decode_asf_mono_body_dispatch(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
     psy: &AsfPsyInfo,
 ) -> Option<Vec<f32>> {
-    if ti.b_long_frame && psy.num_window_groups == 1 {
-        decode_asf_long_mono_body(br, ti, psy)
-    } else if psy.num_window_groups > 1 {
-        decode_asf_grouped_mono_body(br, ti, psy)
-    } else {
-        None
-    }
+    decode_asf_grouped_mono_body_with_max_sfb(br, ti, psy, psy.max_sfb_0, psy.max_sfb_1)
 }
 
 /// Same as [`decode_asf_mono_body_dispatch`] but with an explicit
-/// `max_sfb` (the same value applied to both halves of the
-/// `b_different_framing` case). Used by the joint-MDCT residual
-/// layer where M and S channels carry distinct `max_sfb_0` /
-/// `max_sfb_side_0` bounds.
+/// `max_sfb` for both frame halves (the joint-MDCT residual layer's
+/// `max_sfb` / `max_sfb_side` bounds).
 fn decode_asf_mono_body_for_max_sfb(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
     psy: &AsfPsyInfo,
     max_sfb_in: u32,
 ) -> Option<Vec<f32>> {
-    if ti.b_long_frame && psy.num_window_groups == 1 {
-        decode_asf_long_mono_body_with_max_sfb(br, ti, max_sfb_in)
-    } else if psy.num_window_groups > 1 {
-        decode_asf_grouped_mono_body_with_max_sfb(br, ti, psy, max_sfb_in, max_sfb_in)
-    } else {
-        None
-    }
+    decode_asf_grouped_mono_body_with_max_sfb(br, ti, psy, max_sfb_in, max_sfb_in)
 }
 
-/// Like [`decode_asf_long_mono_body`] but uses an explicit `max_sfb`
-/// (caller-provided) instead of pulling it from the psy_info — useful
-/// for joint-MDCT bodies where M and S channels carry distinct
-/// `max_sfb_0` / `max_sfb_side_0` bounds.
-///
-/// Round-23 raised this to `pub(crate)` so the multichannel
-/// [`crate::mch`] walkers (Tables 27 / 28 / 29) can drive one
-/// `sf_data(ASF)` body per channel from the shared `sf_info(ASF, 0, 0)`
-/// at the head of `three_channel_data` / `four_channel_data` /
-/// `five_channel_data`.
+/// Decode one long-frame `sf_data(ASF)` body with an explicit
+/// `max_sfb` (the multichannel walkers share one `sf_info` across
+/// several bodies).
 pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
     max_sfb_in: u32,
 ) -> Option<Vec<f32>> {
-    let tl = ti.transform_length_0;
-    let tl_idx = ti.transf_length[0];
-    let max_sfb_cap = tables::num_sfb_48(tl)?;
-    let max_sfb = max_sfb_in.min(max_sfb_cap);
-    if max_sfb == 0 {
-        return None;
-    }
-    let sfbo = sfb_offset::sfb_offset_48(tl)?;
-    let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
-    let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
-    let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-    let _snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-    let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
-    Some(scaled)
+    let layout = crate::asf_blocks::AsfLayout::long(ti.transform_length_0, max_sfb_in)?;
+    crate::asf_blocks::decode_sf_data(br, &layout)
 }
 
 /// LFE flavour of [`decode_asf_long_mono_body_with_max_sfb`] — Table 35
@@ -3480,39 +3171,34 @@ pub(crate) fn parse_stereo_data_body_stateful(
             Err(_) => return false,
         };
         tools.psy_info_primary = Some(psy.clone());
-        // Joint-stereo MDCT path: one shared section / psy layout,
-        // two residual channel spectra, followed by a per-sfb
-        // ms_used[] flag array. Both long-frame (single window group)
-        // and short-frame / grouped (`num_window_groups > 1`) shapes
-        // are supported; the latter walks the per-group spec layout
-        // (Tables 39-42) with shared scalefactors and per-group
-        // ms_used[].
-        if ti.b_long_frame && psy.num_window_groups == 1 {
-            match decode_asf_long_stereo_joint_body(br, &ti, &psy) {
-                Some((l, r, ms)) => {
-                    tools.scaled_spec_primary = Some(l);
-                    tools.scaled_spec_secondary = Some(r);
-                    tools.ms_used = Some(ms);
-                    true
-                }
-                None => false,
-            }
-        } else if psy.num_window_groups > 1 {
-            match decode_asf_grouped_stereo_joint_body(br, &ti, &psy) {
-                Some((l, r, ms)) => {
-                    tools.scaled_spec_primary = Some(l);
-                    tools.scaled_spec_secondary = Some(r);
-                    tools.ms_used = Some(ms);
-                    true
-                }
-                None => false,
-            }
-        } else {
-            // Outer layers parsed but Huffman body not walked — the
-            // bitreader isn't at the end of stereo_data(), so downstream
-            // elements aren't safe to parse.
-            false
+        tools.psy_info_secondary = Some(psy.clone());
+        // Table 23: sf_info(ASF, 0, 0); chparam_info(); then one
+        // complete sf_data(ASF) per channel. The two tracks go through
+        // the §5.3.3.2 two-channel matrix the chparam quartets select.
+        let Some(layout) =
+            crate::asf_blocks::AsfLayout::new(&ti, &psy, psy.max_sfb_0, psy.max_sfb_1)
+        else {
+            return false;
+        };
+        let grid = layout.grid();
+        let cp = match parse_chparam_info(br, &grid) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let Some(mut t0) = crate::asf_blocks::decode_sf_data(br, &layout) else {
+            return false;
+        };
+        let Some(mut t1) = crate::asf_blocks::decode_sf_data(br, &layout) else {
+            return false;
+        };
+        apply_two_channel_quartets(&layout, &cp, &mut t0, &mut t1);
+        if cp.mode() == SapMode::MsUsed && !cp.ms_used.is_empty() {
+            tools.ms_used = Some(cp.ms_used.concat());
         }
+        tools.chparam_info = Some(cp);
+        tools.scaled_spec_primary = Some(t0);
+        tools.scaled_spec_secondary = Some(t1);
+        true
     } else {
         let l = match br.read_u32(1) {
             Ok(v) => SpecFrontend::from_bit(v),
@@ -3619,82 +3305,40 @@ pub(crate) fn parse_stereo_data_body_stateful(
     }
 }
 
-/// Decode the `sf_data` body for a stereo, long-frame, single-window-
-/// group ASF substream with `b_enable_mdct_stereo_proc == 1` (joint
-/// MDCT processing — §7.4 / §7.5).
-///
-/// Layout inferred from the spec:
-///   - shared asf_section_data (one section partition drives both
-///     channels' codebook assignment).
-///   - two asf_spectral_data bodies (residuals for channel L and R,
-///     which are actually M and S when ms_used is set).
-///   - shared asf_scalefac_data (the scalefactors are shared so the
-///     joint quant step is uniform across both channels).
-///   - per-sfb ms_used[sfb] flag — one bit per active band.
-///   - asf_snf_data consumed but not injected.
-///
-/// Returns `(left_scaled, right_scaled, ms_used)` on success.
-fn decode_asf_long_stereo_joint_body(
-    br: &mut BitReader<'_>,
-    ti: &AsfTransformInfo,
-    psy: &AsfPsyInfo,
-) -> Option<(Vec<f32>, Vec<f32>, Vec<bool>)> {
-    let tl = ti.transform_length_0;
-    let tl_idx = ti.transf_length[0];
-    let max_sfb_cap = tables::num_sfb_48(tl)?;
-    let max_sfb = psy.max_sfb_0.min(max_sfb_cap);
-    if max_sfb == 0 {
-        return None;
+/// §5.3.3.2: map the two tracks of a `stereo_data()` /
+/// `two_channel_data()` element with `b_enable_mdct_stereo_proc` to
+/// its output channels, per window group and scale-factor band, with
+/// the `(a, b, c, d)` quartets of the element's `chparam_info()`
+/// (§5.3.2 Pseudocode 59): `O0 = a·I0 + b·I1`, `O1 = c·I0 + d·I1`.
+/// The tracks are window-order spectra of `layout`.
+pub(crate) fn apply_two_channel_quartets(
+    layout: &crate::asf_blocks::AsfLayout,
+    cp: &ChparamInfo,
+    t0: &mut [f32],
+    t1: &mut [f32],
+) {
+    if cp.mode() == SapMode::None {
+        return;
     }
-    let sfbo = sfb_offset::sfb_offset_48(tl)?;
-    // Shared asf_section_data.
-    let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
-    // L / M channel residuals.
-    let (q_l, mqi_l) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
-    // R / S channel residuals.
-    let (q_r, mqi_r) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
-    // Shared scalefactors — compute max_quant_idx as the band-wise max
-    // over both channels so the scalefactor DPCM state tracks bands
-    // that have any energy at all.
-    let mqi: Vec<u32> = mqi_l
-        .iter()
-        .zip(mqi_r.iter())
-        .map(|(a, b)| (*a).max(*b))
-        .collect();
-    let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-    // Per-sfb ms_used flag array. Only active bands (cb != 0 and
-    // max_quant_idx > 0) carry a bit per §7.5 Pseudocode 77; other
-    // bands default to false.
-    let mut ms_used = vec![false; max_sfb as usize];
-    for sfb in 0..max_sfb as usize {
-        let cb = sections.sfb_cb[sfb];
-        if cb == 0 || mqi[sfb] == 0 {
-            continue;
-        }
-        ms_used[sfb] = br.read_bit().ok()?;
-    }
-    // asf_snf_data consumed but not currently injected.
-    let _ = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-    // Dequantise + scale both channels with the shared gain.
-    let mut scaled_l = asf_data::dequantise_and_scale(&q_l, &sf_gain, sfbo, max_sfb);
-    let mut scaled_r = asf_data::dequantise_and_scale(&q_r, &sf_gain, sfbo, max_sfb);
-    // Apply inverse M/S per §7.5: L = M + S, R = M - S for bands with
-    // ms_used == true.
-    for (sfb, &used) in ms_used.iter().enumerate() {
-        if !used {
-            continue;
-        }
-        let a = sfbo[sfb] as usize;
-        let b = sfbo[sfb + 1] as usize;
-        let bmax = b.min(scaled_l.len()).min(scaled_r.len());
-        for k in a..bmax {
-            let m = scaled_l[k];
-            let s = scaled_r[k];
-            scaled_l[k] = m + s;
-            scaled_r[k] = m - s;
+    let grid = layout.grid();
+    let abcd = extract_sap_abcd(cp, &grid).abcd;
+    for (g, grp) in layout.groups.iter().enumerate() {
+        for sfb in 0..grp.max_sfb as usize {
+            let Some(&(a, b, c, d)) = abcd.get(g).and_then(|r| r.get(sfb)) else {
+                continue;
+            };
+            for r in layout.band_ranges(g, sfb) {
+                for k in r {
+                    if k >= t0.len() || k >= t1.len() {
+                        break;
+                    }
+                    let (i0, i1) = (t0[k], t1[k]);
+                    t0[k] = a * i0 + b * i1;
+                    t1[k] = c * i0 + d * i1;
+                }
+            }
         }
     }
-    Some((scaled_l, scaled_r, ms_used))
 }
 
 /// Walk an `ac4_substream()` payload. `substream_bytes` is the slice
@@ -3905,6 +3549,7 @@ pub fn walk_ac4_substream_sticky(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sfb_offset;
     use oxideav_core::bits::BitWriter;
 
     /// Repack `bytes` dropping the first `skip_bits` bits — used to turn
@@ -4414,7 +4059,14 @@ mod tests {
         assert!(psy.b_different_framing);
         assert_eq!(psy.max_sfb_0, 10);
         assert_eq!(psy.max_sfb_1, 15);
-        assert_eq!(psy.num_windows, 5);
+        // Pseudocode 3: n_grp_bits + 1 windows, plus the one the forced
+        // boundary between the two transform lengths adds — four
+        // 240-line blocks and two 480-line blocks.
+        assert_eq!(psy.num_windows, 6);
+        assert_eq!(
+            ti.windows(1920).unwrap(),
+            vec![240, 240, 240, 240, 480, 480]
+        );
     }
 
     #[test]
@@ -4582,7 +4234,7 @@ mod tests {
         //   section: cb_idx = 5 (4 bits) + sect_len for max_sfb=10 via
         //   n_sect_bits=3 (long frame at 1920), esc=7.
         bw.write_u32(5, 4);
-        write_sect_len_incr(&mut bw, 10, 3, 7);
+        write_sect_len_incr(&mut bw, 10, 5, 31);
         // spectral pairs — cb 5 is dim=2, so pairs = end_line / 2.
         // sfb_offset_48 @ 1920 index 10 = ?
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
@@ -4655,7 +4307,7 @@ mod tests {
         bw.write_bit(true); // b_long_frame = 1
         bw.write_u32(10, 6); // max_sfb
         bw.write_u32(5, 4); // cb
-        write_sect_len_incr(&mut bw, 10, 3, 7);
+        write_sect_len_incr(&mut bw, 10, 5, 31);
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
         let end_line = sfbo[10] as u32;
         let hcb = huffman::asf_hcb(5).unwrap();
@@ -4713,7 +4365,7 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb
         bw.write_u32(5, 4);
-        write_sect_len_incr(&mut bw, 10, 3, 7);
+        write_sect_len_incr(&mut bw, 10, 5, 31);
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
         let end_line = sfbo[10] as u32;
         let hcb = huffman::asf_hcb(5).unwrap();
@@ -4815,10 +4467,10 @@ mod tests {
         assert_eq!(acpl.quant_mode, crate::acpl::AcplQuantMode::Coarse);
         assert_eq!(acpl.qmf_band, 4);
         assert!(info.tools.acpl_config_1ch_full.is_none());
-        // companding_control is now consumed (was previously skipped);
-        // ACPL_1 body still bails so acpl_data_1ch stays None.
+        // companding_control is consumed; the all-zero payload that
+        // follows is a valid `max_sfb = 0` body (reference scale factor
+        // + `b_snf_data_exists`), so the element parses through.
         assert!(info.tools.companding.is_some());
-        assert!(info.tools.acpl_data_1ch.is_none());
     }
 
     #[test]
@@ -4856,11 +4508,10 @@ mod tests {
         // qmf_band stays 0 for FULL mode (not transmitted).
         assert_eq!(acpl.qmf_band, 0);
         assert!(info.tools.acpl_config_1ch_partial.is_none());
-        // companding_control is now consumed (was previously skipped);
-        // ACPL_2 body parse fires but bails on the synthetic payload so
-        // acpl_data_1ch stays None.
+        // companding_control is consumed; the all-zero payload that
+        // follows is a valid `max_sfb = 0` body (reference scale factor
+        // + `b_snf_data_exists`), so the element parses through.
         assert!(info.tools.companding.is_some());
-        assert!(info.tools.acpl_data_1ch.is_none());
     }
 
     // ---------------- chparam_info() (Table 47) ----------------
@@ -5452,9 +5103,9 @@ mod tests {
         bw.write_bit(false);
     }
 
-    /// Mono short-frame walker: equal-transform-length two-group case.
-    /// `decode_asf_grouped_mono_body` returns a `Vec<f32>` of length
-    /// `2 * sfb_offset[max_sfb]` with all-zero entries.
+    /// Block-switched mono body: a 1920-sample frame of four 480-line
+    /// blocks in two window groups of two. The body decodes to the
+    /// window-order spectrum — `frame_length` lines.
     #[test]
     fn decode_asf_grouped_mono_body_two_groups_equal_tl() {
         let max_sfb = 6u32;
@@ -5476,15 +5127,14 @@ mod tests {
         };
         let psy = AsfPsyInfo {
             max_sfb_0: max_sfb,
-            num_windows: 2,
+            num_windows: 4,
             num_window_groups: 2,
-            scale_factor_grouping: vec![0],
+            scale_factor_grouping: vec![1, 0, 1],
+            frame_len_base: 1920,
             ..Default::default()
         };
         let scaled = decode_asf_grouped_mono_body(&mut br, &ti, &psy).expect("decodes");
-        let sfbo = sfb_offset::sfb_offset_48(480).unwrap();
-        let per_group_len = sfbo[max_sfb as usize] as usize;
-        assert_eq!(scaled.len(), per_group_len * 2);
+        assert_eq!(scaled.len(), 1920);
         assert!(scaled.iter().all(|&v| v == 0.0));
     }
 
@@ -5571,8 +5221,8 @@ mod tests {
             .scaled_spec_primary
             .as_ref()
             .expect("grouped mono sf_data body decoded");
-        let sfbo = sfb_offset::sfb_offset_48(480).unwrap();
-        assert_eq!(scaled.len(), 2 * sfbo[max_sfb as usize] as usize);
+        // Four 480-line blocks in window order.
+        assert_eq!(scaled.len(), 1920);
         assert!(scaled.iter().all(|&v| v == 0.0));
     }
 
@@ -5617,19 +5267,17 @@ mod tests {
         let mut tools = SubstreamTools::default();
         let ok = parse_stereo_data_body(&mut br, &mut tools, 1920);
         assert!(ok, "stereo split short-frame body should parse");
-        let sfbo = sfb_offset::sfb_offset_48(480).unwrap();
-        let expected = 2 * sfbo[max_sfb as usize] as usize;
         let l = tools.scaled_spec_primary.as_ref().unwrap();
         let r = tools.scaled_spec_secondary.as_ref().unwrap();
-        assert_eq!(l.len(), expected);
-        assert_eq!(r.len(), expected);
+        assert_eq!(l.len(), 1920);
+        assert_eq!(r.len(), 1920);
         assert!(l.iter().all(|&v| v == 0.0));
         assert!(r.iter().all(|&v| v == 0.0));
     }
 
-    /// Joint-MDCT stereo short-frame: shared section, two spectra,
-    /// shared scalefac, per-group ms_used flag arrays. Layout per
-    /// `decode_asf_grouped_stereo_joint_body`.
+    /// Joint-MDCT stereo, block-switched (Table 23): `sf_info(ASF, 0,
+    /// 0)`, `chparam_info()` on the two-group grid, then one complete
+    /// `sf_data(ASF)` per channel.
     #[test]
     fn parse_stereo_data_body_joint_short_frame_two_groups_decodes_both_channels() {
         let max_sfb = 4u32;
@@ -5645,39 +5293,72 @@ mod tests {
         bw.write_u32(1, 1);
         bw.write_u32(0, 1);
         bw.write_u32(1, 1);
-        // Shared asf_section_data (per-group all-zero CB).
-        for _ in 0..2 {
-            bw.write_u32(0, 4);
-            let mut remaining = max_sfb.saturating_sub(1);
-            while remaining >= 7 {
-                bw.write_u32(7, 3);
-                remaining -= 7;
-            }
-            bw.write_u32(remaining, 3);
+        // chparam_info(): sap_mode = 1, ms_used[g][sfb] for 2 groups ×
+        // 4 bands — set on band 1 of group 0 and band 2 of group 1.
+        bw.write_u32(1, 2);
+        for bit in [false, true, false, false, false, false, true, false] {
+            bw.write_bit(bit);
         }
-        // L spectral: nothing (cb=0). R spectral: nothing.
-        // Shared scalefac: 8-bit reference + no DPCM (mqi all zero).
-        bw.write_u32(120, 8);
-        // ms_used per group: per-band gate on (cb!=0 && mqi>0). Both
-        // are zero so no ms_used bits emitted.
-        // snf: 1-bit gate.
-        bw.write_bit(false);
+        // sf_data(ASF) for each channel.
+        write_zero_grouped_sf_data_body_one_channel(&mut bw, &[max_sfb, max_sfb], &[2, 2]);
+        write_zero_grouped_sf_data_body_one_channel(&mut bw, &[max_sfb, max_sfb], &[2, 2]);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
         let mut tools = SubstreamTools::default();
         let ok = parse_stereo_data_body(&mut br, &mut tools, 1920);
         assert!(ok, "stereo joint short-frame body should parse");
-        let sfbo = sfb_offset::sfb_offset_48(480).unwrap();
-        let expected = 2 * sfbo[max_sfb as usize] as usize;
         let l = tools.scaled_spec_primary.as_ref().unwrap();
         let r = tools.scaled_spec_secondary.as_ref().unwrap();
-        assert_eq!(l.len(), expected);
-        assert_eq!(r.len(), expected);
+        assert_eq!(l.len(), 1920);
+        assert_eq!(r.len(), 1920);
         // ms_used carries one bool per band per group, concatenated.
         let ms = tools.ms_used.as_ref().unwrap();
-        assert_eq!(ms.len(), 2 * max_sfb as usize);
-        assert!(ms.iter().all(|&b| !b));
+        assert_eq!(
+            ms,
+            &vec![false, true, false, false, false, false, true, false]
+        );
+        let cp = tools.chparam_info.as_ref().unwrap();
+        assert_eq!(cp.mode(), SapMode::MsUsed);
+    }
+
+    /// The §5.3.3.2 quartet of an `ms_used` band reaches every window
+    /// of its group and no other line.
+    #[test]
+    fn two_channel_quartets_follow_the_window_groups() {
+        let ti = AsfTransformInfo {
+            b_long_frame: false,
+            transf_length: [2, 2],
+            transform_length_0: 480,
+            transform_length_1: 480,
+        };
+        let psy = AsfPsyInfo {
+            max_sfb_0: 4,
+            num_windows: 4,
+            num_window_groups: 2,
+            scale_factor_grouping: vec![1, 0, 1],
+            frame_len_base: 1920,
+            ..Default::default()
+        };
+        let layout = crate::asf_blocks::AsfLayout::new(&ti, &psy, 4, 4).unwrap();
+        let cp = build_chparam_info_ms_used(vec![
+            vec![false, true, false, false],
+            vec![false, false, false, false],
+        ]);
+        let mut t0 = vec![3.0f32; 1920];
+        let mut t1 = vec![1.0f32; 1920];
+        apply_two_channel_quartets(&layout, &cp, &mut t0, &mut t1);
+        let sfbo = sfb_offset::sfb_offset_48(480).unwrap();
+        let (lo, hi) = (sfbo[1] as usize, sfbo[2] as usize);
+        for (k, (&a, &b)) in t0.iter().zip(&t1).enumerate() {
+            let win = k / 480;
+            let line = k % 480;
+            if win < 2 && (lo..hi).contains(&line) {
+                assert_eq!((a, b), (4.0, 2.0), "line {k}");
+            } else {
+                assert_eq!((a, b), (3.0, 1.0), "line {k}");
+            }
+        }
     }
 
     /// Mono SIMPLE substream with `spec_frontend == SSF` exercises the

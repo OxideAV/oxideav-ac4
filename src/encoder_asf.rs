@@ -497,6 +497,20 @@ pub fn pick_best_codebook_for_band_with(
 /// Returns a vector of `(start_sfb, end_sfb_exclusive, cb)` tuples
 /// describing the optimal section layout.
 pub fn dp_optimise_sections(cost_band_cb: &[[u32; 12]], max_sections: u32) -> Vec<(u32, u32, u8)> {
+    dp_optimise_sections_coded(
+        cost_band_cb,
+        max_sections,
+        crate::asf_blocks::LONG_FRAME_TL_CODE,
+    )
+}
+
+/// [`dp_optimise_sections`] with the section-header cost of a window
+/// group whose `get_transf_length(g)` code is `tl_code`.
+pub fn dp_optimise_sections_coded(
+    cost_band_cb: &[[u32; 12]],
+    max_sections: u32,
+    tl_code: u32,
+) -> Vec<(u32, u32, u8)> {
     let n = cost_band_cb.len();
     if n == 0 {
         return Vec::new();
@@ -557,7 +571,7 @@ pub fn dp_optimise_sections(cost_band_cb: &[[u32; 12]], max_sections: u32) -> Ve
     for i in 0..n {
         for start in 0..=i {
             let len = (i - start + 1) as u32;
-            let overhead = section_overhead_bits(len) as u64;
+            let overhead = section_overhead_bits_coded(len, tl_code) as u64;
             let (prior_cost, prior_sections) = if start == 0 {
                 (0u64, 0u32)
             } else {
@@ -598,15 +612,21 @@ pub fn dp_optimise_sections(cost_band_cb: &[[u32; 12]], max_sections: u32) -> Ve
     sections
 }
 
-/// Per-section header overhead in bits for the long-frame
-/// (`n_sect_bits = 3`, `sect_esc_val = 7`) case. For a section of length
-/// `len ≥ 1`, emits a 4-bit `sect_cb` then `floor((len-1)/7) + 1` 3-bit
-/// length-increment fields.
+/// Per-section header overhead in bits for a long frame
+/// (`get_transf_length(g) = 4` → `n_sect_bits = 5`, `sect_esc_val =
+/// 31`, Table 39): a 4-bit `sect_cb` then `floor((len − 1) / 31) + 1`
+/// 5-bit length-increment fields.
 #[inline]
 pub fn section_overhead_bits(len: u32) -> u32 {
-    let base = len.saturating_sub(1);
-    let k = base / 7;
-    4 + 3 * (k + 1)
+    section_overhead_bits_coded(len, crate::asf_blocks::LONG_FRAME_TL_CODE)
+}
+
+/// [`section_overhead_bits`] for an arbitrary `get_transf_length(g)`
+/// code.
+#[inline]
+pub fn section_overhead_bits_coded(len: u32, tl_code: u32) -> u32 {
+    let (bits, esc) = crate::asf_blocks::sect_len_coding(tl_code);
+    4 + bits * (len.saturating_sub(1) / esc + 1)
 }
 
 /// Build the per-band per-codebook bit-cost table consumed by
@@ -677,58 +697,101 @@ pub fn build_sections_from_dp(sections: &[(u32, u32, u8)], max_sfb: u32) -> AsfS
     }
 }
 
-/// Compute per-band SNF DPCM indices for the bands that quantise to all-zero
-/// (cb == 0 || max_quant_idx == 0). For each such band, estimate the band's
-/// RMS energy from the original MDCT coefficients and pick the HCB_SNF
-/// index whose `snf_gain = 2^((idx * 1.5 - 84) / 4)` best matches.
+/// How far (in 3,01 dB level steps) a noise-filled band may land
+/// above its measured level when the −16-step `dpcm_snf` range cannot
+/// reach it; past this the band is left unfilled.
+const SNF_MAX_OVERSHOOT_STEPS: f32 = 2.0;
+
+/// Choose the `dpcm_snf` codeword indices (§5.1.4.2 Pseudocode 23) for
+/// the zero bands of one `sf_data(ASF)` body, bands in bitstream order
+/// (group-major).
 ///
-/// Bands with content (cb != 0 && mqi > 0) are not eligible for SNF — the
-/// loop in `parse_asf_snf_data` skips them. Returns `Some(per_band_idx)`
-/// when at least one zero-quant band has measurable energy that warrants
-/// fill, else `None` (the encoder then writes `b_snf_data_exists = 0`).
+/// `decoded_level[b]` is `Some(log2(mean decoded power))` for a band
+/// that carries non-zero quantised lines — the value the decoder's
+/// running `previous_rms` takes there — and `None` for a noise-fill
+/// candidate; `orig_power[b]` is the band's mean power in the input
+/// spectrum. A candidate gets the level delta that brings the
+/// decoder's running level to the band's own, clamped to the codebook
+/// range `−16..=+4`; index 0 (no fill, level untouched) when the band
+/// is empty or sits too far below the reachable range. `None` when no
+/// band is filled (`b_snf_data_exists = 0`).
+pub fn snf_indices(decoded_level: &[Option<f32>], orig_power: &[f64]) -> Option<Vec<i32>> {
+    use crate::asf_blocks::{SNF_DELTA_OFFSET, SNF_NO_FILL_IDX};
+    let mut previous = decoded_level.iter().flatten().next().copied()?;
+    let max_idx = HCB_SNF_LEN.len() as i32 - 1;
+    let (min_delta, max_delta) = (1 - SNF_DELTA_OFFSET, max_idx - SNF_DELTA_OFFSET);
+    let mut out = vec![SNF_NO_FILL_IDX; decoded_level.len()];
+    let mut any = false;
+    for (b, level) in decoded_level.iter().enumerate() {
+        if let Some(l) = level {
+            previous = *l;
+            continue;
+        }
+        let p = orig_power.get(b).copied().unwrap_or(0.0);
+        if p <= 1e-30 {
+            continue;
+        }
+        let want = (p.log2() as f32 - previous).round();
+        if want < min_delta as f32 - SNF_MAX_OVERSHOOT_STEPS {
+            continue;
+        }
+        let delta = (want as i32).clamp(min_delta, max_delta);
+        out[b] = delta + SNF_DELTA_OFFSET;
+        previous += delta as f32;
+        any = true;
+    }
+    any.then_some(out)
+}
+
+/// `log2` of the mean decoded power of one band: quantised lines `q`
+/// reconstructed as `|q|^(4/3) · 2^((sf − 100)/4)` (§5.1.3.2). `None`
+/// for an all-zero band.
+pub fn decoded_band_level(q: &[i32], sf: i32) -> Option<f32> {
+    let g = 2.0f64.powf((sf as f64 - 100.0) * 0.25);
+    let p: f64 = q
+        .iter()
+        .map(|&qi| {
+            let v = (qi.unsigned_abs() as f64).powf(4.0 / 3.0) * g;
+            v * v
+        })
+        .sum();
+    (p > 0.0).then(|| (p / q.len().max(1) as f64).log2() as f32)
+}
+
+/// [`snf_indices`] for one long-frame channel: `qspec` / `sf_per_band`
+/// are the channel's quantised lines and scale factors, `coeffs` its
+/// input spectrum. Bands with a codebook and non-zero lines set the
+/// running level; the others (`sfb_cb == 0` or `max_quant_idx == 0`)
+/// are the noise-fill candidates Table 42 reads a codeword for.
 pub fn compute_snf_dpcm_for_zero_quant_bands(
     coeffs: &[f32],
     sfb_offset: &[u16],
     max_sfb: u32,
     sfb_cb: &[u8],
     max_quant_idx: &[u32],
+    qspec: &[i32],
+    sf_per_band: &[i32],
 ) -> Option<Vec<i32>> {
-    let mut out = vec![0i32; max_sfb as usize];
-    let mut any_set = false;
-    for sfb in 0..max_sfb as usize {
-        let eligible = sfb_cb[sfb] == 0 || max_quant_idx[sfb] == 0;
-        if !eligible {
-            continue;
-        }
-        let a = sfb_offset[sfb] as usize;
-        let b = sfb_offset[sfb + 1] as usize;
-        if b <= a {
-            continue;
-        }
-        let band = &coeffs[a..b.min(coeffs.len())];
-        let n = band.len();
-        if n == 0 {
-            continue;
-        }
-        let mut sum_sq: f64 = 0.0;
-        for &c in band {
-            sum_sq += (c as f64) * (c as f64);
-        }
-        if sum_sq <= 1e-30 {
-            continue;
-        }
-        let rms = (sum_sq / n as f64).sqrt() as f32;
-        if rms <= 0.0 {
-            continue;
-        }
-        // Solve for idx: snf_gain = 2^((idx * 1.5 - 84) / 4) = rms.
-        //   ⇒ idx = (4 * log2(rms) + 84) / 1.5.
-        let idx_f = (4.0 * rms.log2() + 84.0) / 1.5;
-        let idx = (idx_f.round() as i32).clamp(1, (HCB_SNF_LEN.len() as i32) - 1);
-        out[sfb] = idx;
-        any_set = true;
+    let n = max_sfb as usize;
+    let mut level = Vec::with_capacity(n);
+    let mut power = Vec::with_capacity(n);
+    for sfb in 0..n {
+        let a = (sfb_offset[sfb] as usize).min(coeffs.len());
+        let b = (sfb_offset[sfb + 1] as usize).min(coeffs.len());
+        let band = &coeffs[a..b];
+        power.push(
+            band.iter().map(|&c| c as f64 * c as f64).sum::<f64>() / band.len().max(1) as f64,
+        );
+        let coded = sfb_cb[sfb] != 0 && max_quant_idx[sfb] != 0;
+        level.push(if coded {
+            let qa = a.min(qspec.len());
+            let qb = b.min(qspec.len());
+            decoded_band_level(&qspec[qa..qb], sf_per_band[sfb])
+        } else {
+            None
+        });
     }
-    if any_set { Some(out) } else { None }
+    snf_indices(&level, &power)
 }
 
 /// Emit `asf_snf_data()` per Table 42:
@@ -869,13 +932,22 @@ pub fn write_spectral_data_single_section(
 /// [`AsfSections`]. Each section emits a 4-bit `sect_cb` followed by a
 /// length-increment chain (`n_sect_bits = 3`, `esc = 7` for long frame).
 pub fn write_section_data(bw: &mut BitWriter, sections: &AsfSections) {
+    write_section_data_coded(bw, sections, crate::asf_blocks::LONG_FRAME_TL_CODE);
+}
+
+/// [`write_section_data`] for a window group whose
+/// `get_transf_length(g)` code is `tl_code` (Table 39 / Pseudocode 6:
+/// 3-bit increments with escape 7 for codes 0..=2, 5-bit with escape
+/// 31 for code 3 and for a long frame).
+pub fn write_section_data_coded(bw: &mut BitWriter, sections: &AsfSections, tl_code: u32) {
+    let (n_sect_bits, sect_esc_val) = crate::asf_blocks::sect_len_coding(tl_code);
     for i in 0..sections.num_sec_lsf as usize {
         let cb = sections.sect_cb[i];
         let start = sections.sect_start[i] as u32;
         let end = sections.sect_end[i] as u32;
         let len = end - start;
         bw.write_u32(cb as u32, 4);
-        write_sect_len_incr(bw, len, 3, 7);
+        write_sect_len_incr(bw, len, n_sect_bits, sect_esc_val);
     }
 }
 
@@ -1142,6 +1214,106 @@ pub fn finish_substream_body(mut bw: BitWriter) -> Vec<u8> {
     }
 }
 
+/// One channel's `sf_data(ASF)` body, quantised and sectioned on an
+/// [`AsfLayout`](crate::asf_blocks::AsfLayout) and ready to emit.
+#[derive(Debug, Clone)]
+pub struct SfDataCoded {
+    /// The layout the body is coded on.
+    pub layout: crate::asf_blocks::AsfLayout,
+    /// Quantised lines per group, in bitstream order.
+    pub quant: Vec<Vec<i32>>,
+    /// Scale factor per `(group, sfb)`.
+    pub sf: Vec<Vec<i32>>,
+    /// `max_quant_idx[g][sfb]`.
+    pub max_quant_idx: Vec<Vec<u32>>,
+    /// Section layout per group.
+    pub sections: Vec<AsfSections>,
+    /// `dpcm_snf[g][sfb]` codeword indices, bands flattened
+    /// group-major; `None` writes `b_snf_data_exists = 0`.
+    pub snf: Option<Vec<i32>>,
+}
+
+/// Quantise one channel's window-order spectrum `spec` on `layout`
+/// under the active [`AsfQuant`] policy: per `(group, sfb)` band (the
+/// lines of every window of the group, Pseudocode 25 order) a scale
+/// factor and quantised lines, per group the cheapest section layout,
+/// and noise-fill levels for the bands left empty.
+pub fn code_sf_data(layout: &crate::asf_blocks::AsfLayout, spec: &[f32]) -> SfDataCoded {
+    let coded = layout.group(spec);
+    let n_groups = layout.groups.len();
+    let mut quant = Vec::with_capacity(n_groups);
+    let mut sf = Vec::with_capacity(n_groups);
+    let mut mqi = Vec::with_capacity(n_groups);
+    let mut sections = Vec::with_capacity(n_groups);
+    let mut level: Vec<Option<f32>> = Vec::new();
+    let mut power: Vec<f64> = Vec::new();
+    for (g, grp) in layout.groups.iter().enumerate() {
+        let n = grp.max_sfb as usize;
+        let mut q_g = vec![0i32; *grp.sect_offs.last().unwrap_or(&0) as usize];
+        let mut sf_g = vec![100i32; n];
+        let mut mqi_g = vec![0u32; n];
+        let mut per_band: Vec<Vec<i32>> = Vec::with_capacity(n);
+        for sfb in 0..n {
+            let band = &coded[layout.coded_band(g, sfb)];
+            let (_cb, s, q, _cost) = pick_best_codebook_for_band(band);
+            sf_g[sfb] = s;
+            mqi_g[sfb] = q.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+            let lo = grp.sect_offs[sfb] as usize;
+            q_g[lo..lo + q.len()].copy_from_slice(&q);
+            power.push(
+                band.iter().map(|&c| c as f64 * c as f64).sum::<f64>() / band.len().max(1) as f64,
+            );
+            per_band.push(q);
+        }
+        let cost_table = build_band_codebook_cost_table(&per_band);
+        let dp = dp_optimise_sections_coded(&cost_table, 16, grp.tl_code);
+        let sec = build_sections_from_dp(&dp, grp.max_sfb);
+        for sfb in 0..n {
+            let is_coded = sec.sfb_cb[sfb] != 0 && mqi_g[sfb] != 0;
+            level.push(if is_coded {
+                decoded_band_level(&per_band[sfb], sf_g[sfb])
+            } else {
+                None
+            });
+        }
+        quant.push(q_g);
+        sf.push(sf_g);
+        mqi.push(mqi_g);
+        sections.push(sec);
+    }
+    let snf = snf_indices(&level, &power);
+    SfDataCoded {
+        layout: layout.clone(),
+        quant,
+        sf,
+        max_quant_idx: mqi,
+        sections,
+        snf,
+    }
+}
+
+/// Emit one `sf_data(ASF)` body (Tables 39 – 42): section data and
+/// spectral data per window group, then one `asf_scalefac_data()` and
+/// one `asf_snf_data()` running over all groups.
+pub fn write_sf_data(bw: &mut BitWriter, c: &SfDataCoded) {
+    for (grp, sec) in c.layout.groups.iter().zip(&c.sections) {
+        write_section_data_coded(bw, sec, grp.tl_code);
+    }
+    for ((grp, sec), q) in c.layout.groups.iter().zip(&c.sections).zip(&c.quant) {
+        write_spectral_data_sections(bw, q, &grp.sect_offs, sec);
+    }
+    let sf_flat: Vec<i32> = c.sf.concat();
+    let mqi_flat: Vec<u32> = c.max_quant_idx.concat();
+    let cb_flat: Vec<u8> = c
+        .sections
+        .iter()
+        .flat_map(|s| s.sfb_cb.iter().copied())
+        .collect();
+    let total = sf_flat.len() as u32;
+    write_scalefac_data(bw, &sf_flat, &cb_flat, &mqi_flat, total);
+    write_snf_data(bw, c.snf.as_deref(), &cb_flat, &mqi_flat, total);
+}
+
 /// Returns the substream bytes (audio_size header + audio_data + zero-
 /// padding) sized to `pad_target_bytes`.
 pub fn build_mono_simple_asf_body_from_pcm_spectrum(
@@ -1196,6 +1368,8 @@ pub fn build_mono_simple_asf_body_from_pcm_spectrum(
         max_sfb,
         &sections.sfb_cb,
         &max_quant_idx,
+        &qspec,
+        &sf_per_band,
     );
 
     // Bit-stream emission.
@@ -1306,6 +1480,8 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
             max_sfb,
             &sections.sfb_cb,
             &max_quant_idx,
+            &qspec,
+            &sf_per_band,
         );
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
@@ -1497,259 +1673,92 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
     coeffs_r: &[f32],
     pad_target_bytes: usize,
 ) -> Vec<u8> {
-    let sfbo = crate::sfb_offset::sfb_offset_48(transform_length)
+    let layout = crate::asf_blocks::AsfLayout::long(transform_length, max_sfb)
         .expect("encoder: unsupported transform_length");
+    let sfbo = layout.groups[0].sfbo;
     let end_bin = sfbo[max_sfb as usize] as usize;
+    let line = |c: &[f32], k: usize| c.get(k).copied().unwrap_or(0.0);
 
-    // 1. Compute M and S spectra. Per §7.5: M = (L+R)/2, S = (L-R)/2.
-    let n_coeffs = coeffs_l.len().min(coeffs_r.len()).min(end_bin);
-    let mut spec_m = vec![0.0_f32; end_bin];
-    let mut spec_s = vec![0.0_f32; end_bin];
-    for k in 0..n_coeffs {
-        let l = coeffs_l[k];
-        let r = coeffs_r[k];
-        spec_m[k] = 0.5 * (l + r);
-        spec_s[k] = 0.5 * (l - r);
+    // Per band: code (L, R) directly or as M = (L + R)/2, S = (L − R)/2
+    // — whichever costs fewer spectral bits. The decoder's §5.3.3.2
+    // quartet for an `ms_used` band is (1, 1, 1, −1): O0 = I0 + I1,
+    // O1 = I0 − I1.
+    let mut t0 = vec![0.0f32; end_bin];
+    let mut t1 = vec![0.0f32; end_bin];
+    let mut ms_used = vec![false; max_sfb as usize];
+    for sfb in 0..max_sfb as usize {
+        let (a, b) = (sfbo[sfb] as usize, sfbo[sfb + 1] as usize);
+        let band_l: Vec<f32> = (a..b).map(|k| line(coeffs_l, k)).collect();
+        let band_r: Vec<f32> = (a..b).map(|k| line(coeffs_r, k)).collect();
+        let band_m: Vec<f32> = band_l
+            .iter()
+            .zip(&band_r)
+            .map(|(l, r)| 0.5 * (l + r))
+            .collect();
+        let band_s: Vec<f32> = band_l
+            .iter()
+            .zip(&band_r)
+            .map(|(l, r)| 0.5 * (l - r))
+            .collect();
+        let cost = |x: &[f32]| pick_best_codebook_for_band(x).3;
+        let use_ms = cost(&band_m).saturating_add(cost(&band_s))
+            < cost(&band_l).saturating_add(cost(&band_r));
+        ms_used[sfb] = use_ms;
+        let (x0, x1) = if use_ms {
+            (band_m, band_s)
+        } else {
+            (band_l, band_r)
+        };
+        t0[a..b].copy_from_slice(&x0);
+        t1[a..b].copy_from_slice(&x1);
     }
-
-    // 2. Per-SFB M/S decision: for each band evaluate the natural-q bit
-    //    cost of (M, S) vs (L, R) at the same anchor scalefactor, then
-    //    pick the cheaper representation. Track which residual goes into
-    //    the primary / secondary stream and the ms_used flag.
-    let mut q_pri = vec![0i32; end_bin];
-    let mut q_sec = vec![0i32; end_bin];
-    let mut sf_per_band = vec![100i32; max_sfb as usize];
-    let mut max_quant_idx = vec![0u32; max_sfb as usize];
-    let mut natural_q_pri_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb as usize);
-    let mut natural_q_sec_per_band: Vec<Vec<i32>> = Vec::with_capacity(max_sfb as usize);
-    let mut ms_used_per_band = vec![false; max_sfb as usize];
-
-    // Round-52: frame-level "matched-channel" detection. When the
-    // FRAME's total S energy is far below its M energy, every band's
-    // M-quant gets a `q_target` bump applied uniformly. The bump tapers
-    // back to the default 12 as the frame's S/M ratio grows. Per-band
-    // bumps were tried in development but interact destructively with
-    // the shared joint-section cost table — when some bands are bumped
-    // and others aren't, the joint scalefactor sequence misaligns the
-    // decoder's quantised-spectrum dequantisation. The frame-level gate
-    // keeps the bump self-consistent across the section partition.
-    let frame_e_m: f64 = spec_m[..end_bin].iter().map(|&v| (v as f64).powi(2)).sum();
-    let frame_e_s: f64 = spec_s[..end_bin].iter().map(|&v| (v as f64).powi(2)).sum();
-    let frame_ratio = if frame_e_m > 1e-20 {
-        (frame_e_s / (frame_e_m + frame_e_s)) as f32
+    let cp = if ms_used.iter().any(|&m| m) {
+        crate::asf::build_chparam_info_ms_used(vec![ms_used])
+    } else {
+        crate::asf::build_chparam_info_none()
+    };
+    // When the frame's side energy is far below its mid energy, the
+    // bits the near-silent second track saves go into a finer first
+    // track: its peak-quant target rises from the active policy's
+    // value by up to a third as the side share falls from 15 % to 0.
+    let energy = |t: &[f32]| t.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
+    let (e0, e1) = (energy(&t0), energy(&t1));
+    let side_share = if e0 > 1e-20 {
+        (e1 / (e0 + e1)) as f32
     } else {
         1.0
     };
-    let matched_channels = frame_ratio < 0.15;
-    let frame_q_target_m: f32 = if matched_channels {
-        // Smooth taper from 16 at ratio=0 to 12 at ratio=0.15.
-        let max_q = 16.0_f32;
-        let min_q = 12.0_f32;
-        max_q - (max_q - min_q) * (frame_ratio / 0.15).min(1.0)
-    } else {
-        12.0
+    let base = active_asf_quant();
+    let boost = 1.0 + (1.0 - (side_share / 0.15).min(1.0)) / 3.0;
+    let all_ms = cp.sap_mode == 1 && cp.ms_used.iter().flatten().all(|&m| m);
+    let q0 = AsfQuant {
+        q_target: if all_ms {
+            base.q_target * boost
+        } else {
+            base.q_target
+        },
+        ..base
     };
+    let c0 = with_asf_quant(q0, || code_sf_data(&layout, &t0));
+    let c1 = code_sf_data(&layout, &t1);
 
-    // Round-52 per-SFB pipeline. For each scale-factor band:
-    //
-    //   1. Pick the "natural" anchor scalefactor + codebook for each of
-    //      the four candidate residuals — L, R, M, S — at the baseline
-    //      q_target = 12 (matches the round-49 mono path).
-    //   2. Compute bit cost for M/S vs L/R and pick the cheaper option
-    //      per band. The `ms_used[sfb]` flag rides this decision.
-    //   3. When use_ms is chosen AND the band's S energy is far below its
-    //      M energy (the "matched-channels" regime), re-anchor M at a
-    //      bumped q_target (up to 16) to spend the bits saved on the
-    //      near-silent S residual on a finer M quantisation. The bump
-    //      tapers back to 12 when S energy approaches M.
-    //   4. Resolve the shared on-wire scalefactor (the joint syntax has
-    //      one set of scalefactors covering both residuals).
-    //   5. Re-quantise both residuals at the shared sf.
-    for sfb in 0..max_sfb as usize {
-        let a = sfbo[sfb] as usize;
-        let b = sfbo[sfb + 1] as usize;
-        let bmax = b.min(end_bin);
-        let band_l = &coeffs_l[a..bmax.min(coeffs_l.len())];
-        let band_r = &coeffs_r[a..bmax.min(coeffs_r.len())];
-        let band_m = &spec_m[a..bmax];
-        let band_s = &spec_s[a..bmax];
-
-        let (cb_l, sf_l, ql, cost_l) = pick_best_codebook_for_band(band_l);
-        let (cb_r, sf_r, qr, cost_r) = pick_best_codebook_for_band(band_r);
-        let (cb_m_base, sf_m_base, qm_base, cost_m_base) = pick_best_codebook_for_band(band_m);
-        let (cb_s, sf_s, qs, cost_s) = pick_best_codebook_for_band(band_s);
-
-        // M/S vs L/R decision — cost compare runs at the BASELINE
-        // q_target=12 so the M-channel `q_target` bump doesn't bias the
-        // encoder toward L/R coding.
-        let ms_total = cost_m_base.saturating_add(cost_s);
-        let lr_total = cost_l.saturating_add(cost_r);
-        let use_ms = ms_total < lr_total;
-        ms_used_per_band[sfb] = use_ms;
-
-        // Round-52 q_target bump for the M-channel: applied at the
-        // FRAME level when the entire frame qualifies as "matched
-        // channels" (total S energy ≪ M energy). Per-band bumps were
-        // tried in development but interact destructively with the
-        // shared joint-section cost table — when some bands are bumped
-        // and others aren't, the resulting scalefactor sequence
-        // misaligns the decoder's quantised-spectrum dequantisation.
-        // The frame-level gate keeps the bump self-consistent across
-        // every band so the joint section partition stays valid.
-        let (cb_m, sf_m, qm, cost_m) = if use_ms && matched_channels {
-            pick_best_codebook_for_band_with_q_target(band_m, frame_q_target_m)
-        } else {
-            (cb_m_base, sf_m_base, qm_base, cost_m_base)
-        };
-        let _ = (cb_l, cb_r, cb_m, cb_s, ql, qr, qm, qs, cost_m);
-
-        let (sf_a, sf_b) = if use_ms { (sf_m, sf_s) } else { (sf_l, sf_r) };
-
-        // Shared scalefactor — when one residual is silent (its anchor
-        // falls back to the empty-band default sf=100), use the other
-        // residual's anchor outright; otherwise take the max so neither
-        // channel's quants overflow its codebook's representable range.
-        let a_silent = if use_ms {
-            cost_m_base == 0 && cb_m_base == 0
-        } else {
-            cost_l == 0 && cb_l == 0
-        };
-        let b_silent = if use_ms {
-            cost_s == 0 && cb_s == 0
-        } else {
-            cost_r == 0 && cb_r == 0
-        };
-        let sf = match (a_silent, b_silent) {
-            (true, true) => 100,
-            (true, false) => sf_b,
-            (false, true) => sf_a,
-            (false, false) => sf_a.max(sf_b),
-        };
-        sf_per_band[sfb] = sf;
-
-        // Re-quantise both residuals at the shared sf.
-        let coeff_a: Vec<f32> = if use_ms {
-            band_m.to_vec()
-        } else {
-            band_l.to_vec()
-        };
-        let coeff_b: Vec<f32> = if use_ms {
-            band_s.to_vec()
-        } else {
-            band_r.to_vec()
-        };
-        let q_a_re = quantise_band_for_cb(&coeff_a, sf, 11);
-        let q_b_re = quantise_band_for_cb(&coeff_b, sf, 11);
-        let mut mq: u32 = 0;
-        for (i, &qi) in q_a_re.iter().enumerate() {
-            if a + i < q_pri.len() {
-                q_pri[a + i] = qi;
-            }
-            mq = mq.max(qi.unsigned_abs());
-        }
-        for (i, &qi) in q_b_re.iter().enumerate() {
-            if a + i < q_sec.len() {
-                q_sec[a + i] = qi;
-            }
-            mq = mq.max(qi.unsigned_abs());
-        }
-        max_quant_idx[sfb] = mq;
-        natural_q_pri_per_band.push(q_a_re);
-        natural_q_sec_per_band.push(q_b_re);
-    }
-
-    // 3. Shared section_data driven by the *union* of both residuals'
-    //    codebook needs. Build a cost table whose per-band cost is the
-    //    sum of pri + sec costs for each candidate codebook (HCB11 always
-    //    qualifies via escape; other codebooks only qualify if their q_max
-    //    covers BOTH residuals).
-    let cost_table_pri = build_band_codebook_cost_table(&natural_q_pri_per_band);
-    let cost_table_sec = build_band_codebook_cost_table(&natural_q_sec_per_band);
-    let mut cost_table_joint: Vec<[u32; 12]> = Vec::with_capacity(natural_q_pri_per_band.len());
-    for sfb in 0..max_sfb as usize {
-        let mut row = [u32::MAX; 12];
-        let pri_zero = natural_q_pri_per_band[sfb].iter().all(|&qi| qi == 0);
-        let sec_zero = natural_q_sec_per_band[sfb].iter().all(|&qi| qi == 0);
-        if pri_zero && sec_zero {
-            row[0] = 0;
-        }
-        for cb_id in 1u8..=11 {
-            let p = cost_table_pri[sfb][cb_id as usize];
-            let s = cost_table_sec[sfb][cb_id as usize];
-            if p == u32::MAX || s == u32::MAX {
-                continue;
-            }
-            row[cb_id as usize] = p.saturating_add(s);
-        }
-        cost_table_joint.push(row);
-    }
-    let dp_sections = dp_optimise_sections(&cost_table_joint, 16);
-    let sections = build_sections_from_dp(&dp_sections, max_sfb);
-
-    // 4. SNF over zero-quant bands — measured from M (which carries the
-    //    band's joint energy). The decoder applies the same SNF to both
-    //    channels symmetrically via `dequantise_and_scale`; on
-    //    ms_used == false bands the SNF only adds noise to the M side.
-    let snf = compute_snf_dpcm_for_zero_quant_bands(
-        &spec_m,
-        sfbo,
-        max_sfb,
-        &sections.sfb_cb,
-        &max_quant_idx,
-    );
-
-    // 5. Emit the joint stereo_data() body.
+    // Table 22 / 23: stereo_codec_mode = SIMPLE, then stereo_data()
+    // with b_enable_mdct_stereo_proc = 1 — sf_info(ASF, 0, 0),
+    // chparam_info(), sf_data(ASF) × 2.
     let mut bw = BitWriter::new();
-    // ac4_substream() per §5.7.1: audio_size_value (15 b) + b_more_bits (1 b).
     let audio_size = pad_target_bytes as u32;
     bw.write_u32(audio_size & 0x7FFF, 15);
     bw.write_bit(false);
     bw.align_to_byte();
-    // stereo_codec_mode = SIMPLE (0b00, 2 b).
-    bw.write_u32(0, 2);
-    // b_enable_mdct_stereo_proc = 1 (joint-MDCT path).
-    bw.write_bit(true);
-    // Shared transform / psy info — decoder's
-    // `parse_asf_transform_info()` reads one bit (b_long_frame) at
-    // frame_len_base >= 1536 and infers the long-frame transform length.
+    bw.write_u32(0, 2); // stereo_codec_mode = SIMPLE
+    bw.write_bit(true); // b_enable_mdct_stereo_proc
     bw.write_bit(true); // b_long_frame
-    // Shared psy_info: asf_psy_info(0, 0). With
-    // b_dual_maxsfb=false / b_side_limited=false there's a
-    // single max_sfb field at n_msfb_bits width. No
-    // scale_factor_grouping bits in long-frame mode.
     let (n_msfb_bits, _, _) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     bw.write_u32(max_sfb, n_msfb_bits);
-
-    // Shared sf_data: section_data → primary spectral → secondary
-    // spectral → scalefac → ms_used[] → snf.
-    write_section_data(&mut bw, &sections);
-    write_spectral_data_sections(&mut bw, &q_pri, sfbo, &sections);
-    write_spectral_data_sections(&mut bw, &q_sec, sfbo, &sections);
-    write_scalefac_data(
-        &mut bw,
-        &sf_per_band,
-        &sections.sfb_cb,
-        &max_quant_idx,
-        max_sfb,
-    );
-    // ms_used[] — one bit per active band (cb != 0 && mqi > 0). The
-    // decoder skips this read for inactive bands so silent / all-zero
-    // bands must not emit a bit.
-    for sfb in 0..max_sfb as usize {
-        let cb = sections.sfb_cb[sfb];
-        if cb == 0 || max_quant_idx[sfb] == 0 {
-            continue;
-        }
-        bw.write_bit(ms_used_per_band[sfb]);
-    }
-    write_snf_data(
-        &mut bw,
-        snf.as_deref(),
-        &sections.sfb_cb,
-        &max_quant_idx,
-        max_sfb,
-    );
+    write_chparam_info(&mut bw, &cp, &layout.grid());
+    write_sf_data(&mut bw, &c0);
+    write_sf_data(&mut bw, &c1);
 
     finish_substream_body(bw)
 }
@@ -1946,6 +1955,8 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
             max_sfb,
             &sections.sfb_cb,
             &max_quant_idx,
+            &qspec,
+            &sf_per_band,
         );
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
@@ -2091,6 +2102,8 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
             max_sfb_use,
             &sections.sfb_cb,
             &max_quant_idx,
+            &qspec,
+            &sf_per_band,
         );
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
@@ -2385,6 +2398,8 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
             max_sfb_use,
             &sections.sfb_cb,
             &max_quant_idx,
+            &qspec,
+            &sf_per_band,
         );
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
@@ -2624,6 +2639,8 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
             max_sfb_use,
             &sections.sfb_cb,
             &max_quant_idx,
+            &qspec,
+            &sf_per_band,
         );
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
@@ -2883,6 +2900,8 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
             max_sfb_use,
             &sections.sfb_cb,
             &max_quant_idx,
+            &qspec,
+            &sf_per_band,
         );
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
@@ -3131,6 +3150,8 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
             max_sfb_use,
             &sections.sfb_cb,
             &max_quant_idx,
+            &qspec,
+            &sf_per_band,
         );
         (qspec, sf_per_band, max_quant_idx, sections, snf)
     };
@@ -3466,7 +3487,9 @@ mod tests {
         let (n_msfb_bits, _, _) = crate::tables::n_msfb_bits_48(tl).unwrap();
         let parsed_max_sfb = br.read_u32(n_msfb_bits).unwrap();
         assert_eq!(parsed_max_sfb, max_sfb);
-        let sections = parse_asf_section_data(&mut br, 0, tl, max_sfb).unwrap();
+        let sections =
+            parse_asf_section_data(&mut br, crate::asf_blocks::LONG_FRAME_TL_CODE, tl, max_sfb)
+                .unwrap();
         // Round-49: per-band codebook optimiser may choose different
         // codebooks per band (HCB1..11) instead of always HCB5. The
         // exact section count depends on the input spectrum: silent
@@ -3607,22 +3630,21 @@ mod tests {
     // Round 50 — DP section optimiser + SNF emission unit tests.
     // ------------------------------------------------------------------
 
-    /// `section_overhead_bits` matches the spec's 4 + 3 * (k+1) formula.
+    /// `section_overhead_bits` follows Table 39 for a long frame:
+    /// 4 + 5·(k + 1) bits with 31-step escapes.
     #[test]
     fn section_overhead_bits_long_frame() {
-        // L = 1..=7 → k = 0 → overhead = 4 + 3 = 7.
-        for len in 1..=7u32 {
-            assert_eq!(section_overhead_bits(len), 7, "len={len}");
+        for len in 1..=31u32 {
+            assert_eq!(section_overhead_bits(len), 9, "len={len}");
         }
-        // L = 8..=14 → k = 1 → overhead = 4 + 6 = 10.
-        for len in 8..=14u32 {
-            assert_eq!(section_overhead_bits(len), 10, "len={len}");
+        for len in 32..=62u32 {
+            assert_eq!(section_overhead_bits(len), 14, "len={len}");
         }
-        // L = 15..=21 → k = 2 → overhead = 4 + 9 = 13.
-        assert_eq!(section_overhead_bits(15), 13);
-        assert_eq!(section_overhead_bits(21), 13);
-        // L = 22 → k = 3 → overhead = 16.
-        assert_eq!(section_overhead_bits(22), 16);
+        assert_eq!(section_overhead_bits(63), 19);
+        // Partial-block codes 0..=2 use 3-bit increments.
+        assert_eq!(section_overhead_bits_coded(7, 0), 7);
+        assert_eq!(section_overhead_bits_coded(8, 2), 10);
+        assert_eq!(section_overhead_bits_coded(8, 3), 9);
     }
 
     /// `dp_optimise_sections` collapses uniform-cost bands into ONE section.
@@ -3676,30 +3698,46 @@ mod tests {
         assert_eq!(sections[0], (0, 5, 5));
     }
 
-    /// SNF emission: for a band with non-zero original energy that's
-    /// quantised to silence (cb=0), the encoder picks an HCB_SNF index in
-    /// [1, 21].
+    /// SNF emission (§5.1.4.2 Pseudocode 23): a band quantised to
+    /// silence gets the level delta from the decoder's running level —
+    /// the mean decoded power of the last coded band — to its own
+    /// mean power, in 3,01 dB steps, offset by 17.
     #[test]
-    fn snf_emits_index_for_zero_quant_band_with_real_energy() {
-        let coeffs: Vec<f32> = vec![0.5, -0.5, 0.3, -0.4, 0.2, 0.0];
-        let sfb_offset: Vec<u16> = vec![0, 4, 6];
-        let max_sfb = 2u32;
-        let sfb_cb = vec![0u8, 0u8]; // both silent (cb=0)
-        let mqi = vec![0u32, 0u32];
-        let snf =
-            compute_snf_dpcm_for_zero_quant_bands(&coeffs, &sfb_offset, max_sfb, &sfb_cb, &mqi);
-        let snf = snf.expect("expected SNF data for non-silent band");
-        assert!(
-            snf[0] >= 1 && snf[0] <= 21,
-            "expected SNF idx in [1,21], got {}",
-            snf[0]
-        );
+    fn snf_codes_the_level_delta_from_the_previous_coded_band() {
+        // Band 0: two lines quantised to ±1 at sf = 100 (gain 1) →
+        // decoded mean power 1 → level 0. Band 1: silent, input mean
+        // power 1/16 → level −4 → delta −4 → index 13.
+        let coeffs: Vec<f32> = vec![1.0, -1.0, 0.25, -0.25];
+        let sfb_offset: Vec<u16> = vec![0, 2, 4];
+        let snf = compute_snf_dpcm_for_zero_quant_bands(
+            &coeffs,
+            &sfb_offset,
+            2,
+            &[5u8, 0u8],
+            &[1u32, 0u32],
+            &[1, -1, 0, 0],
+            &[100, 100],
+        )
+        .expect("expected SNF data for the silent band");
+        assert_eq!(snf, vec![0, 13]);
+        // The decoder's noise fill reproduces that level.
+        let layout = crate::asf_blocks::AsfLayout::long(1920, 2).unwrap();
+        let w0 = layout.coded_band(0, 0);
+        let mut flat = vec![0.0f32; layout.coded_len()];
+        for v in &mut flat[w0] {
+            *v = 1.0;
+        }
+        crate::asf_blocks::reset_snf_rng(0);
+        crate::asf_blocks::apply_snf(&mut flat, &layout, &[snf]);
+        let r = layout.coded_band(0, 1);
+        let p: f32 = flat[r.clone()].iter().map(|v| v * v).sum::<f32>() / r.len() as f32;
+        assert!((p.log2() + 4.0).abs() < 1.5, "noise level {}", p.log2());
     }
 
-    /// SNF returns None for fully-silent input (no measurable energy).
+    /// No coded band, no reference level: nothing is filled.
     #[test]
-    fn snf_returns_none_for_silent_input() {
-        let coeffs = vec![0.0_f32; 8];
+    fn snf_returns_none_without_a_coded_reference_band() {
+        let coeffs = vec![0.3_f32; 8];
         let sfb_offset: Vec<u16> = vec![0, 4, 8];
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             &coeffs,
@@ -3707,32 +3745,21 @@ mod tests {
             2,
             &[0u8, 0u8],
             &[0u32, 0u32],
+            &[0; 8],
+            &[100, 100],
         );
         assert!(snf.is_none());
     }
 
-    /// SNF skips bands with content (cb != 0 && mqi > 0).
+    /// A silent band far below the reachable −16-step range stays
+    /// unfilled (index 0) and leaves the running level alone; a band
+    /// above the +4-step range is clamped.
     #[test]
-    fn snf_skips_bands_with_quantised_content() {
-        let coeffs: Vec<f32> = vec![0.5, -0.5, 0.3, -0.4];
-        let sfb_offset: Vec<u16> = vec![0, 2, 4];
-        // Band 0 has quantised content; band 1 is silent.
-        let snf = compute_snf_dpcm_for_zero_quant_bands(
-            &coeffs,
-            &sfb_offset,
-            2,
-            &[5u8, 0u8],
-            &[3u32, 0u32],
-        );
-        let snf = snf.expect("expected SNF for the silent band");
-        // Band 0 is not eligible → idx 0 (default-init).
-        assert_eq!(snf[0], 0);
-        // Band 1 is eligible and has real energy → non-zero idx.
-        assert!(
-            snf[1] >= 1,
-            "expected SNF idx >= 1 for band 1, got {}",
-            snf[1]
-        );
+    fn snf_range_limits() {
+        let level = [Some(0.0f32), None, None];
+        let power = [1.0f64, 2.0f64.powi(-40), 2.0f64.powi(9)];
+        let snf = snf_indices(&level, &power).unwrap();
+        assert_eq!(snf, vec![0, 0, 21]);
     }
 
     /// `write_snf_data` emits the 1-bit gate then per-band Huffman codes.
@@ -3796,8 +3823,9 @@ mod tests {
         // Compute greedy bits assuming greedy picks the per-band minimum
         // codebook. For odd bands: only cb=11 feasible. For even bands:
         // cb=1 is cheaper. So greedy = [1, 11, 1, 11, 1, 11] → 6 sections,
-        // each L=1 → overhead 7 each = 42 + (8 + 12 + 8 + 12 + 8 + 12) = 102.
-        let greedy_total: u64 = 6 * 7 + 8 * 3 + 12 * 3;
+        // each L=1 → overhead 9 each (4-bit sect_cb + one 5-bit long-
+        // frame length increment) = 54 + (8 + 12 + 8 + 12 + 8 + 12) = 114.
+        let greedy_total: u64 = 6 * 9 + 8 * 3 + 12 * 3;
         let mut dp_total: u64 = 0;
         for &(s, e, cb) in &dp_sections {
             dp_total += section_overhead_bits(e - s) as u64;
@@ -3810,10 +3838,10 @@ mod tests {
             dp_total <= greedy_total,
             "DP must beat greedy: dp={dp_total} greedy={greedy_total}"
         );
-        // Concrete check: ONE uniform cb=11 section costs 6*12 + 7 = 79,
-        // beating greedy's 102 by 23 bits.
+        // Concrete check: ONE uniform cb=11 section costs 6*12 + 9 = 81,
+        // beating greedy's 114 by 33 bits.
         assert!(
-            dp_total <= 79,
+            dp_total <= 81,
             "DP did not collapse alternating pattern to single section: {dp_total}"
         );
     }

@@ -352,14 +352,13 @@ fn five_x_aspx_acpl_2_walker_inner_body_populates_three_channel_data() {
     bw.write_u32(0, 2); // chparam_info #0
     bw.write_u32(0, 2); // chparam_info #1
     // 3x sf_data(ASF) bodies — each one-section, all-zero spectra:
-    // sect_cb=0 (4 bits), sect_len_incr (3 bits, 7-escape over max_sfb=10):
-    //   max_sfb-1 = 9, esc=7 -> write 7 then 2.
+    // sect_cb=0 (4 bits), sect_len_incr (long frame: 5 bits) over max_sfb=10:
+    //   max_sfb-1 = 9, below the 31 escape -> one field.
     // scalefac reference (8 bits) = 120.
     // snf b_data_exists = 0 (1 bit).
     for _ in 0..3 {
         bw.write_u32(0, 4); // sect_cb=0
-        bw.write_u32(7, 3); // sect_len_incr (esc)
-        bw.write_u32(2, 3); // sect_len_incr remainder
+        bw.write_u32(9, 5); // sect_len_incr: long frame, 5 bits (max_sfb - 1)
         bw.write_u32(120, 8); // scalefac reference
         bw.write_bit(false); // b_snf_data_exists=0
     }
@@ -448,12 +447,11 @@ fn five_x_aspx_acpl_1_walker_inner_body_populates_two_channel_and_centre() {
     bw.write_u32(8, 6); // max_sfb[0]
     bw.write_u32(0, 2); // chparam sap_mode = 0
     // 2x sf_data(ASF) bodies (max_sfb=8, transf_length_idx=0):
-    //   sect_cb=0 (4) + sect_len_incr=7 (3) + sect_len_incr=0 (3)
+    //   sect_cb=0 (4) + sect_len_incr=7 (5 bits: long frame, Table 39)
     //   + scalefac ref (8) + snf b_data_exists (1).
     for _ in 0..2 {
         bw.write_u32(0, 4);
-        bw.write_u32(7, 3);
-        bw.write_u32(0, 3);
+        bw.write_u32(7, 5);
         bw.write_u32(120, 8);
         bw.write_bit(false);
     }
@@ -464,7 +462,7 @@ fn five_x_aspx_acpl_1_walker_inner_body_populates_two_channel_and_centre() {
     bw.write_u32(0, 2);
     for _ in 0..2 {
         bw.write_u32(0, 4); // sect_cb=0
-        bw.write_u32(3, 3); // sect_len_incr (max_sfb-1 = 3, no escape)
+        bw.write_u32(3, 5); // sect_len_incr (max_sfb-1 = 3; long frame, 5 bits)
         bw.write_u32(120, 8); // scalefac ref
         bw.write_bit(false); // snf
     }
@@ -662,14 +660,14 @@ fn five_x_simple_cfg2_walker_populates_four_plus_back_mono() {
     // 4x sf_data(ASF) all-zero bodies.
     let write_zero = |bw: &mut BitWriter, max_sfb: u32| {
         // sect_cb=0 (4 bits), sect_len_incr accumulating to max_sfb-1
-        // (3-bit slots with 7-escape).
+        // (long frame: 5-bit slots with 31-escape, Table 39).
         bw.write_u32(0, 4);
         let mut remaining = max_sfb.saturating_sub(1);
-        while remaining >= 7 {
-            bw.write_u32(7, 3);
-            remaining -= 7;
+        while remaining >= 31 {
+            bw.write_u32(31, 5);
+            remaining -= 31;
         }
-        bw.write_u32(remaining, 3);
+        bw.write_u32(remaining, 5);
         bw.write_u32(120, 8); // scalefac reference
         bw.write_bit(false); // b_snf_data_exists=0
     };
@@ -734,11 +732,11 @@ fn five_x_simple_cfg0_walker_populates_two_two_plus_centre() {
     let write_zero = |bw: &mut BitWriter, max_sfb: u32| {
         bw.write_u32(0, 4);
         let mut remaining = max_sfb.saturating_sub(1);
-        while remaining >= 7 {
-            bw.write_u32(7, 3);
-            remaining -= 7;
+        while remaining >= 31 {
+            bw.write_u32(31, 5);
+            remaining -= 31;
         }
-        bw.write_u32(remaining, 3);
+        bw.write_u32(remaining, 5);
         bw.write_u32(120, 8);
         bw.write_bit(false);
     };
@@ -804,11 +802,11 @@ fn five_x_simple_cfg3_walker_populates_five_channel_data() {
     let write_zero = |bw: &mut BitWriter, max_sfb: u32| {
         bw.write_u32(0, 4);
         let mut remaining = max_sfb.saturating_sub(1);
-        while remaining >= 7 {
-            bw.write_u32(7, 3);
-            remaining -= 7;
+        while remaining >= 31 {
+            bw.write_u32(31, 5);
+            remaining -= 31;
         }
-        bw.write_u32(remaining, 3);
+        bw.write_u32(remaining, 5);
         bw.write_u32(120, 8);
         bw.write_bit(false);
     };

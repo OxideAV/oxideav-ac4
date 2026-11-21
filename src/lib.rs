@@ -510,6 +510,8 @@ pub mod ajoc_substream;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod asf;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
+pub mod asf_blocks;
+#[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod asf_data;
 #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
 pub mod aspx;

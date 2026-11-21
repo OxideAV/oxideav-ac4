@@ -720,7 +720,7 @@ pub fn build_mono_simple_asf_tone_body(
     // (HCB5, dim=2, signed). n_sect_bits = 3 (transf_length_idx=0
     // for long frame).
     bw.write_u32(5, 4); // sect_cb
-    write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+    write_sect_len_incr(&mut bw, max_sfb, 5, 31);
     // asf_spectral_data: emit `tone_cb_idx` for pair `tone_pair_idx`,
     // and codeword 40 (q0=0, q1=0) for every other pair.
     let sfbo = crate::sfb_offset::sfb_offset_48(transform_length).expect("invalid tl");
@@ -10064,7 +10064,7 @@ mod tests {
         let (n_msfb_bits, _, _) = crate::tables::n_msfb_bits_48(n as u32).unwrap();
         bw.write_u32(max_sfb, n_msfb_bits);
         bw.write_u32(cb as u32, 4);
-        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        write_sect_len_incr(&mut bw, max_sfb, 5, 31);
         write_spectral_data_single_section(&mut bw, &qspec, sfbo, max_sfb, cb as u32);
         let sections = single_section(max_sfb, cb);
         write_scalefac_data(
@@ -10090,7 +10090,13 @@ mod tests {
         let _ = br.read_u32(1).unwrap();
         let _ = br.read_bit().unwrap();
         let _ = br.read_u32(n_msfb_bits).unwrap();
-        let parsed = parse_asf_section_data(&mut br, 0, n as u32, max_sfb).unwrap();
+        let parsed = parse_asf_section_data(
+            &mut br,
+            crate::asf_blocks::LONG_FRAME_TL_CODE,
+            n as u32,
+            max_sfb,
+        )
+        .unwrap();
         let (qs, mqi) = parse_asf_spectral_data(&mut br, &parsed, sfbo, max_sfb).unwrap();
         let sfg = parse_asf_scalefac_data(&mut br, &parsed, &mqi, max_sfb, n as u32).unwrap();
         let scaled = dequantise_and_scale(&qs, &sfg, sfbo, max_sfb);

@@ -652,6 +652,8 @@ fn prepare_stereo_channel(coeffs: &[f32], sfbo: &[u16], max_sfb: u32) -> StereoC
         max_sfb,
         &sections.sfb_cb,
         &max_quant_idx,
+        &qspec,
+        &sf_per_band,
     );
     (qspec, sf_per_band, max_quant_idx, sections, snf)
 }

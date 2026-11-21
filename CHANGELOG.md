@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `asf_section_data()` section lengths on long frames: Pseudocode 2
+  returns `get_transf_length(g) = 4` for a long frame, so Table 39
+  reads `sect_len_incr` in **5** bits with escape 31 (the 3-bit /
+  escape-7 form is for partial-block codes 0..=2 only). Decoder and
+  every encoder body writer now follow that; before, both used the
+  3-bit form on long frames and no stream from another encoder could
+  have parsed.
+- `stereo_data()` with `b_enable_mdct_stereo_proc = 1` (Table 23) is
+  `sf_info(ASF, 0, 0)`, `chparam_info()`, then one complete
+  `sf_data(ASF)` per channel, mapped through the §5.3.3.2 quartets —
+  replacing a private shared-sections / shared-scale-factor layout on
+  both the decode and the encode side.
+- `asf_spectral_data()` tuples read all sign bits before the
+  codebook-11 `ext_code`s (Table 40); the reader interleaved them per
+  line and mis-parsed a pair whose first line escaped and whose second
+  was non-zero.
+- Spectral noise fill is the §5.1.4.2 process: the level of an empty
+  band is the running `previous_rms` plus the coded `dpcm_snf − 17`
+  delta in 3,01 dB steps (index 0 = no fill), drawn from the
+  `GetRandomNoiseValue()` generator reset per frame from
+  `sequence_counter` (Pseudocode 24), and it is applied on every
+  `sf_data(ASF)` body (it was a private level formula on the mono path
+  and ignored on the multichannel ones). The encoder codes the
+  matching deltas from each empty band's measured level.
+- Block-switched `sf_data(ASF)` bodies: window groups with more than
+  one window (`sect_sfb_offset = sfb_offset · num_win_in_group`,
+  Pseudocode 4), one `reference_scale_factor` / `b_snf_data_exists`
+  for all groups, the forced group boundary and extra window of
+  `b_different_framing` (Pseudocode 3), `frame_len_base < 1536`
+  layouts, and the Pseudocode 25 ungrouping to window order
+  (`asf_blocks`). A `max_sfb = 0` body is parsed as the 9 bits it is
+  instead of aborting the element.
+
 ### Changed
 
 - MDCT / IMDCT run on a shared mixed-radix FFT plan (`fft`, radix

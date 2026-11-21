@@ -5031,6 +5031,9 @@ impl Decoder for Ac4Decoder {
         let (raw, _had_sync) = self.extract_raw_frame(&pkt)?;
         let info = toc::parse_ac4_toc(raw)
             .map_err(|e| Error::invalid(format!("ac4 decoder: TOC parse failed: {e}")))?;
+        // §5.1.4.2: the spectral-noise-fill generator restarts from the
+        // frame's sequence_counter (Pseudocode 24).
+        crate::asf_blocks::reset_snf_rng(info.sequence_counter as u32);
         // A-JOC object substream (TS 103 190-2 §6.2.3.4): route to the
         // dedicated object decode chain and emit the reconstructed
         // objects as output channels.
@@ -5357,7 +5360,7 @@ mod tests {
         // (dim=2, signed). n_sect_bits = 3 (transf_length_idx=0 for
         // long frame).
         bw.write_u32(5, 4); // sect_cb
-        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        write_sect_len_incr(&mut bw, max_sfb, 5, 31);
         // asf_spectral_data.
         let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
         let end_line = sfbo[max_sfb as usize] as u32;
@@ -5422,7 +5425,7 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(max_sfb, 6); // max_sfb[0]
         bw.write_u32(5, 4); // sect_cb
-        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        write_sect_len_incr(&mut bw, max_sfb, 5, 31);
         let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
         let end_line = sfbo[max_sfb as usize] as u32;
         // Emit one pair where the first line is +1 and rest zero.
@@ -5521,7 +5524,7 @@ mod tests {
         let hcb = huffman::asf_hcb(5).unwrap();
         // Section 0 covers [0..max_sfb) with sect_cb = 5.
         bw.write_u32(5, 4);
-        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        write_sect_len_incr(&mut bw, max_sfb, 5, 31);
         // Spectral: emit cb_idx_l for pair 0, then cb_idx 40 for the rest.
         bw.write_u32(hcb.cw[cb_idx_l], hcb.len[cb_idx_l] as u32);
         let pairs = end_line / 2;
@@ -5534,7 +5537,7 @@ mod tests {
         bw.write_u32(0, 1);
         // sf_data(spec_frontend_r): same pattern, different tone.
         bw.write_u32(5, 4);
-        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        write_sect_len_incr(&mut bw, max_sfb, 5, 31);
         bw.write_u32(hcb.cw[cb_idx_r], hcb.len[cb_idx_r] as u32);
         for _ in 1..pairs {
             bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
@@ -5605,9 +5608,9 @@ mod tests {
     }
 
     /// Build a stereo SIMPLE ac4_substream() body with
-    /// `b_enable_mdct_stereo_proc == 1` (joint M/S). Shared section
-    /// data + scalefactors, two spectral residuals (M and S), a per
-    /// active sfb `ms_used` flag, and an snf_data block.
+    /// `b_enable_mdct_stereo_proc == 1` (TS 103 190-1 Table 23):
+    /// `sf_info(ASF, 0, 0)`, `chparam_info()` with `sap_mode = 2` (M/S
+    /// in all bands), then one complete `sf_data(ASF)` per track.
     fn build_stereo_asf_joint_body(
         tl: u32,
         max_sfb: u32,
@@ -5627,31 +5630,26 @@ mod tests {
         bw.write_bit(true);
         // asf_psy_info(0, 0): max_sfb[0].
         bw.write_u32(max_sfb, 6);
-        // Shared asf_section_data — one section cb=5 over [0..max_sfb).
-        bw.write_u32(5, 4);
-        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        // chparam_info(): sap_mode = 2.
+        bw.write_u32(2, 2);
         let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
         let end_line = sfbo[max_sfb as usize] as u32;
         let pairs = end_line / 2;
         let hcb = huffman::asf_hcb(5).unwrap();
-        // Channel M spectrum.
-        bw.write_u32(hcb.cw[cb_idx_m], hcb.len[cb_idx_m] as u32);
-        for _ in 1..pairs {
-            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+        for cb_idx in [cb_idx_m, cb_idx_s] {
+            // asf_section_data — one section cb=5 over [0..max_sfb).
+            bw.write_u32(5, 4);
+            write_sect_len_incr(&mut bw, max_sfb, 5, 31);
+            // asf_spectral_data.
+            bw.write_u32(hcb.cw[cb_idx], hcb.len[cb_idx] as u32);
+            for _ in 1..pairs {
+                bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
+            }
+            // asf_scalefac_data: reference_scale_factor = 120.
+            bw.write_u32(120, 8);
+            // asf_snf_data: b_snf_data_exists = 0.
+            bw.write_u32(0, 1);
         }
-        // Channel S spectrum.
-        bw.write_u32(hcb.cw[cb_idx_s], hcb.len[cb_idx_s] as u32);
-        for _ in 1..pairs {
-            bw.write_u32(hcb.cw[40], hcb.len[40] as u32);
-        }
-        // Shared scalefac_data: reference_scale_factor = 120.
-        bw.write_u32(120, 8);
-        // ms_used[sfb] — one bit per active sfb. Only sfb 0 has energy
-        // (cb != 0 and shared mqi > 0) so just one bit. Set to 1 so the
-        // decoder runs the M/S -> L/R transform.
-        bw.write_u32(1, 1);
-        // snf_data: b_snf_data_exists = 0.
-        bw.write_u32(0, 1);
         bw.align_to_byte();
         while bw.byte_len() < 820 {
             bw.write_u32(0, 8);
@@ -5661,7 +5659,7 @@ mod tests {
 
     #[test]
     fn decoder_stereo_cpe_joint_ms_emits_two_channels() {
-        // Joint-stereo M/S CPE with shared scalefactors. M has cb_idx=49
+        // Joint-stereo M/S CPE. M has cb_idx=49
         // (q0=1,q1=0), S has cb_idx=40 (q0=0,q1=0 -> all zero). With
         // ms_used[0]=1, the inverse is L = M + S = M, R = M - S = M,
         // so both channels should be equal and non-silent.
@@ -5680,9 +5678,9 @@ mod tests {
         assert!(sub.tools.mdct_stereo_proc, "joint-stereo flag missing");
         assert!(sub.tools.scaled_spec_primary.is_some());
         assert!(sub.tools.scaled_spec_secondary.is_some());
-        // ms_used must have been read and the DC band flagged.
-        let ms_used = sub.tools.ms_used.as_ref().unwrap();
-        assert!(ms_used[0], "ms_used[0] should be true");
+        // chparam_info() selected M/S in every band.
+        let cp = sub.tools.chparam_info.as_ref().unwrap();
+        assert_eq!(cp.mode(), asf::SapMode::MsAll);
         // Both channels non-silent.
         let buf = &af.data[0];
         let mut l: Vec<i16> = Vec::with_capacity(1_920);

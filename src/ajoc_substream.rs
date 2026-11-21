@@ -1405,6 +1405,8 @@ pub(crate) fn write_asf_body_from_spectrum(
         max_sfb,
         &sections.sfb_cb,
         &max_quant_idx,
+        &qspec,
+        &sf_per_band,
     );
     write_section_data(bw, &sections);
     write_spectral_data_sections(bw, &qspec, sfbo, &sections);
