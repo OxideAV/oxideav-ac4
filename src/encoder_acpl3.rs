@@ -691,11 +691,11 @@ fn write_stereo_split_data(
     bw.write_bit(false);
     // L channel: spec_frontend_l = 0 (ASF) + asf_transform_info + asf_psy_info.
     bw.write_bit(false);
-    bw.write_bit(true); // asf_transform_info: b_long_frame = 1
+    crate::encoder_asf::write_full_block_transform_info(bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits); // asf_psy_info: max_sfb[0] in n_msfb_bits
     // R channel: spec_frontend_r = 0 (ASF) + asf_transform_info + asf_psy_info.
     bw.write_bit(false);
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits);
 
     // L sf_data(ASF).
@@ -3041,7 +3041,7 @@ fn write_lfe_mono_data(
     let max_sfb_lfe_clamped = max_sfb_lfe.min(n_msfbl_cap);
 
     // asf_transform_info(): b_long_frame = 1 (LFE is always long-frame).
-    bw.write_bit(true);
+    crate::encoder_asf::note_full_block(transform_length);
     // sf_info_lfe(): max_sfb[0] in n_msfbl_bits.
     bw.write_u32(max_sfb_lfe_clamped, n_msfbl_bits);
     // LFE sf_data(ASF): section + spectral + scalefac + snf.
@@ -3106,7 +3106,7 @@ fn write_two_channel_data(
     let (n_msfb_bits, _, _) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     // Shared sf_info(ASF, 0, 0).
-    bw.write_bit(true); // asf_transform_info: b_long_frame = 1
+    crate::encoder_asf::write_full_block_transform_info(bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits); // asf_psy_info: max_sfb[0]
     // chparam_info(): sap_mode = 0 (identity SAP, no ms_used / sap_data).
     bw.write_u32(0, 2);
@@ -3139,7 +3139,7 @@ fn write_mono_data_centre(bw: &mut BitWriter, transform_length: u32, max_sfb: u3
     // spec_frontend = 0 (ASF).
     bw.write_bit(false);
     // asf_transform_info(): b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(bw, transform_length);
     // asf_psy_info(ASF, 0, 0): max_sfb[0].
     bw.write_u32(max_sfb, n_msfb_bits);
     // sf_data(ASF).

@@ -112,7 +112,8 @@ impl AsfTransformInfo {
     /// the lengths do not tile the frame.
     pub fn windows(&self, frame_len_base: u32) -> Option<Vec<usize>> {
         if self.b_long_frame {
-            return (self.transform_length_0 > 0).then(|| vec![self.transform_length_0 as usize]);
+            return (self.transform_length_0 > 0 && self.transform_length_0 == frame_len_base)
+                .then(|| vec![self.transform_length_0 as usize]);
         }
         let (t0, t1) = (self.transform_length_0, self.transform_length_1);
         if t0 == 0 || t1 == 0 {

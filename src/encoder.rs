@@ -423,19 +423,6 @@ impl Ac4Encoder {
                 opts.frame_rate_index
             )));
         }
-        if frame_len < 1536 {
-            // TS 103 190-1 §4.3.6.1: below frame_len_base 1536 the ASF
-            // transform info carries the Table 103 `transf_length` code
-            // and the grouped psy / spectral layout instead of
-            // `b_long_frame` — the body writers only emit the long-frame
-            // form today.
-            return Err(Error::unsupported(format!(
-                "ac4 encoder: frame_rate_index {} ({frame_len}-sample frames) needs the \
-                 short-frame ASF syntax (frame_len_base < 1536) which the body writers do \
-                 not emit yet — use an index with 1536 samples or more (0..=4, 13)",
-                opts.frame_rate_index
-            )));
-        }
         if opts.gop == 0 {
             return Err(Error::invalid("ac4 encoder: gop must be >= 1"));
         }

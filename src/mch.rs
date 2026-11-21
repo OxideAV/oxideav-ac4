@@ -270,16 +270,21 @@ pub fn parse_mono_data(
         // Non-LFE: leading 1-bit spec_frontend selector.
         out.spec_frontend_bit = br.read_u32(1)? as u8;
     }
-    // Both LFE and non-LFE invoke the ASF transform-info shell — the
-    // LFE channel is always coded with the ASF frontend per Table 21.
-    let ti = parse_asf_transform_info(br, frame_len_base)?;
+    // Non-LFE: `sf_info(ASF, 0, 0)` opens with `asf_transform_info()`.
+    // LFE: `sf_info_lfe()` (Table 35) carries no transform info — it
+    // sets `b_long_frame = 1` (one block of `frame_length` lines) and
+    // reads only `max_sfb[0]` in `n_msfbl_bits`.
+    let ti = if b_lfe {
+        AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0; 2],
+            transform_length_0: frame_len_base,
+            transform_length_1: frame_len_base,
+        }
+    } else {
+        parse_asf_transform_info(br, frame_len_base)?
+    };
     out.transform_info = Some(ti);
-    // `sf_info(ASF, 0, 0)` for non-LFE; `sf_info_lfe()` for LFE.
-    // r20: dispatch to the dedicated `parse_asf_psy_info_lfe()` that
-    // uses Table 106 column `n_msfbl_bits` for `max_sfb[0]` instead of
-    // the regular `n_msfb_bits`. The two widths can differ by 2-4 bits
-    // (e.g. 48 kHz long-frame: 6 vs 3) so this matters for any real
-    // 5.1 / 7.1 stream LFE alignment.
     let psy = if b_lfe {
         parse_asf_psy_info_lfe(br, &ti)?
     } else {
@@ -1869,11 +1874,10 @@ mod tests {
     #[test]
     fn parse_mono_data_lfe_long_frame() {
         // mono_data(1) for frame_len_base=1920 long-frame:
-        //   asf_transform_info: b_long_frame=1 -> tl=1920.
-        //   sf_info_lfe(): max_sfb[0] read with n_msfbl_bits=3 (Table
-        //   106 column 4 for tl=1920) = value 5.
+        //   sf_info_lfe() (Table 35): b_long_frame = 1 is implied —
+        //   no transform-info bits — and max_sfb[0] is read with
+        //   n_msfbl_bits=3 (Table 106 column 4 for tl=1920) = value 5.
         let mut bw = BitWriter::new();
-        bw.write_bit(true); // b_long_frame
         bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 for tl=1920
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -1892,25 +1896,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_mono_data_lfe_rejects_short_only_transform() {
-        // tl=480 -> n_msfbl_bits = 0 (LFE not permitted at this tl).
-        // Reach `parse_asf_psy_info_lfe` by feeding b_long_frame=0
-        // followed by a 2-bit `transf_length` selecting tl=480 at
-        // frame_len_base=1920. asf_transform_info Table 99 row for
-        // 1920 maps transf_length=0..=3 to {1920, 960, 480, 240}.
+    fn parse_mono_data_lfe_uses_the_frame_length_transform() {
+        // sf_info_lfe() never signals a transform length: the LFE is
+        // one block of frame_length lines whatever the other channels
+        // do. At frame_len_base = 960 (48 fps) max_sfb[0] is read in
+        // Table 106's n_msfbl_bits for a 960-line transform.
+        let (_, _, n_msfbl_bits) = crate::tables::n_msfb_bits_48(960).unwrap();
+        assert!(n_msfbl_bits > 0);
         let mut bw = BitWriter::new();
-        bw.write_bit(false); // b_long_frame=0
-        bw.write_u32(2, 2); // transf_length=2 -> tl=480 (Table 99)
-        bw.write_u32(2, 2); // transf_length[1]=2 -> tl=480 (no different framing)
+        bw.write_u32(3, n_msfbl_bits);
+        write_zero_sf_data_body(&mut bw, 3, 3);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
-        let err = parse_mono_data(&mut br, true, 1920).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("LFE") || msg.contains("transform_length"),
-            "expected LFE-rejection error, got: {msg}"
-        );
+        let lfe = parse_mono_data(&mut br, true, 960).unwrap();
+        let ti = lfe.transform_info.unwrap();
+        assert!(ti.b_long_frame);
+        assert_eq!(ti.transform_length_0, 960);
+        assert_eq!(lfe.psy_info.unwrap().max_sfb_0, 3);
+        assert!(lfe.scaled_spec.is_some());
     }
 
     /// Round 37: `parse_mono_data(b_lfe=false)` walks the trailing
@@ -1956,7 +1960,6 @@ mod tests {
     #[test]
     fn parse_mono_data_lfe_walks_sf_data_body() {
         let mut bw = BitWriter::new();
-        bw.write_bit(true); // b_long_frame
         bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 @ tl=1920
         write_zero_sf_data_body(&mut bw, 5, 4);
         bw.align_to_byte();
@@ -2149,7 +2152,7 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
         // LFE mono_data(1):
-        bw.write_bit(true); // b_long_frame
+        // sf_info_lfe(): no transform info, max_sfb[0] only.
         bw.write_u32(4, 3); // max_sfb[0] -- n_msfbl_bits = 3 for tl=1920
         write_zero_sf_data_body(&mut bw, 4, 4); // round 38: LFE body
         // coding_config = 3, then five_channel_data:
@@ -3233,7 +3236,7 @@ mod tests {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 2); // SIMPLE
         // LFE mono_data(1):
-        bw.write_bit(true); // b_long_frame
+        // sf_info_lfe(): no transform info, max_sfb[0] only.
         bw.write_u32(4, 3); // max_sfb[0] (n_msfbl_bits=3 @ tl=1920)
         write_zero_sf_data_body(&mut bw, 4, 4); // round 38: LFE body
         // coding_config = 3 -> five_channel_data:

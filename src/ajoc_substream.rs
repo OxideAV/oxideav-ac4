@@ -1435,7 +1435,7 @@ pub fn write_two_channel_data_simple(
     let (n_msfb_bits, _, _) = crate::tables::n_msfb_bits_48(transform_length)
         .ok_or_else(|| Error::invalid("ac4: unsupported transform_length"))?;
     // asf_transform_info(): b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(bw, transform_length);
     // asf_psy_info(): max_sfb.
     bw.write_u32(max_sfb, n_msfb_bits);
     // chparam_info(): sap_mode = 0 (independent channels).
@@ -1460,7 +1460,7 @@ pub fn write_mono_data_simple(
     // spec_frontend = ASF (0).
     bw.write_bit(false);
     // asf_transform_info(): b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(bw, transform_length);
     // sf_info(): max_sfb.
     bw.write_u32(max_sfb, n_msfb_bits);
     write_asf_body_from_spectrum(bw, coeffs, sfbo, max_sfb);
@@ -1490,7 +1490,7 @@ pub fn write_mono_data_lfe_simple(
         return Err(Error::invalid("ac4: LFE max_sfb out of range"));
     }
     // asf_transform_info(): b_long_frame = 1 (forced for LFE).
-    bw.write_bit(true);
+    crate::encoder_asf::note_full_block(transform_length);
     // sf_info_lfe(): max_sfb (n_msfbl_bits wide).
     bw.write_u32(max_sfb_lfe, n_msfbl_bits);
     write_asf_body_from_spectrum(bw, coeffs, sfbo, max_sfb_lfe);

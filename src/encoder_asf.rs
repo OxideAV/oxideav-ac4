@@ -497,11 +497,7 @@ pub fn pick_best_codebook_for_band_with(
 /// Returns a vector of `(start_sfb, end_sfb_exclusive, cb)` tuples
 /// describing the optimal section layout.
 pub fn dp_optimise_sections(cost_band_cb: &[[u32; 12]], max_sections: u32) -> Vec<(u32, u32, u8)> {
-    dp_optimise_sections_coded(
-        cost_band_cb,
-        max_sections,
-        crate::asf_blocks::LONG_FRAME_TL_CODE,
-    )
+    dp_optimise_sections_coded(cost_band_cb, max_sections, full_block_code())
 }
 
 /// [`dp_optimise_sections`] with the section-header cost of a window
@@ -618,7 +614,7 @@ pub fn dp_optimise_sections_coded(
 /// 5-bit length-increment fields.
 #[inline]
 pub fn section_overhead_bits(len: u32) -> u32 {
-    section_overhead_bits_coded(len, crate::asf_blocks::LONG_FRAME_TL_CODE)
+    section_overhead_bits_coded(len, full_block_code())
 }
 
 /// [`section_overhead_bits`] for an arbitrary `get_transf_length(g)`
@@ -932,7 +928,40 @@ pub fn write_spectral_data_single_section(
 /// [`AsfSections`]. Each section emits a 4-bit `sect_cb` followed by a
 /// length-increment chain (`n_sect_bits = 3`, `esc = 7` for long frame).
 pub fn write_section_data(bw: &mut BitWriter, sections: &AsfSections) {
-    write_section_data_coded(bw, sections, crate::asf_blocks::LONG_FRAME_TL_CODE);
+    write_section_data_coded(bw, sections, full_block_code());
+}
+
+thread_local! {
+    static FULL_BLOCK_CODE: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(crate::asf_blocks::LONG_FRAME_TL_CODE) };
+}
+
+/// The `get_transf_length(g)` code of the full block the body writers
+/// on this thread are emitting — set by
+/// [`write_full_block_transform_info`] / [`note_full_block`], read by
+/// [`write_section_data`] and [`section_overhead_bits`].
+pub fn full_block_code() -> u32 {
+    FULL_BLOCK_CODE.with(|c| c.get())
+}
+
+/// Record that the following `sf_data(ASF)` bodies are one full block
+/// of `transform_length` lines without writing anything (the LFE's
+/// `sf_info_lfe()` carries no transform info, Table 35).
+pub fn note_full_block(transform_length: u32) {
+    FULL_BLOCK_CODE.with(|c| c.set(crate::asf_blocks::full_block_tl_code(transform_length)));
+}
+
+/// `asf_transform_info()` (Table 37) for a frame coded as one full
+/// block of `transform_length` (= `frame_len_base`) lines:
+/// `b_long_frame = 1` for the 1536 / 1920 / 2048 frame lengths, else
+/// the 2-bit `transf_length` whose Table 103 entry is the frame length.
+pub fn write_full_block_transform_info(bw: &mut BitWriter, transform_length: u32) {
+    note_full_block(transform_length);
+    if transform_length >= 1536 {
+        bw.write_bit(true);
+    } else {
+        bw.write_u32(crate::asf_blocks::full_block_tl_code(transform_length), 2);
+    }
 }
 
 /// [`write_section_data`] for a window group whose
@@ -1382,7 +1411,7 @@ pub fn build_mono_simple_asf_body_from_pcm_spectrum(
     bw.write_u32(0, 1);
     bw.write_u32(0, 1);
     // asf_transform_info: b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     // asf_psy_info(0, 0): max_sfb[0] in n_msfb_bits bits.
     let (n_msfb_bits, _, _) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
@@ -1511,11 +1540,11 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     // --- Left channel header ---
     bw.write_u32(0, 1); // spec_frontend_l = ASF
-    bw.write_bit(true); // b_long_frame
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits); // max_sfb_l
     // --- Right channel header ---
     bw.write_u32(0, 1); // spec_frontend_r = ASF
-    bw.write_bit(true); // b_long_frame
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits); // max_sfb_r (same width as L in
     // this split-MDCT path)
 
@@ -1673,7 +1702,7 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
     coeffs_r: &[f32],
     pad_target_bytes: usize,
 ) -> Vec<u8> {
-    let layout = crate::asf_blocks::AsfLayout::long(transform_length, max_sfb)
+    let layout = crate::asf_blocks::AsfLayout::full_block(transform_length, max_sfb)
         .expect("encoder: unsupported transform_length");
     let sfbo = layout.groups[0].sfbo;
     let end_bin = sfbo[max_sfb as usize] as usize;
@@ -1752,7 +1781,7 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
     bw.align_to_byte();
     bw.write_u32(0, 2); // stereo_codec_mode = SIMPLE
     bw.write_bit(true); // b_enable_mdct_stereo_proc
-    bw.write_bit(true); // b_long_frame
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     let (n_msfb_bits, _, _) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     bw.write_u32(max_sfb, n_msfb_bits);
@@ -2000,7 +2029,7 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
     // five_channel_data() per Table 29 — shared sf_info + 5x sf_data bodies.
     //
     // asf_transform_info(): b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     // asf_psy_info(ASF, b_dual_maxsfb = 0, b_side_limited = 0):
     //   max_sfb[0] in n_msfb_bits bits — shared across all 5 channels.
     let (n_msfb_bits, _, _) =
@@ -2149,7 +2178,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
 
     // LFE: mono_data(b_lfe = 1) per Table 21. No leading spec_frontend bit.
     // asf_transform_info(): b_long_frame = 1 (LFE is always long-frame).
-    bw.write_bit(true);
+    crate::encoder_asf::note_full_block(transform_length);
     // sf_info_lfe(): max_sfb[0] written with n_msfbl_bits (Table 106 col 4).
     let (_n_msfb_bits, _, n_msfbl_bits) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
@@ -2187,7 +2216,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
     // five_channel_data() per Table 29 — shared sf_info + 5x sf_data bodies.
     //
     // asf_transform_info(): b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     // asf_psy_info(ASF, b_dual_maxsfb = 0, b_side_limited = 0):
     //   max_sfb[0] in n_msfb_bits bits — shared across all 5 non-LFE channels.
     let (n_msfb_bits, _, _) =
@@ -2475,7 +2504,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
 
     // five_channel_data() per Table 29 — shared sf_info + 5x sf_data
     // bodies. asf_transform_info(): b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     // asf_psy_info(ASF, b_dual_maxsfb=0, b_side_limited=0):
     //   max_sfb[0] in n_msfb_bits bits — shared across all 5 SCEs.
     bw.write_u32(max_sfb, n_msfb_bits);
@@ -2510,7 +2539,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     // Additional `two_channel_data()` for Lb/Rb per Table 26. The shape
     // is `asf_transform_info() + asf_psy_info() + chparam_info() +
     // sf_data(ASF) + sf_data(ASF)`.
-    bw.write_bit(true); // b_long_frame = 1
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     // asf_psy_info(): max_sfb[0] in n_msfb_bits bits — shared
     // between Lb and Rb.
     bw.write_u32(max_sfb_add, n_msfb_bits);
@@ -2692,7 +2721,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
 
     // five_channel_data() per Table 29.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits);
     write_five_channel_info(&mut bw, &five_wire, max_sfb);
     for analysis in &analyses_five {
@@ -2718,7 +2747,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
     // 7.X SIMPLE/ASPX additional-channel block: b_use_sap_add_ch = 0 →
     // identity SAP, then `two_channel_data()` for Lb/Rb.
     bw.write_bit(false);
-    bw.write_bit(true); // b_long_frame = 1
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     bw.write_u32(max_sfb_add, n_msfb_bits);
     bw.write_u32(0, 2); // chparam_info(): identity SAP
     for analysis in &analyses_add {
@@ -2953,7 +2982,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
 
     // five_channel_data() per Table 29.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits);
     write_five_channel_info(&mut bw, &five_wire, max_sfb);
     for analysis in &analyses_five {
@@ -2979,7 +3008,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
     // 7.X SIMPLE/ASPX additional-channel block: b_use_sap_add_ch = 0 →
     // identity SAP, then `two_channel_data()` for Lb/Rb.
     bw.write_bit(false);
-    bw.write_bit(true); // b_long_frame = 1
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     bw.write_u32(max_sfb_add, n_msfb_bits);
     bw.write_u32(0, 2); // chparam_info(): identity SAP
     for analysis in &analyses_add {
@@ -3221,7 +3250,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // bit. asf_transform_info(): b_long_frame = 1 (LFE is always
     // long-frame). sf_info_lfe(): max_sfb[0] in n_msfbl_bits bits
     // (Table 106 col 4).
-    bw.write_bit(true);
+    crate::encoder_asf::note_full_block(transform_length);
     let (n_msfb_bits, _, n_msfbl_bits) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     assert!(
@@ -3258,7 +3287,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
 
     // five_channel_data() per Table 29 — shared sf_info + 5x sf_data
     // bodies. asf_transform_info(): b_long_frame = 1.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     // asf_psy_info(ASF, b_dual_maxsfb=0, b_side_limited=0):
     //   max_sfb[0] in n_msfb_bits bits — shared across all 5 SCEs.
     bw.write_u32(max_sfb, n_msfb_bits);
@@ -3293,7 +3322,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // Additional `two_channel_data()` for Lb/Rb per Table 26. The shape
     // is `asf_transform_info() + asf_psy_info() + chparam_info() +
     // sf_data(ASF) + sf_data(ASF)`.
-    bw.write_bit(true); // b_long_frame = 1
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     // asf_psy_info(): max_sfb[0] in n_msfb_bits bits — shared
     // between Lb and Rb.
     bw.write_u32(max_sfb_add, n_msfb_bits);
@@ -3455,9 +3484,9 @@ mod tests {
     /// quantised spectrum should match the encoder's chosen quants.
     #[test]
     fn build_body_roundtrips_through_asf_parser() {
-        // Tiny test: tl = 256, max_sfb = 5. Non-trivial coefficients in
-        // band 1 (bin 4, 5, 6, 7).
-        let tl = 256u32;
+        // Tiny test: a 1920-line long frame, max_sfb = 5. Non-trivial
+        // coefficients in band 1 (bin 4, 5, 6, 7).
+        let tl = 1920u32;
         let max_sfb = 5u32;
         let sfbo = crate::sfb_offset::sfb_offset_48(tl).unwrap();
         let end_bin = sfbo[max_sfb as usize] as usize;

@@ -28,6 +28,7 @@ pub fn kbd_alpha(n: u32) -> f32 {
         1024 | 960 | 768 => 4.0,
         512 | 480 | 384 => 4.5,
         256 | 240 | 192 => 5.0,
+        128 | 120 | 96 => 6.0,
         _ => 3.0,
     }
 }
@@ -368,6 +369,80 @@ pub fn imdct_olap_symmetric(x_unwindowed: &[f32], window: &[f32], overlap: &mut 
     pcm
 }
 
+/// Overlap/add state of one channel for the block-switched transform
+/// of TS 103 190-1 §5.5.2.2 steps 5 – 6 (Pseudocodes 63 / 64).
+///
+/// The buffer holds `Nfull` samples: the not-yet-windowed second half
+/// of the previous block at offset `(Nfull − Nprev) / 2`, preceded by
+/// whatever earlier blocks left for output. The windows are chosen
+/// when two blocks meet: both halves use the KBD slope of the shorter
+/// block, centred on the longer one (ones before, zeros after).
+#[derive(Debug, Clone, Default)]
+pub struct BlockOverlap {
+    buf: Vec<f32>,
+    n_prev: usize,
+}
+
+impl BlockOverlap {
+    /// Fresh (silent) state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the `2N` unfolded IMDCT samples `x` of a block of length
+    /// `N` in a frame of `n_full` samples; appends the block's `N`
+    /// output samples to `out`.
+    pub fn block(&mut self, x: &[f32], n_full: usize, out: &mut Vec<f32>) {
+        let n = x.len() / 2;
+        if n == 0 || n > n_full {
+            return;
+        }
+        if self.buf.len() != n_full || self.n_prev == 0 || self.n_prev > n_full {
+            // First block, or the frame length changed: silent history
+            // shaped like a block of this length.
+            self.buf.clear();
+            self.buf.resize(n_full, 0.0);
+            self.n_prev = n;
+        }
+        let n_prev = self.n_prev;
+        let nskip = (n_full - n) / 2;
+        let nskip_prev = (n_full - n_prev) / 2;
+        let nw = n.min(n_prev);
+        let kbd = kbd_window_shared(nw as u32);
+        // Right-half window on the previous block's stored half.
+        let rs = (n_prev - nw) / 2;
+        let prev = &mut self.buf[nskip_prev..nskip_prev + n_prev];
+        for (v, w) in prev[rs..rs + nw].iter_mut().zip(&kbd[nw..]) {
+            *v *= *w;
+        }
+        for v in &mut prev[rs + nw..] {
+            *v = 0.0;
+        }
+        // Left-half window on this block, overlap/add.
+        let ls = (n - nw) / 2;
+        let cur = &mut self.buf[nskip..nskip + n];
+        for ((v, xi), w) in cur[ls..ls + nw]
+            .iter_mut()
+            .zip(&x[ls..ls + nw])
+            .zip(&kbd[..nw])
+        {
+            *v += xi * w;
+        }
+        for (v, xi) in cur[ls + nw..].iter_mut().zip(&x[ls + nw..n]) {
+            *v += *xi;
+        }
+        out.extend_from_slice(&self.buf[..n]);
+        // Keep what is not output yet, then store the unwindowed
+        // second half for the next overlap/add.
+        self.buf.copy_within(n..n + nskip, 0);
+        self.buf[nskip..nskip + n].copy_from_slice(&x[n..2 * n]);
+        for v in &mut self.buf[nskip + n..] {
+            *v = 0.0;
+        }
+        self.n_prev = n;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +552,110 @@ mod tests {
                 assert!((a - b).abs() <= 2e-5 * peak, "n {n} k {k}: {a} vs {b}");
             }
         }
+    }
+
+    /// Forward block transform of `2N` samples through an arbitrary
+    /// analysis window (test-side mirror of Pseudocodes 63 / 64).
+    fn analyse_block(
+        signal: &[f32],
+        centre: usize,
+        n: usize,
+        n_prev: usize,
+        n_next: usize,
+    ) -> Vec<f32> {
+        // The block's 2N samples start N before the boundary `centre`
+        // between its two halves.
+        let mut seg: Vec<f32> = (0..2 * n)
+            .map(|i| {
+                let t = centre as isize - n as isize + i as isize;
+                if t >= 0 && (t as usize) < signal.len() {
+                    signal[t as usize]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let slope = |nw: usize| kbd_window(nw as u32);
+        let nwl = n.min(n_prev);
+        let wl = slope(nwl);
+        let ls = (n - nwl) / 2;
+        for (i, v) in seg[..n].iter_mut().enumerate() {
+            *v *= if i < ls {
+                0.0
+            } else if i < ls + nwl {
+                wl[i - ls]
+            } else {
+                1.0
+            };
+        }
+        let nwr = n.min(n_next);
+        let wr = slope(nwr);
+        let rs = (n - nwr) / 2;
+        for (i, v) in seg[n..].iter_mut().enumerate() {
+            *v *= if i < rs {
+                1.0
+            } else if i < rs + nwr {
+                wr[nwr + i - rs]
+            } else {
+                0.0
+            };
+        }
+        mdct_forward(&seg)
+    }
+
+    #[test]
+    fn block_switched_overlap_add_reconstructs_the_signal() {
+        // Frames of 1920 samples: long, 2×480 + 960 (the §5.5.3
+        // example), 8×240, long, long.
+        let n_full = 1920usize;
+        let frames: Vec<Vec<usize>> = vec![
+            vec![1920],
+            vec![480, 480, 960],
+            vec![240; 8],
+            vec![1920],
+            vec![1920],
+        ];
+        let total = n_full * (frames.len() + 1);
+        let signal: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.013).sin() * 0.5 + (i as f32 * 0.21).cos() * 0.2)
+            .collect();
+        let blocks: Vec<usize> = frames.iter().flatten().copied().collect();
+        // A block's two halves meet `nskip + N` after the block start
+        // in the frame grid: track each block's centre in time.
+        let mut centres = Vec::new();
+        let mut pos = 0usize; // start of the block's output span
+        for &n in &blocks {
+            // The block outputs [pos, pos + n); its halves meet at
+            // pos + n/2 + n_full/2 (Pseudocode 64's nskip placement).
+            centres.push(pos + n / 2 + n_full / 2);
+            pos += n;
+        }
+        let mut st = BlockOverlap::new();
+        let mut out = Vec::new();
+        for (b, &n) in blocks.iter().enumerate() {
+            let n_prev = if b == 0 { n } else { blocks[b - 1] };
+            let n_next = if b + 1 < blocks.len() {
+                blocks[b + 1]
+            } else {
+                n
+            };
+            let spec = analyse_block(&signal, centres[b], n, n_prev, n_next);
+            let x = imdct(&spec);
+            st.block(&x, n_full, &mut out);
+        }
+        assert_eq!(out.len(), n_full * frames.len());
+        // Output sample t reproduces signal[t] once the first block's
+        // history is flushed (time-domain aliasing cancels across every
+        // block boundary, whatever the two lengths).
+        let start = n_full;
+        let end = out.len() - n_full;
+        let mut err = 0.0f64;
+        let mut sig = 0.0f64;
+        for t in start..end {
+            err += (out[t] as f64 - signal[t] as f64).powi(2);
+            sig += (signal[t] as f64).powi(2);
+        }
+        let snr = 10.0 * (sig / err.max(1e-30)).log10();
+        assert!(snr > 80.0, "block-switched TDAC SNR {snr:.1} dB");
     }
 }

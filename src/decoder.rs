@@ -71,9 +71,13 @@ pub struct Ac4Decoder {
     pub last_substream: Option<asf::Ac4SubstreamInfo>,
     /// Per-channel overlap-add state (length = transform_length samples).
     /// Keyed by channel index; resized on transform-length change.
-    overlap: Vec<Vec<f32>>,
-    /// Transform length of the previous frame (for overlap sizing).
+    overlap: Vec<mdct::BlockOverlap>,
+    /// Frame length the overlap states were last used with; a change
+    /// restarts every channel from silence.
     prev_transform_length: u32,
+    /// Block layout queued per output slot for the next IMDCT on that
+    /// slot (see [`Self::queue_blocks`]); empty = one full block.
+    slot_blocks: Vec<Option<Vec<usize>>>,
     /// Per-channel A-SPX persistent state — noise generator
     /// `noise_idx_prev` (§5.7.6.4.3 Pseudocode 103), tone generator
     /// `sine_idx_prev` (§5.7.6.4.4 Pseudocode 105), and the
@@ -313,6 +317,7 @@ impl Ac4Decoder {
             last_substream: None,
             overlap: Vec::new(),
             prev_transform_length: 0,
+            slot_blocks: Vec::new(),
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
@@ -815,27 +820,64 @@ impl Ac4Decoder {
         out
     }
 
-    /// Run IMDCT + KBD overlap-add for a single channel, returning
-    /// floating-point PCM (suitable for the A-SPX QMF pipeline).
+    /// The frame span an ASF element covers: `samples` when the blocks
+    /// `ti` describes tile a `samples`-long frame (one full block or a
+    /// block-switched arrangement), else the element's first transform
+    /// length (which the caller's `== samples` guard then rejects).
+    fn frame_n(ti: &asf::AsfTransformInfo, samples: usize) -> usize {
+        match ti.windows(samples as u32) {
+            Some(_) => samples,
+            None => ti.transform_length_0 as usize,
+        }
+    }
+
+    /// Queue the block layout of `ti` for the next IMDCT on `slot`:
+    /// the spectrum handed to [`Self::imdct_channel_f32`] is then the
+    /// window-order concatenation of the frame's partial blocks
+    /// (§5.1.5) and is transformed block by block (§5.5). A single
+    /// full block queues nothing.
+    fn queue_blocks(&mut self, slot: usize, ti: &asf::AsfTransformInfo, samples: usize) {
+        if self.slot_blocks.len() <= slot {
+            self.slot_blocks.resize(slot + 1, None);
+        }
+        self.slot_blocks[slot] = ti.windows(samples as u32).filter(|w| w.len() > 1);
+    }
+
+    /// Run the IMDCT + block-switched overlap/add (§5.5.2.2) for one
+    /// channel, returning floating-point PCM. `scaled` is one full
+    /// block of `n` lines unless a block layout was queued for the
+    /// slot ([`Self::queue_blocks`]), in which case it holds the
+    /// frame's partial blocks in window order.
     fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
-        // Transform-length change clears *all* channel overlap state so
-        // the next frame starts from a consistent history.
+        // Frame-length change restarts every channel from silence.
         if self.prev_transform_length != n as u32 {
             self.overlap.clear();
             self.prev_transform_length = n as u32;
         }
         while self.overlap.len() <= ch {
-            self.overlap.push(vec![0.0_f32; n]);
+            self.overlap.push(mdct::BlockOverlap::new());
         }
-        if self.overlap[ch].len() != n {
-            self.overlap[ch] = vec![0.0_f32; n];
+        let blocks = self
+            .slot_blocks
+            .get_mut(ch)
+            .and_then(|b| b.take())
+            .filter(|b| b.iter().sum::<usize>() == n)
+            .unwrap_or_else(|| vec![n]);
+        let mut out = Vec::with_capacity(n);
+        let mut pos = 0usize;
+        let mut x = Vec::new();
+        for &len in &blocks {
+            x.clear();
+            x.resize(len, 0.0f32);
+            if pos < scaled.len() {
+                let copy = (scaled.len() - pos).min(len);
+                x[..copy].copy_from_slice(&scaled[pos..pos + copy]);
+            }
+            pos += len;
+            let y = mdct::imdct(&x);
+            self.overlap[ch].block(&y, n, &mut out);
         }
-        let mut x = vec![0.0_f32; n];
-        let copy = scaled.len().min(n);
-        x[..copy].copy_from_slice(&scaled[..copy]);
-        let y = mdct::imdct(&x);
-        let window = mdct::kbd_window_shared(n as u32);
-        mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
+        out
     }
 
     /// Convert an f32 PCM buffer to i16, clamping to the i16 range.
@@ -2181,7 +2223,7 @@ impl Ac4Decoder {
         let Some(ti) = four.transform_info.as_ref() else {
             return;
         };
-        let n = ti.transform_length_0 as usize;
+        let n = Self::frame_n(ti, samples);
         if n == 0 || n != samples {
             return;
         }
@@ -2217,6 +2259,7 @@ impl Ac4Decoder {
             let Some(scaled) = four.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
+            self.queue_blocks(slot, ti, samples);
             let pcm_f = self.imdct_channel_f32(slot, scaled, n);
             entries.push((slot, pcm_f, trailers_for_ch[ch_in]));
         }
@@ -2276,14 +2319,14 @@ impl Ac4Decoder {
         let Some(ti_a) = tcd_a.transform_info.as_ref() else {
             return;
         };
-        let n_a = ti_a.transform_length_0 as usize;
+        let n_a = Self::frame_n(ti_a, samples);
         if n_a == 0 || n_a != samples {
             return;
         }
         let Some(ti_b) = tcd_b.transform_info.as_ref() else {
             return;
         };
-        let n_b = ti_b.transform_length_0 as usize;
+        let n_b = Self::frame_n(ti_b, samples);
         if n_b == 0 || n_b != samples {
             return;
         }
@@ -2311,6 +2354,7 @@ impl Ac4Decoder {
             let Some(scaled) = tcd_a.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
+            self.queue_blocks(slot, ti_a, samples);
             let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
             entries.push((
                 slot,
@@ -2322,6 +2366,7 @@ impl Ac4Decoder {
             let Some(scaled) = tcd_b.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
+            self.queue_blocks(slot, ti_b, samples);
             let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
             entries.push((
                 slot,
@@ -2452,14 +2497,14 @@ impl Ac4Decoder {
         let Some(ti3) = three.transform_info.as_ref() else {
             return;
         };
-        let n3 = ti3.transform_length_0 as usize;
+        let n3 = Self::frame_n(ti3, samples);
         if n3 == 0 || n3 != samples {
             return;
         }
         let Some(ti2) = tcd.transform_info.as_ref() else {
             return;
         };
-        let n2 = ti2.transform_length_0 as usize;
+        let n2 = Self::frame_n(ti2, samples);
         if n2 == 0 || n2 != samples {
             return;
         }
@@ -2475,6 +2520,7 @@ impl Ac4Decoder {
             let Some(scaled) = three.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
+            self.queue_blocks(slot, ti3, samples);
             let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
             entries.push((
                 slot,
@@ -2487,6 +2533,7 @@ impl Ac4Decoder {
             let Some(scaled) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
+            self.queue_blocks(slot, ti2, samples);
             let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
             entries.push((
                 slot,
@@ -2529,7 +2576,7 @@ impl Ac4Decoder {
         let Some(ti) = five.transform_info.as_ref() else {
             return;
         };
-        let n = ti.transform_length_0 as usize;
+        let n = Self::frame_n(ti, samples);
         if n == 0 || n != samples {
             return;
         }
@@ -2545,6 +2592,7 @@ impl Ac4Decoder {
             let Some(scaled) = five.scaled_spec_per_channel[ch_in].as_ref() else {
                 continue;
             };
+            self.queue_blocks(slot, ti, samples);
             let pcm_f = self.imdct_channel_f32(slot, scaled, n);
             entries.push((
                 slot,
@@ -2583,6 +2631,7 @@ impl Ac4Decoder {
         // `last_substream` up front so the IMDCT step can mutate
         // `self.overlap` without a borrow conflict.
         let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
+        self.slot_blocks.clear();
         // Detach the inputs + the ASPX tables once so we can run IMDCT
         // (which mutates overlap state) and the ASPX extension without
         // a borrow conflict on self.
@@ -2918,13 +2967,13 @@ impl Ac4Decoder {
                 .scaled_spec_primary
                 .as_ref()
                 .zip(sub.tools.transform_info_primary.as_ref())
-                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+                .map(|(s, ti)| (s.clone(), Self::frame_n(ti, samples as usize)));
             let sec = sub
                 .tools
                 .scaled_spec_secondary
                 .as_ref()
                 .zip(sub.tools.transform_info_secondary.as_ref())
-                .map(|(s, ti)| (s.clone(), ti.transform_length_0 as usize));
+                .map(|(s, ti)| (s.clone(), Self::frame_n(ti, samples as usize)));
             let tables = sub.tools.aspx_frequency_tables.clone();
             let cfg = sub.tools.aspx_config;
             // add_harmonic flags per channel: prefer the 2-channel
@@ -3126,6 +3175,22 @@ impl Ac4Decoder {
                 None => (None, None),
             }
         };
+        // Block layouts of the mono / channel-pair channels for the
+        // IMDCTs below (no-op for full blocks).
+        let cpe_ti = self.last_substream.as_ref().map(|sub| {
+            (
+                sub.tools.transform_info_primary,
+                sub.tools.transform_info_secondary,
+            )
+        });
+        if let Some((p, s2)) = cpe_ti {
+            if let Some(ti) = p {
+                self.queue_blocks(0, &ti, samples as usize);
+            }
+            if let Some(ti) = s2 {
+                self.queue_blocks(1, &ti, samples as usize);
+            }
+        }
         if use_stereo_cpe_synced {
             // Synced stereo-CPE pipeline. IMDCT each channel, then
             // run the M=2 phase-1 / sync-apply / phase-2 helper.

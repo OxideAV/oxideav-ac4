@@ -714,7 +714,7 @@ pub fn build_mono_simple_asf_tone_body(
     //   asf_psy_info(0, 0) with max_sfb[0] in 6 bits.
     bw.write_u32(0, 1); // mono_codec_mode = SIMPLE
     bw.write_u32(0, 1); // spec_frontend = ASF
-    bw.write_bit(true); // b_long_frame = 1
+    crate::encoder_asf::write_full_block_transform_info(&mut bw, transform_length);
     bw.write_u32(max_sfb, 6); // max_sfb[0]
     // asf_section_data: one section covering 0..max_sfb with cb=5
     // (HCB5, dim=2, signed). n_sect_bits = 3 (transf_length_idx=0

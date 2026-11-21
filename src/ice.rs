@@ -1026,7 +1026,7 @@ pub fn write_five_channel_data_simple(
     let (n_msfb_bits, _, _) = crate::tables::n_msfb_bits_48(transform_length)
         .ok_or_else(|| Error::invalid("ac4: unsupported transform_length"))?;
     // sf_info(ASF, 0, 0): b_long_frame = 1 + shared max_sfb.
-    bw.write_bit(true);
+    crate::encoder_asf::write_full_block_transform_info(bw, transform_length);
     bw.write_u32(max_sfb, n_msfb_bits);
     // five_channel_info(): chel_matsel = 0 + 5× chparam_info(sap 0).
     bw.write_u32(0, 4);

@@ -7,8 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Frame rates 47,95 – 120 fps** (`frame_rate_index` 5..=12, frame
+  lengths 960 / 1024 / 768 / 512 / 384) through the framework encoder
+  on every layout and tool family: each frame is one full block
+  signalled by the 2-bit `transf_length` (Table 103) with the Table 39
+  section-length width of its code. Settled relative error at the
+  long-frame floor on mono / stereo / 5.1 / 7.1 / 7.1.4
+  (tests/round456_frame_rate_matrix.rs).
+- **Block switching in the decoder** (§5.5.2.2 Pseudocodes 63 / 64,
+  §5.5.3): partial blocks of any Table 187 arrangement are inverse
+  transformed block by block through `mdct::BlockOverlap` — the
+  `Nfull` composition buffer with the left / right KBD slopes of the
+  shorter neighbour (Table 186 α incl. 6 for 128 / 120 / 96) — on the
+  mono, channel-pair and 5.X SIMPLE / ASPX routes. Time-domain
+  aliasing cancels across every length change (> 80 dB on a long →
+  2×480 + 960 → 8×240 → long sequence).
+
 ### Fixed
 
+- The LFE's `sf_info_lfe()` (Table 35) has no transform-info bits:
+  `b_long_frame = 1` is an assignment, the element reads `max_sfb[0]`
+  only. Decoder and all four LFE writers consumed / emitted a
+  `b_long_frame` bit there.
 - `asf_section_data()` section lengths on long frames: Pseudocode 2
   returns `get_transf_length(g) = 4` for a long frame, so Table 39
   reads `sect_len_incr` in **5** bits with escape 31 (the 3-bit /

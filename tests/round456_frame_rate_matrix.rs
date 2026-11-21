@@ -5,10 +5,9 @@
 //! immersive route. Each configuration must produce frames whose TOC
 //! announces the requested indices, decode to exactly the Table 83 /
 //! 84 frame length, and land within the waveform parity floor on the
-//! settled frame. The short-frame indices 5..=12 (< 1536 samples) are
-//! rejected at construction — their `asf_transform_info()` carries the
-//! Table 103 `transf_length` code instead of `b_long_frame` (§4.3.6.1),
-//! which the body writers do not emit.
+//! settled frame. The short-frame indices 5..=12 (< 1536 samples) run
+//! the same matrix: their `asf_transform_info()` carries the Table 103
+//! `transf_length` code instead of `b_long_frame` (§4.3.6.1).
 //!
 //! Before this round the TOC writers emitted one unconditional
 //! `frame_rate_multiply_info()` bit and no `frame_rate_fractions_info()`
@@ -79,7 +78,10 @@ fn run(channels: usize, rate: u32, fri: u32, mode: &str) -> f64 {
         .set("framing", "raw")
         .set("mode", mode);
     let mut enc = reg.first_encoder(&p).expect("encoder");
-    let total = n * FRAMES;
+    // Enough frames that a settled input frame, its one-frame codec
+    // delay and the 577-sample QMF route lag all fit.
+    let frames = FRAMES.max(2880usize.div_ceil(n) + 2);
+    let total = n * frames;
     let chans: Vec<Vec<f32>> = (0..channels)
         .map(|c| signal(c, total, rate, lfe_slots(channels).contains(&c)))
         .collect();
@@ -102,7 +104,7 @@ fn run(channels: usize, rate: u32, fri: u32, mode: &str) -> f64 {
     }
     assert_eq!(
         pkts.len(),
-        FRAMES,
+        frames,
         "{channels}ch idx {fri}: one packet per frame"
     );
     let mut dec = reg.first_decoder(&p).expect("decoder");
@@ -133,7 +135,7 @@ fn run(channels: usize, rate: u32, fri: u32, mode: &str) -> f64 {
     }
     // Settled input frame FRAMES-3 lands on output frame FRAMES-2 plus
     // the route lag (0 on the waveform routes, 577 on the QMF routes).
-    let start = n * (FRAMES - 3);
+    let start = n * (frames - 3 - 577usize.div_ceil(n));
     let mut worst = 0.0f64;
     for c in 0..channels {
         let reference = &chans[c][start..start + n];
@@ -193,19 +195,35 @@ fn selected_indices_on_7_1_22_2_and_the_parametric_immersive_route() {
     }
 }
 
+/// Frame lengths below 1536 samples (`frame_rate_index` 5..=12:
+/// 47,95 – 120 fps, 960 / 1024 / 768 / 512 / 384 samples). Their
+/// `asf_transform_info()` has no `b_long_frame`; each frame is one
+/// full block signalled by the 2-bit `transf_length` whose Table 103
+/// entry is the frame length, with the 3-bit section-length form at
+/// 512 / 384 lines, and the LFE's `sf_info_lfe()` carries no
+/// transform info at all.
 #[test]
-fn short_frame_indices_are_rejected_at_construction() {
-    let reg = registry();
+fn every_short_frame_48k_index_round_trips() {
     for fri in 5..=12u32 {
-        let mut p = CodecParameters::audio(CodecId::new("ac4"));
-        p.sample_rate = Some(48_000);
-        p.channels = Some(2);
-        p.sample_format = Some(SampleFormat::F32);
-        p.options = CodecOptions::new().set("frame_rate_index", fri.to_string());
-        assert!(
-            reg.first_encoder(&p).is_err(),
-            "index {fri} must be rejected"
-        );
+        for (ch, mode) in [
+            (1usize, "waveform"),
+            (2, "waveform"),
+            (6, "waveform"),
+            (8, "waveform"),
+        ] {
+            let e = run(ch, 48_000, fri, mode);
+            assert!(e < 0.12, "{ch}ch {mode} idx {fri}: settled rel err {e:.4}");
+        }
+    }
+}
+
+#[test]
+fn selected_short_frame_indices_on_the_immersive_routes() {
+    for fri in [6u32, 7, 9, 10, 12] {
+        for mode in ["waveform", "parametric"] {
+            let e = run(12, 48_000, fri, mode);
+            assert!(e < 0.12, "12ch {mode} idx {fri}: settled rel err {e:.4}");
+        }
     }
 }
 

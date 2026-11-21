@@ -35,6 +35,20 @@ pub fn sect_len_coding(tl_code: u32) -> (u32, u32) {
     if tl_code <= 2 { (3, 7) } else { (5, 31) }
 }
 
+/// `get_transf_length(g)` for a frame coded as one full block of `tl`
+/// lines: 4 for the long frames of `frame_len_base ≥ 1536`; below
+/// that Pseudocode 2 returns the `transf_length` field itself — 3 for
+/// the 1024 / 960 / 768 frame lengths, 2 for 512 / 384 (Table 103).
+pub fn full_block_tl_code(tl: u32) -> u32 {
+    if tl >= 1536 {
+        LONG_FRAME_TL_CODE
+    } else if tl >= 768 {
+        3
+    } else {
+        2
+    }
+}
+
 /// One window group of an ASF frame.
 #[derive(Debug, Clone)]
 pub struct AsfGroup {
@@ -169,11 +183,15 @@ impl AsfLayout {
         })
     }
 
-    /// Layout of a long frame (one full block of `tl` lines).
-    pub fn long(tl: u32, max_sfb: u32) -> Option<Self> {
+    /// Layout of a frame coded as one full block of `tl` lines — a
+    /// long frame for `tl ≥ 1536`, the full-length `transf_length`
+    /// code below that (see [`full_block_tl_code`]).
+    pub fn full_block(tl: u32, max_sfb: u32) -> Option<Self> {
+        let code = full_block_tl_code(tl);
+        let long = code == LONG_FRAME_TL_CODE;
         let ti = AsfTransformInfo {
-            b_long_frame: true,
-            transf_length: [0; 2],
+            b_long_frame: long,
+            transf_length: if long { [0; 2] } else { [code; 2] },
             transform_length_0: tl,
             transform_length_1: tl,
         };
@@ -184,6 +202,11 @@ impl AsfLayout {
             ..AsfPsyInfo::default()
         };
         Self::new(&ti, &psy, max_sfb, max_sfb)
+    }
+
+    /// Alias of [`Self::full_block`].
+    pub fn long(tl: u32, max_sfb: u32) -> Option<Self> {
+        Self::full_block(tl, max_sfb)
     }
 
     /// `true` when the frame is one full block.
