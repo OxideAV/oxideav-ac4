@@ -9592,12 +9592,15 @@ mod tests {
     }
 
     #[test]
-    fn encoder_sequence_counter_wraps_at_1024() {
+    fn encoder_sequence_counter_wraps_from_1020_to_1() {
+        // TS 103 190-1 §4.3.3.2.2: an encoder writes no counter above
+        // 1 020; the value after it is 1 (0 is the splicer's marker).
         let mut enc = Ac4ImsEncoder::new();
-        enc.sequence_counter = 1023;
+        enc.sequence_counter = 1019;
         let _ = enc.encode_frame(0);
-        // 1023 + 1 = 1024 → wraps to 0 (10-bit field).
-        assert_eq!(enc.sequence_counter, 0);
+        assert_eq!(enc.sequence_counter, 1020);
+        let _ = enc.encode_frame(0);
+        assert_eq!(enc.sequence_counter, 1);
     }
 
     #[test]
