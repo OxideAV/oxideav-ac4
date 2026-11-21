@@ -82,6 +82,10 @@ use crate::huffman::{
 ///   the escape cost separately during bit-counting.
 pub const CB_QMAX: [u32; 12] = [0, 1, 1, 2, 2, 4, 4, 7, 7, 12, 12, 16];
 
+/// Largest magnitude of a quantised spectral line (TS 103 190-1
+/// §5.1.3.1 NOTE 1).
+pub const MAX_QUANT_SPEC: i32 = 8191;
+
 /// All candidate codebook IDs the optimiser sweeps.
 pub const ALL_CB_IDS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
@@ -294,12 +298,9 @@ fn quantise_band_for_cb(coeffs: &[f32], sf: i32, cb_id: u8) -> Vec<i32> {
         let qi = quantise_coeff(c, sf);
         q[i] = if cb_id == 11 {
             // HCB11 inline range is [-16, 16] but |q| == 16 triggers
-            // the escape; values larger than 16 are encoded via ext.
-            // For clamping purposes only: bound the absolute value at
-            // a sane upper limit (256 → log2 = 8 → n_ext = 4 → ~13 extra
-            // bits, still affordable). This stops one runaway sample
-            // from blowing the bit budget.
-            qi.clamp(-256, 256)
+            // the escape; values larger than 16 are encoded via ext,
+            // up to the largest quantised line §5.1.3.1 allows.
+            qi.clamp(-MAX_QUANT_SPEC, MAX_QUANT_SPEC)
         } else {
             qi.clamp(-q_max, q_max)
         };
@@ -337,7 +338,8 @@ pub fn pick_best_codebook_for_band(coeffs: &[f32]) -> (u8, i32, Vec<i32>, u32) {
 pub struct AsfQuant {
     /// Per-band peak-quant target: the band's anchor scalefactor is
     /// chosen so its largest coefficient lands at about this quant
-    /// index (legacy 12 → ≈ 26 dB per-band SNR).
+    /// index (legacy 12 → ≈ 26 dB per-band SNR). Used when
+    /// [`Self::noise_db`] is `None`.
     pub q_target: f32,
     /// Band gate in the MDCT coefficient domain: a band whose peak
     /// magnitude is below this is coded silent (codebook 0 + spectral
@@ -345,13 +347,43 @@ pub struct AsfQuant {
     /// resolution. `0.0` disables the gate (legacy — every band with
     /// any energy is coded at full resolution).
     pub gate: f32,
+    /// Masking-driven noise allocation (the rate-controlled mode):
+    /// `Some(q)` gives every band the quantisation-noise power
+    ///
+    /// ```text
+    ///   N_b = 10^(−q/10) · P_b^γ · R^(1−γ)
+    /// ```
+    ///
+    /// per line, with `P_b` the band's mean line power, `R`
+    /// [`Self::noise_ref`] (the frame's loudest line power) and
+    /// `γ =` [`NOISE_MASK_EXPONENT`]. The frame's loudest band is coded
+    /// at about `q` dB signal-to-noise; a band `d` dB below it at
+    /// `q − (1 − γ)·d` dB — noise follows the masker energy, but less
+    /// than proportionally, so quiet bands next to loud ones give up
+    /// their bits first — and a band whose allowance reaches its own
+    /// power is left to the spectral noise fill.
+    pub noise_db: Option<f32>,
+    /// Reference line power `R` of [`Self::noise_db`]; `0.0` falls
+    /// back to the band's own power (constant signal-to-noise).
+    pub noise_ref: f32,
 }
+
+/// Exponent `γ` of the masking-driven allocation: `1` would hold the
+/// signal-to-noise ratio constant across bands, `0` the noise power
+/// (the mean-square-optimal split). In between, noise rises with the
+/// masker but more slowly — the level dependence of simultaneous
+/// masking. 0,45 is the value that minimises the noise-to-mask ratio
+/// `examples/ac4_quality.rs` measures at 64 – 256 kbit/s (0,3 … 0,9
+/// swept; 0,6 costs 0,2 – 0,6 dB of it and 2,5 – 4 dB of SNR).
+pub const NOISE_MASK_EXPONENT: f32 = 0.45;
 
 impl AsfQuant {
     /// The historical policy: `q_target = 12`, no gate.
     pub const LEGACY: AsfQuant = AsfQuant {
         q_target: 12.0,
         gate: 0.0,
+        noise_db: None,
+        noise_ref: 0.0,
     };
 }
 
@@ -359,6 +391,34 @@ impl Default for AsfQuant {
     fn default() -> Self {
         Self::LEGACY
     }
+}
+
+thread_local! {
+    static OBSERVED_PEAK: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Largest line power any band quantiser call on this thread has seen
+/// since the last [`reset_observed_peak_power`] — the measurement the
+/// rate loop turns into [`AsfQuant::noise_ref`].
+pub fn observed_peak_power() -> f32 {
+    OBSERVED_PEAK.with(|c| c.get())
+}
+
+/// Restart the [`observed_peak_power`] measurement.
+pub fn reset_observed_peak_power() {
+    OBSERVED_PEAK.with(|c| c.set(0.0));
+}
+
+/// Scale-factor gain whose power-law quantiser (`q = round((|x|/g)^¾)`,
+/// reconstruction `g·q^(4/3)`) leaves about `noise` quantisation-noise
+/// power per line on lines of RMS magnitude `rms`.
+///
+/// A rounding error of variance 1/12 on `q` maps to
+/// `(g·(4/3)·q^(1/3))²/12` on the line; with `q^(1/3) = (|x|/g)^(1/4)`
+/// that is `(4/27)·g^(3/2)·|x|^(1/2)`, hence
+/// `g = (27·N / (4·rms^(1/2)))^(2/3)`.
+pub fn gain_for_noise(noise: f32, rms: f32) -> f32 {
+    (27.0 * noise / (4.0 * rms.max(1e-30).sqrt())).powf(2.0 / 3.0)
 }
 
 thread_local! {
@@ -416,16 +476,41 @@ pub fn pick_best_codebook_for_band_with(
         return (0, 100, Vec::new(), 0);
     }
     let max_abs = coeffs.iter().fold(0.0_f32, |a, &c| a.max(c.abs()));
+    OBSERVED_PEAK.with(|c| c.set(c.get().max(max_abs * max_abs)));
     if max_abs <= 1e-12 || max_abs < quant.gate {
         return (0, 100, vec![0i32; coeffs.len()], 0);
     }
-    // Anchor scalefactor: target peak quant ≈ q_target (default 12 for
-    // the round-49 mono path; round-52 joint M/S bumps the M-channel
-    // target as high as 30 to spend bits saved on a silent S channel).
-    let q_target_43 = q_target.powf(4.0 / 3.0);
-    let sf_gain_min = max_abs / q_target_43;
-    let sf_anchor_f = 100.0 + 4.0 * sf_gain_min.log2();
-    let sf_anchor = (sf_anchor_f.ceil() as i32).clamp(0, 255);
+    let sf_anchor = if let Some(q_db) = quant.noise_db {
+        // Masking-driven allocation: the band's noise allowance sets
+        // the quantiser step; a band whose allowance reaches its own
+        // power carries no lines (noise fill takes over).
+        let power = coeffs.iter().map(|&c| c * c).sum::<f32>() / coeffs.len() as f32;
+        let reference = if quant.noise_ref > 0.0 {
+            quant.noise_ref
+        } else {
+            power
+        };
+        let noise = 10f32.powf(-q_db / 10.0)
+            * power.powf(NOISE_MASK_EXPONENT)
+            * reference.powf(1.0 - NOISE_MASK_EXPONENT);
+        if noise >= power {
+            return (0, 100, vec![0i32; coeffs.len()], 0);
+        }
+        let g = gain_for_noise(noise, power.sqrt());
+        // Keep the band's peak inside the quantised-line range.
+        let g_min = max_abs / (MAX_QUANT_SPEC as f32).powf(4.0 / 3.0);
+        let sf = (100.0 + 4.0 * g.log2()).round();
+        let sf_min = (100.0 + 4.0 * g_min.log2()).ceil();
+        sf.max(sf_min).clamp(0.0, 255.0) as i32
+    } else {
+        // Anchor scalefactor: target peak quant ≈ q_target (default 12
+        // for the round-49 mono path; the matched-pair refinement
+        // raises the first track's target).
+        let q_target_43 = q_target.powf(4.0 / 3.0);
+        let sf_gain_min = max_abs / q_target_43;
+        let sf_anchor_f = 100.0 + 4.0 * sf_gain_min.log2();
+        (sf_anchor_f.ceil() as i32).clamp(0, 255)
+    };
     // Compute the natural quantisation at this sf via the HCB11 path
     // (no clipping — we want to know the true magnitudes for the
     // codebook-fit check).

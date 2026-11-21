@@ -371,6 +371,11 @@ pub struct Ac4FrameInfo {
     pub bitstream_version: u32,
     /// 10-bit frame counter.
     pub sequence_counter: u32,
+    /// `wait_frames` (§4.3.3.2.4 Table 81) when `b_wait_frames` is
+    /// set: 0 = constant bit rate, 1..=6 = average bit rate with the
+    /// decoder waiting 0..=5 frames (twice that at `frame_rate_index`
+    /// 10..=12) before output, 7 = variable bit rate.
+    pub wait_frames: Option<u32>,
     /// 0 = 44.1 kHz, 1 = 48 kHz base.
     pub fs_index: u32,
     /// Base sample rate derived from `fs_index`.
@@ -499,11 +504,13 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     }
     let sequence_counter = br.read_u32(10)?;
     let b_wait_frames = br.read_bit()?;
+    let mut wait_frames = None;
     if b_wait_frames {
-        let wait_frames = br.read_u32(3)?;
-        if wait_frames > 0 {
+        let w = br.read_u32(3)?;
+        if w > 0 {
             let _reserved = br.read_u32(2)?;
         }
+        wait_frames = Some(w);
     }
     let fs_index = br.read_u32(1)?;
     let frame_rate_index = br.read_u32(4)?;
@@ -632,6 +639,7 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     Ok(Ac4FrameInfo {
         bitstream_version,
         sequence_counter,
+        wait_frames,
         fs_index,
         base_sample_rate: base_sr,
         sample_rate,

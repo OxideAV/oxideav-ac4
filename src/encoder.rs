@@ -493,7 +493,31 @@ pub struct Ac4Encoder {
     /// Samples of the next frame the inner encoder wants to see before
     /// a frame is coded (block-switching lookahead; 0 = none).
     lookahead: usize,
+    /// Rate control state (`bitrate > 0`).
+    rate: RateState,
 }
+
+/// Bit-reservoir rate control state of [`Ac4Encoder`].
+#[derive(Debug, Clone, Copy, Default)]
+struct RateState {
+    /// Bits saved so far, spendable by later frames (0..=one frame's
+    /// budget — the decoder buffer `wait_frames` announces).
+    reservoir: f64,
+    /// Noise-allocation level the previous frame settled on (dB).
+    q_db: f32,
+    /// Reference line power measured on the previous trial.
+    reference: f32,
+    /// Frames whose coarsest setting still exceeded the budget.
+    overflows: u64,
+    /// Total bits emitted (packet payloads).
+    bits: u64,
+}
+
+/// Rate-control search range of the noise-allocation level, in dB of
+/// signal-to-noise on the frame's loudest band.
+const RATE_Q_RANGE: (f32, f32) = (-6.0, 66.0);
+/// Encode trials per frame at most.
+const RATE_TRIALS: usize = 8;
 
 impl Ac4Encoder {
     /// Typed constructor — the `params.options` bag is parsed into
@@ -568,6 +592,12 @@ impl Ac4Encoder {
                 Layout::Mono | Layout::Stereo | Layout::S5_0 | Layout::S5_1
             );
         inner.block_switching = switched;
+        if opts.bitrate > 0 {
+            // Average bit rate with a one-frame reservoir: the decoder
+            // waits one frame (two at the 100 – 120 fps rates) before
+            // output (Table 81, wait_frames = 2).
+            inner.wait_frames = Some(2);
+        }
 
         let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
         out_params.sample_rate = Some(sample_rate);
@@ -592,6 +622,10 @@ impl Ac4Encoder {
             ready: std::collections::VecDeque::new(),
             flushed: false,
             lookahead: if switched { frame_len as usize / 2 } else { 0 },
+            rate: RateState {
+                q_db: 20.0,
+                ..RateState::default()
+            },
         })
     }
 
@@ -702,16 +736,143 @@ impl Ac4Encoder {
         }
     }
 
-    /// Dispatch one frame (channels in the inner encoder's slot order)
-    /// to the matching `Ac4ImsEncoder` path.
+    /// Bits per frame of the target bitrate.
+    fn frame_budget_bits(&self) -> f64 {
+        self.opts.bitrate as f64 * self.frame_len as f64 / self.sample_rate as f64
+    }
+
+    /// Bits saved up in the rate-control reservoir.
+    pub fn reservoir_bits(&self) -> f64 {
+        self.rate.reservoir
+    }
+
+    /// Frames whose coarsest quantiser setting still exceeded the
+    /// frame budget plus reservoir (the stream ran over the target
+    /// there).
+    pub fn rate_overflow_frames(&self) -> u64 {
+        self.rate.overflows
+    }
+
+    /// Encode one frame: directly at the constant-quality quantiser,
+    /// or — with a target bitrate — at the finest noise-allocation
+    /// level whose frame fits the budget plus the reservoir.
+    ///
+    /// The search runs whole-frame trials on clones of the inner
+    /// encoder (every tool's cross-frame state included) and keeps the
+    /// state of the trial it emits: from the previous frame's level
+    /// it walks towards the fit boundary with a doubling step, then
+    /// bisects the bracket.
     fn encode_one(&mut self, chans: &[Vec<f32>]) -> Vec<u8> {
+        if self.opts.bitrate == 0 {
+            let mut inner = std::mem::take(&mut self.inner);
+            let out = self.encode_frame(&mut inner, chans);
+            self.inner = inner;
+            return out;
+        }
+        use crate::encoder_asf::{
+            AsfQuant, observed_peak_power, reset_observed_peak_power, with_asf_quant,
+        };
+        let overhead_bits = match self.opts.framing {
+            Framing::Sync => 4 * 8,
+            Framing::SyncCrc => 6 * 8,
+            Framing::Raw => 0,
+        } as f64;
+        let budget = self.frame_budget_bits();
+        let allowed = budget + self.rate.reservoir - overhead_bits;
+        let (q_min, q_max) = RATE_Q_RANGE;
+        // (level, bytes, encoder state) of the finest fitting trial and
+        // of the smallest trial.
+        let mut best: Option<(f32, Vec<u8>, Ac4ImsEncoder)> = None;
+        let mut smallest: Option<(f32, Vec<u8>, Ac4ImsEncoder)> = None;
+        // Lowest level known not to fit.
+        let mut too_fine: Option<f32> = None;
+        let mut q = self.rate.q_db.clamp(q_min, q_max);
+        let mut step = 3.0f32;
+        for _ in 0..RATE_TRIALS {
+            let mut trial = self.inner.clone();
+            let policy = AsfQuant {
+                noise_db: Some(q),
+                noise_ref: self.rate.reference,
+                ..AsfQuant::LEGACY
+            };
+            reset_observed_peak_power();
+            let bytes = with_asf_quant(policy, || self.encode_frame(&mut trial, chans));
+            self.rate.reference = observed_peak_power();
+            let fits = (bytes.len() * 8) as f64 <= allowed;
+            if smallest
+                .as_ref()
+                .is_none_or(|(_, b, _)| bytes.len() < b.len())
+            {
+                smallest = Some((q, bytes.clone(), trial.clone()));
+            }
+            if fits {
+                if best.as_ref().is_none_or(|(bq, _, _)| q > *bq) {
+                    best = Some((q, bytes, trial));
+                }
+            } else if too_fine.is_none_or(|t| q < t) {
+                too_fine = Some(q);
+            }
+            // Next level: bisect once the fit boundary is bracketed,
+            // else walk towards it with a doubling step.
+            let next = match (best.as_ref().map(|b| b.0), too_fine) {
+                (Some(lo), Some(hi)) if hi > lo => {
+                    if hi - lo <= 0.75 {
+                        break;
+                    }
+                    0.5 * (lo + hi)
+                }
+                (Some(lo), _) => {
+                    if lo >= q_max {
+                        break;
+                    }
+                    let n = (lo + step).min(q_max);
+                    step *= 2.0;
+                    n
+                }
+                (None, Some(hi)) => {
+                    if hi <= q_min {
+                        break;
+                    }
+                    let n = (hi - step).max(q_min);
+                    step *= 2.0;
+                    n
+                }
+                (None, None) => break,
+            };
+            q = next;
+        }
+        let (bytes, state) = match best {
+            Some((bq, bytes, state)) => {
+                self.rate.q_db = bq;
+                (bytes, state)
+            }
+            None => {
+                // Nothing fits: emit the smallest trial.
+                self.rate.overflows += 1;
+                let (sq, bytes, state) = smallest.expect("at least one trial ran");
+                self.rate.q_db = sq;
+                (bytes, state)
+            }
+        };
+        self.inner = state;
+        let used = (bytes.len() * 8) as f64 + overhead_bits;
+        self.rate.bits += used as u64;
+        // One frame's budget is the most the reservoir may hold (the
+        // decoder buffer `wait_frames` announces); unspent bits beyond
+        // it are given up.
+        self.rate.reservoir = (self.rate.reservoir + budget - used).clamp(0.0, budget);
+        bytes
+    }
+
+    /// Dispatch one frame (channels in the inner encoder's slot order)
+    /// to the matching `Ac4ImsEncoder` path on `enc`.
+    fn encode_frame(&self, enc: &mut Ac4ImsEncoder, chans: &[Vec<f32>]) -> Vec<u8> {
         let iframe = !self.layout.supports_pframes(self.opts.mode)
             || self.frame_index.is_multiple_of(self.opts.gop as u64);
-        self.inner.b_iframe_global = iframe;
+        enc.b_iframe_global = iframe;
         let s: Vec<&[f32]> = chans.iter().map(|c| c.as_slice()).collect();
         let sfb = self.max_sfb;
         let lfe = self.max_sfb_lfe;
-        let enc = &mut self.inner;
         match (self.layout, self.opts.mode) {
             (Layout::Mono, _) => enc.encode_frame_pcm_with_max_sfb(s[0], sfb),
             (Layout::Stereo, _) => enc.encode_frame_pcm_stereo_with_max_sfb(s[0], s[1], sfb),

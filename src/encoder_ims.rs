@@ -167,6 +167,12 @@ pub struct Ac4ImsEncoder {
     /// [`crate::encoder_asf::with_asf_quant`] on the SIMPLE / ASF,
     /// SCPL and 22.2 bodies.
     pub asf_dynamic_range_db: Option<f32>,
+    /// `wait_frames` (TS 103 190-1 §4.3.3.2.4 Table 81) to announce in
+    /// the TOC: `None` writes `b_wait_frames = 0`; `Some(0)` declares a
+    /// constant-bit-rate stream, `Some(1..=6)` an average-bit-rate
+    /// stream whose decoder waits 0..=5 frames, `Some(7)` a
+    /// variable-rate stream.
+    pub wait_frames: Option<u8>,
     /// Transient-switched block lengths (TS 103 190-1 §5.5.3) on the
     /// mono, stereo and 5.0 / 5.1 SIMPLE entry points: a frame span
     /// with an attack is coded as short blocks (see
@@ -217,6 +223,7 @@ impl Ac4ImsEncoder {
             ice_env_ana: Vec::new(),
             ajcc_enc_state: crate::encoder_ajcc::AjccEncoderState::new(),
             asf_dynamic_range_db: None,
+            wait_frames: None,
             block_switching: false,
             transient: crate::encoder_blocks::TransientDetector::new(),
             lookahead: Vec::new(),
@@ -262,16 +269,25 @@ impl Ac4ImsEncoder {
     /// `asf_dynamic_range_db` below the peak coefficient of `spectra`
     /// (`gate = 0`, i.e. no gate, when the knob is `None`).
     fn frame_quant<'a>(&self, spectra: impl IntoIterator<Item = &'a [f32]>) -> AsfQuant {
-        let Some(db) = self.asf_dynamic_range_db else {
-            return AsfQuant::LEGACY;
-        };
+        // An enclosing policy (the rate loop's noise allocation) stays
+        // in force; this frame adds its gate and reference level.
+        let outer = crate::encoder_asf::active_asf_quant();
         let peak = spectra
             .into_iter()
             .flat_map(|s| s.iter())
             .fold(0.0_f32, |a, &c| a.max(c.abs()));
+        let gate = match self.asf_dynamic_range_db {
+            Some(db) => peak * 10f32.powf(-db.max(0.0) / 20.0),
+            None => 0.0,
+        };
         AsfQuant {
-            gate: peak * 10f32.powf(-db.max(0.0) / 20.0),
-            ..AsfQuant::LEGACY
+            gate,
+            noise_ref: if outer.noise_db.is_some() {
+                peak * peak
+            } else {
+                outer.noise_ref
+            },
+            ..outer
         }
     }
 
@@ -480,8 +496,17 @@ impl Ac4ImsEncoder {
         bw.write_u32(self.bitstream_version as u32, 2);
         // sequence_counter (10 b).
         bw.write_u32(self.sequence_counter as u32, 10);
-        // b_wait_frames = 0.
-        bw.write_u32(0, 1);
+        // b_wait_frames (+ wait_frames and its 2 reserved bits).
+        match self.wait_frames {
+            None => bw.write_u32(0, 1),
+            Some(w) => {
+                bw.write_u32(1, 1);
+                bw.write_u32((w & 7) as u32, 3);
+                if w & 7 > 0 {
+                    bw.write_u32(0, 2);
+                }
+            }
+        }
         // fs_index (1 b), frame_rate_index (4 b).
         bw.write_u32(self.fs_index as u32, 1);
         bw.write_u32(self.frame_rate_index as u32, 4);
@@ -678,6 +703,7 @@ impl Ac4ImsEncoder {
             fs_index: self.fs_index as u32,
             frame_rate_index: self.frame_rate_index as u32,
             b_iframe: self.b_iframe_global,
+            wait_frames: self.wait_frames,
         }
     }
 

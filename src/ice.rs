@@ -2063,6 +2063,9 @@ pub struct RawFrameHeader {
     pub frame_rate_index: u32,
     /// `b_iframe_global` / `b_pres_ndot` / `b_audio_ndot`.
     pub b_iframe: bool,
+    /// `wait_frames` (TS 103 190-1 Table 81) to announce; `None`
+    /// writes `b_wait_frames = 0`.
+    pub wait_frames: Option<u8>,
 }
 
 impl RawFrameHeader {
@@ -2073,6 +2076,7 @@ impl RawFrameHeader {
             fs_index: 1,
             frame_rate_index: 1,
             b_iframe,
+            wait_frames: None,
         }
     }
 }
@@ -2090,7 +2094,16 @@ fn encode_chan_raw_frame(
     // ---- ac4_toc() (§6.2.1.1) ----
     bw.write_u32(2, 2); // bitstream_version = 2
     bw.write_u32(hdr.sequence_counter & 0x3FF, 10);
-    bw.write_bit(false); // b_wait_frames
+    match hdr.wait_frames {
+        None => bw.write_bit(false), // b_wait_frames
+        Some(w) => {
+            bw.write_bit(true);
+            bw.write_u32((w & 7) as u32, 3);
+            if w & 7 > 0 {
+                bw.write_u32(0, 2); // reserved
+            }
+        }
+    }
     bw.write_u32(hdr.fs_index & 1, 1); // fs_index
     bw.write_u32(hdr.frame_rate_index & 0xF, 4); // frame_rate_index
     bw.write_bit(b_iframe); // b_iframe_global

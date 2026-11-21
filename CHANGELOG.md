@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Rate control** (framework option `bitrate` in bit/s,
+  `Ac4EncoderOptions::with_bitrate`; 0 keeps the constant quantiser).
+  Each frame is coded at the finest *noise-allocation level* whose
+  size fits its budget plus a bit reservoir of one frame's budget; the
+  stream is announced as average bit rate with the matching decoder
+  wait (`wait_frames = 2`, TS 103 190-1 §4.3.3.2.4 Table 81 — now
+  written by both TOC writers and exposed as
+  `Ac4FrameInfo::wait_frames`). The level drives a masking-driven
+  allocation in the band quantiser (`AsfQuant::noise_db`): every band
+  gets the noise power `10^(−q/10) · P_b^γ · R^(1−γ)` per line (`P_b`
+  band power, `R` the frame's loudest line, `γ = 0,45`), the scale
+  factor follows from the power-law quantiser's noise
+  (`encoder_asf::gain_for_noise`), and a band whose allowance reaches
+  its own power is left to spectral noise fill. The search runs
+  whole-frame trials on clones of the inner encoder (bracket with a
+  doubling step from the previous frame's level, then bisect; at most
+  eight trials), so it covers every layout and both tool families.
+  Targets are met within 0,5 % from 48 kbit/s stereo to 768 kbit/s
+  7.1.4, no frame exceeds budget + reservoir, and quality follows the
+  rate: stereo 21,4 / 26,3 / 28,5 / 32,7 dB SNR at 64 / 96 / 128 /
+  192 kbit/s — the constant quantiser needs 311 kbit/s for 25,6 dB;
+  5.1 at 256 kbit/s 26,7 dB (733 kbit/s before), 7.1.4 at 512 kbit/s
+  27,4 dB (1 221 kbit/s before) (tests/round492_rate_control.rs,
+  `examples/ac4_quality.rs` for the SNR / noise-to-mask table).
+- Quantised spectral lines up to the §5.1.3.1 limit of 8 191 (the
+  band quantiser clamped at 256).
 - **Decoder delay handling** (`decoder::LatencyMode`,
   `Ac4Decoder::set_latency_mode`, decoder option `latency` = `raw` /
   `aligned` / `trimmed`): `Ac4Decoder::tool_delay_samples()` reports
